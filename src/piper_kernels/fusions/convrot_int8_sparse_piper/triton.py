@@ -8,6 +8,7 @@ from collections.abc import Callable
 import torch
 import triton
 
+from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat, padded_sequence_length
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
@@ -89,6 +90,7 @@ def project_query(
                 group_m=execution_plan.group_m,
                 num_warps=execution_plan.num_warps,
                 num_stages=execution_plan.num_stages,
+                **lds_only_fence_options(execution_plan.lds_only_fences),
             )
 
         full_row_blocks = chunk_rows // execution_plan.block_m
@@ -187,6 +189,7 @@ def project_key(
                 bias_ptr=bias,
                 num_warps=execution_plan.num_warps,
                 num_stages=execution_plan.num_stages,
+                **lds_only_fence_options(execution_plan.lds_only_fences),
             )
 
         _launch_full_and_tail_blocks(input_qdata, heads, execution_plan, launch)
@@ -248,6 +251,7 @@ def project_value(
                 group_m=execution_plan.group_m,
                 num_warps=execution_plan.num_warps,
                 num_stages=execution_plan.num_stages,
+                **lds_only_fence_options(execution_plan.lds_only_fences),
             )
 
         _launch_full_and_tail_blocks(input_qdata, heads, execution_plan, launch)

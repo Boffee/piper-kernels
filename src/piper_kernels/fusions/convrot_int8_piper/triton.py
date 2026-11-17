@@ -6,6 +6,7 @@
 import torch
 import triton
 
+from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
     resolve_qk_quantization,
@@ -87,6 +88,7 @@ def project_query(
                 per_thread_scales=per_thread_scales,
                 num_warps=execution_plan.num_warps,
                 num_stages=execution_plan.num_stages,
+                **lds_only_fence_options(execution_plan.lds_only_fences),
             )
 
         full_blocks = chunk_rows // 64
@@ -162,6 +164,7 @@ def project_key(
                 bias_ptr=bias,
                 num_warps=execution_plan.num_warps,
                 num_stages=execution_plan.num_stages,
+                **lds_only_fence_options(execution_plan.lds_only_fences),
             )
         _quantization.prepare_chunk_centered_key(
             stored,
@@ -235,4 +238,5 @@ def project_value(
                     ),
                     num_warps=execution_plan.num_warps,
                     num_stages=execution_plan.num_stages,
+                    **lds_only_fence_options(execution_plan.lds_only_fences),
                 )

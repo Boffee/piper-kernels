@@ -2,12 +2,15 @@
 
 import sys
 from dataclasses import replace
+from functools import partial
 
 import pytest
 import triton
+from _accelerators import rocm_fences_only_lds
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
+from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._amd import policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd
@@ -68,14 +71,7 @@ def test_amd_paired_projection_compiles_to_matrix_instructions(architecture, ali
     assert ("v_mfma_i32" if architecture == "gfx942" else "v_wmma_i32") in compiled.asm["amdgcn"]
 
 
-@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
-@pytest.mark.parametrize("aligned_nk", [False, True])
-def test_rdna4_h3_projection_schedule_compiles(architecture, aligned_nk):
-    target = AcceleratorTarget("hip", architecture)
-    plan = replace(
-        policy.select_execution_plan(target, in_features=8_192),
-        matmul_block_n=128,
-    )
+def _compile_rdna4_projection(architecture, plan, *, aligned_nk, group_m, options):
     source = ASTSource(
         kernels.int8_matmul_kernel,
         {
@@ -102,21 +98,63 @@ def test_rdna4_h3_projection_schedule_compiles(architecture, aligned_nk):
             "second_has_bias": False,
             "aligned_m": False,
             "aligned_nk": aligned_nk,
-            "group_m": 0,
+            "group_m": group_m,
             "explicit_bias_fma": False,
-            "per_tile_tail": False,
+            "per_tile_tail": bool(group_m),
         },
     )
-    compiled = triton.compile(
+    return triton.compile(
         source,
         target=GPUTarget("hip", architecture, 32),
         options={
             "num_warps": plan.matmul_num_warps,
             "num_stages": plan.matmul_num_stages,
-            **amd._amd_matmul_compiler_options(target),
+            **options,
         },
     )
+
+
+@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
+@pytest.mark.parametrize("aligned_nk", [False, True])
+def test_rdna4_h3_projection_schedule_compiles(architecture, aligned_nk):
+    target = AcceleratorTarget("hip", architecture)
+    plan = replace(
+        policy.select_execution_plan(target, in_features=8_192),
+        matmul_block_n=128,
+    )
+    compiled = _compile_rdna4_projection(
+        architecture,
+        plan,
+        aligned_nk=aligned_nk,
+        group_m=0,
+        options=amd._amd_matmul_compiler_options(target),
+    )
     assert "v_wmma_i32" in compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(
+    not rocm_fences_only_lds(),
+    reason="requires a ROCm build whose Triton fences global memory at LDS barriers",
+)
+def test_rdna4_projection_barriers_fence_only_lds():
+    target = AcceleratorTarget("hip", "gfx1201")
+    plan = policy.select_execution_plan(target, in_features=5_120)
+    options = amd._amd_matmul_compiler_options(target)
+    lds_only = amd_compiler_workarounds.LDS_ONLY_FENCE_ATTRS
+    global_fences = {
+        "llvm_fn_attrs": tuple(item for item in options["llvm_fn_attrs"] if item not in lds_only)
+    }
+    compile_projection = partial(
+        _compile_rdna4_projection,
+        "gfx1201",
+        plan,
+        aligned_nk=True,
+        group_m=amd._LARGE_MATMUL_GROUP_M_TILES,
+    )
+    # The first check fails if Triton stops fencing global memory at its LDS
+    # barriers: then retire the workaround as amd_compiler_workarounds describes.
+    assert "global_inv" in compile_projection(options=global_fences).asm["amdgcn"]
+    assert "global_inv" not in compile_projection(options=options).asm["amdgcn"]
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"])

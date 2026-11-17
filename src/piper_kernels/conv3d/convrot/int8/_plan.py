@@ -28,3 +28,5 @@ class ConvolutionExecutionPlan:
     preparation: PreparationSchedule
     convolution: ConvolutionSchedule
     use_weight_descriptor: bool
+    # Fence only LDS at barriers; an RDNA workaround in _triton.amd_compiler_workarounds.
+    lds_only_fences: bool = False

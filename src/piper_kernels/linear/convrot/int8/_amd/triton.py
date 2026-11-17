@@ -13,6 +13,7 @@ from piper_kernels._input_activations import apply_input_activation, input_activ
 from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._residual import ResidualAdd
 from piper_kernels._residual.triton import apply_residual_add
+from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot import triton as convrot_backend
@@ -398,7 +399,13 @@ def _amd_matmul_compiler_options(
     hip_option_fields = getattr(hip_options, "__dataclass_fields__", {})
     if "llvm_fn_attrs" not in hip_option_fields:
         return {}
-    return {"llvm_fn_attrs": "amdgpu-sched-strategy=iterative-ilp"}
+    return {
+        "llvm_fn_attrs": (
+            ("amdgpu-sched-strategy", "iterative-ilp"),
+            # Barriers here only guard LDS tile reuse, so prefetches need not drain.
+            *amd_compiler_workarounds.LDS_ONLY_FENCE_ATTRS,
+        )
+    }
 
 
 def quantize_input(

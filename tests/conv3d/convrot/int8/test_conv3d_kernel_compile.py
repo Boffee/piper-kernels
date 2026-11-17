@@ -4,9 +4,11 @@ import sys
 
 import pytest
 import triton
+from _accelerators import rocm_fences_only_lds
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
+from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import triton as kernels
 from piper_kernels.conv3d.convrot.int8._amd import policy as amd_policy
@@ -32,7 +34,7 @@ from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
 )
 def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, target):
     policy = amd_policy if target.backend == "hip" else nvidia_policy
-    schedule = policy.select_execution_plan(
+    plan = policy.select_execution_plan(
         AcceleratorTarget.from_compiler_target(target),
         channels=channels,
         outputs=128,
@@ -41,7 +43,8 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
         output_height=17,
         weight_aligned=True,
         group_norm=False,
-    ).convolution
+    )
+    schedule = plan.convolution
     # Cover ordinary valid convolution as well as causal spatial reflection
     # on every accepted compiler target without multiplying the tile matrix.
     causal = rows == 16384
@@ -96,10 +99,16 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
     compiled = triton.compile(
         source,
         target=target,
-        options={"num_warps": schedule.num_warps, "num_stages": schedule.num_stages},
+        options={
+            "num_warps": schedule.num_warps,
+            "num_stages": schedule.num_stages,
+            **lds_only_fence_options(plan.lds_only_fences),
+        },
     )
     if target.backend == "hip":
         assert "v_wmma_i32" in compiled.asm["amdgcn"]
+        if rocm_fences_only_lds():
+            assert "global_inv" not in compiled.asm["amdgcn"]
     else:
         assert "mma.sync" in compiled.asm["ptx"]
 
