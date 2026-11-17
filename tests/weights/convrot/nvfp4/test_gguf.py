@@ -3,7 +3,7 @@
 import pytest
 import torch
 from _accelerators import exact_sm120_available
-from gguf_format._fixtures import dequantize_reference, finite_packed
+from gguf_format._fixtures import finite_packed, reference_case
 
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
@@ -11,11 +11,7 @@ from piper_kernels.weights.convrot import triton as convrot_backend
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
 
-def _materialized_reference(
-    packed: torch.Tensor,
-    quant_type: GGUFQuantizationType,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dense = dequantize_reference(packed, quant_type, dtype=torch.float32).cuda()
+def _materialized_reference(dense: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rotated = torch.empty_like(dense)
     convrot_backend.rotate_input(dense, rotated, 64, num_warps=4)
     return nvfp4_ops._compiled_prepare_dynamic(rotated, None)
@@ -25,10 +21,8 @@ def _materialized_reference(
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 @pytest.mark.parametrize("quant_type", list(GGUFQuantizationType))
 def test_from_gguf_matches_materialized_reference(quant_type: GGUFQuantizationType) -> None:
-    torch.manual_seed(840 + int(quant_type))
-    packed = finite_packed(quant_type)
-
-    expected = _materialized_reference(packed, quant_type)
+    packed, dense = reference_case(quant_type, seed=840 + int(quant_type))
+    expected = _materialized_reference(dense.cuda())
     actual = ConvRotNVFP4Tensor.from_gguf(
         packed.cuda(),
         quant_type=quant_type,
@@ -93,11 +87,9 @@ def test_copy_from_gguf_refills_existing_storage_and_scale(dtype: torch.dtype) -
 def test_from_gguf_without_global_scale_matches_from_hp(
     is_swizzled_scales: bool,
 ) -> None:
-    packed = finite_packed(GGUFQuantizationType.BF16, rows=128)
-    dense = dequantize_reference(packed, GGUFQuantizationType.BF16).cuda()
-
+    packed, dense = reference_case(GGUFQuantizationType.BF16, seed=870, rows=128)
     expected = ConvRotNVFP4Tensor.from_hp(
-        dense,
+        dense.to(device="cuda", dtype=torch.bfloat16),
         group_size=64,
         is_swizzled_scales=is_swizzled_scales,
     )

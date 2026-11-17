@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from gguf_format._fixtures import dequantize_reference, finite_packed
+from gguf_format._fixtures import finite_packed, reference_case
 
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -23,10 +23,8 @@ _gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA o
 )
 @pytest.mark.parametrize("quant_type", list(GGUFQuantizationType))
 def test_nvidia_conversion_matches_fp32_decoding(quant_type):
-    torch.manual_seed(820 + int(quant_type))
-    packed = finite_packed(quant_type)
-    dense = dequantize_reference(packed, quant_type, dtype=torch.float32).cuda()
-    expected = ConvRotInt8Tensor.from_hp(dense, group_size=64)
+    packed, dense = reference_case(quant_type, seed=820 + int(quant_type))
+    expected = ConvRotInt8Tensor.from_hp(dense.cuda(), group_size=64)
     actual = ConvRotInt8Tensor.from_gguf(packed.cuda(), quant_type=quant_type, group_size=64)
     assert torch.equal(actual.qdata, expected.qdata)
     # The FP32 butterfly and matrix-multiply oracle can differ in their last bits.
@@ -46,11 +44,8 @@ def test_from_gguf_matches_materialized_reference(
         monkeypatch.setattr(
             int8_weight_triton, "select_conversion_chunks", lambda target, width: None
         )
-    torch.manual_seed(820 + int(quant_type))
-    packed = finite_packed(quant_type, rows=3, features=1280)
-    dense = dequantize_reference(packed, quant_type, dtype=torch.float32).cuda()
-
-    expected = ConvRotInt8Tensor.from_hp(dense, group_size=group_size)
+    packed, dense = reference_case(quant_type, seed=820 + int(quant_type), rows=3, features=1280)
+    expected = ConvRotInt8Tensor.from_hp(dense.cuda(), group_size=group_size)
     actual = ConvRotInt8Tensor.from_gguf(
         packed.cuda(),
         quant_type=quant_type,
@@ -160,10 +155,8 @@ def test_generic_conversion_widths_and_bounded_batches(monkeypatch, quant_type, 
     monkeypatch.setattr(int8_weight_triton, "select_conversion_chunks", lambda target, width: None)
     # Force repeated batches, including a one-row tail and maxima larger than the budget.
     monkeypatch.setattr(int8_weight_triton, "_GGUF_MAXIMA_BYTES", 48)
-    torch.manual_seed(75)
-    packed = finite_packed(quant_type, rows=5, features=width)
-    dense = dequantize_reference(packed, quant_type, dtype=torch.float32).cuda()
-    expected = ConvRotInt8Tensor.from_hp(dense, group_size=16)
+    packed, dense = reference_case(quant_type, seed=75, rows=5, features=width)
+    expected = ConvRotInt8Tensor.from_hp(dense.cuda(), group_size=16)
     device_packed = packed.cuda()
     # Packed inputs may be noncontiguous; output views must keep their surrounding canaries.
     strided = torch.zeros(5, device_packed.shape[1] * 2, device="cuda", dtype=torch.uint8)
