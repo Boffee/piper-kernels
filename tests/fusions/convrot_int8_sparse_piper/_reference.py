@@ -61,7 +61,7 @@ def reconstruct_key_center(
     *,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Decode a 2-term residual INT8 H(K_mean) tensor to floating point."""
+    """Decode a 2-term residual INT8 rotated K64 center tensor to floating point."""
     return key_center[..., 0, :].to(dtype) * key_center_scale[..., 0:1].to(dtype) + key_center[
         ..., 1, :
     ].to(dtype) * key_center_scale[..., 1:2].to(dtype)
@@ -85,15 +85,15 @@ def check_qk_sample_fp64(projected, output, head, start, rows, norm, cos, sin, *
         )
     rotated = _rotate_fp64(projected)
     if not is_query:
-        rotated_mean = rotated.mean(0)
+        rotated_center = 0.5 * (rotated.amax(0) + rotated.amin(0))
         tile = start // _BLOCK_ROWS
         reconstructed_center = reconstruct_key_center(
             output[2][0, head, tile],
             output[3][0, head, tile],
             dtype=torch.float64,
         )
-        torch.testing.assert_close(reconstructed_center, rotated_mean, rtol=2e-4, atol=2e-4)
-        rotated = rotated - rotated_mean
+        torch.testing.assert_close(reconstructed_center, rotated_center, rtol=2e-4, atol=2e-4)
+        rotated = rotated - rotated_center
     padded = rotated.new_zeros((_BLOCK_ROWS, head_dim), dtype=torch.float64)
     padded[:rows] = rotated
     scale_rows = 32 if is_query else _BLOCK_ROWS

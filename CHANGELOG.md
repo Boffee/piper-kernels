@@ -15,10 +15,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - `SparsePiperAttention` / `sparse_piper_attention` and the sparse-Piper
   compiler fusions (`convrot_int8_sparse_piper_compile_options`,
   `nvfp4_sparse_piper_compile_options`, `convrot_nvfp4_sparse_piper_compile_options`)
-  now center keys and values per independent `64`-token tile (`K64 + V64`)
-  instead of using sequence-wide global mean reductions. Numerical outputs
-  differ from prior releases (including full-keep configurations), so callers
-  upgrading should revalidate end-to-end quality.
+  now center keys and values per independent `64`-token tile (`K64 + V64` — `K`
+  by its rotated midpoint and `V` by its mean) instead of using sequence-wide
+  global mean reductions. Numerical outputs differ from prior releases
+  (including full-keep configurations), so callers upgrading should revalidate
+  end-to-end quality.
 - Replaced sequence-wide K/V mean centering in `piper_attention` and `convrot_int8_piper` with independent `1024`-token chunk centering (`K1024 + V1024`) across both causal and non-causal paths, updating `piper_kernels::piper_attention_from_quantized` and its offline SM8x/SM120/RDNA4 compiler paths.
 
 ### Removed

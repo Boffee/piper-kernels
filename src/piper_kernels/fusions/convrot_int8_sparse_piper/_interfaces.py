@@ -78,7 +78,7 @@ class ProjectionBackend(Protocol):
 
         Minmax routing uses two [B,H,S/64,D] summary tensors. Mean routing
         uses one summary tensor and an empty auxiliary [B,H,0,D]. K is
-        tile-centered by its K64 INT8 residual mean (two signed terms per tile);
+        tile-centered by its K64 INT8 residual rotated midpoint (two signed terms per tile);
         routing summaries describe the uncentered FP32 transform values before
         BF16 K storage.
         """

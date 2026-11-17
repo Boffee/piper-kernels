@@ -95,9 +95,9 @@ the current Q/K values on every call. The default `"minmax"` policy scores
 extrema summaries; `"mean"` scores block means. The application owns the ratio
 profile and its quality validation. Even a full keep budget uses sparse Piper's
 quantized arithmetic (`K64 + V64` per-tile centering: `K` centered per `K64` tile
-with 2-term INT8 rotated centers restored in scores, and `V` centered per `K64`
-tile with BF16 tile means restored in the numerator), which differs from dense
-Piper's `V` quantization.
+by its rotated midpoint with 2-term INT8 centers restored in scores, and `V`
+centered per `K64` tile by its BF16 mean restored in the numerator), which differs
+from dense Piper's `V` quantization.
 
 `sparse_key_blocks` counts complete physical blocks in the leading key prefix and
 must be between 1 and `min(sequence_length // 64, 65536)`. A compact partial final
