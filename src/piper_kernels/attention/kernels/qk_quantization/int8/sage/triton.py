@@ -193,7 +193,7 @@ def store_key_center_tile(
     feature_offsets,
     head_dim: tl.constexpr,
 ):
-    """Store one tile's 2-term INT8 H(K_mean) center and FP32 residual scales."""
+    """Store one tile's 2-term INT8 rotated center and FP32 residual scales."""
     center_base = tile_offset * 2
     tl.store(
         key_center_ptr + center_base * head_dim + feature_offsets,
@@ -216,7 +216,7 @@ def quantize_tile_centered_key_tile(
     block_m: tl.constexpr,
     scale_rows: tl.constexpr,
 ):
-    """Tile-center and INT8-encode K in one Hadamard pass plus 2-term H(K_mean).
+    """Tile-center and INT8-encode K in one Hadamard pass plus 2-term rotated midpoint.
 
     ``values`` must already be zeroed outside ``valid`` so the Hadamard
     butterfly never mixes uninitialized/padded elements into valid features.
@@ -234,16 +234,17 @@ def quantize_tile_centered_key_tile(
         (heads_per_program, num_tiles, scale_rows, head_dim),
     )
     grouped_valid = tl.reshape(valid, (num_tiles, scale_rows))
-    valid_count = tl.maximum(tl.sum(grouped_valid.to(tl.float32), axis=1), 1.0)
-    rotated_mean = (
-        tl.sum(tl.where(grouped_valid[None, :, :, None], grouped, 0.0), axis=2)
-        / valid_count[None, :, None]
-    )
-    centered = tl.where(grouped_valid[None, :, :, None], grouped - rotated_mean[:, :, None, :], 0.0)
+    valid_mask = grouped_valid[None, :, :, None]
+    has_valid = tl.sum(grouped_valid.to(tl.int32), axis=1)[None, :, None] > 0
+    rotated_max = tl.max(tl.where(valid_mask, grouped, -float("inf")), axis=2)  # pyright: ignore[reportArgumentType]
+    rotated_min = tl.min(tl.where(valid_mask, grouped, float("inf")), axis=2)  # pyright: ignore[reportArgumentType]
+    rotated_midpoint = 0.5 * (rotated_max + rotated_min)  # pyright: ignore[reportOperatorIssue]
+    rotated_center = tl.where(has_valid, rotated_midpoint, 0.0)
+    centered = tl.where(valid_mask, grouped - rotated_center[:, :, None, :], 0.0)
     maximum = tl.max(tl.max(tl.abs(centered), axis=3), axis=2)
     key_scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
     quantized = round_to_int8(centered / key_scale[:, :, None, None])
-    center_0, center_1, center_scale_0, center_scale_1 = encode_residual_int8_tile(rotated_mean)
+    center_0, center_1, center_scale_0, center_scale_1 = encode_residual_int8_tile(rotated_center)
     return (
         tl.reshape(quantized, (heads_per_program, block_m, head_dim)),
         key_scale,
@@ -587,7 +588,7 @@ def quantize_key_tile_centered_per_block_kernel(
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):
-    """Quantize K with per-block (K64) tile centering and 2-term H(K_mean)."""
+    """Quantize K with per-block (K64) tile centering and 2-term rotated midpoints."""
     scale_group = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
     batch = tl.program_id(2).to(tl.int64)
@@ -650,7 +651,7 @@ def prepare_tile_centered_key(
     storage_key_length: int,
     block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize K with per-K64 tile centering and emit 2-term H(K_mean) centers."""
+    """Quantize K with per-K64 tile centering and emit 2-term rotated midpoints."""
     batch, heads, key_length, head_dim = key.shape
     if storage_key_length < key_length:
         raise ValueError("K storage length cannot be smaller than the logical key length")

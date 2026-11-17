@@ -172,16 +172,15 @@ def test_fused_key_projection_matches_the_tile_centered_contract(
     assert actual_center_scale.dtype is torch.float32
     assert actual_max.shape == (1, 2, storage_tiles, head_dim)
     assert actual_min.shape == actual_max.shape
-    non_trivial = (expected.key_scale > 1e-6).repeat_interleave(64, dim=2)[..., None]
-    assert (
-        int((actual_key.to(torch.int16) - expected.key).abs().masked_fill(~non_trivial, 0).max())
-        <= 1
-    )
+    expected_scale = expected.key_scale.repeat_interleave(64, dim=2)[..., None]
+    non_trivial = expected_scale > 1e-6
+    code_diff = (actual_key.to(torch.int16) - expected.key).abs()
+    assert int(code_diff.masked_fill(~non_trivial, 0).max()) <= 1
     dequant_actual = actual_key.float() * actual_scale.repeat_interleave(64, dim=2)[..., None]
-    dequant_expected = (
-        expected.key.float() * expected.key_scale.repeat_interleave(64, dim=2)[..., None]
+    dequant_expected = expected.key.float() * expected_scale
+    assert torch.all(
+        (dequant_actual - dequant_expected).abs() <= torch.clamp(expected_scale * 1.05, min=1e-5)
     )
-    torch.testing.assert_close(dequant_actual, dequant_expected, rtol=1e-2, atol=1e-5)
     torch.testing.assert_close(actual_scale, expected.key_scale, atol=1e-6, rtol=1e-4)
     torch.testing.assert_close(
         reconstruct_key_center(actual_center, actual_center_scale),
@@ -300,8 +299,8 @@ def test_constant_transformed_keys_are_centered_to_fp32_roundoff(routing_mode, s
     key, scale, _center, _center_scale, summary, _ = key_fusion._project_key_op(
         *operands.as_tuple(), 1e-5, routing_mode
     )
-    # Dividing the tile sum by a non-power-of-two valid count can leave FP32
-    # roundoff. With epsilon-sized scales even that can produce nonzero codes.
+    # Reconstructing the tile center across Hadamard stages can leave FP32 roundoff.
+    # With epsilon-sized scales even that can produce nonzero codes.
     decoded = key.float() * scale.repeat_interleave(64, dim=2)[..., None]
     error_bound = 4 * torch.finfo(torch.float32).eps * key.shape[-1] ** 0.5 * summary.abs().max()
     assert decoded.abs().max() <= error_bound

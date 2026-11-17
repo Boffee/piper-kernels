@@ -72,6 +72,25 @@ def _valid_rows(rows, positions, row_end, block_lengths_ptr, mask_block_lengths:
 
 
 @gluon.jit
+def _summarize_block_means(block_values, block_mask, row_valid, mask_rows: gl.constexpr):
+    """Reduce masked ``[blocks, 64, 128]`` values to per-block FP32 means."""
+    blocks: gl.constexpr = block_values.shape[0]
+    if mask_rows:
+        summed_values = (
+            block_values if block_mask is None else gl.where(block_mask, block_values, 0.0)
+        )
+        block_sum = gl.sum(summed_values, axis=1)
+        # Count rows, not row-feature pairs: a per-feature count would hold 32 more
+        # registers per thread through the reduction.
+        row_counts = gl.reshape(row_valid.to(gl.int32), [blocks, _GL_TILE_ROWS])
+        valid_count = gl.convert_layout(
+            gl.sum(row_counts, axis=1), gl.SliceLayout(1, block_sum.type.layout)
+        )
+        return block_sum / valid_count[:, None]
+    return gl.sum(block_values, axis=1) / _GL_TILE_ROWS
+
+
+@gluon.jit
 def _summarize_blocks(
     values,
     positions,
@@ -82,6 +101,7 @@ def _summarize_blocks(
     mean_pool_summary: gl.constexpr,
     mask_block_lengths: gl.constexpr,
     mask_rows: gl.constexpr,
+    use_inf_pad: gl.constexpr,
 ):
     """Zero invalid rows and reduce each 64-row block to its routing summaries.
 
@@ -91,23 +111,37 @@ def _summarize_blocks(
     blocks: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
     rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
     row_valid = _valid_rows(rows, positions, row_end, block_lengths_ptr, mask_block_lengths)
+    if use_inf_pad:
+        if mask_rows:
+            values = gl.where(row_valid[:, None], values, 0.0)
+        block_values = gl.reshape(values, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM])
+        if mean_pool_summary:
+            mean = _summarize_block_means(block_values, None, row_valid, mask_rows)
+            return values, mean, mean, row_valid
+        if mask_rows:
+            block_valid_layout: gl.constexpr = gl.SliceLayout(2, block_values.type.layout)  # pyright: ignore[reportAttributeAccessIssue]
+            block_valid = gl.convert_layout(
+                gl.reshape(row_valid, [blocks, _GL_TILE_ROWS]), block_valid_layout
+            )[:, :, None]
+            # Padding invalid rows (which were just zeroed above) with +-inf via one mask
+            # tensor keeps the key kernel within its 2-program SM8x/SM120 register limit.
+            inf_pad = gl.where(block_valid, 0.0, float("inf"))
+            maximum, minimum = gl.reduce(
+                (block_values - inf_pad, block_values + inf_pad),
+                1,
+                _minmax,
+            )
+            return values, maximum, minimum, row_valid
+        maximum, minimum = gl.reduce((block_values, block_values), 1, _minmax)
+        return values, maximum, minimum, row_valid
+
     valid = row_valid[:, None] & (features >= 0)[None, :]
     if mask_rows:
         values = gl.where(valid, values, 0.0)
     block_values = gl.reshape(values, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM])
     block_valid = gl.reshape(valid, [blocks, _GL_TILE_ROWS, _GL_HEAD_DIM])
     if mean_pool_summary:
-        if mask_rows:
-            block_sum = gl.sum(gl.where(block_valid, block_values, 0.0), axis=1)
-            # Count rows, not row-feature pairs: a per-feature count would hold 32 more
-            # registers per thread through the reduction.
-            row_counts = gl.reshape(row_valid.to(gl.int32), [blocks, _GL_TILE_ROWS])
-            valid_count = gl.convert_layout(
-                gl.sum(row_counts, axis=1), gl.SliceLayout(1, block_sum.type.layout)
-            )
-            mean = block_sum / valid_count[:, None]
-        else:
-            mean = gl.sum(block_values, axis=1) / _GL_TILE_ROWS
+        mean = _summarize_block_means(block_values, block_valid, row_valid, mask_rows)
         return values, mean, mean, row_valid
     if mask_rows:
         maximum, minimum = gl.reduce(
@@ -185,6 +219,7 @@ def _query_kernel(
         mean_pool_summary,
         mask_block_lengths,
         mask_rows,
+        False,
     )
     summary = maximum
     if not mean_pool_summary:
@@ -251,6 +286,24 @@ def _tile_mean(values, row_valid, mask_rows: gl.constexpr, mask_values: gl.const
         )
         return tile_sum / valid_count[:, None]
     return gl.sum(values, axis=1) / _GL_TILE_ROWS
+
+
+@gluon.jit
+def _tile_midpoint(values, tile_row_valid, mask_rows: gl.constexpr):
+    """Compute per-K64 tile FP32 midpoints over rotated keys."""
+    if mask_rows:
+        tile_max, tile_min = gl.reduce(
+            (
+                gl.where(tile_row_valid, values, -float("inf")),
+                gl.where(tile_row_valid, values, float("inf")),
+            ),
+            1,
+            _minmax,
+        )
+        # Empty tiles reduce to (-inf, +inf); finite non-empty tiles always satisfy min <= max.
+        return gl.where(tile_max >= tile_min, 0.5 * (tile_max + tile_min), 0.0)
+    tile_max, tile_min = gl.reduce((values, values), 1, _minmax)
+    return 0.5 * (tile_max + tile_min)
 
 
 @gluon.jit
@@ -355,6 +408,7 @@ def _key_kernel(
         mean_pool_summary,
         mask_block_lengths,
         mask_rows,
+        True,
     )
 
     batch_head = batch * heads + head
@@ -372,13 +426,17 @@ def _key_kernel(
     rotated = gl.reshape(
         fragments.signed_hadamard(values, features), [tiles, _GL_TILE_ROWS, _GL_HEAD_DIM]
     )
-    row_valid_tiles = gl.reshape(row_valid, [tiles, _GL_TILE_ROWS])
-    rotated_mean = _tile_mean(rotated, row_valid_tiles, mask_rows, False)
-
-    centered = rotated - rotated_mean[:, None, :]
     if mask_rows:
         row_mask_layout: gl.constexpr = gl.SliceLayout(2, rotated.type.layout)  # pyright: ignore[reportAttributeAccessIssue]
-        tile_row_valid = gl.convert_layout(row_valid_tiles, row_mask_layout)[:, :, None]
+        tile_row_valid = gl.convert_layout(
+            gl.reshape(row_valid, [tiles, _GL_TILE_ROWS]), row_mask_layout
+        )[:, :, None]
+    else:
+        tile_row_valid = None
+    rotated_center = _tile_midpoint(rotated, tile_row_valid, mask_rows)
+
+    centered = rotated - rotated_center[:, None, :]
+    if mask_rows:
         centered = gl.where(tile_row_valid, centered, 0.0)
     key_scale = fragments.int8_scale(gl.max(gl.max(gl.abs(centered), axis=2), axis=1))
     quantized = fragments.round_to_int8(centered / key_scale[:, None, None])
@@ -399,10 +457,10 @@ def _key_kernel(
         mask_rows,
     )
 
-    # Encode and store the 2-term H(K_mean) after freeing the 128-reg tile buffer.
-    center_scale_0 = fragments.int8_scale(gl.max(gl.abs(rotated_mean), axis=1))
-    center_0 = fragments.round_to_int8(rotated_mean / center_scale_0[:, None])
-    residual = rotated_mean - center_0.to(gl.float32) * center_scale_0[:, None]
+    # Encode and store the 2-term rotated midpoint after freeing the 128-reg tile buffer.
+    center_scale_0 = fragments.int8_scale(gl.max(gl.abs(rotated_center), axis=1))
+    center_0 = fragments.round_to_int8(rotated_center / center_scale_0[:, None])
+    residual = rotated_center - center_0.to(gl.float32) * center_scale_0[:, None]
     center_scale_1 = fragments.int8_scale(gl.max(gl.abs(residual), axis=1))
     center_1 = fragments.round_to_int8(residual / center_scale_1[:, None])
     _store_key_centers(

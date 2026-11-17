@@ -106,7 +106,7 @@ def _compute_k_bias_batch(
     mma_layout: gl.constexpr,
     key_layout: gl.constexpr,
 ):
-    """Compute Q @ H(K_mean)^T score biases for one batch of 16 routed/dense tiles."""
+    """Compute Q @ rotated_center^T score biases for one batch of 16 routed/dense tiles."""
     elements_d: gl.constexpr = 8 if (mma_warps == 4 and head_dim == 64) else 16
     threads_d: gl.constexpr = head_dim // elements_d
     threads_m: gl.constexpr = 32 // threads_d

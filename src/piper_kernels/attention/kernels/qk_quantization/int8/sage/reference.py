@@ -200,7 +200,7 @@ def quantize_tile_centered_query_key(
     valid_key_rows: torch.Tensor | None = None,
     quantization_range: int = 127,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Tile-center and smooth K, returning Q/K INT8 codes, scales, and 2-term H(K_mean)."""
+    """Tile-center and smooth K, returning Q/K INT8 codes, scales, and 2-term H(K) midpoints."""
     batch, kv_heads, key_length, head_dim = key.shape
     padded_key, _ = _pad_sequence(key.float(), tile_rows)
     tile_count = padded_key.shape[2] // tile_rows
@@ -213,20 +213,22 @@ def quantize_tile_centered_query_key(
     else:
         valid_mask = valid_key_rows.reshape(1, 1, tile_count, tile_rows, 1).bool()
     valid_key_tiles = torch.where(valid_mask, key_tiles, 0.0)
-    valid_count = valid_mask.sum(dim=3, keepdim=True).clamp_min(1.0)
-    key_mean = valid_key_tiles.sum(dim=3, keepdim=True) / valid_count
-    key_centered = torch.where(valid_mask, valid_key_tiles - key_mean, 0.0).reshape_as(padded_key)[
-        :, :, :key_length
-    ]
-    key_mean_rotated = rotate_signed_hadamard_heads(key_mean.squeeze(3))
+    rotated_key_tiles = rotate_signed_hadamard_heads(valid_key_tiles)
+    tile_max = rotated_key_tiles.masked_fill(~valid_mask, -torch.inf).amax(dim=3, keepdim=True)
+    tile_min = rotated_key_tiles.masked_fill(~valid_mask, torch.inf).amin(dim=3, keepdim=True)
+    has_valid = valid_mask.any(dim=3, keepdim=True)
+    rotated_center = torch.where(has_valid, 0.5 * (tile_max + tile_min), 0.0)
+    rotated_centered = torch.where(valid_mask, rotated_key_tiles - rotated_center, 0.0).reshape_as(
+        padded_key
+    )[:, :, :key_length]
     key_center, key_center_scale = encode_residual_int8(
-        key_mean_rotated,
+        rotated_center.squeeze(3),
         quantization_range=quantization_range,
     )
 
     query_int8, key_int8, query_scale, key_scale = _quantize_rotated_query_key(
         rotate_signed_hadamard_heads(query.float()),
-        rotate_signed_hadamard_heads(key_centered),
+        rotated_centered,
         granularity=granularity,
         query_length=query.shape[2],
         key_length=key_length,

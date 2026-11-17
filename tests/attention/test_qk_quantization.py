@@ -196,11 +196,11 @@ def test_quantize_tile_centered_query_key_masks_block_lengths(granularity: str) 
     )
 
     masked_tiles = key.float().reshape(2, 2, 2, 64, 64) * valid_key_rows[None, None, :, :, None]
-    counts = valid_key_rows.sum(dim=1).clamp_min(1.0)[None, None, :, None, None]
-    expected_mean = masked_tiles.sum(dim=3, keepdim=True) / counts
-    expected_center, expected_center_scale = encode_residual_int8(
-        rotate_signed_hadamard_heads(expected_mean.squeeze(3))
-    )
+    rotated_tiles = rotate_signed_hadamard_heads(masked_tiles)
+    valid_mask = valid_key_rows[None, None, :, :, None]
+    tile_max = rotated_tiles.masked_fill(~valid_mask, -torch.inf).amax(dim=3)
+    tile_min = rotated_tiles.masked_fill(~valid_mask, torch.inf).amin(dim=3)
+    expected_center, expected_center_scale = encode_residual_int8(0.5 * (tile_max + tile_min))
     torch.testing.assert_close(key_center, expected_center, atol=0, rtol=0)
     torch.testing.assert_close(key_center_scale, expected_center_scale, atol=1e-6, rtol=1e-6)
     assert query_int8.shape == query.shape

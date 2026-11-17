@@ -144,11 +144,11 @@ def _fp64_query_block(prepared, head, query_block):
     k_scale = context.key_scale[0, kv_head, tiles].repeat_interleave(64).double()
     key_center = context.key_center[0, kv_head, tiles]
     key_center_scale = context.key_center_scale[0, kv_head, tiles]
-    rotated_mean = (
+    rotated_center = (
         key_center[:, 0].double() * key_center_scale[:, 0, None].double()
         + key_center[:, 1].double() * key_center_scale[:, 1, None].double()
     )
-    k_bias = ((q @ rotated_mean.T) * q_scale[:rows, None]).repeat_interleave(64, dim=-1)
+    k_bias = ((q @ rotated_center.T) * q_scale[:rows, None]).repeat_interleave(64, dim=-1)
     multiplier = context.value_scale_multiplier[0, kv_head, tiles, 0].repeat_interleave(64)
     scores = (q @ k.T) * q_scale[:rows, None] * k_scale[None, :] + k_bias
     scores = scores.masked_fill(~valid[None, :], -torch.inf)

@@ -134,7 +134,7 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
     """Evaluate the selected quantized Sparse Piper algorithm in PyTorch.
 
     This matches the native algorithmic contract: grouped INT8 Q/K centered per
-    K64 tile with 2-term H(K_mean) centers, V64 tile-centered and tile-scaled
+    K64 tile with 2-term INT8 rotated midpoints, V64 tile-centered and tile-scaled
     INT8 V with BF16 tile means, paired K128 recurrence, UINT8 probabilities,
     and a pre-rounding FP32 denominator. It is a correctness reference, not a
     fast fallback.
@@ -233,12 +233,12 @@ def reference_sparse_piper_attention(  # noqa: PLR0915
                     pair_tile_stop = (pair_stop + _BLOCK_ROWS - 1) // _BLOCK_ROWS
                     pair_centers = selected_key_center[pair_tile_start:pair_tile_stop]
                     pair_center_scales = selected_key_center_scale[pair_tile_start:pair_tile_stop]
-                    pair_rotated_means = (
+                    pair_rotated_centers = (
                         pair_centers[:, 0].float() * pair_center_scales[:, 0, None]
                         + pair_centers[:, 1].float() * pair_center_scales[:, 1, None]
                     )
                     k_bias = (
-                        (block_query.float() @ pair_rotated_means.mT)
+                        (block_query.float() @ pair_rotated_centers.mT)
                         * block_query_scale[:, None]
                         * scale
                     ).repeat_interleave(_BLOCK_ROWS, dim=-1)[:, : pair_stop - pair_start]
