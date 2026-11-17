@@ -38,9 +38,9 @@ def test_dynamic_output_reuses_storage_and_replays(
     arguments, _ = _arguments(sequence_length=193, bias=False)
     # Two batches with different value means detect per-batch scaling and unsafe
     # write order when compacting a narrower output into the attention allocation.
-    attention_args = [tensor.repeat(2, *([1] * (tensor.ndim - 1))) for tensor in arguments[:10]]
-    attention_args[9][1].add_(3)
-    attention_args.extend(arguments[10:14])
+    attention_args = [tensor.repeat(2, *([1] * (tensor.ndim - 1))) for tensor in arguments[:12]]
+    attention_args[11][1].add_(3)
+    attention_args.extend(arguments[12:16])
     dense_weight = torch.randn((output_features, 256), device="cuda", dtype=torch.bfloat16)
     weight = NVFP4Tensor.to_nvfp4(
         dense_weight,
@@ -90,7 +90,7 @@ def test_dynamic_output_reuses_storage_and_replays(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             replayed = op(*op_args, **op_kwargs)
-        attention_args[9].mul_(4)
+        attention_args[11].mul_(4)
         graph.replay()
         # Replay must reproduce eager execution of this same fused operation.
         eager = op(*op_args, **op_kwargs)

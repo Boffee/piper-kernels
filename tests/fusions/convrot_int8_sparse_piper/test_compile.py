@@ -624,24 +624,19 @@ def _run_explicit_fused_projection(  # noqa: PLR0913
         head_dim=model.head_dim,
         bias=model.key.bias,
     )
-    input_mean = int8_ops.dequantized_input_mean(
-        *value_input,
-        block_lengths,
-    )
     projection_arguments = (
         *value_input,
-        input_mean,
         model.value.weight.qdata,
         model.value.weight.scale,
     )
+    value = fused_value._project_value_op(
+        *projection_arguments,
+        block_lengths,
+        model.head_dim,
+        bias=model.value.bias,
+        value_format=int(require_attention_backend(hidden_states).value_format),
+    )
     if coarse_gate is None:
-        value = fused_value._project_value_op(
-            *projection_arguments,
-            block_lengths,
-            model.head_dim,
-            bias=model.value.bias,
-            value_format=int(require_attention_backend(hidden_states).value_format),
-        )
         return _sparse_piper_attention_from_quantized_op(
             *query,
             *key,
@@ -658,13 +653,6 @@ def _run_explicit_fused_projection(  # noqa: PLR0913
         )
     assert coarse_scale is not None
     assert coarse_key_blocks is not None
-    value = fused_value._project_value_with_block_means_op(
-        *projection_arguments,
-        block_lengths,
-        model.head_dim,
-        bias=model.value.bias,
-        value_format=int(require_attention_backend(hidden_states).value_format),
-    )
     return _sparse_piper_attention_with_coarse_residual_from_quantized_op(
         *query,
         *key,
@@ -822,8 +810,7 @@ def test_compile_options_fuse_sparse_piper_projection_region(monkeypatch, head_d
         == 1
     )
     assert (
-        capture.targets.count(torch.ops.piper_kernels.convrot_int8_dequantized_input_mean.default)
-        == 1
+        torch.ops.piper_kernels.convrot_int8_dequantized_input_mean.default not in capture.targets
     )
     assert (
         capture.targets.count(
@@ -934,7 +921,7 @@ def test_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None
     assert relative_l2 < 0.025
     assert (
         capture.targets.count(
-            torch.ops.piper_kernels.convrot_int8_sparse_piper_project_value_with_block_means.default
+            torch.ops.piper_kernels.convrot_int8_sparse_piper_project_value.default
         )
         == 1
     )
@@ -946,7 +933,7 @@ def test_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None
     )
     absent_targets = (
         torch.ops.piper_kernels.convrot_int8_linear.default,
-        torch.ops.piper_kernels.convrot_int8_sparse_piper_project_value.default,
+        torch.ops.piper_kernels.convrot_int8_dequantized_input_mean.default,
         torch.ops.piper_kernels.sparse_piper_attention.default,
         torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
         torch.ops.piper_kernels.sparse_piper_coarse_residual.default,

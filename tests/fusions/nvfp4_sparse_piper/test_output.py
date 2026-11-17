@@ -20,7 +20,6 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
 )
 from piper_kernels.fusions.nvfp4_sparse_piper import key, output, query, value
 from piper_kernels.linear.nvfp4 import _ops, _projection, reference
-from piper_kernels.linear.nvfp4.triton import linear_mean
 
 from .._accuracy import assert_fusion_output_close
 from ._helpers import make_operands
@@ -87,16 +86,9 @@ def _arguments(
         1e-5,
         128,
     )
-    value_mean = linear_mean(
-        *v_projection.as_tuple(),
-        None,
-        1,
-        sequence_length,
-    ).view(1, _HEADS, _HEAD_DIM)
     prepared_value = value.project_value(
         *v_projection.as_tuple(),
         None,
-        value_mean,
         128,
     )
     attention = SparsePiperAttention((0.5, 1.0))
@@ -125,7 +117,6 @@ def _arguments(
         *prepared_query,
         *prepared_key,
         *prepared_value,
-        value_mean,
         attention._ratio_profile,
         sparse_key_blocks,
         sequence_length,
@@ -141,7 +132,6 @@ def _arguments(
             *prepared_query,
             *prepared_key,
             *prepared_value,
-            value_mean,
             attention._ratio_profile,
             sparse_key_blocks,
             sequence_length,
@@ -166,18 +156,9 @@ def _padded_arguments(
         sequence_length=sequence_length,
         bias=True,
     )
-    attention_arguments = arguments[:14]
-    projection_arguments = arguments[14:]
+    attention_arguments = arguments[:16]
+    projection_arguments = arguments[16:]
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
-    block_mean = (
-        torch.randn(
-            (1, _HEADS, sequence_length // 64, _HEAD_DIM),
-            device="cuda",
-            dtype=torch.float32,
-        )
-        if coarse
-        else None
-    )
     coarse_gate = (
         torch.randn(
             (1, sequence_length, _HEADS, _HEAD_DIM),
@@ -190,13 +171,11 @@ def _padded_arguments(
     coarse_scale = 0.125 if coarse else None
     coarse_key_blocks = sequence_length // 64 if coarse else None
     if coarse:
-        assert block_mean is not None
         assert coarse_gate is not None
         materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
-            *attention_arguments[:10],
-            block_mean,
+            *attention_arguments[:12],
             coarse_gate,
-            *attention_arguments[10:],
+            *attention_arguments[12:],
             coarse_scale,
             coarse_key_blocks,
             block_lengths,
@@ -231,7 +210,6 @@ def _padded_arguments(
         *arguments,
         128,
         block_lengths,
-        block_mean,
         coarse_gate,
         coarse_scale,
         coarse_key_blocks,
@@ -304,17 +282,11 @@ def _projected_gate_arguments(
             torch.bfloat16,
         ).view(1, sequence_length, _HEADS, _HEAD_DIM)
     coarse_key_blocks = (sequence_length + 63) // 64
-    block_mean = torch.randn(
-        (1, _HEADS, coarse_key_blocks, _HEAD_DIM),
-        device="cuda",
-        dtype=torch.float32,
-    )
     with torch.no_grad():
         expected = output._attention_output_op(
             *arguments,
             128,
             None,
-            block_mean,
             coarse_gate,
             0.125,
             coarse_key_blocks,
@@ -324,7 +296,6 @@ def _projected_gate_arguments(
         *arguments,
         128,
         None,
-        block_mean,
         None,
         0.125,
         coarse_key_blocks,
@@ -382,9 +353,9 @@ def test_attention_output_supports_mixed_precision_bias(
 def test_high_first_attention_output_matches_low_first() -> None:
     arguments, _reference = _arguments(sequence_length=193, bias=True)
     high_arguments = list(arguments)
-    qdata = high_arguments[14]
+    qdata = high_arguments[16]
     assert isinstance(qdata, torch.Tensor)
-    high_arguments[14] = ((qdata & 0x0F) << 4) | (qdata >> 4)
+    high_arguments[16] = ((qdata & 0x0F) << 4) | (qdata >> 4)
 
     with torch.no_grad():
         expected = output._attention_output_op(*arguments, 128)
@@ -430,7 +401,7 @@ def test_attention_output_supports_bounded_attention_features(
         actual = output._attention_output_op(*arguments)
 
     assert actual.shape == expected.shape == (1, 192, _OUTPUT_FEATURES)
-    block_lengths = arguments[-6]
+    block_lengths = arguments[-5]
     assert isinstance(block_lengths, torch.Tensor)
     valid_rows = torch.arange(64, device="cuda")[None] < block_lengths[:, None]
     assert_fusion_output_close(actual[:, valid_rows.flatten()], expected[:, valid_rows.flatten()])
@@ -517,11 +488,13 @@ def test_attention_output_fake_kernel_propagates_shape(dtype: torch.dtype) -> No
         torch.empty((1, 2, 3, 128), device="meta", dtype=torch.float32),
         torch.empty((1, 2, 192, 128), device="meta", dtype=torch.int8),
         torch.empty((1, 2, 3), device="meta", dtype=torch.float32),
+        torch.empty((1, 2, 3, 2, 128), device="meta", dtype=torch.int8),
+        torch.empty((1, 2, 3, 2), device="meta", dtype=torch.float32),
         torch.empty((1, 2, 3, 128), device="meta", dtype=torch.float32),
         torch.empty((1, 2, 3, 128), device="meta", dtype=torch.float32),
         torch.empty((1, 2, 128, 192), device="meta", dtype=torch.int8),
         torch.empty((1, 2, 3, 1), device="meta", dtype=torch.float32),
-        torch.empty((1, 2, 128), device="meta", dtype=torch.float32),
+        torch.empty((1, 2, 3, 128), device="meta", dtype=torch.bfloat16),
         _SparsePiperRatioProfile((500_000, 1_000_000)),
         2,
         191,

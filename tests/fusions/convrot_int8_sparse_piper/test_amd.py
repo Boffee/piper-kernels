@@ -15,13 +15,12 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import _backend, key, outpu
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
-from piper_kernels.linear.convrot.int8 import _ops
 
 from ._reference import (
     assert_int8_codes_close,
     check_qk_sample_fp64,
     check_value_sample_fp64,
-    key_mean_fp64,
+    reconstruct_key_center,
 )
 
 
@@ -55,7 +54,6 @@ def test_grouped_order_preserves_complete_outputs_with_partial_groups_and_query_
     norm = torch.rand(head_dim, dtype=torch.bfloat16, device="cuda") + 0.5
     angles = torch.rand((sequence, head_dim * 3 // 4), device="cuda")
     cos, sin = angles.cos(), angles.sin()
-    mean = _ops.dequantized_input_mean(qdata, scale)
 
     def run():
         return (
@@ -74,10 +72,9 @@ def test_grouped_order_preserves_complete_outputs_with_partial_groups_and_query_
                 chunk_rows=1089,
             ),
             key._project_key_op(qdata, scale, weight, weight_scale, norm, cos, sin, 1e-5, 0),
-            value._project_value_with_block_means_op(
+            value._project_value_op(
                 qdata,
                 scale,
-                mean,
                 weight,
                 weight_scale,
                 head_dim=head_dim,
@@ -91,10 +88,19 @@ def test_grouped_order_preserves_complete_outputs_with_partial_groups_and_query_
             launch.keywords, "execution_plan", replace(launch.keywords["execution_plan"], group_m=0)
         )
     expected = run()
-    for left, right in zip(actual, expected, strict=True):
+    for index, (left, right) in enumerate(zip(actual, expected, strict=True)):
         assert_int8_codes_close(left[0], right[0])
-        for actual_metadata, expected_metadata in zip(left[1:], right[1:], strict=True):
-            torch.testing.assert_close(actual_metadata, expected_metadata, rtol=3e-5, atol=2e-5)
+        if index == 1:
+            torch.testing.assert_close(left[1], right[1], rtol=3e-5, atol=2e-5)
+            actual_center = reconstruct_key_center(left[2], left[3])
+            expected_center = reconstruct_key_center(right[2], right[3])
+            torch.testing.assert_close(actual_center, expected_center, rtol=2e-4, atol=2e-4)
+            tail = zip(left[4:], right[4:], strict=True)
+        else:
+            tail = zip(left[1:], right[1:], strict=True)
+        for actual_metadata, expected_metadata in tail:
+            rtol = 1.6e-2 if expected_metadata.dtype is torch.bfloat16 else 3e-5
+            torch.testing.assert_close(actual_metadata, expected_metadata, rtol=rtol, atol=2e-4)
 
 
 @pytest.mark.usefixtures("large_device_memory")
@@ -124,7 +130,6 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        mean = _ops.dequantized_input_mean(qdata, scale)
         q = query._project_query_op(
             qdata,
             scale,
@@ -141,10 +146,9 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
         k = key._project_key_op(
             qdata, scale, weights[1], scales[1], norm, cos, sin, 1e-5, 0, head_dim=head_dim
         )
-        v = value._project_value_with_block_means_op(
+        v = value._project_value_op(
             qdata,
             scale,
-            mean,
             weights[2],
             scales[2],
             head_dim=head_dim,
@@ -153,22 +157,9 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
     stream.synchronize()
     assert _backend.select_output_backend(q[0]) is not None
 
-    # Independently check all represented-input feature means with bounded workspace.
-    expected_mean = torch.zeros((1, width), device="cuda", dtype=torch.float64)
-    for start in range(0, sequence, 4096):
-        expected_mean += (
-            qdata[:, start : start + 4096].double() * scale[:, start : start + 4096, None].double()
-        ).sum(1)
-    expected_mean /= sequence
-    torch.testing.assert_close(mean.double(), expected_mean, rtol=2e-5, atol=2e-6)
     storage = (sequence + 63) // 64 * 64
     for head in (0, heads // 2, heads - 1):
         columns = slice(head * head_dim, (head + 1) * head_dim)
-        mean_k = key_mean_fp64(
-            qdata[0], scale[0], weights[1][columns], scales[1][columns], norm, cos, sin
-        )
-        mean_v = (expected_mean @ weights[2][columns].double().T) * scales[2][columns, 0].double()
-        torch.testing.assert_close(v[2][:, head].double(), mean_v, rtol=2e-5, atol=2e-5)
         for start in sorted({0, (sequence // 2) // 64 * 64, (sequence - 1) // 64 * 64}):
             rows = min(64, sequence - start)
             for index, projected_operands in enumerate((q, k, v)):
@@ -188,12 +179,9 @@ def test_h3_projections_match_sampled_fp64_math_through_100k(
                         cos,
                         sin,
                         is_query=index == 0,
-                        key_mean=mean_k,
                     )
                 else:
-                    check_value_sample_fp64(
-                        projected, projected_operands, head, start, rows, mean_v
-                    )
+                    check_value_sample_fp64(projected, projected_operands, head, start, rows)
     assert q[0].shape == (1, heads, storage, head_dim)
     assert k[0].shape == (1, heads, storage, head_dim)
     assert v[0].shape == ValueFormat.AMD_WMMA.shape(1, heads, storage, head_dim)
@@ -223,11 +211,9 @@ def test_h3_chunked_output_matches_materialized_boundary_with_bounded_workspace(
     query_args = qdata, scale, weights[0], scales[0], norm, cos, sin, 1e-5, head_dim**-0.5
     q = query._project_query_op(*query_args, 0)
     k = key._project_key_op(qdata, scale, weights[1], scales[1], norm, cos, sin, 1e-5, 0)
-    mean = _ops.dequantized_input_mean(qdata, scale)
     v = value._project_value_op(
         qdata,
         scale,
-        mean,
         weights[2],
         scales[2],
         head_dim=head_dim,

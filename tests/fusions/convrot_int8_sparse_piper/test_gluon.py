@@ -16,7 +16,6 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
-from piper_kernels.fusions.convrot_int8_sparse_piper import _kernels
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import (
@@ -24,6 +23,8 @@ from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import (
     gluon_async_copy,
     policy,
 )
+
+from ._reference import reconstruct_key_center
 
 _SM89_TARGET = AcceleratorTarget("cuda", "sm89")
 _NVIDIA_TARGETS = [
@@ -62,32 +63,38 @@ def _outputs(
     heads=3,
     head_dim=128,
     mean_routing=False,
-    emit_block_mean=True,
 ):
     """Allocate sentinel-filled outputs, so unwritten elements compare equal."""
 
     def filled(shape, dtype=torch.float32):
-        return torch.full(shape, 99 if dtype is torch.int8 else -7.0, device=device, dtype=dtype)
+        if dtype is torch.int8:
+            fill = 99
+        elif dtype is torch.bfloat16:
+            fill = -7.0
+        else:
+            fill = -7.0
+        return torch.full(shape, fill, device=device, dtype=dtype)
 
+    storage_tiles = storage // 64
     if operation == "query":
         return (
             filled((batch, heads, storage, head_dim), torch.int8),
             filled((batch, heads, storage // 32)),
-            filled((batch, heads, storage // 64, head_dim)),
+            filled((batch, heads, storage_tiles, head_dim)),
         )
     if operation == "key":
         return (
             filled((batch, heads, storage, head_dim), torch.int8),
-            filled((batch, heads, storage // 64)),
-            filled((batch, heads, storage // 64, head_dim)),
-            filled((batch, heads, 0 if mean_routing else storage // 64, head_dim)),
+            filled((batch, heads, storage_tiles)),
+            filled((batch, heads, storage_tiles, 2, head_dim), torch.int8),
+            filled((batch, heads, storage_tiles, 2)),
+            filled((batch, heads, storage_tiles, head_dim)),
+            filled((batch, heads, 0 if mean_routing else storage_tiles, head_dim)),
         )
-    value_mean = filled((batch, heads, head_dim))
     return (
         filled((batch, heads, head_dim, storage), torch.int8),
-        filled((batch, heads, storage // 64, 1)),
-        value_mean,
-        filled((batch, heads, storage // 64, head_dim)) if emit_block_mean else value_mean,
+        filled((batch, heads, storage_tiles, 1)),
+        filled((batch, heads, storage_tiles, head_dim), torch.bfloat16),
     )
 
 
@@ -101,7 +108,6 @@ def _launch(
     block_lengths=None,
     bias=None,
     window=(64, 129),
-    emit_block_mean=True,
     target=_SM89_TARGET,
     **options,
 ):
@@ -137,17 +143,12 @@ def _launch(
             *operands, 1e-5, routing_mode, block_lengths, out=out, bias=bias, **options
         )
     else:
-        input_mean = input_qdata.new_zeros(
-            (input_qdata.shape[0], input_qdata.shape[2]), dtype=torch.float32
-        )
         module.project_value(
             input_qdata,
             input_scale,
-            input_mean,
             weight_qdata,
             weight_scale,
             block_lengths,
-            emit_block_mean=emit_block_mean,
             value_format=ValueFormat.TRANSPOSED,
             out=out,
             bias=bias,
@@ -207,13 +208,8 @@ def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, 
     function = getattr(gluon_async_copy, f"_{operation}_kernel")
     kernel = MagicMock()
     monkeypatch.setattr(gluon_async_copy, function.__name__, kernel)
-    mean_kernel = MagicMock()
-    monkeypatch.setattr(_kernels, "_project_prepared_input_mean_kernel", mean_kernel)
     guard = Mock(side_effect=lambda device: nullcontext())
     monkeypatch.setattr(gluon_async_copy, "device_context", guard)
-    finalize_mean, encode_key = Mock(), Mock()
-    monkeypatch.setattr(gluon_async_copy.centered_projection, "finalize_mean", finalize_mean)
-    monkeypatch.setattr(gluon_async_copy.qk_quantization, "prepare_key", encode_key)
     sequence, window = 448, (64, 300)
     rows = window[1] if operation == "query" else sequence
     storage = padded_sequence_length(rows)
@@ -245,30 +241,6 @@ def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, 
         if operation == "query":
             assert arguments["chunk_start"] == window[0]
             assert arguments["query_sequence_end"] == sum(window)
-    if operation == "value":
-        mean_kernel.__getitem__.assert_called_once_with((3, 2))
-        assert mean_kernel.__getitem__.return_value.call_args.kwargs["block_n"] == 128
-    else:
-        mean_kernel.__getitem__.assert_not_called()
-    if operation == "key":
-        _assert_centered_key_encoding(calls[0], out, finalize_mean, encode_key, sequence, storage)
-    else:
-        finalize_mean.assert_not_called()
-        encode_key.assert_not_called()
-
-
-def _assert_centered_key_encoding(call, out, finalize_mean, encode_key, sequence, storage):
-    """The kernels store BF16 K and tile sums; the shared encoder centers and quantizes K."""
-    stored, partials = call.args[8:10]
-    assert stored.dtype is torch.bfloat16
-    assert stored.shape == out[0].shape
-    assert partials.shape == (2, 3, storage // 64, 128)
-    finalize_mean.assert_called_once()
-    assert finalize_mean.call_args.args == (partials, sequence)
-    encode_key.assert_called_once()
-    assert encode_key.call_args.kwargs["grouped"] is True
-    assert encode_key.call_args.kwargs["storage_key_length"] == storage
-    assert encode_key.call_args.kwargs["out"] == (out[0], out[1])
 
 
 # Register allocation depends on the specialized input width, and small widths can
@@ -280,8 +252,9 @@ _POINTER_TYPES = {
     "weight_ptr": "*i8",
     "query_ptr": "*i8",
     "key_ptr": "*i8",
+    "key_center_ptr": "*i8",
     "value_ptr": "*i8",
-    "stored_ptr": "*bf16",
+    "value_mean_ptr": "*bf16",
     "block_lengths_ptr": "*i32",
     "norm_weight_ptr": "*bf16",
     "bias_ptr": "*bf16",
@@ -295,7 +268,6 @@ _POINTER_TYPES = {
 # avoided it but spilled SM120's full tiles, and one slice width serves every target.
 _ACCEPTED_SPILL_STORES = {
     (80, "query", "bias_without_norm"): 176,
-    (89, "key", "full_tiles_mean_routing"): 48,
 }
 
 
@@ -324,7 +296,6 @@ def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, 
         "mean_pool_summary": variant in ("full_tiles_mean_routing", "mean_routing"),
         "mask_block_lengths": variant == "block_lengths",
         "mask_rows": variant not in ("full_tiles", "full_tiles_mean_routing"),
-        "emit_block_mean": True,
     }
     constants = {name: value for name, value in constants.items() if name in function.arg_names}
     signature, attributes = {}, {}
@@ -353,20 +324,43 @@ def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, 
         (architecture, operation, variant), PROJECTION_SPILL_STORE_BUDGET_BYTES
     )
     truncations = [line for line in compiled.asm["ttgir"].splitlines() if "arith.truncf" in line]
-    # Only K rounds its transformed rows to BF16, for the shared centered encoder.
-    assert bool(truncations) is (operation == "key")
+    # Only V rounds its per-tile means to BF16.
+    assert bool(truncations) is (operation == "value")
     assert all("f32" in line and "bf16" in line for line in truncations)
 
 
-def _assert_matches(actual, expected, *, scale_rtol=1e-5):
+def _assert_matches(actual, expected, operation):
     codes = (actual[0].to(torch.int16) - expected[0].to(torch.int16)).abs()
-    assert int(codes.max()) <= 1
-    assert float((codes > 0).float().mean()) < 1e-4
-    torch.testing.assert_close(actual[1], expected[1], rtol=scale_rtol, atol=0)
-    for left, right in zip(actual[2:], expected[2:], strict=True):
-        # Q summaries add a block's maximum and minimum, so compare against the block scale.
-        scale = float(right[torch.isfinite(right)].abs().max()) if right.numel() else 1.0
-        torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-6 * scale, equal_nan=True)
+    if operation == "key":
+        expected_scale = expected[1].repeat_interleave(64, dim=2)[..., None]
+        non_trivial_tiles = expected_scale > 1e-6
+        assert int(codes.masked_fill(~non_trivial_tiles, 0).max()) <= 1
+        assert float(((codes > 0) & non_trivial_tiles).float().mean()) < 1e-4
+        dequant_actual = actual[0].float() * actual[1].repeat_interleave(64, dim=2)[..., None]
+        dequant_expected = expected[0].float() * expected_scale
+        assert torch.all(
+            (dequant_actual - dequant_expected).abs()
+            <= torch.clamp(expected_scale * 1.05, min=1e-5)
+        )
+        torch.testing.assert_close(actual[1], expected[1], rtol=1e-5, atol=1e-8)
+        actual_center = reconstruct_key_center(actual[2], actual[3])
+        expected_center = reconstruct_key_center(expected[2], expected[3])
+        scale = float(expected_center.abs().max()) if expected_center.numel() else 1.0
+        torch.testing.assert_close(actual_center, expected_center, rtol=1e-4, atol=1e-4 * scale)
+        tail = zip(actual[4:], expected[4:], strict=True)
+    else:
+        assert int(codes.max()) <= 1
+        assert float((codes > 0).float().mean()) < 1e-4
+        torch.testing.assert_close(actual[1], expected[1], rtol=1e-5, atol=1e-8)
+        tail = zip(actual[2:], expected[2:], strict=True)
+    for left, right in tail:
+        left_fp32, right_fp32 = left.float(), right.float()
+        # Q summaries add a block's maximum and minimum, and V means are BF16.
+        scale = float(right_fp32[torch.isfinite(right_fp32)].abs().max()) if right.numel() else 1.0
+        rtol = 1.6e-2 if right.dtype is torch.bfloat16 else 1e-5
+        torch.testing.assert_close(
+            left_fp32, right_fp32, rtol=rtol, atol=1e-6 * scale, equal_nan=True
+        )
 
 
 @pytest.mark.gpu
@@ -393,7 +387,6 @@ def _assert_matches(actual, expected, *, scale_rtol=1e-5):
             "batch": 1,
             "sequence": 200,
             "rotary_dim": 32,
-            "emit_block_mean": False,
             "window": (0, 77),
         },
     ],
@@ -420,13 +413,11 @@ def test_gluon_projections_match_the_triton_launchers(operation, case):
         ),
         "bias": torch.randn(3 * 128, device="cuda").bfloat16() if case.get("bias") else None,
         "window": case["window"],
-        "emit_block_mean": case.get("emit_block_mean", True),
     }
     allocation = {
         "storage": padded_sequence_length(case["window"][1] if operation == "query" else sequence),
         "batch": batch,
         "mean_routing": mean_routing,
-        "emit_block_mean": options["emit_block_mean"],
     }
     expected = _outputs(operation, "cuda", **allocation)
     actual = _outputs(operation, "cuda", **allocation)
@@ -447,9 +438,7 @@ def test_gluon_projections_match_the_triton_launchers(operation, case):
     )
     _launch(gluon_async_copy, operation, operands, actual, **options)
 
-    # K scales come from BF16 K storage, where 1-ulp FP32 differences can cross a rounding
-    # boundary, as between dense and sparse K.
-    _assert_matches(actual, expected, scale_rtol=3e-3 if operation == "key" else 1e-5)
+    _assert_matches(actual, expected, operation)
 
 
 @pytest.mark.parametrize("operand_index", [0, 2], ids=["input", "weight"])

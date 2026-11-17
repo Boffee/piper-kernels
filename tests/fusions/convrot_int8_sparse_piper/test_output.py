@@ -106,18 +106,9 @@ def _padded_arguments(
         sequence_length=sequence_length,
         bias=True,
     )
-    attention_arguments = arguments[:14]
-    projection_arguments = arguments[14:]
+    attention_arguments = arguments[:16]
+    projection_arguments = arguments[16:]
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
-    block_mean = (
-        torch.randn(
-            (1, _HEADS, sequence_length // 64, _HEAD_DIM),
-            device="cuda",
-            dtype=torch.float32,
-        )
-        if coarse
-        else None
-    )
     coarse_gate = (
         torch.randn(
             (1, sequence_length, _HEADS, _HEAD_DIM),
@@ -130,13 +121,11 @@ def _padded_arguments(
     coarse_scale = 0.125 if coarse else None
     coarse_key_blocks = sequence_length // 64 if coarse else None
     if coarse:
-        assert block_mean is not None
         assert coarse_gate is not None
         materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
-            *attention_arguments[:10],
-            block_mean,
+            *attention_arguments[:12],
             coarse_gate,
-            *attention_arguments[10:],
+            *attention_arguments[12:],
             coarse_scale,
             coarse_key_blocks,
             block_lengths,
@@ -160,7 +149,6 @@ def _padded_arguments(
         *arguments,
         64,
         block_lengths,
-        block_mean,
         coarse_gate,
         coarse_scale,
         coarse_key_blocks,
@@ -328,8 +316,8 @@ def test_attention_output_projects_a_bounded_coarse_gate(
         sequence_length=sequence_length,
         bias=False,
     )
-    attention_arguments = arguments[:14]
-    output_arguments = arguments[14:]
+    attention_arguments = arguments[:16]
+    output_arguments = arguments[16:]
     gate_features = _HEADS * _HEAD_DIM
     gate_input_qdata = torch.randint(
         -127,
@@ -361,18 +349,12 @@ def test_attention_output_projects_a_bounded_coarse_gate(
         .unflatten(-1, (_HEADS, _HEAD_DIM))
     )
     query_blocks = (sequence_length + 63) // 64
-    block_mean = torch.randn(
-        (1, _HEADS, query_blocks, _HEAD_DIM),
-        device="cuda",
-        dtype=torch.float32,
-    )
     coarse_scale = _HEAD_DIM**-0.5
     coarse_key_blocks = query_blocks
     materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
-        *attention_arguments[:10],
-        block_mean,
+        *attention_arguments[:12],
         coarse_gate,
-        *attention_arguments[10:],
+        *attention_arguments[12:],
         coarse_scale,
         coarse_key_blocks,
     )
@@ -393,7 +375,6 @@ def test_attention_output_projects_a_bounded_coarse_gate(
             *output_arguments,
             64,
             None,
-            block_mean,
             None,
             coarse_scale,
             coarse_key_blocks,
@@ -433,11 +414,13 @@ def test_attention_output_fake_kernel_propagates_shape(dtype: torch.dtype) -> No
         torch.empty((2, 3, 3, 128), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 192, 128), device="meta", dtype=torch.int8),
         torch.empty((2, 3, 3), device="meta", dtype=torch.float32),
+        torch.empty((2, 3, 3, 2, 128), device="meta", dtype=torch.int8),
+        torch.empty((2, 3, 3, 2), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 3, 128), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 3, 128), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 128, 192), device="meta", dtype=torch.int8),
         torch.empty((2, 3, 3, 1), device="meta", dtype=torch.float32),
-        torch.empty((2, 3, 128), device="meta", dtype=torch.float32),
+        torch.empty((2, 3, 3, 128), device="meta", dtype=torch.bfloat16),
         _SparsePiperRatioProfile((500_000, 1_000_000, 750_000)),
         2,
         191,
@@ -463,11 +446,13 @@ def test_attention_output_fake_kernel_uses_padded_storage_length() -> None:
         torch.empty((2, 3, 3, 128), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 192, 128), device="meta", dtype=torch.int8),
         torch.empty((2, 3, 3), device="meta", dtype=torch.float32),
+        torch.empty((2, 3, 3, 2, 128), device="meta", dtype=torch.int8),
+        torch.empty((2, 3, 3, 2), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 3, 128), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 3, 128), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 128, 192), device="meta", dtype=torch.int8),
         torch.empty((2, 3, 3, 1), device="meta", dtype=torch.float32),
-        torch.empty((2, 3, 128), device="meta", dtype=torch.float32),
+        torch.empty((2, 3, 3, 128), device="meta", dtype=torch.bfloat16),
         _SparsePiperRatioProfile((500_000, 1_000_000, 750_000)),
         2,
         132,
@@ -508,11 +493,13 @@ def test_inplace_fake_validates_forced_metadata_without_tensor_operations() -> N
         64**-0.5,
         key,
         torch.empty((1, 1, 2), device="meta"),
+        torch.empty((1, 1, 2, 2, 64), device="meta", dtype=torch.int8),
+        torch.empty((1, 1, 2, 2), device="meta"),
         summary,
         summary,
         torch.empty((1, 1, 64, 128), device="meta", dtype=torch.int8),
         torch.empty((1, 1, 2, 1), device="meta"),
-        torch.empty((1, 1, 64), device="meta"),
+        torch.empty((1, 1, 2, 64), device="meta", dtype=torch.bfloat16),
         _SparsePiperRatioProfile((500_000,)),
         1,
         65,

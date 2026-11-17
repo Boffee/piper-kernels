@@ -179,6 +179,8 @@ def _key_epilogue_kernel(  # noqa: PLR0913, PLR0917
     sin_ptr,
     key_ptr,
     key_scale_ptr,
+    key_center_ptr,
+    key_center_scale_ptr,
     key_summary_ptr,
     key_aux_ptr,
     block_lengths_ptr,
@@ -242,6 +244,8 @@ def _key_epilogue_kernel(  # noqa: PLR0913, PLR0917
         transformed,
         key_ptr,
         key_scale_ptr,
+        key_center_ptr,
+        key_center_scale_ptr,
         key_summary_ptr,
         key_aux_ptr,
         block_lengths_ptr,
@@ -267,10 +271,9 @@ def _value_epilogue_kernel(  # noqa: PLR0913, PLR0917
     input_per_tensor_scale_ptr,
     weight_per_tensor_scale_ptr,
     bias_ptr,
-    value_mean_ptr,
     value_ptr,
     value_scale_ptr,
-    block_mean_ptr,
+    value_mean_ptr,
     block_lengths_ptr,
     chunk_rows,
     chunk_start,
@@ -285,7 +288,6 @@ def _value_epilogue_kernel(  # noqa: PLR0913, PLR0917
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
     mask_block_lengths: tl.constexpr,
-    emit_block_mean: tl.constexpr,
     block_m: tl.constexpr,
 ):
     local_block = row_block_offset + tl.program_id(0)
@@ -312,10 +314,9 @@ def _value_epilogue_kernel(  # noqa: PLR0913, PLR0917
     )
     sparse_piper_kernels.store_value_tile(
         projection,
-        value_mean_ptr,
         value_ptr,
         value_scale_ptr,
-        block_mean_ptr,
+        value_mean_ptr,
         block_lengths_ptr,
         batch,
         heads,
@@ -325,7 +326,6 @@ def _value_epilogue_kernel(  # noqa: PLR0913, PLR0917
         storage_sequence_length,
         row_block,
         mask_block_lengths,
-        emit_block_mean,
         heads_per_program,
         head_dim,
         block_m,
@@ -416,6 +416,8 @@ def launch_key(  # noqa: PLR0913, PLR0917
     sin,
     key,
     key_scale,
+    key_center,
+    key_center_scale,
     key_summary,
     key_aux,
     chunk_start: int,
@@ -444,6 +446,8 @@ def launch_key(  # noqa: PLR0913, PLR0917
                 sin,
                 key,
                 key_scale,
+                key_center,
+                key_center_scale,
                 key_summary,
                 key_aux,
                 block_lengths_ptr,
@@ -475,27 +479,24 @@ def launch_key(  # noqa: PLR0913, PLR0917
             launch(1, full_blocks, ragged=True)
 
 
-def launch_value(  # noqa: PLR0913, PLR0917
+def launch_value(
     projection,
     input_per_tensor_scale,
     weight_per_tensor_scale,
     bias,
-    value_mean,
     value,
     value_scale,
-    block_mean,
+    value_mean,
     block_lengths,
     chunk_start: int,
     logical_sequence_length: int,
-    *,
-    emit_block_mean: bool,
 ) -> None:
     chunk_rows, output_features = projection.shape
     head_dim = value_mean.shape[-1]
     heads = output_features // head_dim
     storage_sequence_length = value.shape[3]
     has_block_lengths = block_lengths is not None
-    block_lengths_ptr = block_lengths if has_block_lengths else value_mean
+    block_lengths_ptr = block_lengths if has_block_lengths else value_scale
 
     with device_context(projection.device):
 
@@ -505,10 +506,9 @@ def launch_value(  # noqa: PLR0913, PLR0917
                 input_per_tensor_scale,
                 weight_per_tensor_scale,
                 bias,
-                value_mean,
                 value,
                 value_scale,
-                block_mean,
+                value_mean,
                 block_lengths_ptr,
                 chunk_rows,
                 chunk_start,
@@ -523,7 +523,6 @@ def launch_value(  # noqa: PLR0913, PLR0917
                 heads_per_program=_HEADS_PER_PROGRAM,
                 head_dim=head_dim,
                 mask_block_lengths=has_block_lengths,
-                emit_block_mean=emit_block_mean,
                 block_m=_KEY_VALUE_BLOCK_M,
                 num_warps=8,
             )

@@ -171,7 +171,6 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
     if (
         _backend.select_projection_backend(input_value, head_dim=head_dim) is None
         or linear_backend.select_linear_backend(input_value) is None
-        or linear_backend.select_dequantized_mean(input_value) is None
         or attention_backend.select_attention_backend(input_value) is None
     ):
         return False
@@ -229,7 +228,7 @@ def _valid_sparse_piper_coarse_residual_projection(
     return sparse_piper_compile.valid_sparse_piper_coarse_residual(match)
 
 
-def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
+def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
     match: Match,
     sparse_input: torch.fx.Node,
     sparse_q_weight_qdata: torch.fx.Node,
@@ -362,24 +361,33 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
             query_values,
             kwargs={"head_dim": head_dim, "bias": sparse_q_bias},
         )
+        storage_tiles = storage_sequence_length // _TILE_ROWS
         key_values = (
             input_value.new_empty(
                 (batch, heads, storage_sequence_length, head_dim),
                 dtype=torch.int8,
             ),
             input_value.new_empty(
-                (batch, heads, storage_sequence_length // _TILE_ROWS),
+                (batch, heads, storage_tiles),
                 dtype=torch.float32,
             ),
             input_value.new_empty(
-                (batch, heads, storage_sequence_length // _TILE_ROWS, head_dim),
+                (batch, heads, storage_tiles, 2, head_dim),
+                dtype=torch.int8,
+            ),
+            input_value.new_empty(
+                (batch, heads, storage_tiles, 2),
+                dtype=torch.float32,
+            ),
+            input_value.new_empty(
+                (batch, heads, storage_tiles, head_dim),
                 dtype=torch.float32,
             ),
             (
                 input_value.new_empty((batch, heads, 0, head_dim), dtype=torch.float32)
                 if mean_pool_routing
                 else input_value.new_empty(
-                    (batch, heads, storage_sequence_length // _TILE_ROWS, head_dim),
+                    (batch, heads, storage_tiles, head_dim),
                     dtype=torch.float32,
                 )
             ),
@@ -395,53 +403,36 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
             sparse_sin,
             sparse_k_norm_epsilon,
         )
-        key, key_scale, key_summary, key_aux = linear_compile_fx.emit_tuple_result(
-            graph,
-            torch.ops.piper_kernels.convrot_int8_sparse_piper_project_key.default,
-            (*key_arguments, sparse_routing_mode, *block_length_arguments),
-            key_values,
-            kwargs={"head_dim": head_dim, "bias": sparse_k_bias},
+        key, key_scale, key_center, key_center_scale, key_summary, key_aux = (
+            linear_compile_fx.emit_tuple_result(
+                graph,
+                torch.ops.piper_kernels.convrot_int8_sparse_piper_project_key.default,
+                (*key_arguments, sparse_routing_mode, *block_length_arguments),
+                key_values,
+                kwargs={"head_dim": head_dim, "bias": sparse_k_bias},
+            )
         )
         v_input, v_scales, _ = prepare(sparse_v_input_scale)
-        input_mean = graph.call_function(
-            torch.ops.piper_kernels.convrot_int8_dequantized_input_mean.default,
-            args=(v_input, v_scales, *block_length_arguments),
-        )
-        input_mean.meta["val"] = input_value.new_empty(
-            (batch, input_value.shape[-1]),
-            dtype=torch.float32,
-        )
         value_values = (
             input_value.new_empty(
                 value_format.shape(batch, heads, storage_sequence_length, head_dim),
                 dtype=torch.int8,
             ),
             input_value.new_empty(
-                (batch, heads, storage_sequence_length // _TILE_ROWS, 1),
+                (batch, heads, storage_tiles, 1),
                 dtype=torch.float32,
             ),
-            input_value.new_empty((batch, heads, head_dim), dtype=torch.float32),
-        )
-        with_coarse_residual = coarse_gate is not None
-        if with_coarse_residual:
-            value_values = (
-                *value_values,
-                input_value.new_empty(
-                    (batch, heads, storage_sequence_length // _TILE_ROWS, head_dim),
-                    dtype=torch.float32,
-                ),
-            )
-        value_projection = linear_compile_fx.emit_tuple_result(
-            graph,
-            (
-                torch.ops.piper_kernels.convrot_int8_sparse_piper_project_value_with_block_means.default
-                if with_coarse_residual
-                else torch.ops.piper_kernels.convrot_int8_sparse_piper_project_value.default
+            input_value.new_empty(
+                (batch, heads, storage_tiles, head_dim),
+                dtype=torch.bfloat16,
             ),
+        )
+        value, value_scale_multiplier, value_mean = linear_compile_fx.emit_tuple_result(
+            graph,
+            torch.ops.piper_kernels.convrot_int8_sparse_piper_project_value.default,
             (
                 v_input,
                 v_scales,
-                input_mean,
                 sparse_v_weight_qdata,
                 sparse_v_weight_scale,
                 sparse_block_lengths,
@@ -450,13 +441,14 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
             value_values,
             kwargs={"bias": sparse_v_bias, "value_format": int(value_format)},
         )
-        value, value_scale_multiplier, value_mean = value_projection[:3]
         attention_arguments = (
             query,
             query_scale,
             query_summary,
             key,
             key_scale,
+            key_center,
+            key_center_scale,
             key_summary,
             key_aux,
             value,
@@ -474,7 +466,6 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0915, PLR0917
             sparse_query_blocks=sparse_query_blocks,
             force_tile_ids=sparse_force_tile_ids,
             force_tile_counts=sparse_force_tile_counts,
-            block_mean=value_projection[3] if with_coarse_residual else None,
             coarse_gate=prepared_coarse_gate,
             coarse_scale=coarse_scale,
             coarse_key_blocks=coarse_key_blocks,
@@ -534,6 +525,8 @@ _HEAD_SLICING = head_slices.HeadSlicing(
             _ops.convrot_int8_sparse_piper_project_key.default: (
                 "key",
                 "key_scale",
+                "key_center",
+                "key_center_scale",
                 "key_summary",
                 "key_aux",
             )
@@ -543,12 +536,6 @@ _HEAD_SLICING = head_slices.HeadSlicing(
                 "value",
                 "value_scale_multiplier",
                 "value_mean",
-            ),
-            _ops.convrot_int8_sparse_piper_project_value_with_block_means.default: (
-                "value",
-                "value_scale_multiplier",
-                "value_mean",
-                "block_mean",
             ),
         },
     ),

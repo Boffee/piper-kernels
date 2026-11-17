@@ -2,13 +2,13 @@
 
 Inputs use the parent case's dimensions, dtype, and seed with ConvRot INT8 weights.
 Timings exclude input/weight preparation and attention. Q/K include
-RMSNorm, RoPE, routing summaries, rotation and quantization; V includes projected
-global means, block means and centered quantization. The combined measurement
-also includes the represented-input mean reduction used by V.
+RMSNorm, RoPE, routing summaries, rotation and quantization; K emits per-K64-tile
+residual INT8 centers and V emits per-K64-tile means with centered quantization in
+single passes without a sequence-wide mean reduction.
 
 Output buffers are reused. TOPS counts only 2*S*K*N INT8 multiply/add operations
-per projection, not the FP32 epilogues or mean reduction. Independently timed
-phases need not sum exactly to the combined measurement.
+per projection, not the FP32 epilogues. Independently timed phases need not sum
+exactly to the combined measurement.
 """
 
 import argparse
@@ -30,7 +30,6 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
 from piper_kernels.fusions.convrot_int8_sparse_piper import _backend, key, query, value
-from piper_kernels.linear.convrot.int8 import _ops
 from piper_kernels.linear.convrot.int8._backend import select_preparation_backend
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
@@ -127,8 +126,6 @@ def _benchmark(
     cos, sin = angles.cos().to(device), angles.sin().to(device)
     del angles
     routing = routing_mode_from_name(args.routing)
-    mean_call = partial(_ops.dequantized_input_mean, qdata, scale)
-    mean = mean_call()
     q_args = (
         qdata,
         scale,
@@ -155,14 +152,15 @@ def _benchmark(
     q = query._launch_query_projection(*q_args)
     k = key._launch_key_projection(*k_args)
     value_format = require_attention_backend(qdata).value_format
-    v = value._launch_value_projection(
+    v_args = (
         qdata,
         scale,
-        mean,
         weights[2].qdata,
         weights[2].scale,
+    )
+    v = value._launch_value_projection(
+        *v_args,
         None,
-        emit_block_mean=True,
         value_format=value_format,
         head_dim=case.head_dim,
     )
@@ -170,25 +168,18 @@ def _benchmark(
         backend.project_query, *q_args, None, chunk_start=0, chunk_rows=sequence, out=q
     )
     k_call = partial(backend.project_key, *k_args, None, out=k)
-
-    def v_call(input_mean: torch.Tensor = mean) -> None:
-        backend.project_value(
-            qdata,
-            scale,
-            input_mean,
-            weights[2].qdata,
-            weights[2].scale,
-            None,
-            emit_block_mean=True,
-            value_format=value_format,
-            out=v,
-        )
+    v_call = partial(
+        backend.project_value,
+        *v_args,
+        None,
+        value_format=value_format,
+        out=v,
+    )
 
     def combined_call() -> None:
-        input_mean = mean_call()
         q_call()
         k_call()
-        v_call(input_mean)
+        v_call()
 
     combined_call()
     torch.cuda.synchronize()
@@ -201,8 +192,7 @@ def _benchmark(
         "query": (q_call, query_operations),
         "key": (k_call, kv_operations),
         "value": (v_call, kv_operations),
-        "input_mean": (mean_call, 0),
-        "mean_and_qkv": (combined_call, query_operations + 2 * kv_operations),
+        "qkv": (combined_call, query_operations + 2 * kv_operations),
     }
     records = []
     for phase, (operation, integer_operations) in phases.items():
@@ -216,14 +206,11 @@ def _benchmark(
                 configuration={
                     "input_source": "cpu_seeded_synthetic_activations_and_packed_weights",
                     "routing": args.routing,
-                    "emit_value_block_means": True,
                     "seed": case.seed,
                     "dtype": case.dtype,
                     "group_size": _GROUP_SIZE,
                     "phase": phase,
-                    "output_allocation": "mean_only"
-                    if phase in ("input_mean", "mean_and_qkv")
-                    else "preallocated",
+                    "output_allocation": "preallocated",
                 },
                 timings=timing,
                 environment=environment,

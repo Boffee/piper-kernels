@@ -25,9 +25,7 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.attention import _output as attention_output
-from piper_kernels.fusions.convrot_int8_sage_qk import _key_kernels as key_kernels
 from piper_kernels.fusions.convrot_int8_sage_qk import _validation as qk_validation
-from piper_kernels.fusions.convrot_int8_sage_qk import key as key_projection
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend,
     _compile,
@@ -61,10 +59,8 @@ def _call(
     operation,
     operands,
     routing=_MINMAX_ROUTING,
-    emit_block_mean=False,
     *,
     bias=None,
-    mean=None,
     value_format=ValueFormat.TRANSPOSED,
 ):
     head_dim = operands[4].shape[0]
@@ -75,16 +71,12 @@ def _call(
     if operation == "key":
         return key._launch_key_projection(*operands, 1e-6, routing, bias=bias)
     qdata, scale, weight, weight_scale, *_ = operands
-    if mean is None:
-        mean = qdata.new_empty((2, 272), dtype=torch.float32)
     return value._launch_value_projection(
         qdata,
         scale,
-        mean,
         weight,
         weight_scale,
         None,
-        emit_block_mean=emit_block_mean,
         value_format=int(value_format),
         head_dim=head_dim,
         bias=bias,
@@ -181,7 +173,7 @@ def test_projection_facades_forward_shared_buffers_without_execution_plans(
     monkeypatch.setattr(_backend, "require_projection_backend", select)
     with FakeTensorMode():
         operands = _operands()
-        result = _call(operation, operands, routing, emit_block_mean=True)
+        result = _call(operation, operands, routing)
     select.assert_called_once_with(operands[0], head_dim=128)
     execute.assert_called_once()
     assert execute.call_args.args[0] is operands[0]
@@ -189,27 +181,39 @@ def test_projection_facades_forward_shared_buffers_without_execution_plans(
         left is right for left, right in zip(result, execute.call_args.kwargs["out"], strict=True)
     )
     assert result[0].dtype is torch.int8
-    assert all(tensor.dtype is torch.float32 for tensor in result[1:])
     assert (
         set(execute.call_args.kwargs)
         == {
             "query": {"out", "chunk_start", "chunk_rows", "bias"},
             "key": {"out", "bias"},
-            "value": {"out", "emit_block_mean", "bias", "value_format"},
+            "value": {"out", "bias", "value_format"},
         }[operation]
     )
     if operation == "query":
+        assert all(tensor.dtype is torch.float32 for tensor in result[1:])
         assert result[0].shape == (2, 3, 192, 128)
         assert result[1].shape == (2, 3, 6)
         assert result[2].shape == (2, 3, 3, 128)
         assert execute.call_args.kwargs["chunk_start"] == 64
         assert execute.call_args.kwargs["chunk_rows"] == 129
     elif operation == "key":
+        assert [tensor.dtype for tensor in result] == [
+            torch.int8,
+            torch.float32,
+            torch.int8,
+            torch.float32,
+            torch.float32,
+            torch.float32,
+        ]
         assert result[0].shape == (2, 3, 256, 128)
-        assert result[3].shape == (2, 3, 0 if routing == _MEAN_ROUTING else 4, 128)
+        assert result[2].shape == (2, 3, 4, 2, 128)
+        assert result[3].shape == (2, 3, 4, 2)
+        assert result[4].shape == (2, 3, 4, 128)
+        assert result[5].shape == (2, 3, 0 if routing == _MEAN_ROUTING else 4, 128)
     else:
+        assert [tensor.dtype for tensor in result] == [torch.int8, torch.float32, torch.bfloat16]
         assert result[0].shape == (2, 3, 128, 256)
-        assert result[3].shape == (2, 3, 4, 128)
+        assert result[2].shape == (2, 3, 4, 128)
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
@@ -225,10 +229,9 @@ def test_unvalidated_projection_rejects_before_output_allocation(
         # Allocate the test's own inputs before guarding: a cold FakeTensorMode
         # dispatch routes new_empty through torch.empty, so allocating after the
         # guard fails on test setup instead of on library allocations.
-        mean = operands[0].new_empty((2, 272), dtype=torch.float32)
         monkeypatch.setattr(torch, "empty", Mock(side_effect=AssertionError("allocated outputs")))
         with pytest.raises(ValueError, match="sparse projections are unavailable"):
-            _call(operation, operands, mean=mean)
+            _call(operation, operands)
 
 
 @pytest.mark.parametrize("missing", [None, "attention", "linear"])
@@ -303,6 +306,8 @@ def _run_output_fusion(projected_query, operands, storage):
     arguments = {
         "key": storage,
         "key_scale": storage,
+        "key_center": storage,
+        "key_center_scale": storage,
         "key_summary": storage,
         "key_aux": storage,
         "value": storage,
@@ -476,7 +481,7 @@ def test_shared_fusion_does_not_inspect_targets_or_launch_kernels(module):
     _assert_shared_fusion_boundary(Path(module.__file__).read_text())
 
 
-@pytest.mark.parametrize("module", [projection, key_projection])
+@pytest.mark.parametrize("module", [projection])
 def test_shared_projection_launcher_does_not_own_target_policy(module):
     _assert_shared_fusion_boundary(Path(module.__file__).read_text())
 
@@ -527,8 +532,9 @@ def test_amd_projection_compiler_selects_actual_attention_width(
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
     )
-    for attribute in ("select_linear_backend", "select_dequantized_mean"):
-        monkeypatch.setattr(_compile.linear_backend, attribute, Mock(return_value=object()))
+    monkeypatch.setattr(
+        _compile.linear_backend, "select_linear_backend", Mock(return_value=object())
+    )
     validate = Mock(return_value=True)
     monkeypatch.setattr(_compile.sparse_piper_compile, "valid_sparse_piper_attention", validate)
     match, _ = _projection_match(head_dim, input_features)
@@ -536,12 +542,11 @@ def test_amd_projection_compiler_selects_actual_attention_width(
     validate.assert_called_once()
 
 
-@pytest.mark.parametrize("missing", [None, "projection", "linear", "mean", "attention"])
+@pytest.mark.parametrize("missing", [None, "projection", "linear", "attention"])
 def test_projection_compiler_requires_each_emitted_operation(monkeypatch, missing):
     selectors = {
         "projection": (_backend, "select_projection_backend"),
         "linear": (_compile.linear_backend, "select_linear_backend"),
-        "mean": (_compile.linear_backend, "select_dequantized_mean"),
         "attention": (_compile.attention_backend, "select_attention_backend"),
     }
     probes = []
@@ -610,52 +615,27 @@ def _capture_projection(
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     functions = {
         "query": _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel,
-        "key": key_kernels._project_key_kernel,
+        "key": _kernels._convrot_project_rmsnorm_rope_quantize_sparse_key_kernel,
         "value": _kernels._convrot_project_quantize_sparse_value_kernel,
     }
     function = functions[operation]
     kernel = MagicMock()
-    monkeypatch.setattr(key_kernels if operation == "key" else _kernels, function.__name__, kernel)
-    mean_kernel = MagicMock()
-    monkeypatch.setattr(_kernels, "_project_prepared_input_mean_kernel", mean_kernel)
+    monkeypatch.setattr(_kernels, function.__name__, kernel)
     monkeypatch.setattr(_backend, "require_projection_backend", Mock(return_value=implementation))
     guard = Mock(side_effect=lambda device: nullcontext())
-    monkeypatch.setattr(
-        key_projection if operation == "key" else projection, "device_context", guard
-    )
-    if operation == "key":
-        mean_guard = Mock(side_effect=lambda device: nullcontext())
-        monkeypatch.setattr(key_projection.centered_projection, "device_context", mean_guard)
-        monkeypatch.setattr(
-            key_projection.centered_projection._kernels, "_mean_finalize_kernel", MagicMock()
-        )
-        monkeypatch.setattr(key_projection.qk_quantization, "prepare_key", Mock())
+    monkeypatch.setattr(projection, "device_context", guard)
     with FakeTensorMode():
         operands = _operands(head_dim=head_dim)
         bias = operands[3].new_empty((3 * head_dim,)) if with_bias else None
         _call(
             operation,
             operands,
-            emit_block_mean=True,
             bias=bias,
             value_format=ValueFormat.AMD_WMMA if target.is_amd_hip else ValueFormat.TRANSPOSED,
         )
     guard.assert_called_once_with(torch.device("cuda:1"))
-    if operation == "key":
-        mean_guard.assert_called_once_with(torch.device("cuda:1"))
-        preparation = key_projection.qk_quantization.prepare_key.call_args
-        assert preparation.args[0].dtype is torch.bfloat16
-        assert preparation.args[1].dtype is torch.float32
-        finalization = key_projection.centered_projection._kernels._mean_finalize_kernel
-        assert all(
-            argument.dtype is torch.float32
-            for argument in finalization.__getitem__.return_value.call_args.args[:2]
-        )
     for call in kernel.__getitem__.return_value.call_args_list:
         assert call.kwargs["bias_ptr"] is bias
-    if operation == "value":
-        mean_kernel.__getitem__.return_value.assert_called_once()
-        assert mean_kernel.__getitem__.return_value.call_args.kwargs["bias_ptr"] is bias
     return function, kernel
 
 
@@ -702,17 +682,6 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
             assert call.kwargs["mask_ragged_tail"] is (index == 1)
         if operation != "query":
             assert call.args[-1] == (0 if index == 0 else rows // block_m)
-    if operation == "value":
-        mean = _kernels._project_prepared_input_mean_kernel
-        mean.__getitem__.assert_called_once_with((triton.cdiv(3, heads_per_program), 2))
-        assert mean.__getitem__.return_value.call_args.kwargs == {
-            "bias_ptr": None,
-            "input_features": 272,
-            "output_features": 3 * head_dim,
-            "block_n": heads_per_program * head_dim,
-            "block_k": 64 if is_amd else 128,
-            "num_warps": warps,
-        }
 
 
 @pytest.mark.parametrize(
@@ -788,7 +757,7 @@ def test_production_launches_compile_with_expected_storage_precision(
         truncations = [
             line for line in compiled.asm["ttgir"].splitlines() if "arith.truncf" in line
         ]
-        assert bool(truncations) is (operation == "key")
+        assert bool(truncations) is (operation == "value")
         assert all("f32" in line and "bf16" in line for line in truncations)
 
 

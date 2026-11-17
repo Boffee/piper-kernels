@@ -289,15 +289,12 @@ def _replace_attention_output_with_target(
         match.kwargs["output_dynamic_activation_scale"]
     )
     bounded_arguments = sparse_piper_pattern.bounded_attention_arguments(match)
-    block_lengths, block_mean, coarse_gate, coarse_scale, coarse_key_blocks, query_blocks = (
-        bounded_arguments
-    )
+    block_lengths, coarse_gate, coarse_scale, coarse_key_blocks, query_blocks = bounded_arguments
     gate_projection = _prepared_gate_projection(coarse_gate)
     gate_arguments: tuple[Argument, ...] = ()
     if gate_projection is not None:
         bounded_arguments = (
             block_lengths,
-            block_mean,
             None,
             coarse_scale,
             coarse_key_blocks,

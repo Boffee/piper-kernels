@@ -75,7 +75,11 @@ def test_weightless_projection_fake_kernel_keeps_the_explicit_head_width(
     output = op(*args, head_dim=head_dim)
     assert output[0].shape == (1, heads, 256, head_dim)
     assert output[0].dtype is torch.int8
-    assert output[2].shape == (1, heads, 4, head_dim)
+    if operation == "key":
+        assert output[2].shape == (1, heads, 4, 2, head_dim)
+        assert output[4].shape == (1, heads, 4, head_dim)
+    else:
+        assert output[2].shape == (1, heads, 4, head_dim)
 
 
 def test_symbolic_head_width_is_validated_during_fake_execution():

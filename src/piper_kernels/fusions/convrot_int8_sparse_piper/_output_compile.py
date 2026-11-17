@@ -322,6 +322,8 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
     output_query_summary: torch.fx.Node,
     output_key: torch.fx.Node,
     output_key_scale: torch.fx.Node,
+    output_key_center: torch.fx.Node,
+    output_key_center_scale: torch.fx.Node,
     output_key_summary: torch.fx.Node,
     output_key_aux: torch.fx.Node,
     output_value: torch.fx.Node,
@@ -341,15 +343,12 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
     original = match.output_node()
     graph = match.graph
     bounded_arguments = sparse_piper_pattern.bounded_attention_arguments(match)
-    block_lengths, block_mean, coarse_gate, coarse_scale, coarse_key_blocks, query_blocks = (
-        bounded_arguments
-    )
+    block_lengths, coarse_gate, coarse_scale, coarse_key_blocks, query_blocks = bounded_arguments
     gate_projection = _prepared_gate_projection(coarse_gate)
     gate_arguments: tuple[Argument, ...] = ()
     if gate_projection is not None:
         bounded_arguments = (
             block_lengths,
-            block_mean,
             None,
             coarse_scale,
             coarse_key_blocks,
@@ -373,6 +372,8 @@ def _replace_attention_output(  # noqa: PLR0913, PLR0917
         attention_tail = (
             output_key,
             output_key_scale,
+            output_key_center,
+            output_key_center_scale,
             output_key_summary,
             output_key_aux,
             output_value,

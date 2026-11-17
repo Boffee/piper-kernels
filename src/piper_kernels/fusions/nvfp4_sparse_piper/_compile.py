@@ -247,15 +247,16 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             query_values,
             kwargs={"head_dim": head_dim},
         )
+        storage_tiles = storage_sequence_length // _TILE_ROWS
         key_summary = input_value.new_empty(
-            (1, heads, storage_sequence_length // _TILE_ROWS, head_dim),
+            (1, heads, storage_tiles, head_dim),
             dtype=torch.float32,
         )
         key_values = (
             input_value.new_empty((1, heads, storage_sequence_length, head_dim), dtype=torch.int8),
-            input_value.new_empty(
-                (1, heads, storage_sequence_length // _TILE_ROWS), dtype=torch.float32
-            ),
+            input_value.new_empty((1, heads, storage_tiles), dtype=torch.float32),
+            input_value.new_empty((1, heads, storage_tiles, 2, head_dim), dtype=torch.int8),
+            input_value.new_empty((1, heads, storage_tiles, 2), dtype=torch.float32),
             key_summary,
             (
                 input_value.new_empty((1, heads, 0, head_dim), dtype=torch.float32)
@@ -279,59 +280,26 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             key_values,
             kwargs={"head_dim": head_dim},
         )
-        value_mean_flat = graph.call_function(
-            torch.ops.piper_kernels.nvfp4_linear_mean.default,
-            args=(
-                *value_projection.storage_arguments(),
-                1,
-                logical_sequence_length,
-                *block_length_arguments,
-            ),
-        )
-        value_mean_flat.meta["val"] = input_value.new_empty(
-            (1, heads * head_dim), dtype=torch.float32
-        )
-        value_mean = graph.call_function(
-            torch.ops.aten.reshape.default,
-            args=(value_mean_flat, (1, heads, head_dim)),
-        )
-        value_mean.meta["val"] = input_value.new_empty((1, heads, head_dim), dtype=torch.float32)
-        with_coarse_residual = coarse_gate is not None
         value_values = (
             input_value.new_empty((1, heads, head_dim, storage_sequence_length), dtype=torch.int8),
-            input_value.new_empty(
-                (1, heads, storage_sequence_length // _TILE_ROWS, 1),
-                dtype=torch.float32,
-            ),
+            input_value.new_empty((1, heads, storage_tiles, 1), dtype=torch.float32),
+            input_value.new_empty((1, heads, storage_tiles, head_dim), dtype=torch.bfloat16),
         )
-        if with_coarse_residual:
-            value_values = (
-                *value_values,
-                input_value.new_empty(
-                    (1, heads, storage_sequence_length // _TILE_ROWS, head_dim),
-                    dtype=torch.float32,
-                ),
-            )
         value_nodes = linear_compile_fx.emit_tuple_result(
             graph,
-            (
-                torch.ops.piper_kernels.nvfp4_sparse_piper_project_value_with_block_means.default
-                if with_coarse_residual
-                else torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default
-            ),
+            torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default,
             (
                 *value_projection.storage_arguments(),
-                value_mean,
                 nvfp4_chunking.DEFAULT_CHUNK_ROWS,
                 *block_length_arguments,
             ),
             value_values,
+            kwargs={"head_dim": head_dim},
         )
         attention_arguments = (
             *query_nodes,
             *key_nodes,
-            *value_nodes[:2],
-            value_mean,
+            *value_nodes,
         )
         replacement = sparse_piper_compile.emit_quantized_sparse_piper_attention(
             graph,
@@ -344,7 +312,6 @@ def _replace_projection(  # noqa: PLR0913, PLR0917
             sparse_query_blocks=sparse_query_blocks,
             force_tile_ids=sparse_force_tile_ids,
             force_tile_counts=sparse_force_tile_counts,
-            block_mean=value_nodes[2] if with_coarse_residual else None,
             coarse_gate=coarse_gate,
             coarse_scale=coarse_scale,
             coarse_key_blocks=coarse_key_blocks,

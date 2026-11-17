@@ -2,7 +2,7 @@
 
 ``value_format`` is a static ValueFormat ID. The compiler selects it from the
 attention consumer; fake implementations use it without querying a device.
-Quantization groups and prequantization block means do not depend on storage.
+Quantization groups and per-tile means do not depend on storage.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from ._layout import SUPPORTED_HEAD_DIMS, TILE_ROWS, padded_sequence_length, val
 def _validate_inputs(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
-    input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     head_dim: int = 128,
@@ -31,12 +30,6 @@ def _validate_inputs(
     batch, sequence_length, heads = validate_projection_inputs(
         input_qdata, input_scale, weight_qdata, weight_scale, bias, head_dim=head_dim, name="V"
     )
-    if input_mean.shape != (batch, input_qdata.shape[2]) or input_mean.dtype is not torch.float32:
-        raise ValueError("V projection represented-input mean must be a batch/feature FP32 matrix")
-    if input_mean.device != input_qdata.device:
-        raise ValueError("V projection operands must share a device")
-    if input_mean.layout is not torch.strided or not input_mean.is_contiguous():
-        raise ValueError("V projection operands must be contiguous")
     if sequence_length < TILE_ROWS:
         raise ValueError(f"V projection requires at least {TILE_ROWS} sequence rows")
     return batch, sequence_length, heads
@@ -45,20 +38,17 @@ def _validate_inputs(
 def _launch_value_projection(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
-    input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     block_lengths: torch.Tensor | None,
     *,
-    emit_block_mean: bool,
     head_dim: int = 128,
     bias: torch.Tensor | None = None,
     value_format: int = int(ValueFormat.TRANSPOSED),
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, heads = _validate_inputs(
         input_qdata,
         input_scale,
-        input_mean,
         weight_qdata,
         weight_scale,
         head_dim,
@@ -66,6 +56,7 @@ def _launch_value_projection(
     )
     validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     storage_sequence_length = padded_sequence_length(sequence_length)
+    storage_tiles = storage_sequence_length // TILE_ROWS
     storage_format = ValueFormat(value_format)
     backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
     value = torch.empty(
@@ -74,37 +65,26 @@ def _launch_value_projection(
         dtype=torch.int8,
     )
     value_scale_multiplier = torch.empty(
-        (batch, heads, storage_sequence_length // TILE_ROWS, 1),
+        (batch, heads, storage_tiles, 1),
         device=input_qdata.device,
         dtype=torch.float32,
     )
     value_mean = torch.empty(
-        (batch, heads, head_dim),
+        (batch, heads, storage_tiles, head_dim),
         device=input_qdata.device,
-        dtype=torch.float32,
-    )
-    block_mean = (
-        torch.empty(
-            (batch, heads, storage_sequence_length // TILE_ROWS, head_dim),
-            device=input_qdata.device,
-            dtype=torch.float32,
-        )
-        if emit_block_mean
-        else value_mean
+        dtype=torch.bfloat16,
     )
     backend.project_value(
         input_qdata,
         input_scale,
-        input_mean,
         weight_qdata,
         weight_scale,
         block_lengths,
-        emit_block_mean=emit_block_mean,
         value_format=storage_format,
-        out=(value, value_scale_multiplier, value_mean, block_mean),
+        out=(value, value_scale_multiplier, value_mean),
         bias=bias,
     )
-    return value, value_scale_multiplier, value_mean, block_mean
+    return value, value_scale_multiplier, value_mean
 
 
 @torch.library.custom_op(
@@ -114,7 +94,6 @@ def _launch_value_projection(
 def _project_value_op(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
-    input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     block_lengths: torch.Tensor | None = None,
@@ -122,43 +101,15 @@ def _project_value_op(
     bias: torch.Tensor | None = None,
     value_format: int = int(ValueFormat.TRANSPOSED),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    value, value_scale_multiplier, value_mean, _block_mean = _launch_value_projection(
+    return _launch_value_projection(
         input_qdata,
         input_scale,
-        input_mean,
         weight_qdata,
         weight_scale,
         block_lengths,
-        emit_block_mean=False,
         value_format=value_format,
         head_dim=head_dim,
         bias=bias,
-    )
-    return value, value_scale_multiplier, value_mean
-
-
-def _fake_value_projection(
-    input_qdata: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    head_dim: int = 128,
-    value_format: int = int(ValueFormat.TRANSPOSED),
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch, sequence_length, _input_features = input_qdata.shape
-    storage_sequence_length = padded_sequence_length(sequence_length)
-    heads = weight_qdata.shape[0] // head_dim
-    return (
-        input_qdata.new_empty(
-            ValueFormat(value_format).shape(batch, heads, storage_sequence_length, head_dim)
-        ),
-        input_qdata.new_empty(
-            (batch, heads, storage_sequence_length // TILE_ROWS, 1),
-            dtype=torch.float32,
-        ),
-        input_qdata.new_empty((batch, heads, head_dim), dtype=torch.float32),
-        input_qdata.new_empty(
-            (batch, heads, storage_sequence_length // TILE_ROWS, head_dim),
-            dtype=torch.float32,
-        ),
     )
 
 
@@ -166,7 +117,6 @@ def _fake_value_projection(
 def _project_value_op_fake(
     input_qdata: torch.Tensor,
     _input_scale: torch.Tensor,
-    _input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
     _block_lengths: torch.Tensor | None = None,
@@ -174,54 +124,17 @@ def _project_value_op_fake(
     _bias: torch.Tensor | None = None,
     value_format: int = int(ValueFormat.TRANSPOSED),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    value, value_scale_multiplier, value_mean, _block_mean = _fake_value_projection(
-        input_qdata,
-        weight_qdata,
-        head_dim,
-        value_format,
+    batch, sequence_length, _input_features = input_qdata.shape
+    storage_sequence_length = padded_sequence_length(sequence_length)
+    storage_tiles = storage_sequence_length // TILE_ROWS
+    heads = weight_qdata.shape[0] // head_dim
+    return (
+        input_qdata.new_empty(
+            ValueFormat(value_format).shape(batch, heads, storage_sequence_length, head_dim)
+        ),
+        input_qdata.new_empty(
+            (batch, heads, storage_tiles, 1),
+            dtype=torch.float32,
+        ),
+        input_qdata.new_empty((batch, heads, storage_tiles, head_dim), dtype=torch.bfloat16),
     )
-    return value, value_scale_multiplier, value_mean
-
-
-@torch.library.custom_op(
-    "piper_kernels::convrot_int8_sparse_piper_project_value_with_block_means",
-    mutates_args=(),
-)
-def _project_value_with_block_means_op(
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    input_mean: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    block_lengths: torch.Tensor | None = None,
-    head_dim: int = 128,
-    bias: torch.Tensor | None = None,
-    value_format: int = int(ValueFormat.TRANSPOSED),
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _launch_value_projection(
-        input_qdata,
-        input_scale,
-        input_mean,
-        weight_qdata,
-        weight_scale,
-        block_lengths,
-        emit_block_mean=True,
-        value_format=value_format,
-        head_dim=head_dim,
-        bias=bias,
-    )
-
-
-@_project_value_with_block_means_op.register_fake
-def _project_value_with_block_means_op_fake(
-    input_qdata: torch.Tensor,
-    _input_scale: torch.Tensor,
-    _input_mean: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    _weight_scale: torch.Tensor,
-    _block_lengths: torch.Tensor | None = None,
-    head_dim: int = 128,
-    _bias: torch.Tensor | None = None,
-    value_format: int = int(ValueFormat.TRANSPOSED),
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _fake_value_projection(input_qdata, weight_qdata, head_dim, value_format)

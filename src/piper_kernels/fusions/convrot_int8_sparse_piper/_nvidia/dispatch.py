@@ -142,15 +142,13 @@ def project_key(  # noqa: PLR0913
     )
 
 
-def project_value(  # noqa: PLR0913
+def project_value(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
-    input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     block_lengths: torch.Tensor | None,
     *,
-    emit_block_mean: bool,
     value_format: ValueFormat,
     out: ValueOutput,
     bias: torch.Tensor | None = None,
@@ -172,11 +170,9 @@ def project_value(  # noqa: PLR0913
     launch(
         input_qdata,
         input_scale,
-        input_mean,
         weight_qdata,
         weight_scale,
         block_lengths,
-        emit_block_mean=emit_block_mean,
         value_format=value_format,
         out=out,
         bias=bias,

@@ -55,42 +55,47 @@ def _transform_qk_fp64(projected, norm, cos, sin):
     return projected
 
 
-def key_mean_fp64(qdata, scale, weight, weight_scale, norm, cos, sin):
-    """Reduce the represented BF16 K mean independently with bounded workspace."""
-    sequence = qdata.shape[0]
-    total = torch.zeros(weight.shape[0], device=qdata.device, dtype=torch.float64)
-    for start in range(0, sequence, 1024):
-        stop = min(start + 1024, sequence)
-        projected = qdata[start:stop].double() @ weight.double().T
-        projected *= scale[start:stop, None].double()
-        projected *= weight_scale[:, 0].double()
-        transformed = _transform_qk_fp64(projected, norm, cos[start:stop], sin[start:stop])
-        total += transformed.bfloat16().double().sum(0)
-    return total / sequence
+def reconstruct_key_center(
+    key_center: torch.Tensor,
+    key_center_scale: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Decode a 2-term residual INT8 H(K_mean) tensor to floating point."""
+    return key_center[..., 0, :].to(dtype) * key_center_scale[..., 0:1].to(dtype) + key_center[
+        ..., 1, :
+    ].to(dtype) * key_center_scale[..., 1:2].to(dtype)
 
 
-def check_qk_sample_fp64(
-    projected, output, head, start, rows, norm, cos, sin, *, is_query, key_mean=None
-):
-    """Check raw summaries and Q32 or centered represented-K64 encoding."""
+def check_qk_sample_fp64(projected, output, head, start, rows, norm, cos, sin, *, is_query):
+    """Check raw summaries and Q32 or tile-centered K64 encoding."""
     head_dim = projected.shape[-1]
     projected = _transform_qk_fp64(
         projected, norm, cos[start : start + rows], sin[start : start + rows]
     )
     maximum, minimum = projected.amax(0), projected.amin(0)
     summary = maximum + minimum if is_query else maximum
+    summary_index = 2 if is_query else 4
     torch.testing.assert_close(
-        output[2][0, head, start // _BLOCK_ROWS].double(), summary, rtol=3e-5, atol=3e-5
+        output[summary_index][0, head, start // _BLOCK_ROWS].double(), summary, rtol=3e-5, atol=3e-5
     )
     if not is_query:
         torch.testing.assert_close(
-            output[3][0, head, start // _BLOCK_ROWS].double(), minimum, rtol=3e-5, atol=3e-5
+            output[5][0, head, start // _BLOCK_ROWS].double(), minimum, rtol=3e-5, atol=3e-5
         )
+    rotated = _rotate_fp64(projected)
     if not is_query:
-        assert key_mean is not None
-        projected = projected.bfloat16().double() - key_mean
-    padded = projected.new_zeros((_BLOCK_ROWS, head_dim), dtype=torch.float64)
-    padded[:rows] = _rotate_fp64(projected)
+        rotated_mean = rotated.mean(0)
+        tile = start // _BLOCK_ROWS
+        reconstructed_center = reconstruct_key_center(
+            output[2][0, head, tile],
+            output[3][0, head, tile],
+            dtype=torch.float64,
+        )
+        torch.testing.assert_close(reconstructed_center, rotated_mean, rtol=2e-4, atol=2e-4)
+        rotated = rotated - rotated_mean
+    padded = rotated.new_zeros((_BLOCK_ROWS, head_dim), dtype=torch.float64)
+    padded[:rows] = rotated
     scale_rows = 32 if is_query else _BLOCK_ROWS
     codes, expected_scale = _encode_fp64(padded, scale_rows)
     actual = output[0][0, head, start : start + _BLOCK_ROWS]
@@ -108,16 +113,17 @@ def check_qk_sample_fp64(
     )
 
 
-def check_value_sample_fp64(projected, output, head, start, rows, mean_v):
-    """Check a centered V64 block, scale multiplier, and uncentered block mean."""
+def check_value_sample_fp64(projected, output, head, start, rows):
+    """Check a tile-centered V64 block, scale multiplier, and BF16 tile mean."""
+    value_mean = projected.mean(0).bfloat16().double()
     torch.testing.assert_close(
-        output[3][0, head, start // _BLOCK_ROWS].double(),
-        projected.mean(0),
-        rtol=2e-5,
+        output[2][0, head, start // _BLOCK_ROWS].double(),
+        value_mean,
+        rtol=1.6e-2,
         atol=2e-4,
     )
     centered = projected.new_zeros((_BLOCK_ROWS, projected.shape[-1]), dtype=torch.float64)
-    centered[:rows] = projected - mean_v
+    centered[:rows] = projected - value_mean
     codes, expected_scale = _encode_fp64(centered, _BLOCK_ROWS)
     # AMD tests pass final [B,H,tiles,D,64] storage. Decode one selected tile
     # with bit axes rather than repeating the device writer's offset formula.
@@ -143,6 +149,8 @@ class ProjectedQuery:
 class ProjectedKey:
     key: torch.Tensor
     key_scale: torch.Tensor
+    key_center: torch.Tensor
+    key_center_scale: torch.Tensor
     key_max: torch.Tensor
     key_min: torch.Tensor
 
@@ -152,7 +160,6 @@ class ProjectedValue:
     value: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_mean: torch.Tensor
-    block_mean: torch.Tensor
 
 
 def _padded_blocks(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -251,7 +258,7 @@ def composed_key_projection(
     bias: torch.Tensor | None = None,
     block_lengths: torch.Tensor | None = None,
 ) -> ProjectedKey:
-    """Compose FP32 transforms, BF16 K storage, FP32 centering and raw summaries."""
+    """Compose FP32 transforms, K64 tile-centered INT8 quantization, and raw summaries."""
     sequence_length = input_qdata.shape[1]
     key = _materialized_fp32_qk(
         input_qdata,
@@ -268,17 +275,16 @@ def composed_key_projection(
     blocks, valid = _padded_blocks(key)
     if block_lengths is not None:
         valid &= torch.arange(_BLOCK_ROWS, device=key.device)[None, :] < block_lengths[:, None]
-    stored = blocks.masked_fill(~valid[None, None, :, :, None], 0).flatten(2, 3).bfloat16()
-    stored = stored[:, :, :sequence_length]
-    key_int8, key_scale = qk_quantization.prepare_key(
-        stored,
-        stored.float().mean(2),
-        grouped=True,
+    masked = blocks.masked_fill(~valid[None, None, :, :, None], 0).flatten(2, 3)
+    masked = masked[:, :, :sequence_length].contiguous()
+    key_int8, key_scale, key_center, key_center_scale = qk_quantization.prepare_tile_centered_key(
+        masked,
         storage_key_length=storage_length,
+        block_lengths=block_lengths,
     )
     key_max = blocks.masked_fill(~valid[None, None, :, :, None], -torch.inf).amax(dim=3)
     key_min = blocks.masked_fill(~valid[None, None, :, :, None], torch.inf).amin(dim=3)
-    return ProjectedKey(key_int8, key_scale, key_max, key_min)
+    return ProjectedKey(key_int8, key_scale, key_center, key_center_scale, key_max, key_min)
 
 
 def composed_mean_pool_summary(
@@ -311,23 +317,16 @@ def composed_mean_pool_summary(
 def composed_value_projection(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
-    input_mean: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     head_dim: int = 128,
     *,
     bias: torch.Tensor | None = None,
+    block_lengths: torch.Tensor | None = None,
 ) -> ProjectedValue:
-    """Materialize the FP32 operations fused by one-pass value projection."""
+    """Materialize the FP32 operations fused by K64 tile-centered value projection."""
     batch, sequence_length, _input_features = input_qdata.shape
     heads = weight_qdata.shape[0] // head_dim
-    value_mean = ((input_mean @ weight_qdata.float().T) * weight_scale[:, 0]).view(
-        batch,
-        heads,
-        head_dim,
-    )
-    if bias is not None:
-        value_mean += bias.float().view(1, heads, head_dim)
     projected = int8_ops.linear_prepared(
         input_qdata,
         input_scale,
@@ -337,19 +336,21 @@ def composed_value_projection(
         torch.float32,
     ).view(batch, sequence_length, heads, head_dim)
     projected_blocks, valid = _padded_blocks(projected.permute(0, 2, 1, 3).float())
-    block_mean = (projected_blocks * valid[None, None, :, :, None]).sum(dim=3) / valid.sum(dim=1)[
-        None, None, :, None
+    if block_lengths is not None:
+        valid &= (
+            torch.arange(_BLOCK_ROWS, device=projected.device)[None, :] < block_lengths[:, None]
+        )
+    lengths = valid.sum(dim=1).clamp(min=1)
+    value_mean = (
+        (projected_blocks * valid[None, None, :, :, None]).sum(dim=3) / lengths[None, None, :, None]
+    ).bfloat16()
+    centered = (projected_blocks - value_mean.float()[:, :, :, None, :]) * valid[
+        None, None, :, :, None
     ]
-    storage_length = padded_sequence_length(sequence_length)
-    centered = projected.new_zeros((batch, heads, storage_length, head_dim))
-    centered[:, :, :sequence_length] = (
-        projected.permute(0, 2, 1, 3).float() - value_mean[:, :, None, :]
+    value_scale = torch.maximum(
+        centered.abs().amax(dim=(-1, -2)) / 127.0 + 1e-7,
+        value_mean.float().abs().amax(dim=-1) * (2.0**-80),
     )
-    centered = centered.unflatten(
-        2,
-        (storage_length // _BLOCK_ROWS, _BLOCK_ROWS),
-    )
-    value_scale = centered.abs().amax(dim=(-1, -2)) / 127.0 + 1e-7
     normalized = centered / value_scale[..., None, None]
     quantized = (
         torch.trunc(normalized + 0.5 * torch.where(normalized >= 0, 1.0, -1.0))
@@ -360,5 +361,4 @@ def composed_value_projection(
         quantized.flatten(2, 3).permute(0, 1, 3, 2).contiguous(),
         (value_scale * 255.0).unsqueeze(-1),
         value_mean,
-        block_mean,
     )

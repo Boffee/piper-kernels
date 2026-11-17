@@ -242,11 +242,9 @@ class Pipeline(torch.nn.Module):
                 1e-5,
                 _MINMAX_ROUTING,
             )
-            mean = _ops.dequantized_input_mean(data, scale)
             v = sparse_value._project_value_op(
                 data,
                 scale,
-                mean,
                 vw.qdata,
                 vw.scale,
                 head_dim=self.head_dim,
@@ -254,7 +252,6 @@ class Pipeline(torch.nn.Module):
                     sparse_attention_backend.require_attention_backend(data).value_format
                 ),
             )
-            del mean
         # Do not charge the materialized path for storage its next stage no longer uses.
         del data, scale
         if self.keep_ratio is None:
