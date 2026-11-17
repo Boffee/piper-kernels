@@ -137,11 +137,20 @@ def _fp64_query_block(prepared, head, query_block):
     valid &= torch.arange(indices.numel(), device=device) < tile_count * 64
     pairs = tiles.numel() // 2
     q = query.data[0, head, query_block * 64 : query_block * 64 + rows].double()
-    q_scale = query.scale[0, head, query_block * 2 : query_block * 2 + 2].repeat_interleave(32)
+    q_scale = (
+        query.scale[0, head, query_block * 2 : query_block * 2 + 2].repeat_interleave(32).double()
+    )
     k = context.key[0, kv_head].index_select(0, indices).double()
     k_scale = context.key_scale[0, kv_head, tiles].repeat_interleave(64).double()
+    key_center = context.key_center[0, kv_head, tiles]
+    key_center_scale = context.key_center_scale[0, kv_head, tiles]
+    rotated_mean = (
+        key_center[:, 0].double() * key_center_scale[:, 0, None].double()
+        + key_center[:, 1].double() * key_center_scale[:, 1, None].double()
+    )
+    k_bias = ((q @ rotated_mean.T) * q_scale[:rows, None]).repeat_interleave(64, dim=-1)
     multiplier = context.value_scale_multiplier[0, kv_head, tiles, 0].repeat_interleave(64)
-    scores = (q @ k.T) * q_scale[:rows, None].double() * k_scale[None, :]
+    scores = (q @ k.T) * q_scale[:rows, None] * k_scale[None, :] + k_bias
     scores = scores.masked_fill(~valid[None, :], -torch.inf)
     scores = scores.reshape(rows, pairs, 128).transpose(0, 1)
     multipliers = multiplier.double().reshape(pairs, 1, 128)
@@ -154,10 +163,15 @@ def _fp64_query_block(prepared, head, query_block):
     values = context.value[0, kv_head].index_select(1, indices).T.reshape(pairs, 128, -1)
     products = torch.bmm(codes, values.double())
     weights = torch.exp2(pair_max - pair_max.amax(dim=0))
-    numerator = (products * weights[:, :, None]).sum(dim=0)
+    tile_masses = (
+        probabilities.reshape(pairs, rows, 2, 64).sum(dim=-1) * weights[:, :, None] * 255.0
+    )
+    tile_means = context.value_mean[0, kv_head, tiles].reshape(pairs, 2, -1).double()
+    numerator = (products * weights[:, :, None]).sum(dim=0) + (
+        tile_masses.transpose(0, 1).reshape(rows, pairs * 2) @ tile_means.reshape(pairs * 2, -1)
+    )
     denominator = (probabilities.sum(dim=-1) * weights).sum(dim=0)
-    output = numerator / (denominator.clamp_min(1e-30)[:, None] * 255)
-    return output + context.value_mean[0, kv_head].double()
+    return numerator / (denominator.clamp_min(1e-30)[:, None] * 255)
 
 
 def _assert_matches_fp64(prepared, output, coarse=None, limit=0.005, blocks=None):

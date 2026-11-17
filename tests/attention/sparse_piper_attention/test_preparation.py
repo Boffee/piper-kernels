@@ -70,13 +70,15 @@ def test_fused_preparation_matches_separate_passes(
     from piper_kernels.attention.kernels.qk_quantization.int8.sage import (  # noqa: PLC0415
         triton as qk_quantization,
     )
-    from piper_kernels.attention.piper_attention import _quantization  # noqa: PLC0415
     from piper_kernels.attention.sparse_piper_attention import _summaries_triton  # noqa: PLC0415
     from piper_kernels.attention.sparse_piper_attention._block_layout import (  # noqa: PLC0415
         valid_block_rows,
     )
+    from piper_kernels.attention.sparse_piper_attention.coarse import (  # noqa: PLC0415
+        mean_pool_block_values,
+    )
 
-    # Cross a mean-reduction chunk boundary, with GQA and non-contiguous head strides.
+    # Cross a K64 tile boundary, with GQA and non-contiguous head strides.
     rows = 17 * 64 if padded else 17 * 64 + 5
     storage = (rows + 63) // 64 * 64
     sparse_key_blocks = rows // 64 if sparse_key_blocks is None else sparse_key_blocks
@@ -104,20 +106,18 @@ def test_fused_preparation_matches_separate_passes(
         masked_query, masked_key, masked_value = (
             torch.where(valid, tensor, 0) for tensor in (query, key, value)
         )
-    key_mean, value_mean = _quantization.compute_kv_means(masked_key, masked_value, is_causal=False)
-    actual_means = _quantization.compute_kv_means(
-        key, value, is_causal=False, block_lengths=lengths
-    )
-    for actual, expected in zip(actual_means, (key_mean, value_mean), strict=True):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    expected_qk = qk_quantization.prepare_query_key(
+    expected_query, expected_query_scale = qk_quantization.prepare_query(
         masked_query,
-        masked_key,
-        key_mean,
         head_dim**-0.5,
         grouped=True,
-        storage_key_length=storage,
         storage_query_length=storage,
+    )
+    expected_key, expected_key_scale, expected_key_center, expected_key_center_scale = (
+        qk_quantization.prepare_tile_centered_key(
+            masked_key,
+            storage_key_length=storage,
+            block_lengths=lengths,
+        )
     )
     expected_summaries = _summaries_triton.sequence_block_summaries(
         masked_query,
@@ -135,11 +135,22 @@ def test_fused_preparation_matches_separate_passes(
         query, head_dim**-0.5, emit_summaries=True, **options
     )
     separate = preparation._prepare_sparse_piper_operands(query, head_dim**-0.5, **options)
-    for name in ("query", "key", "query_scale", "key_scale"):
-        torch.testing.assert_close(
-            getattr(fused, name), getattr(expected_qk, name), atol=0, rtol=0, msg=name
-        )
-    for name in ("value", "value_mean", "value_scale_multiplier"):
+    for name, expected in (
+        ("query", expected_query),
+        ("key", expected_key),
+        ("query_scale", expected_query_scale),
+        ("key_scale", expected_key_scale),
+        ("key_center", expected_key_center),
+        ("key_center_scale", expected_key_center_scale),
+    ):
+        torch.testing.assert_close(getattr(fused, name), expected, atol=0, rtol=0, msg=name)
+    for name in (
+        "value",
+        "value_mean",
+        "value_scale_multiplier",
+        "key_center",
+        "key_center_scale",
+    ):
         torch.testing.assert_close(
             getattr(fused, name), getattr(separate, name), atol=0, rtol=0, msg=name
         )
@@ -151,7 +162,10 @@ def test_fused_preparation_matches_separate_passes(
         assert summary.shape == (2, 2, sparse_key_blocks, head_dim)
         # A prefix view of a full-sequence allocation would retain the wasted storage.
         assert summary.untyped_storage().nbytes() == summary.numel() * summary.element_size()
-    torch.testing.assert_close(fused.value_mean, value_mean, atol=0, rtol=0)
+    expected_v_mean = mean_pool_block_values(masked_value.transpose(1, 2), lengths).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(fused.value_mean, expected_v_mean, atol=1e-2, rtol=2e-2)
 
 
 @pytest.mark.gpu
@@ -255,21 +269,23 @@ def test_fused_qk_compilation_is_reused_across_sequence_shapes(preparation, head
         key = torch.zeros(
             batch, rows, heads // 2, head_dim, device="cuda", dtype=torch.bfloat16
         ).transpose(1, 2)
-        key_mean = torch.zeros(batch, heads // 2, head_dim, device="cuda")
-        prepared, *summaries = preparation._prepare_query_key_with_summaries(
-            query,
-            key,
-            key_mean,
-            head_dim**-0.5,
-            storage_sequence_length=rows,
-            sparse_key_blocks=sparse_key_blocks,
-            block_lengths=None,
+        prepared, key_center, key_center_scale, *summaries = (
+            preparation._prepare_query_key_with_summaries(
+                query,
+                key,
+                head_dim**-0.5,
+                storage_sequence_length=rows,
+                sparse_key_blocks=sparse_key_blocks,
+                block_lengths=None,
+            )
         )
         # The new producer must retain the all-zero quantization guards.
         assert torch.count_nonzero(prepared.query) == 0
         assert torch.count_nonzero(prepared.key) == 0
+        assert torch.count_nonzero(key_center) == 0
         assert torch.isfinite(prepared.query_scale).all()
         assert torch.isfinite(prepared.key_scale).all()
+        assert torch.isfinite(key_center_scale).all()
         assert all(torch.count_nonzero(summary) == 0 for summary in summaries)
     assert all(
         sum(len(cache[0]) for cache in kernel.device_caches.values()) == 1 for kernel in kernels

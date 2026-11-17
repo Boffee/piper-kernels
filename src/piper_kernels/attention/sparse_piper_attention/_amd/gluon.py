@@ -20,6 +20,7 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
     concat_columns,
     pipeline_boundary,
     pv_tiles,
+    qk_center_bias_pair,
     qk_tiles,
     query_fragments,
     rescale_numerator,
@@ -62,6 +63,8 @@ def _sparse_piper_attention_kernel(
     key_ptr,
     value_ptr,
     query_scale_ptr,
+    key_center_ptr,
+    key_center_scale_ptr,
     parameters_ptr,
     value_mean_ptr,
     coarse_output_ptr,
@@ -149,6 +152,10 @@ def _sparse_piper_attention_kernel(
     denominator = gl.zeros([1, 64], gl.float32, row_layout)
     running_max = gl.full([1, 64], -float("inf"), gl.float32, row_layout)
     parameters = parameters_ptr + kv_batch_head * sequence_tiles * PARAMETER_COUNT
+    key_center_head = key_center_ptr + kv_batch_head * sequence_tiles * (2 * head_dim)
+    key_center_scale_head = key_center_scale_ptr + kv_batch_head * sequence_tiles * 2
+    value_mean_head = value_mean_ptr + kv_batch_head * sequence_tiles * head_dim
+    offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
     # D128 benefits from prioritizing matrix work over the intervening softmax.
     # Keep sequence lengths dynamic so projection windows share this schedule.
     matrix_priority: gl.constexpr = 3 if head_dim == 128 else None
@@ -181,6 +188,16 @@ def _sparse_piper_attention_kernel(
             use_64bit_context_offsets,
             head_dim,
             pipeline_priority=matrix_priority,
+        )
+        k_bias_0, k_bias_1 = qk_center_bias_pair(
+            query,
+            key_center_head,
+            key_center_scale_head,
+            tile_0,
+            tile_1,
+            query_scale,
+            use_64bit_context_offsets,
+            head_dim,
         )
         parameters_0 = parameters + tile_0 * PARAMETER_COUNT
         parameters_1 = parameters + tile_1 * PARAMETER_COUNT
@@ -229,8 +246,8 @@ def _sparse_piper_attention_kernel(
         maximum_0 = gl.convert_layout(gl.max(scores_0, 2), row_layout)
         maximum_1 = gl.convert_layout(gl.max(scores_1, 2), row_layout)
         block_max = gl.maximum(
-            gl.fma(maximum_0, scale_0, offset_0[:, None]),
-            gl.fma(maximum_1, scale_1, offset_1[:, None]),
+            gl.fma(maximum_0, scale_0, offset_0[:, None] + k_bias_0),
+            gl.fma(maximum_1, scale_1, offset_1[:, None] + k_bias_1),
         )
         next_max = gl.maximum(running_max, block_max)
         old_weight = gl.exp2(running_max - next_max)
@@ -251,13 +268,14 @@ def _sparse_piper_attention_kernel(
                 scale_0 if chunk < 2 else scale_1,
                 inverse_0 if chunk < 2 else inverse_1,
                 log_0 if chunk < 2 else log_1,
+                k_bias=k_bias_0 if chunk < 2 else k_bias_1,
             )
             packed += (words,)
             sums += (total,)
             pipeline_boundary("softmax", softmax_priority)
-        denominator = (
-            denominator * old_weight + ((sums[0] + sums[1]) + (sums[2] + sums[3])) * current_weight
-        )
+        mass_0 = sums[0] + sums[1]
+        mass_1 = sums[2] + sums[3]
+        denominator = denominator * old_weight + (mass_0 + mass_1) * current_weight
         probabilities = concat_columns(
             concat_columns(packed[0], packed[1]), concat_columns(packed[2], packed[3])
         )
@@ -271,11 +289,25 @@ def _sparse_piper_attention_kernel(
             use_64bit_context_offsets,
             pipeline_priority=matrix_priority,
         )
+        value_mean_0 = gl.load(
+            value_mean_head + gl.sum(tile_0, 0).to(offset_type) * head_dim + features
+        ).to(gl.float32)
+        value_mean_1 = gl.load(
+            value_mean_head + gl.sum(tile_1, 0).to(offset_type) * head_dim + features
+        ).to(gl.float32)
+        numerator = gl.fma(
+            (mass_0 * current_weight * 255.0)[:, :, None],
+            value_mean_0[None, None, :],
+            gl.fma(
+                (mass_1 * current_weight * 255.0)[:, :, None],
+                value_mean_1[None, None, :],
+                numerator,
+            ),
+        )
         running_max = next_max
 
     inverse_denominator = 1.0 / (gl.maximum(denominator, 1e-30) * 255.0)
     result = numerator * inverse_denominator[:, :, None]
-    result += gl.load(value_mean_ptr + kv_batch_head * head_dim + features)[None, None, :]
     output_rows = (local_query_block * 64 + rows).to(gl.int64)
     valid_rows = (global_query_block * 64 + rows < logical_sequence_length) | mask_block_lengths
     if apply_coarse_residual:
@@ -355,6 +387,8 @@ class _ContextLauncher:
                 context.key,
                 context.value,
                 query_state.scale,
+                context.key_center,
+                context.key_center_scale,
                 self.parameters,
                 context.value_mean,
                 launch.coarse_output,

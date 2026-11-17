@@ -53,7 +53,8 @@ def test_attention_preserves_dtype_and_accuracy(device, head_dim, ratio, dtype):
     constant = torch.full_like(operands[2], 1 + increment)
     zeros = torch.zeros_like(operands[0])
     actual = attention(zeros, zeros, constant, sparse_key_blocks=3)
-    torch.testing.assert_close(actual, constant, atol=0, rtol=0)
+    tolerance = 2e-7 if dtype is torch.float32 else 0
+    torch.testing.assert_close(actual, constant, atol=tolerance, rtol=0)
 
 
 def test_sparse_attention_rejects_mixed_activation_dtypes():
@@ -492,3 +493,20 @@ def test_automatic_cuda_graphs_do_not_replay_an_earlier_ratio_profile(forced: bo
             actual = compiled(*operands, **force_tiles).clone()
             torch.testing.assert_close(actual, model(*operands, **force_tiles), rtol=0, atol=0)
     assert capture.calls == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or select_attention_backend(torch.empty((), device="cuda")) is None,
+    reason="requires a native sparse-attention backend",
+)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("constant_value", [2.0**100, -(2.0**100)])
+def test_native_restores_large_constant_value(head_dim: int, constant_value: float) -> None:
+    query = torch.zeros((1, 128, 1, head_dim), dtype=torch.bfloat16, device="cuda")
+    key = torch.zeros_like(query)
+    value = torch.full_like(query, constant_value)
+    actual = SparsePiperAttention((1.0,))(query, key, value, sparse_key_blocks=2)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, value, atol=0, rtol=0)

@@ -68,12 +68,14 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
     value = torch.randint(
         -127, 128, (2, kv_heads, head_dim, 256), dtype=torch.int8, generator=generator
     )
-    mean = torch.randn((2, kv_heads, head_dim), generator=generator)
+    mean = torch.randn((2, kv_heads, 4, head_dim), dtype=torch.bfloat16, generator=generator)
     context = _PreparedSparsePiperContext(
         key=torch.zeros((2, kv_heads, 256, head_dim), dtype=torch.int8),
         value=reference_value_storage(value, value_format),
         value_format=value_format,
         key_scale=torch.ones((2, kv_heads, 4)),
+        key_center=torch.zeros((2, kv_heads, 4, 2, head_dim), dtype=torch.int8),
+        key_center_scale=torch.ones((2, kv_heads, 4, 2)),
         value_scale_multiplier=torch.full((2, kv_heads, 4, 1), 255.0),
         value_mean=mean,
         route_head_offsets=torch.tensor([0, 1, 3], dtype=torch.int32),
@@ -100,10 +102,13 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
                 indices = [
                     tile * 64 + row for tile in [*prefix, 2, 3] for row in range(lengths[tile])
                 ]
-                expected = (
-                    value[batch, kv_head, :, indices].double().mean(dim=1)
-                    + mean[batch, kv_head].double()
-                )
+                tile_ids = torch.tensor([*prefix, 2, 3], dtype=torch.long)
+                expected = value[batch, kv_head, :, indices].double().mean(dim=1) + (
+                    mean[batch, kv_head, tile_ids].double()
+                    * torch.tensor(
+                        [lengths[tile] for tile in tile_ids.tolist()], dtype=torch.float64
+                    )[:, None]
+                ).sum(dim=0) / sum(lengths[tile] for tile in tile_ids.tolist())
                 rows = 64 if internal_padding else min(64, 193 - global_block * 64)
                 expected = expected.to(torch.bfloat16).expand(rows, head_dim)
                 torch.testing.assert_close(

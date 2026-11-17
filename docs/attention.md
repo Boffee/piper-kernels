@@ -88,10 +88,13 @@ Keep ratios lie in `(0, 1]` and belong to immutable model configuration. Physica
 budgets round to whole blocks across heads, with at least one retained block per
 head. `attention.resolve_head_keep_blocks(sparse_key_blocks)` returns the exact
 per-query-head budgets as a tuple of Python integers. Routes are recomputed from
-the current Q/K values on every call. The default `"minmax"`
-policy scores extrema summaries; `"mean"` scores block means. The application owns
-the ratio profile and its quality validation. Even a full keep budget uses sparse
-Piper's quantized arithmetic, which differs from dense Piper's V quantization.
+the current Q/K values on every call. The default `"minmax"` policy scores
+extrema summaries; `"mean"` scores block means. The application owns the ratio
+profile and its quality validation. Even a full keep budget uses sparse Piper's
+quantized arithmetic (`K64 + V64` per-tile centering: `K` centered per `K64` tile
+with 2-term INT8 rotated centers restored in scores, and `V` centered per `K64`
+tile with BF16 tile means restored in the numerator), which differs from dense
+Piper's `V` quantization.
 
 `sparse_key_blocks` counts complete physical blocks in the leading key prefix and
 must be between 1 and `min(sequence_length // 64, 65536)`. A compact partial final

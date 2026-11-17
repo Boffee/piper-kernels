@@ -24,6 +24,7 @@ from piper_kernels.attention.kernels.piper._nvidia.fragments import (
     rescale_packed,
     uint8_int8_mma,
 )
+from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 
 _LOG2_255 = 7.994353436858858
@@ -31,6 +32,8 @@ _LOG2_255 = 7.994353436858858
 _GL_BLOCK_N = gl.constexpr(TILE_ROWS)
 _GL_LOG2_255 = gl.constexpr(_LOG2_255)
 _GL_VALUE_LOG_BOUND_CORRECTION = gl.constexpr(0.086085)
+K_BIAS_GROUP_TILES = gl.constexpr(16)
+_K_BIAS_GROUP_PAIRS = gl.constexpr(8)
 
 
 @gluon.jit
@@ -46,6 +49,199 @@ def _fma_fp32(lhs, rhs, addend):
 
 
 @gluon.jit
+def _resolve_batch_tiles(
+    batch_tile_start,
+    tile_count,
+    route_base,
+    routed_sparse_tile_count,
+    selected_sparse_tile_count,
+    sparse_key_blocks,
+    stride_rr,
+    use_sparse_routes,
+    skip_dense_routing: gl.constexpr,
+    layout: gl.constexpr,
+):
+    positions = gl.minimum(
+        batch_tile_start + gl.arange(0, K_BIAS_GROUP_TILES, layout), tile_count - 1
+    )
+    return tile_offset(
+        route_base,
+        positions,
+        routed_sparse_tile_count,
+        selected_sparse_tile_count,
+        sparse_key_blocks,
+        stride_rr,
+        use_sparse_routes,
+        skip_dense_routing,
+    )
+
+
+@gluon.jit
+def build_k_bias_cache(block_m: gl.constexpr, mma_layout: gl.constexpr):
+    """Build the initial 8-pair K-bias batch cache ahead of the recurrence loop."""
+    dummy = gl.zeros([block_m, K_BIAS_GROUP_TILES], gl.float32, mma_layout)
+    return gl.split(gl.reshape(dummy, [block_m, _K_BIAS_GROUP_PAIRS, 2]))
+
+
+@gluon.jit
+def _compute_k_bias_batch(
+    query,
+    query_scale,
+    key_center_ptr,
+    key_center_scale_ptr,
+    key_center_shared,
+    route_base,
+    batch_tile_start,
+    tile_count,
+    routed_sparse_tile_count,
+    selected_sparse_tile_count,
+    sparse_key_blocks,
+    stride_rr,
+    use_sparse_routes,
+    skip_dense_routing: gl.constexpr,
+    kv_batch_head,
+    sequence_tiles,
+    head_dim: gl.constexpr,
+    mma_warps: gl.constexpr,
+    mma_layout: gl.constexpr,
+    key_layout: gl.constexpr,
+):
+    """Compute Q @ H(K_mean)^T score biases for one batch of 16 routed/dense tiles."""
+    elements_d: gl.constexpr = 8 if (mma_warps == 4 and head_dim == 64) else 16
+    threads_d: gl.constexpr = head_dim // elements_d
+    threads_m: gl.constexpr = 32 // threads_d
+    load_layout: gl.constexpr = gl.BlockedLayout(
+        [1, elements_d], [threads_m, threads_d], [mma_warps, 1], [1, 0]
+    )
+    tile_layout: gl.constexpr = gl.SliceLayout(1, load_layout)
+    feature_layout: gl.constexpr = gl.SliceLayout(0, load_layout)
+    tiles = _resolve_batch_tiles(
+        batch_tile_start,
+        tile_count,
+        route_base,
+        routed_sparse_tile_count,
+        selected_sparse_tile_count,
+        sparse_key_blocks,
+        stride_rr,
+        use_sparse_routes,
+        skip_dense_routing,
+        tile_layout,
+    )
+
+    kv_head_base = kv_batch_head.to(gl.int64) * sequence_tiles
+    feature_offsets = gl.arange(0, head_dim, feature_layout)
+    center_pointers_0 = (
+        key_center_ptr
+        + (kv_head_base + tiles[:, None].to(gl.int64)) * (2 * head_dim)
+        + feature_offsets[None, :]
+    )
+    center_pointers_1 = center_pointers_0 + head_dim
+    zero_acc = gl.zeros([query.shape[0], K_BIAS_GROUP_TILES], gl.int32, mma_layout)
+    center_0 = gl.load(center_pointers_0)
+    key_center_shared.store(center_0)
+    gl.barrier()
+    dot_0 = mma_v2(query, key_center_shared.permute([1, 0]).load(key_layout), zero_acc)
+    center_1 = gl.load(center_pointers_1)
+    gl.barrier()
+    key_center_shared.store(center_1)
+    gl.barrier()
+    dot_1 = mma_v2(query, key_center_shared.permute([1, 0]).load(key_layout), zero_acc)
+
+    scale_tiles = _resolve_batch_tiles(
+        batch_tile_start,
+        tile_count,
+        route_base,
+        routed_sparse_tile_count,
+        selected_sparse_tile_count,
+        sparse_key_blocks,
+        stride_rr,
+        use_sparse_routes,
+        skip_dense_routing,
+        gl.SliceLayout(0, mma_layout),
+    )
+
+    scale_base = (kv_head_base + scale_tiles.to(gl.int64)) * 2
+    scale_0 = gl.load(key_center_scale_ptr + scale_base)
+    scale_1 = gl.load(key_center_scale_ptr + scale_base + 1)
+    return (
+        dot_0.to(gl.float32) * scale_0[None, :] + dot_1.to(gl.float32) * scale_1[None, :]
+    ) * query_scale[:, None]
+
+
+@gluon.jit
+def _extract_pair_k_bias(bias_cache_0, bias_cache_1, local_pair, row_layout: gl.constexpr):
+    """Select one pair's tile biases from the active 16-tile bias batch."""
+    pair_columns: gl.constexpr = gl.arange(
+        0, _K_BIAS_GROUP_PAIRS, gl.SliceLayout(0, bias_cache_0.type.layout)
+    )[None, :]
+    k_bias_0 = gl.convert_layout(
+        gl.sum(gl.where(pair_columns == local_pair, bias_cache_0, 0.0), axis=1), row_layout
+    )
+    k_bias_1 = gl.convert_layout(
+        gl.sum(gl.where(pair_columns == local_pair, bias_cache_1, 0.0), axis=1), row_layout
+    )
+    return k_bias_0, k_bias_1
+
+
+@gluon.jit
+def compute_pair_k_bias(
+    pair_index,
+    bias_cache_0,
+    bias_cache_1,
+    query,
+    query_scale,
+    key_center_ptr,
+    key_center_scale_ptr,
+    key_center_shared,
+    route_base,
+    tile_count,
+    routed_sparse_tile_count,
+    selected_sparse_tile_count,
+    sparse_key_blocks,
+    stride_rr,
+    use_sparse_routes,
+    skip_dense_routing: gl.constexpr,
+    kv_batch_head,
+    sequence_tiles,
+    head_dim: gl.constexpr,
+    mma_warps: gl.constexpr,
+    mma_layout: gl.constexpr,
+    key_layout: gl.constexpr,
+    row_layout: gl.constexpr,
+):
+    """Refresh the 8-pair K-bias batch on boundaries and return this pair's biases."""
+    local_pair = pair_index % _K_BIAS_GROUP_PAIRS  # pyright: ignore[reportOperatorIssue]
+    if local_pair == 0:
+        bias_batch = _compute_k_bias_batch(
+            query,
+            query_scale,
+            key_center_ptr,
+            key_center_scale_ptr,
+            key_center_shared,
+            route_base,
+            pair_index * 2,
+            tile_count,
+            routed_sparse_tile_count,
+            selected_sparse_tile_count,
+            sparse_key_blocks,
+            stride_rr,
+            use_sparse_routes,
+            skip_dense_routing,
+            kv_batch_head,
+            sequence_tiles,
+            head_dim,
+            mma_warps,
+            mma_layout,
+            key_layout,
+        )
+        bias_cache_0, bias_cache_1 = gl.split(
+            gl.reshape(bias_batch, [query.shape[0], _K_BIAS_GROUP_PAIRS, 2])
+        )
+    k_bias_0, k_bias_1 = _extract_pair_k_bias(bias_cache_0, bias_cache_1, local_pair, row_layout)
+    return k_bias_0, k_bias_1, bias_cache_0, bias_cache_1
+
+
+@gluon.jit
 def piper_probability_pair(
     query,
     key_shared_pair,
@@ -53,6 +249,8 @@ def piper_probability_pair(
     key_scale_ptr,
     value_scale_multiplier_ptr,
     block_lengths_ptr,
+    k_bias_0,
+    k_bias_1,
     denominator,
     running_max,
     batch_head,
@@ -70,6 +268,7 @@ def piper_probability_pair(
 ):
     """Advance one shared Piper coordinate over two independently scaled K64 tiles."""
     block_m: gl.constexpr = query.shape[0]
+    row_layout: gl.constexpr = running_max.type.layout
     key = key_shared_pair.permute([1, 0]).load(key_layout)
     integer_scores = mma_v2(
         query,
@@ -105,16 +304,9 @@ def piper_probability_pair(
             valid_keys_1 &= has_second
         integer_scores_0 = gl.where(valid_keys_0[None, :], integer_scores_0, -2147483648)
         integer_scores_1 = gl.where(valid_keys_1[None, :], integer_scores_1, -2147483648)
-    # A duplicate second tile is entirely invalid, so its maximum is
-    # replaced by -inf below without masking all of its integer scores.
 
-    # Q/K scales are nonnegative. Their FP32 conversion and multiplication
-    # are monotonic, so the row maximum can be reduced exactly in INT32
-    # before scaling, keeping both full FP32 score tiles out of this stage.
-    score_max_0 = gl.max(integer_scores_0, axis=1).to(gl.float32) * score_scale_0  # pyright: ignore[reportAttributeAccessIssue]
-    score_max_1 = gl.max(integer_scores_1, axis=1).to(gl.float32) * score_scale_1  # pyright: ignore[reportAttributeAccessIssue]
-    # Every selected physical K64 has at least one valid key; only the
-    # duplicated final tile can have no active keys in this kernel's contract.
+    score_max_0 = gl.max(integer_scores_0, axis=1).to(gl.float32) * score_scale_0 + k_bias_0  # pyright: ignore[reportAttributeAccessIssue]
+    score_max_1 = gl.max(integer_scores_1, axis=1).to(gl.float32) * score_scale_1 + k_bias_1  # pyright: ignore[reportAttributeAccessIssue]
     if mask_duplicate:
         score_max_1 = gl.where(has_second, score_max_1, -float("inf"))
 
@@ -139,23 +331,21 @@ def piper_probability_pair(
     next_max = gl.maximum(running_max, block_max)
     old_weight = gl.exp2(running_max - next_max)
     current_weight = gl.exp2(block_max - next_max)
-    scores_0 = integer_scores_0.to(gl.float32) * score_scale_0[:, None]
-    scores_1 = integer_scores_1.to(gl.float32) * score_scale_1[:, None]
-    # Join the independent K64 coordinates along a register dimension before
-    # probability work, retaining the original shared coordinate and K64 scales.
-    scores = gl.reshape(
-        gl.permute(gl.join(scores_0, scores_1), [0, 2, 1]),
+    delta_0 = k_bias_0 - block_max
+    delta_1 = k_bias_1 - block_max
+    shifted_0 = integer_scores_0.to(gl.float32) * score_scale_0[:, None] + delta_0[:, None]
+    shifted_1 = integer_scores_1.to(gl.float32) * score_scale_1[:, None] + delta_1[:, None]
+    shifted_scores = gl.reshape(
+        gl.permute(gl.join(shifted_0, shifted_1), [0, 2, 1]),
         [block_m, 2 * _GL_BLOCK_N],
     )
-    scores = gl.convert_layout(scores, mma_layout)
+    shifted_scores = gl.convert_layout(shifted_scores, mma_layout)
     paired_columns = gl.arange(0, 2 * _GL_BLOCK_N, column_layout)
     value_scale_multiplier = gl.where(
         paired_columns < _GL_BLOCK_N,
         value_scale_multiplier_0,
         value_scale_multiplier_1,
     )
-    # Mask the final exponent argument, permitting FMA for valid score shifts.
-    shifted_scores = scores - block_max[:, None]
     if mask_block_lengths or mask_ragged_tail:
         valid_keys = gl.reshape(
             gl.permute(gl.join(valid_keys_0, valid_keys_1), [1, 0]), [2 * _GL_BLOCK_N]
@@ -170,14 +360,20 @@ def piper_probability_pair(
         probabilities * value_scale_multiplier[None, :] + 0.5
     )
     probability_uint8 = gl.convert_layout(probability_uint8, probability_layout)
-    probability_sum = gl.sum(probabilities, axis=1)
-    denominator = denominator * old_weight + probability_sum * current_weight
+    p0, p1 = gl.split(gl.permute(gl.reshape(probabilities, [block_m, 2, _GL_BLOCK_N]), [0, 2, 1]))
+    mass_0 = gl.convert_layout(gl.sum(p0, axis=1), row_layout)
+    mass_1 = gl.convert_layout(gl.sum(p1, axis=1), row_layout)
+    if mask_duplicate:
+        mass_1 = gl.where(has_second, mass_1, 0.0)
+    denominator = denominator * old_weight + (mass_0 + mass_1) * current_weight
     return (
         probability_uint8,
         denominator,
         next_max,
         old_weight,
         current_weight,
+        mass_0,
+        mass_1,
     )
 
 
@@ -212,16 +408,40 @@ def piper_pv_pair(
 
 
 @gluon.jit
+def accumulate_value_mean_pair(
+    accumulator,
+    value_mean_ptr,
+    mass_0,
+    mass_1,
+    current_weight,
+    kv_batch_head,
+    start_n_0,
+    start_n_1,
+    sequence_tiles,
+    mma_layout: gl.constexpr,
+):
+    """Add per-K64 tile V mean restoration directly into the FP32 numerator."""
+    head_dim: gl.constexpr = accumulator.shape[1]
+    offsets_d = gl.arange(0, head_dim, gl.SliceLayout(0, mma_layout))
+    base = kv_batch_head.to(gl.int64) * sequence_tiles
+    tile_0 = (start_n_0 // _GL_BLOCK_N).to(gl.int64)
+    tile_1 = (start_n_1 // _GL_BLOCK_N).to(gl.int64)
+    value_mean_0 = gl.load(value_mean_ptr + (base + tile_0) * head_dim + offsets_d).to(gl.float32)
+    value_mean_1 = gl.load(value_mean_ptr + (base + tile_1) * head_dim + offsets_d).to(gl.float32)
+    weight_0 = (mass_0 * current_weight * 255.0)[:, None]
+    weight_1 = (mass_1 * current_weight * 255.0)[:, None]
+    return accumulator + weight_0 * value_mean_0[None, :] + weight_1 * value_mean_1[None, :]
+
+
+@gluon.jit
 def store_attention_output(
     accumulator,
     denominator,
-    value_mean_ptr,
     coarse_output_ptr,
     coarse_gate_ptr,
     output_ptr,
     batch,
     head,
-    kv_batch_head,
     query_block,
     global_query_block,
     output_start_m,
@@ -242,14 +462,12 @@ def store_attention_output(
     apply_coarse_residual: gl.constexpr,
     mask_output_tail: gl.constexpr,
 ):
-    """Normalize, restore the V mean, add an optional coarse residual, and store once."""
+    """Normalize, add an optional coarse residual, and store once."""
     block_m: gl.constexpr = accumulator.shape[0]
     head_dim: gl.constexpr = accumulator.shape[1]
     column_layout: gl.constexpr = gl.SliceLayout(0, mma_layout)
     offsets_d = gl.arange(0, head_dim, column_layout)
     output = accumulator / (gl.maximum(denominator, 1e-30) * 255.0)[:, None]
-    value_mean = gl.load(value_mean_ptr + kv_batch_head * head_dim + offsets_d).to(gl.float32)
-    output += value_mean[None, :]
     valid_queries = global_query_block * _GL_BLOCK_N + offsets_m < logical_sequence_length
     if block_m == 128:
         valid_queries = output_start_m + offsets_m < output_sequence_length

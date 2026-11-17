@@ -17,6 +17,8 @@ from .layout import ValueFormat
 _P_UINT8_RANGE = tl.constexpr(255.0)
 _V_INT8_RANGE = tl.constexpr(127.0)
 _SCALE_EPSILON = tl.constexpr(1e-7)
+# Keep per-tile mean restoration finite when a constant tile has tiny residual scale.
+_VALUE_MEAN_SCALE_FLOOR = tl.constexpr(2.0**-80)
 _AMD_VALUE_FORMAT = tl.constexpr(int(ValueFormat.AMD_WMMA))
 _TRANSPOSED_VALUE_FORMAT = tl.constexpr(int(ValueFormat.TRANSPOSED))
 
@@ -45,34 +47,44 @@ def summarize_block_tiles(
 @triton.jit
 def quantize_value_tile(
     values,
-    value_mean,
     valid_rows,
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     scale_rows: tl.constexpr,
 ):
-    """Center and encode a tile, returning logical head/row/feature codes."""
-    centered = tl.where(
-        valid_rows[:, None, None],
-        values - value_mean[None, :, :],
-        0.0,
-    )
+    """Per-K64 tile-center and encode V, returning codes, multipliers, and BF16 means."""
+    num_tiles: tl.constexpr = block_m // scale_rows
     grouped = tl.reshape(
-        tl.permute(centered, (1, 0, 2)),
+        tl.permute(values, (1, 0, 2)),
         (
             heads_per_program,
-            block_m // scale_rows,
+            num_tiles,
             scale_rows,
             head_dim,
         ),
     )
-    maximum = tl.max(tl.max(tl.abs(grouped), axis=3), axis=2)
-    value_scale = maximum / _V_INT8_RANGE + _SCALE_EPSILON
-    quantized = qk_quantization.round_to_int8(grouped / value_scale[:, :, None, None])
+    grouped_valid = tl.reshape(valid_rows, (num_tiles, scale_rows))
+    masked = tl.where(grouped_valid[None, :, :, None], grouped, 0.0)
+    valid_count = tl.maximum(tl.sum(grouped_valid.to(tl.float32), axis=1), 1.0)
+    mean_fp32 = tl.sum(masked, axis=2) / valid_count[None, :, None]
+    mean_bf16 = mean_fp32.to(tl.bfloat16)
+    centered = tl.where(
+        grouped_valid[None, :, :, None],
+        masked - mean_bf16.to(tl.float32)[:, :, None, :],
+        0.0,
+    )
+    maximum = tl.max(tl.max(tl.abs(centered), axis=3), axis=2)
+    mean_magnitude = tl.max(tl.abs(mean_bf16.to(tl.float32)), axis=2)
+    value_scale = tl.maximum(
+        maximum / _V_INT8_RANGE + _SCALE_EPSILON,
+        mean_magnitude * _VALUE_MEAN_SCALE_FLOOR,
+    )
+    quantized = qk_quantization.round_to_int8(centered / value_scale[:, :, None, None])
     return (
         tl.reshape(quantized, (heads_per_program, block_m, head_dim)),
         value_scale * _P_UINT8_RANGE,
+        mean_bf16,
     )
 
 
@@ -179,6 +191,8 @@ def store_key_tile(
     values,
     key_ptr,
     key_scale_ptr,
+    key_center_ptr,
+    key_center_scale_ptr,
     key_summary_ptr,
     key_aux_ptr,
     block_lengths_ptr,
@@ -196,11 +210,11 @@ def store_key_tile(
     block_m: tl.constexpr,
     scale_rows: tl.constexpr,
 ):
-    """Quantize and store one transformed sparse-Piper key tile and route summaries."""
+    """Quantize and store one K64-centered sparse-Piper key tile and route summaries."""
     head_offsets = head_offsets.to(tl.int64)
     feature_offsets = tl.arange(0, head_dim)
     local_tile_offsets = tl.arange(0, block_m // scale_rows)
-    tile_offsets = row_block * (block_m // scale_rows) + local_tile_offsets
+    tile_offsets = (row_block * (block_m // scale_rows) + local_tile_offsets).to(tl.int64)
     row_in_tile = tl.arange(0, scale_rows)
     if mask_block_lengths:
         lengths = tl.load(
@@ -232,12 +246,15 @@ def store_key_tile(
         tl.constexpr(False),
     )
 
-    quantized, key_scale = qk_quantization.quantize_key_tile(
-        values,
-        heads_per_program,
-        head_dim,
-        block_m,
-        scale_rows,
+    quantized, key_scale, center_0, center_1, center_scale_0, center_scale_1 = (
+        qk_quantization.quantize_tile_centered_key_tile(
+            values,
+            valid,
+            heads_per_program,
+            head_dim,
+            block_m,
+            scale_rows,
+        )
     )
     key_offsets = (
         (batch * heads + head_offsets[:, None, None]) * storage_sequence_length * head_dim
@@ -254,6 +271,12 @@ def store_key_tile(
     scale_offsets = (batch * heads + head_offsets[:, None]) * tile_count + tile_offsets[None, :]
     tile_mask = (head_offsets[:, None] < heads) & (tile_offsets[None, :] < tile_count)
     tl.store(key_scale_ptr + scale_offsets, key_scale, mask=tile_mask)
+    center_offsets_0 = (scale_offsets * 2)[:, :, None] * head_dim + feature_offsets[None, None, :]
+    center_offsets_1 = center_offsets_0 + head_dim
+    tl.store(key_center_ptr + center_offsets_0, center_0, mask=tile_mask[:, :, None])
+    tl.store(key_center_ptr + center_offsets_1, center_1, mask=tile_mask[:, :, None])
+    tl.store(key_center_scale_ptr + scale_offsets * 2, center_scale_0, mask=tile_mask)
+    tl.store(key_center_scale_ptr + scale_offsets * 2 + 1, center_scale_1, mask=tile_mask)
     summary_offsets = scale_offsets[:, :, None] * head_dim + feature_offsets[None, None, :]
     tl.store(key_summary_ptr + summary_offsets, key_summary, mask=tile_mask[:, :, None])
     if not mean_pool_summary:
@@ -280,10 +303,9 @@ def value_storage_offsets(
 @triton.jit
 def store_value_tile(
     values,
-    value_mean_ptr,
     value_ptr,
     value_scale_ptr,
-    block_mean_ptr,
+    value_mean_ptr,
     block_lengths_ptr,
     batch,
     heads,
@@ -293,26 +315,18 @@ def store_value_tile(
     storage_sequence_length,
     row_block,
     mask_block_lengths: tl.constexpr,
-    emit_block_mean: tl.constexpr,
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
     scale_rows: tl.constexpr,
     value_format: tl.constexpr = _TRANSPOSED_VALUE_FORMAT,
 ):
-    """Center, quantize, and optionally mean-pool one sparse-Piper value tile."""
+    """Per-K64 tile-center and quantize one sparse-Piper value tile."""
     head_offsets = head_offsets.to(tl.int64)
     feature_offsets = tl.arange(0, head_dim)
-    value_mean = tl.load(
-        value_mean_ptr
-        + (batch * heads + head_offsets[:, None]) * head_dim
-        + feature_offsets[None, :],
-        mask=head_offsets[:, None] < heads,
-        other=0.0,
-    )
     tile_count = storage_sequence_length // scale_rows
     local_tile_offsets = tl.arange(0, block_m // scale_rows)
-    tile_offsets = row_block * (block_m // scale_rows) + local_tile_offsets
+    tile_offsets = (row_block * (block_m // scale_rows) + local_tile_offsets).to(tl.int64)
     scale_offsets = (batch * heads + head_offsets[:, None]) * tile_count + tile_offsets[None, :]
     if mask_block_lengths:
         block_lengths = tl.load(
@@ -325,39 +339,20 @@ def store_value_tile(
         valid_rows = tl.reshape(grouped_valid, (block_m,))
     else:
         valid_rows = sequence_offsets < logical_sequence_length
-    if emit_block_mean:
-        value_blocks = tl.reshape(
-            tl.permute(values, (1, 0, 2)),
-            (
-                heads_per_program,
-                block_m // scale_rows,
-                scale_rows,
-                head_dim,
-            ),
-        )
-        grouped_valid = tl.reshape(valid_rows, (block_m // scale_rows, scale_rows))
-        valid_count = tl.maximum(tl.sum(grouped_valid.to(tl.int32), axis=1), 1)
-        block_mean = (
-            tl.sum(
-                tl.where(grouped_valid[None, :, :, None], value_blocks, 0.0),
-                axis=2,
-            )
-            / valid_count[None, :, None]
-        )
-        block_mean_offsets = scale_offsets[:, :, None] * head_dim + feature_offsets[None, None, :]
-        tl.store(
-            block_mean_ptr + block_mean_offsets,
-            block_mean,
-            mask=(head_offsets[:, None, None] < heads) & (tile_offsets[None, :, None] < tile_count),
-        )
-    quantized, value_scale_multiplier = quantize_value_tile(  # pyright: ignore[reportGeneralTypeIssues]
+    quantized, value_scale_multiplier, value_mean = quantize_value_tile(  # pyright: ignore[reportGeneralTypeIssues]
         values,
-        value_mean,
         valid_rows,
         heads_per_program,
         head_dim,
         block_m,
         scale_rows,
+    )
+    value_mean_offsets = scale_offsets[:, :, None] * head_dim + feature_offsets[None, None, :]
+    tile_mask = (head_offsets[:, None] < heads) & (tile_offsets[None, :] < tile_count)
+    tl.store(
+        value_mean_ptr + value_mean_offsets,
+        value_mean,
+        mask=tile_mask[:, :, None],
     )
     value_offsets = value_storage_offsets(
         batch * heads + head_offsets[:, None, None],
@@ -377,5 +372,5 @@ def store_value_tile(
     tl.store(
         value_scale_ptr + scale_offsets,
         value_scale_multiplier,
-        mask=(head_offsets[:, None] < heads) & (tile_offsets[None, :] < tile_count),
+        mask=tile_mask,
     )

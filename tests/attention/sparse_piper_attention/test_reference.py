@@ -85,3 +85,26 @@ def test_quantized_reference_restores_constant_value_exactly() -> None:
     )
 
     torch.testing.assert_close(actual, value, atol=0, rtol=0)
+
+
+def test_quantized_reference_restores_large_constant_value() -> None:
+    layout = _resolve_route_layout(_normalize_head_keep_ratios((1.0,)), 2, torch.device("cpu"))
+    query = torch.zeros((1, 128, 1, 64), dtype=torch.bfloat16)
+    key = torch.zeros_like(query)
+    routes = packed_routes_from_sequences(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        layout,
+        _MINMAX_ROUTING,
+    )
+    for constant in (2.0**100, -(2.0**100)):
+        value = torch.full_like(query, constant)
+        actual = reference_sparse_piper_attention(
+            query,
+            key,
+            value,
+            routes,
+            sparse_key_blocks=2,
+            scale=64**-0.5,
+        )
+        torch.testing.assert_close(actual, value, atol=0, rtol=0)

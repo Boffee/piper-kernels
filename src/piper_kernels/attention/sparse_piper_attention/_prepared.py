@@ -38,6 +38,8 @@ class _PreparedSparsePiperContext:
     value: torch.Tensor
     value_format: ValueFormat
     key_scale: torch.Tensor
+    key_center: torch.Tensor
+    key_center_scale: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_mean: torch.Tensor
     route_head_offsets: torch.Tensor
@@ -74,7 +76,7 @@ class _PreparedSparsePiperAttention:
 
 @dataclass(frozen=True, slots=True)
 class _PreparedSparsePiperOperands:
-    """Quantized sequence-global operands before routes are known.
+    """Quantized Q/K/V operands before routes are known.
 
     ``query_summary``/``key_summary``/``key_aux`` are the min/max routing
     summaries, present only when preparation was asked to emit them.
@@ -85,6 +87,8 @@ class _PreparedSparsePiperOperands:
     value: torch.Tensor
     value_format: ValueFormat
     key_scale: torch.Tensor
+    key_center: torch.Tensor
+    key_center_scale: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_mean: torch.Tensor
     query: torch.Tensor
@@ -111,6 +115,8 @@ class _PreparedSparsePiperOperands:
             value=self.value,
             value_format=self.value_format,
             key_scale=self.key_scale,
+            key_center=self.key_center,
+            key_center_scale=self.key_center_scale,
             value_scale_multiplier=self.value_scale_multiplier,
             value_mean=self.value_mean,
             route_head_offsets=route_head_offsets,
@@ -130,6 +136,8 @@ class _PreparedSparsePiperOperands:
 def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    key_center_scale: torch.Tensor,
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
@@ -179,10 +187,20 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
     tile_count = storage_sequence_length // TILE_ROWS
     if key_scale.shape != (batch, heads, tile_count):
         raise ValueError("quantized sparse Piper K scales must contain one value per K64")
+    if (
+        key_center.shape != (batch, heads, tile_count, 2, head_dim)
+        or key_center.dtype is not torch.int8
+    ):
+        raise ValueError("quantized sparse Piper K centers must be [batch,heads,K64,2,D] INT8")
+    if key_center_scale.shape != (batch, heads, tile_count, 2):
+        raise ValueError("quantized sparse Piper K center scales must contain two values per K64")
     if value_scale_multiplier.shape != (batch, heads, tile_count, 1):
         raise ValueError("quantized sparse Piper V scales must contain one value per K64")
-    if value_mean.shape != (batch, heads, head_dim):
-        raise ValueError("quantized sparse Piper V mean must be [batch,heads,D64/D128]")
+    if (
+        value_mean.shape != (batch, heads, tile_count, head_dim)
+        or value_mean.dtype is not torch.bfloat16
+    ):
+        raise ValueError("quantized sparse Piper V mean must be [batch,heads,K64,D64/D128] BF16")
     # Layout construction owns the value-range invariants documented
     # above. Inspecting device values here would add a validation kernel or a host
     # synchronization to every launch; only launch-critical tensor properties
@@ -191,12 +209,14 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
         block_lengths.shape != (tile_count,) or block_lengths.dtype is not torch.int32
     ):
         raise ValueError("quantized sparse Piper block lengths must be one INT32 value per K64")
-    scales = key_scale, value_scale_multiplier, value_mean
+    scales = key_scale, key_center_scale, value_scale_multiplier
     if any(scale.dtype is not torch.float32 for scale in scales):
-        raise ValueError("quantized sparse Piper scales and V mean must use FP32")
+        raise ValueError("quantized sparse Piper scales must use FP32")
     tensors = (
         key,
+        key_center,
         value,
+        value_mean,
         *scales,
         head_keep_blocks,
         route_head_offsets,
@@ -244,6 +264,8 @@ def _prepare_sparse_piper_context_from_quantized(  # noqa: PLR0912, PLR0913
         value=value,
         value_format=value_format,
         key_scale=key_scale,
+        key_center=key_center,
+        key_center_scale=key_center_scale,
         value_scale_multiplier=value_scale_multiplier,
         value_mean=value_mean,
         route_head_offsets=route_head_offsets,

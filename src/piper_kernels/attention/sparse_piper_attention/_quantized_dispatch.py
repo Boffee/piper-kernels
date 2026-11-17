@@ -51,6 +51,8 @@ class _PreparedQuantizedSparsePiperContext:
 def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    key_center_scale: torch.Tensor,
     key_summary: torch.Tensor,
     key_aux: torch.Tensor,
     value: torch.Tensor,
@@ -61,7 +63,6 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
     logical_sequence_length: int,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
-    block_mean: torch.Tensor | None = None,
     coarse_scale: float | None = None,
     coarse_key_blocks: int | None = None,
     sparse_query_blocks: int | None = None,
@@ -88,9 +89,7 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
     )
     validate_routing_mode(routing_mode)
     pooled_value = None
-    if block_mean is None:
-        if coarse_scale is not None or coarse_key_blocks is not None:
-            raise ValueError("coarse output metadata requires block means")
+    if coarse_scale is None and coarse_key_blocks is None:
         route_key_blocks = sparse_key_blocks
     else:
         if coarse_scale is None or coarse_key_blocks is None:
@@ -98,13 +97,15 @@ def _prepare_quantized_sparse_piper_context(  # noqa: PLR0913, PLR0917
         _validate_coarse_key_blocks(
             sparse_key_blocks,
             coarse_key_blocks,
-            available_coarse_key_blocks=block_mean.shape[2],
+            available_coarse_key_blocks=value_mean.shape[2],
         )
         route_key_blocks = coarse_key_blocks
-        pooled_value = block_mean[:, :, :route_key_blocks]
+        pooled_value = value_mean[:, :, :route_key_blocks].float()
     kernel_context = _prepare_sparse_piper_context_from_quantized(
         key,
         key_scale,
+        key_center,
+        key_center_scale,
         value,
         value_scale_multiplier,
         value_mean,
@@ -207,6 +208,8 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
     query_summary: torch.Tensor,
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    key_center_scale: torch.Tensor,
     key_summary: torch.Tensor,
     key_aux: torch.Tensor,
     value: torch.Tensor,
@@ -219,13 +222,17 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
     *,
+    coarse_scale: float | None = None,
+    coarse_key_blocks: int | None = None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
-) -> _PreparedSparsePiperAttention:
-    """Build validated shared launch state for quantized sparse Piper."""
+) -> tuple[_PreparedSparsePiperAttention, torch.Tensor | None]:
+    """Build validated launch state and optional coarse output for quantized sparse Piper."""
     context = _prepare_quantized_sparse_piper_context(
         key,
         key_scale,
+        key_center,
+        key_center_scale,
         key_summary,
         key_aux,
         value,
@@ -236,7 +243,9 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
         logical_sequence_length,
         routing_mode,
         block_lengths,
-        sparse_query_blocks=sparse_query_blocks,
+        coarse_scale,
+        coarse_key_blocks,
+        sparse_query_blocks,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
     )
@@ -246,63 +255,7 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
         query_scale,
         query_summary,
         global_block_offset=0,
-    )[0]
-
-
-def _prepare_quantized_sparse_piper_attention_with_coarse(  # noqa: PLR0913, PLR0917
-    query: torch.Tensor,
-    query_scale: torch.Tensor,
-    query_summary: torch.Tensor,
-    key: torch.Tensor,
-    key_scale: torch.Tensor,
-    key_summary: torch.Tensor,
-    key_aux: torch.Tensor,
-    value: torch.Tensor,
-    value_scale_multiplier: torch.Tensor,
-    value_mean: torch.Tensor,
-    block_mean: torch.Tensor,
-    ratio_profile: _SparsePiperRatioProfile,
-    sparse_key_blocks: int,
-    logical_sequence_length: int,
-    routing_mode: int,
-    coarse_scale: float,
-    coarse_key_blocks: int,
-    block_lengths: torch.Tensor | None = None,
-    sparse_query_blocks: int | None = None,
-    *,
-    force_tile_ids: torch.Tensor | None = None,
-    force_tile_counts: torch.Tensor | None = None,
-) -> tuple[_PreparedSparsePiperAttention, torch.Tensor]:
-    """Prepare fine routes and a potentially wider coarse K/V prefix."""
-    context = _prepare_quantized_sparse_piper_context(
-        key,
-        key_scale,
-        key_summary,
-        key_aux,
-        value,
-        value_scale_multiplier,
-        value_mean,
-        ratio_profile,
-        sparse_key_blocks,
-        logical_sequence_length,
-        routing_mode,
-        block_lengths,
-        block_mean,
-        coarse_scale,
-        coarse_key_blocks,
-        sparse_query_blocks,
-        force_tile_ids=force_tile_ids,
-        force_tile_counts=force_tile_counts,
     )
-    prepared, coarse_output = _prepare_quantized_sparse_piper_query(
-        context,
-        query,
-        query_scale,
-        query_summary,
-        global_block_offset=0,
-    )
-    assert coarse_output is not None
-    return prepared, coarse_output
 
 
 def _quantized_attention_output_sequence_length(
@@ -384,6 +337,8 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     query_summary: torch.Tensor,
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    key_center_scale: torch.Tensor,
     key_summary: torch.Tensor,
     key_aux: torch.Tensor,
     value: torch.Tensor,
@@ -415,12 +370,14 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
         query, logical_sequence_length, block_lengths
     )
     output = _new_quantized_attention_output(query, sequence_length, output_dtype=output_dtype)
-    prepared = _prepare_quantized_sparse_piper_attention(
+    prepared, _coarse_output = _prepare_quantized_sparse_piper_attention(
         query,
         query_scale,
         query_summary,
         key,
         key_scale,
+        key_center,
+        key_center_scale,
         key_summary,
         key_aux,
         value,
@@ -450,12 +407,13 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
     query_summary: torch.Tensor,
     key: torch.Tensor,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    key_center_scale: torch.Tensor,
     key_summary: torch.Tensor,
     key_aux: torch.Tensor,
     value: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
-    block_mean: torch.Tensor,
     coarse_gate: torch.Tensor,
     ratio_profile: _SparsePiperRatioProfile,
     sparse_key_blocks: int,
@@ -476,26 +434,27 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
         query, logical_sequence_length, block_lengths
     )
     output = _new_quantized_attention_output(query, sequence_length, output_dtype=output_dtype)
-    prepared, coarse_output = _prepare_quantized_sparse_piper_attention_with_coarse(
+    prepared, coarse_output = _prepare_quantized_sparse_piper_attention(
         query,
         query_scale,
         query_summary,
         key,
         key_scale,
+        key_center,
+        key_center_scale,
         key_summary,
         key_aux,
         value,
         value_scale_multiplier,
         value_mean,
-        block_mean,
         ratio_profile,
         sparse_key_blocks,
         logical_sequence_length,
         routing_mode,
-        coarse_scale,
-        coarse_key_blocks,
         block_lengths,
         sparse_query_blocks,
+        coarse_scale=coarse_scale,
+        coarse_key_blocks=coarse_key_blocks,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
     )
@@ -515,6 +474,8 @@ def _sparse_piper_attention_from_quantized_op_fake(
     _query_summary: torch.Tensor,
     _key: torch.Tensor,
     _key_scale: torch.Tensor,
+    _key_center: torch.Tensor,
+    _key_center_scale: torch.Tensor,
     _key_summary: torch.Tensor,
     _key_aux: torch.Tensor,
     _value: torch.Tensor,
@@ -549,12 +510,13 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op_fake(
     _query_summary: torch.Tensor,
     _key: torch.Tensor,
     _key_scale: torch.Tensor,
+    _key_center: torch.Tensor,
+    _key_center_scale: torch.Tensor,
     _key_summary: torch.Tensor,
     _key_aux: torch.Tensor,
     _value: torch.Tensor,
     _value_scale_multiplier: torch.Tensor,
     _value_mean: torch.Tensor,
-    _block_mean: torch.Tensor,
     _coarse_gate: torch.Tensor,
     _ratio_profile: _SparsePiperRatioProfile,
     _sparse_key_blocks: int,
