@@ -5,10 +5,12 @@ import sys
 
 import pytest
 import triton
+from _accelerators import rocm_fences_only_lds
 from triton.backends.compiler import GPUTarget
 from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels.attention.sparse_piper_attention._amd.gluon import (
+    _LLVM_FN_ATTRS,
     _requires_64bit_context_offsets,
     _requires_64bit_query_offsets,
     _sparse_piper_attention_kernel,
@@ -70,7 +72,7 @@ def _compile_attention(
         options={
             "num_warps": 4,
             "num_stages": 1,
-            "llvm_fn_attrs": (("target-features", "-cumode" if head_dim == 128 else "+cumode"),),
+            "llvm_fn_attrs": _LLVM_FN_ATTRS,
         },
     )
 
@@ -106,6 +108,8 @@ def test_fused_amd_compilation(
     # Keep rotated QK, online softmax, and the optional coarse epilogue in FP32.
     assert "tt.fp_to_fp" not in compiled.asm["ttgir"]
     assert compiled.asm["ttgir"].count("arith.truncf") == 1  # final BF16 store only
+    if rocm_fences_only_lds():
+        assert "global_inv" not in compiled.asm["amdgcn"]
 
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])

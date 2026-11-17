@@ -17,10 +17,11 @@ from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
+    accumulate_chunk_value_means,
+    compute_chunk_key_biases,
     concat_columns,
     pipeline_boundary,
     pv_tiles,
-    qk_center_bias_pair,
     qk_tiles,
     query_fragments,
     rescale_numerator,
@@ -40,6 +41,15 @@ from ._parameters import (
     prepare_parameters,
 )
 
+# Launch attributes shared by every sparse RDNA4 kernel compile.
+_LLVM_FN_ATTRS = (
+    ("target-features", "-cumode"),
+    *amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS,
+    *amd_compiler_workarounds.LDS_ONLY_FENCE_ATTRS,
+)
+_PAIRS_PER_CHUNK = gl.constexpr(8)
+_TILES_PER_CHUNK = gl.constexpr(16)
+
 
 def _requires_64bit_query_offsets(
     query_storage_sequence_length: int,
@@ -55,6 +65,24 @@ def _requires_64bit_context_offsets(
 ) -> bool:
     """Return whether local K/V byte offsets exceed unsigned 32-bit range."""
     return storage_sequence_length * head_dim > (1 << 32)
+
+
+@gluon.jit
+def _load_tile_column(shared, column_index, row_layout: gl.constexpr):
+    column_layout: gl.constexpr = gl.BlockedLayout([1, 1], [16, 2], [4, 1], [1, 0])
+    values = shared.gather(gl.full([64, 1], column_index, gl.int32, column_layout), 1).reshape([64])
+    return gl.convert_layout(values, gl.SliceLayout(0, row_layout))[None, :]
+
+
+@gluon.jit
+def _store_tile_column(shared, values, column_index):
+    column_layout: gl.constexpr = gl.BlockedLayout([1, 1], [16, 2], [4, 1], [1, 0])
+    row_1d_layout: gl.constexpr = gl.SliceLayout(1, column_layout)
+    shared.scatter(
+        gl.convert_layout(values.reshape([64]), row_1d_layout)[:, None],
+        gl.full([64, 1], column_index, gl.int32, column_layout),
+        1,
+    )
 
 
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_ARGUMENTS)
@@ -117,12 +145,11 @@ def _sparse_piper_attention_kernel(
     rows = gl.arange(0, 64, gl.SliceLayout(0, row_layout))
     # The two K64 tiles always produce 128 score columns, independently of D.
     columns = gl.arange(0, 128, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
-    features = gl.arange(0, head_dim, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
     route_head_offset = gl.load(route_head_offsets_ptr + head)
     route_base = (
         routes_ptr
         + batch * stride_rb
-        + query_blocks.to(gl.int64) * stride_rq
+        + query_block.to(gl.int64) * stride_rq
         + route_head_offset * stride_rr
     )
     routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
@@ -155,157 +182,197 @@ def _sparse_piper_attention_kernel(
     key_center_head = key_center_ptr + kv_batch_head * sequence_tiles * (2 * head_dim)
     key_center_scale_head = key_center_scale_ptr + kv_batch_head * sequence_tiles * 2
     value_mean_head = value_mean_ptr + kv_batch_head * sequence_tiles * head_dim
-    offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
     # D128 benefits from prioritizing matrix work over the intervening softmax.
     # Keep sequence lengths dynamic so projection windows share this schedule.
     matrix_priority: gl.constexpr = 3 if head_dim == 128 else None
     softmax_priority: gl.constexpr = 0 if head_dim == 128 else None
 
-    for pair in range(pair_count):
-        tile_0 = tile_offset(
-            route_base,
-            pair * 2,
-            routed_sparse_tile_count,
-            selected_sparse_tile_count,
-            sparse_key_blocks,
-            stride_rr,
-            use_sparse_routes,
+    matrix_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+    )
+    vector_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[0]
+    )
+    tile_masses_shared = gl.allocate_shared_memory(
+        gl.float32, [64, _TILES_PER_CHUNK], matrix_shared_layout
+    )
+    pair_max_shared = gl.allocate_shared_memory(
+        gl.float32, [64, _PAIRS_PER_CHUNK], matrix_shared_layout
+    )
+    key_bias_shared = gl.allocate_shared_memory(
+        gl.float32, [64, _TILES_PER_CHUNK], matrix_shared_layout
+    )
+    tiles_shared = gl.allocate_shared_memory(gl.int32, [_TILES_PER_CHUNK], vector_shared_layout)
+    tile_load_layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
+
+    chunk_count = gl.cdiv(pair_count, _PAIRS_PER_CHUNK)
+    for chunk in range(chunk_count):
+        start_pair = chunk * _PAIRS_PER_CHUNK
+        end_pair = gl.minimum(start_pair + _PAIRS_PER_CHUNK, pair_count)
+        num_valid_tiles = gl.minimum(tile_count - start_pair * 2, _TILES_PER_CHUNK)
+        positions = gl.minimum(
+            start_pair * 2 + gl.arange(0, _TILES_PER_CHUNK, tile_load_layout),
+            tile_count - 1,
         )
-        tile_1 = tile_offset(
-            route_base,
-            gl.minimum(pair * 2 + 1, tile_count - 1),
-            routed_sparse_tile_count,
-            selected_sparse_tile_count,
-            sparse_key_blocks,
-            stride_rr,
-            use_sparse_routes,
+        tiles_shared.store(
+            tile_offset(
+                route_base,
+                positions,
+                routed_sparse_tile_count,
+                selected_sparse_tile_count,
+                sparse_key_blocks,
+                stride_rr,
+                use_sparse_routes,
+            )
         )
-        scores = qk_tiles(
-            query,
-            key_ptr + kv_batch_head * storage_sequence_length * head_dim,
-            tile_0,
-            tile_1,
-            use_64bit_context_offsets,
-            head_dim,
-            pipeline_priority=matrix_priority,
-        )
-        k_bias_0, k_bias_1 = qk_center_bias_pair(
+        gl.barrier()
+        compute_chunk_key_biases(
             query,
             key_center_head,
             key_center_scale_head,
-            tile_0,
-            tile_1,
+            tiles_shared,
+            key_bias_shared,
             query_scale,
             use_64bit_context_offsets,
             head_dim,
         )
-        parameters_0 = parameters + tile_0 * PARAMETER_COUNT
-        parameters_1 = parameters + tile_1 * PARAMETER_COUNT
-        key_scale_0 = gl.load(parameters_0 + KEY_SCALE)
-        key_scale_1 = gl.load(parameters_1 + KEY_SCALE)
-        scale_0 = query_scale * key_scale_0[:, None]
-        scale_1 = query_scale * key_scale_1[:, None]
-        if mask_block_lengths:
-            length_0 = gl.load(block_lengths_ptr + tile_0)
-            length_1 = gl.load(block_lengths_ptr + tile_1)
-        else:
-            length_0 = gl.minimum(64, logical_sequence_length - tile_0 * 64)
-            length_1 = gl.minimum(64, logical_sequence_length - tile_1 * 64)
-        complete = (
-            (gl.sum(length_0, 0) == 64) & (gl.sum(length_1, 0) == 64) & (pair * 2 + 1 < tile_count)
-        )
-        if not complete:
-            column_block_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(1, MMA_LAYOUT))
-            valid_length_0 = gl.convert_layout(length_0, column_block_layout, assert_trivial=True)
-            valid_length_1 = gl.convert_layout(length_1, column_block_layout, assert_trivial=True)
-            valid = gl.where(
-                columns[None, :] < 64,
-                columns[None, :] < valid_length_0[:, None],
-                (columns[None, :] - 64 < valid_length_1[:, None]) & (pair * 2 + 1 < tile_count),
-            )
-            column_scale_0 = gl.convert_layout(
-                key_scale_0, column_block_layout, assert_trivial=True
-            )
-            column_scale_1 = gl.convert_layout(
-                key_scale_1, column_block_layout, assert_trivial=True
-            )
-            scale = (
-                gl.where(columns[None, :] < 64, column_scale_0[:, None], column_scale_1[:, None])[
-                    :, None, :
-                ]
-                * query_scale[:, :, None]
-            )
-            # Invalid scores are -inf. Handle a zero scale before multiplication
-            # so padded keys can never turn 0 * -inf into NaN.
-            scores = gl.where(valid[:, None, :], gl.where(scale == 0, 0.0, scores), -float("inf"))
-            scale_0 = gl.where(scale_0 == 0, 1.0, scale_0)
-            scale_1 = gl.where(scale_1 == 0, 1.0, scale_1)
-        scores_0, scores_1 = split_columns(scores)
-        offset_0 = gl.load(parameters_0 + LOG_MULTIPLIER_OVER_255)
-        offset_1 = gl.load(parameters_1 + LOG_MULTIPLIER_OVER_255)
-        maximum_0 = gl.convert_layout(gl.max(scores_0, 2), row_layout)
-        maximum_1 = gl.convert_layout(gl.max(scores_1, 2), row_layout)
-        block_max = gl.maximum(
-            gl.fma(maximum_0, scale_0, offset_0[:, None] + k_bias_0),
-            gl.fma(maximum_1, scale_1, offset_1[:, None] + k_bias_1),
-        )
-        next_max = gl.maximum(running_max, block_max)
-        old_weight = gl.exp2(running_max - next_max)
-        current_weight = gl.exp2(block_max - next_max)
-        numerator = rescale_numerator(numerator, old_weight)
-        scores_00, scores_01 = split_columns(scores_0)
-        scores_10, scores_11 = split_columns(scores_1)
-        chunks = (scores_00, scores_01, scores_10, scores_11)
-        inverse_0 = gl.load(parameters_0 + INVERSE_MULTIPLIER)
-        inverse_1 = gl.load(parameters_1 + INVERSE_MULTIPLIER)
-        log_0 = gl.load(parameters_0 + LOG_MULTIPLIER)
-        log_1 = gl.load(parameters_1 + LOG_MULTIPLIER)
-        packed, sums = (), ()
-        for chunk in gl.static_range(4):
-            words, total = softmax_fragment(
-                chunks[chunk],
-                block_max,
-                scale_0 if chunk < 2 else scale_1,
-                inverse_0 if chunk < 2 else inverse_1,
-                log_0 if chunk < 2 else log_1,
-                k_bias=k_bias_0 if chunk < 2 else k_bias_1,
-            )
-            packed += (words,)
-            sums += (total,)
-            pipeline_boundary("softmax", softmax_priority)
-        mass_0 = sums[0] + sums[1]
-        mass_1 = sums[2] + sums[3]
-        denominator = denominator * old_weight + (mass_0 + mass_1) * current_weight
-        probabilities = concat_columns(
-            concat_columns(packed[0], packed[1]), concat_columns(packed[2], packed[3])
-        )
-        numerator = pv_tiles(
-            probabilities,
-            value_ptr + kv_batch_head * storage_sequence_length * head_dim,
-            tile_0,
-            tile_1,
-            numerator,
-            current_weight,
-            use_64bit_context_offsets,
-            pipeline_priority=matrix_priority,
-        )
-        value_mean_0 = gl.load(
-            value_mean_head + gl.sum(tile_0, 0).to(offset_type) * head_dim + features
-        ).to(gl.float32)
-        value_mean_1 = gl.load(
-            value_mean_head + gl.sum(tile_1, 0).to(offset_type) * head_dim + features
-        ).to(gl.float32)
-        numerator = gl.fma(
-            (mass_0 * current_weight * 255.0)[:, :, None],
-            value_mean_0[None, None, :],
-            gl.fma(
-                (mass_1 * current_weight * 255.0)[:, :, None],
-                value_mean_1[None, None, :],
-                numerator,
-            ),
-        )
-        running_max = next_max
+        gl.barrier()
 
+        for pair in range(start_pair, end_pair):
+            pair_in_chunk = pair - start_pair
+            tile_0 = tiles_shared.gather(gl.full([1], 2 * pair_in_chunk, gl.int32, block_layout), 0)
+            tile_1 = tiles_shared.gather(
+                gl.full([1], 2 * pair_in_chunk + 1, gl.int32, block_layout), 0
+            )
+            scores = qk_tiles(
+                query,
+                key_ptr + kv_batch_head * storage_sequence_length * head_dim,
+                tile_0,
+                tile_1,
+                use_64bit_context_offsets,
+                head_dim,
+                pipeline_priority=matrix_priority,
+            )
+            k_bias_0 = _load_tile_column(key_bias_shared, 2 * pair_in_chunk, row_layout)
+            k_bias_1 = _load_tile_column(key_bias_shared, 2 * pair_in_chunk + 1, row_layout)
+            parameters_0 = parameters + tile_0 * PARAMETER_COUNT
+            parameters_1 = parameters + tile_1 * PARAMETER_COUNT
+            key_scale_0 = gl.load(parameters_0 + KEY_SCALE)
+            key_scale_1 = gl.load(parameters_1 + KEY_SCALE)
+            scale_0 = query_scale * key_scale_0[:, None]
+            scale_1 = query_scale * key_scale_1[:, None]
+            if mask_block_lengths:
+                length_0 = gl.load(block_lengths_ptr + tile_0)
+                length_1 = gl.load(block_lengths_ptr + tile_1)
+            else:
+                length_0 = gl.minimum(64, logical_sequence_length - tile_0 * 64)
+                length_1 = gl.minimum(64, logical_sequence_length - tile_1 * 64)
+            complete = (
+                (gl.sum(length_0, 0) == 64)
+                & (gl.sum(length_1, 0) == 64)
+                & (pair * 2 + 1 < tile_count)
+            )
+            if not complete:
+                column_block_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(1, MMA_LAYOUT))
+                valid_length_0 = gl.convert_layout(
+                    length_0, column_block_layout, assert_trivial=True
+                )
+                valid_length_1 = gl.convert_layout(
+                    length_1, column_block_layout, assert_trivial=True
+                )
+                valid = gl.where(
+                    columns[None, :] < 64,
+                    columns[None, :] < valid_length_0[:, None],
+                    (columns[None, :] - 64 < valid_length_1[:, None]) & (pair * 2 + 1 < tile_count),
+                )
+                column_scale_0 = gl.convert_layout(
+                    key_scale_0, column_block_layout, assert_trivial=True
+                )
+                column_scale_1 = gl.convert_layout(
+                    key_scale_1, column_block_layout, assert_trivial=True
+                )
+                scale = (
+                    gl.where(
+                        columns[None, :] < 64, column_scale_0[:, None], column_scale_1[:, None]
+                    )[:, None, :]
+                    * query_scale[:, :, None]
+                )
+                # Invalid scores are -inf. Handle a zero scale before multiplication
+                # so padded keys can never turn 0 * -inf into NaN.
+                scores = gl.where(
+                    valid[:, None, :], gl.where(scale == 0, 0.0, scores), -float("inf")
+                )
+                scale_0 = gl.where(scale_0 == 0, 1.0, scale_0)
+                scale_1 = gl.where(scale_1 == 0, 1.0, scale_1)
+            scores_0, scores_1 = split_columns(scores)
+            offset_0 = gl.load(parameters_0 + LOG_MULTIPLIER_OVER_255)
+            offset_1 = gl.load(parameters_1 + LOG_MULTIPLIER_OVER_255)
+            maximum_0 = gl.convert_layout(gl.max(scores_0, 2), row_layout)
+            maximum_1 = gl.convert_layout(gl.max(scores_1, 2), row_layout)
+            block_max = gl.maximum(
+                gl.fma(maximum_0, scale_0, offset_0[:, None] + k_bias_0),
+                gl.fma(maximum_1, scale_1, offset_1[:, None] + k_bias_1),
+            )
+            next_max = gl.maximum(running_max, block_max)
+            old_weight = gl.exp2(running_max - next_max)
+            current_weight = gl.exp2(block_max - next_max)
+            numerator = rescale_numerator(numerator, old_weight)
+            scores_00, scores_01 = split_columns(scores_0)
+            scores_10, scores_11 = split_columns(scores_1)
+            chunks = (scores_00, scores_01, scores_10, scores_11)
+            inverse_0 = gl.load(parameters_0 + INVERSE_MULTIPLIER)
+            inverse_1 = gl.load(parameters_1 + INVERSE_MULTIPLIER)
+            log_0 = gl.load(parameters_0 + LOG_MULTIPLIER)
+            log_1 = gl.load(parameters_1 + LOG_MULTIPLIER)
+            packed, sums = (), ()
+            for fragment in gl.static_range(4):
+                words, total = softmax_fragment(
+                    chunks[fragment],
+                    block_max,
+                    scale_0 if fragment < 2 else scale_1,
+                    inverse_0 if fragment < 2 else inverse_1,
+                    log_0 if fragment < 2 else log_1,
+                    k_bias=k_bias_0 if fragment < 2 else k_bias_1,
+                )
+                packed += (words,)
+                sums += (total,)
+                pipeline_boundary("softmax", softmax_priority)
+            mass_0 = sums[0] + sums[1]
+            mass_1 = sums[2] + sums[3]
+            denominator = denominator * old_weight + (mass_0 + mass_1) * current_weight
+            probabilities = concat_columns(
+                concat_columns(packed[0], packed[1]), concat_columns(packed[2], packed[3])
+            )
+            _store_tile_column(tile_masses_shared, mass_0, 2 * pair_in_chunk)
+            _store_tile_column(tile_masses_shared, mass_1, 2 * pair_in_chunk + 1)
+            _store_tile_column(pair_max_shared, block_max, pair_in_chunk)
+            numerator = pv_tiles(
+                probabilities,
+                value_ptr + kv_batch_head * storage_sequence_length * head_dim,
+                tile_0,
+                tile_1,
+                numerator,
+                current_weight,
+                use_64bit_context_offsets,
+                pipeline_priority=matrix_priority,
+            )
+            running_max = next_max
+
+        gl.barrier()
+        numerator = accumulate_chunk_value_means(
+            numerator,
+            tile_masses_shared,
+            pair_max_shared,
+            tiles_shared,
+            running_max,
+            value_mean_head,
+            num_valid_tiles,
+            use_64bit_context_offsets,
+            head_dim,
+        )
+        gl.barrier()
+
+    features = gl.arange(0, head_dim, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
     inverse_denominator = 1.0 / (gl.maximum(denominator, 1e-30) * 255.0)
     result = numerator * inverse_denominator[:, :, None]
     output_rows = (local_query_block * 64 + rows).to(gl.int64)
@@ -419,8 +486,5 @@ class _ContextLauncher:
                 launch.apply_coarse_residual,
                 num_warps=4,
                 num_stages=1,
-                llvm_fn_attrs=(
-                    ("target-features", "-cumode" if launch.head_dim == 128 else "+cumode"),
-                    *amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS,
-                ),
+                llvm_fn_attrs=_LLVM_FN_ATTRS,
             )
