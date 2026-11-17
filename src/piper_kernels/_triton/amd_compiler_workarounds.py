@@ -31,10 +31,11 @@ and sparse Piper attention about 3% slower.
    only LDS pass :data:`LDS_ONLY_FENCE_ATTRS`; their workgroup fences are tagged
    as LDS-only, which keeps the LDS waits and drops the global ones. Remove this
    once Triton emits LDS-only fences for its shared-memory barriers. Uses:
-   :data:`LDS_ONLY_FENCE_ATTRS` at the RDNA4 ConvRot INT8 GEMM launch;
-   :func:`lds_only_fence_options` at the shared Conv3D and dense/sparse Piper
-   projection launches, which RDNA4 policies enable through their plans'
-   ``lds_only_fences``; and the stage hook below.
+   :data:`LDS_ONLY_FENCE_ATTRS` at the RDNA4 ConvRot INT8 GEMM, dense Piper
+   attention, and sparse Piper attention launches; :func:`lds_only_fence_options`
+   at the shared Conv3D and dense/sparse Piper projection launches, which RDNA4
+   policies enable through their plans' ``lds_only_fences``; and the stage hook
+   below.
 
 To retire a workaround, set its ``fixed`` version below when a Triton release
 addresses the cause; releases from then on compile without it. Once Piper's

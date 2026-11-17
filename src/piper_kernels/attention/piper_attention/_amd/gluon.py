@@ -38,8 +38,9 @@ from .triton import prepare_value
 
 # Launch attributes shared by every dense RDNA4 kernel compile.
 _LLVM_FN_ATTRS = (
-    ("target-features", "+cumode"),
+    ("target-features", "-cumode"),
     *amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS,
+    *amd_compiler_workarounds.LDS_ONLY_FENCE_ATTRS,
 )
 _GL_TILES_PER_CHUNK = gl.constexpr(_quantization._TILES_PER_CHUNK)
 

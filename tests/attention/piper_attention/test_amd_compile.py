@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 import triton
+from _accelerators import rocm_fences_only_lds
 from triton.backends.compiler import GPUTarget
 from triton.experimental.gluon._runtime import GluonASTSource
 
@@ -86,6 +87,8 @@ def test_dense_amd_compilation(architecture, head_dim, causal, dtype, wide):
     assert any("neg_lo:[1,0,0]" in line for line in instructions)
     assert all("clamp" not in line for line in instructions)
     assert compiled.asm["ttgir"].count("arith.truncf") == 1  # final output only
+    if rocm_fences_only_lds():
+        assert "global_inv" not in compiled.asm["amdgcn"]
 
 
 def _compile_llvm_ir_with_scalar_fma(scalar_fma: bool, head_dim: int = 128) -> str:
@@ -132,7 +135,7 @@ def test_dense_amd_plain_fma_is_still_vectorized():
     reason="requires a ROCm build whose Triton pins warp-pipeline memory operations",
 )
 def test_dense_amd_launch_attributes_unpin_warp_pipeline_loads():
-    pinned = _compile_dense_kernel(llvm_fn_attrs=(("target-features", "+cumode"),))
+    pinned = _compile_dense_kernel(llvm_fn_attrs=(("target-features", "-cumode"),))
     unpinned = _compile_dense_kernel()
     # The first check fails if Triton changes how it pins loads, which would
     # otherwise silently disable the workaround, or stops pinning them: then
