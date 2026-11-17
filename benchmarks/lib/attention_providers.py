@@ -155,16 +155,10 @@ def _load_canonical_sage_attention(capability: tuple[int, int]) -> CanonicalSage
     return cast(CanonicalSageAttention, module.sageattn_qk_int8_pv_fp8_cuda)
 
 
-def _qk_jit_functions(target: AcceleratorTarget) -> dict[str, object]:
+def _query_jit_function(target: AcceleratorTarget) -> dict[str, object]:
     if select_qk_quantization(target) == "per_warp":
-        return {
-            "quantize-query-per-warp": qk_backend.quantize_query_per_warp_kernel,
-            "quantize-key-per-block": qk_backend.quantize_key_per_block_kernel,
-        }
-    return {
-        "quantize-query-per-thread": qk_backend.quantize_query_per_thread_kernel,
-        "quantize-key-per-thread": qk_backend.quantize_key_per_thread_kernel,
-    }
+        return {"quantize-query-per-warp": qk_backend.quantize_query_per_warp_kernel}
+    return {"quantize-query-per-thread": qk_backend.quantize_query_per_thread_kernel}
 
 
 def _sage_attention_2pp_jit_functions(
@@ -196,10 +190,9 @@ def _piper_attention_jit_functions(
     target: AcceleratorTarget,
 ) -> dict[str, object]:
     return {
-        "kv-mean-partial": piper_quantization._kv_mean_partial_kernel,
-        "kv-mean-finish": piper_quantization._kv_mean_finalize_kernel,
-        **_qk_jit_functions(target),
-        "quantize-value-per-key": piper_attention_backend._quantize_value_per_key_kernel,
+        "prepare-key-k1024": piper_quantization._quantize_key_k1024_kernel,
+        **_query_jit_function(target),
+        "quantize-value-per-key": piper_quantization._quantize_value_k1024_kernel,
         "attention": piper_attention_backend._piper_attention_kernel,
     }
 
@@ -289,9 +282,8 @@ def _make_amd_piper_attention_provider(
             "value_scale": "per_key",
         },
         triton_jit_functions={
-            "kv-mean-partial": piper_quantization._kv_mean_partial_kernel,
-            "kv-mean-finish": piper_quantization._kv_mean_finalize_kernel,
-            **_qk_jit_functions(target),
+            "prepare-key-k1024": piper_quantization._quantize_key_k1024_kernel,
+            **_query_jit_function(target),
             "quantize-pack-value-per-key": amd_preparation._prepare_value_kernel,
             "attention": amd_piper._dense_piper_kernel,
         },

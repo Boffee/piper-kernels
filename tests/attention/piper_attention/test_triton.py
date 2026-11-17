@@ -19,6 +19,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
+from piper_kernels.attention.piper_attention import _quantization, _quantized_dispatch
 from piper_kernels.attention.piper_attention._nvidia import gluon_async_copy as _gluon_async_copy
 from piper_kernels.attention.piper_attention._nvidia import policy as _policy
 from piper_kernels.attention.piper_attention._nvidia import triton as _backend
@@ -705,7 +706,8 @@ def test_derived_value_log_bound_runs_all_common_modes(
     assert _sqnr_db(derived, stored) >= 35.0
 
 
-def test_centered_value_fusion_restores_constant_value() -> None:
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_centered_value_fusion_restores_constant_value(is_causal: bool) -> None:
     torch.manual_seed(56)
     query = torch.randn(1, 2, 1024, 128, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
@@ -713,8 +715,41 @@ def test_centered_value_fusion_restores_constant_value() -> None:
     value = value_row.expand_as(query).contiguous()
 
     with torch.no_grad():
-        actual = piper_attention(query, key, value)
+        actual = piper_attention(query, key, value, is_causal=is_causal)
 
+    torch.testing.assert_close(actual, value, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("architecture", ["sm120", "sm89"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("constant_value", [2.0**100, -(2.0**100)])
+def test_centered_value_fusion_restores_large_constant_value(
+    architecture: str,
+    head_dim: int,
+    is_causal: bool,
+    constant_value: float,
+) -> None:
+    query = torch.zeros((1, 2, 2048, head_dim), device="cuda", dtype=torch.bfloat16)
+    key = torch.zeros_like(query)
+    value = torch.full_like(query, constant_value)
+    plan = default_execution_plan(
+        query,
+        is_causal,
+        target=AcceleratorTarget("cuda", architecture),
+    )
+
+    with torch.no_grad():
+        actual = _run_piper_attention(
+            query,
+            key,
+            value,
+            head_dim**-0.5,
+            is_causal,
+            execution_plan=plan,
+        )
+
+    assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, value, atol=0.0, rtol=0.0)
 
 
@@ -723,11 +758,11 @@ def test_causal_triton_is_independent_of_future_value_rows(
     optimize_causal_traversal: bool,
 ) -> None:
     torch.manual_seed(62)
-    query = torch.randn(1, 1, 65, 64, device="cuda", dtype=torch.float16)
+    query = torch.randn(1, 1, 1057, 64, device="cuda", dtype=torch.float16)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
     changed_value = value.clone()
-    changed_value[:, :, 32:] = torch.randn_like(changed_value[:, :, 32:]) * 32
+    changed_value[:, :, 1024:] = torch.randn_like(changed_value[:, :, 1024:]) * 32
     plan = replace(
         _triton_plan(query, True),
         optimize_causal_traversal=optimize_causal_traversal,
@@ -752,8 +787,8 @@ def test_causal_triton_is_independent_of_future_value_rows(
         )
 
     torch.testing.assert_close(
-        original[:, :, :32],
-        changed[:, :, :32],
+        original[:, :, :1024],
+        changed[:, :, :1024],
         atol=0.0,
         rtol=0.0,
     )
@@ -962,9 +997,12 @@ def test_context_reused_with_new_queries_and_caller_outputs(
         def unexpected_kv_preparation(*args, **kwargs):
             pytest.fail("query preparation and launch must reuse the prepared K/V context")
 
-        monkeypatch.setattr(_backend._quantization, "compute_kv_means", unexpected_kv_preparation)
-        monkeypatch.setattr(_backend.qk_quantization, "prepare_key", unexpected_kv_preparation)
-        monkeypatch.setattr(_backend, "_quantize_value_per_key_kernel", unexpected_kv_preparation)
+        monkeypatch.setattr(
+            _backend._quantization, "prepare_chunk_centered_key", unexpected_kv_preparation
+        )
+        monkeypatch.setattr(
+            _backend._quantization, "prepare_chunk_centered_value", unexpected_kv_preparation
+        )
         for query, reference in zip(queries, expected, strict=True):
             prepared_query = _backend._prepare_piper_query(query, scale, execution_plan=plan)
             guarded = torch.full((query.numel() + 32,), 7.0, device=query.device, dtype=dtype)
@@ -1114,3 +1152,273 @@ def test_triton_runs_under_torch_compile() -> None:
         actual = torch.compile(consumer, fullgraph=True)(query, key, value)
 
     assert torch.equal(actual, expected)
+
+
+def _quantize_kv_shard(
+    key_shard: torch.Tensor,
+    value_shard: torch.Tensor,
+    *,
+    grouped: bool,
+    storage_length: int,
+) -> tuple[
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+]:
+    key_tensors = _quantization.prepare_chunk_centered_key(
+        key_shard,
+        grouped=grouped,
+        storage_key_length=storage_length,
+        scale_storage_length=storage_length,
+    )
+    value_tensors = _quantization.prepare_chunk_centered_value(
+        value_shard,
+        storage_key_length=storage_length,
+        scale_storage_length=storage_length,
+        store_log_scale=True,
+    )
+    return key_tensors, value_tensors
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_chunk_centered_kv_token_sharding_invariance(is_causal: bool) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(709 + int(is_causal))
+    batch, heads, kv_heads, head_dim = 2, 6, 2, 128
+    shard_split = 1024
+    shard1_length = 1057
+    total_length = shard_split + shard1_length
+    storage_total = ((total_length + 63) // 64) * 64
+    shard1_storage = ((shard1_length + 63) // 64) * 64
+
+    query = torch.randn(
+        (batch, heads, total_length, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    key = torch.randn(
+        (batch, kv_heads, total_length, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    value = torch.randn(
+        (batch, kv_heads, total_length, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+
+    granularity = _quantized_dispatch.select_qk_quantization(
+        AcceleratorTarget.from_device(query.device)
+    )
+    grouped = granularity == "per_warp"
+
+    full_key, full_value = _quantize_kv_shard(
+        key, value, grouped=grouped, storage_length=storage_total
+    )
+    shard0_key, shard0_value = _quantize_kv_shard(
+        key[:, :, :shard_split],
+        value[:, :, :shard_split],
+        grouped=grouped,
+        storage_length=shard_split,
+    )
+    shard1_key, shard1_value = _quantize_kv_shard(
+        key[:, :, shard_split:],
+        value[:, :, shard_split:],
+        grouped=grouped,
+        storage_length=shard1_storage,
+    )
+
+    cat_key_int8 = torch.cat((shard0_key[0], shard1_key[0]), dim=2)
+    cat_key_scale = torch.cat((shard0_key[1], shard1_key[1]), dim=2)
+    cat_key_center = torch.cat((shard0_key[2], shard1_key[2]), dim=2)
+    cat_value_int8 = torch.cat((shard0_value[0], shard1_value[0]), dim=3)
+    cat_value_mul = torch.cat((shard0_value[1], shard1_value[1]), dim=2)
+    cat_value_log = torch.cat((shard0_value[2], shard1_value[2]), dim=2).float()
+    cat_value_mean = torch.cat((shard0_value[3], shard1_value[3]), dim=2)
+
+    assert torch.equal(cat_key_int8[:, :, :total_length], full_key[0][:, :, :total_length])
+    assert torch.equal(cat_key_scale, full_key[1])
+    assert torch.equal(cat_key_center, full_key[2])
+    assert torch.equal(
+        cat_value_int8[:, :, :, :total_length], full_value[0][:, :, :, :total_length]
+    )
+    assert torch.equal(cat_value_mul[:, :, :total_length], full_value[1][:, :, :total_length])
+    assert torch.equal(
+        cat_value_log[:, :, :total_length], full_value[2][:, :, :total_length].float()
+    )
+    assert torch.equal(cat_value_mean, full_value[3])
+
+    # Mutating the opposite shard must leave every chunk tensor (including tail) unchanged.
+    mutated_key_prefix, mutated_value_prefix = key.clone(), value.clone()
+    mutated_key_prefix[:, :, :shard_split].mul_(-7.0).add_(13.0)
+    mutated_value_prefix[:, :, :shard_split].mul_(-5.0).sub_(9.0)
+    isolated_shard1_key, isolated_shard1_value = _quantize_kv_shard(
+        mutated_key_prefix[:, :, shard_split:],
+        mutated_value_prefix[:, :, shard_split:],
+        grouped=grouped,
+        storage_length=shard1_storage,
+    )
+    for actual_tensor, expected_tensor in zip(
+        (*isolated_shard1_key, *isolated_shard1_value),
+        (*shard1_key, *shard1_value),
+        strict=True,
+    ):
+        assert torch.equal(actual_tensor, expected_tensor)
+
+    mutated_key_suffix, mutated_value_suffix = key.clone(), value.clone()
+    mutated_key_suffix[:, :, shard_split:].mul_(9.0).sub_(11.0)
+    mutated_value_suffix[:, :, shard_split:].mul_(6.0).add_(4.0)
+    isolated_shard0_key, isolated_shard0_value = _quantize_kv_shard(
+        mutated_key_suffix[:, :, :shard_split],
+        mutated_value_suffix[:, :, :shard_split],
+        grouped=grouped,
+        storage_length=shard_split,
+    )
+    for actual_tensor, expected_tensor in zip(
+        (*isolated_shard0_key, *isolated_shard0_value),
+        (*shard0_key, *shard0_value),
+        strict=True,
+    ):
+        assert torch.equal(actual_tensor, expected_tensor)
+
+    query_int8, query_scale = qk_quantization.prepare_query(
+        query,
+        head_dim**-0.5,
+        grouped=grouped,
+        storage_query_length=storage_total,
+    )
+    sharded_output = _quantized_dispatch._piper_attention_from_quantized_op(
+        query_int8,
+        query_scale,
+        cat_key_int8,
+        cat_key_scale,
+        cat_key_center,
+        cat_value_int8,
+        cat_value_mul,
+        cat_value_log,
+        cat_value_mean,
+        total_length,
+        total_length,
+        is_causal,
+        torch.bfloat16,
+    )
+    assert torch.equal(sharded_output, piper_attention(query, key, value, is_causal=is_causal))
+
+
+@pytest.mark.parametrize("architecture", ["sm120", "sm89"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_intra_chunk_weights_survive_large_k_bias(
+    architecture: str,
+    head_dim: int,
+    is_causal: bool,
+) -> None:
+    query = torch.zeros((1, 1, 128, head_dim), device="cuda", dtype=torch.bfloat16)
+    query[:, :, :, :2] = 1.0
+    key = torch.zeros_like(query)
+    key[:, :, :, 0] = 1.0e9
+    key[:, :, :64, 1] = 8.0
+    key[:, :, 64:, 1] = -8.0
+    value = torch.zeros_like(query)
+    value[:, :, :64, 0] = 1.0
+    plan = default_execution_plan(
+        query,
+        is_causal,
+        target=AcceleratorTarget("cuda", architecture),
+    )
+
+    with torch.no_grad():
+        actual = _run_piper_attention(
+            query,
+            key,
+            value,
+            1.0,
+            is_causal,
+            execution_plan=plan,
+        )
+
+    assert torch.isfinite(actual).all()
+    assert actual[0, 0, -1, 0].item() > 0.9
+
+
+@pytest.mark.parametrize("architecture", ["sm120", "sm89"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_multi_chunk_shifted_key_means_match_reference(
+    architecture: str,
+    head_dim: int,
+    is_causal: bool,
+) -> None:
+    torch.manual_seed(713 + head_dim + int(is_causal))
+    query = torch.randn((1, 2, 1089, head_dim), device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    key[:, :, :1024, 0] -= 1.0
+    key[:, :, 1024:, 0] += 3.0
+    value = torch.randn_like(query)
+    value[:, :, 1024:] += 2.0
+    target = AcceleratorTarget("cuda", architecture)
+    plan = default_execution_plan(query, is_causal, target=target)
+    granularity = _quantized_dispatch.select_qk_quantization(target)
+
+    with torch.no_grad():
+        actual = _run_piper_attention(
+            query,
+            key,
+            value,
+            0.125,
+            is_causal,
+            execution_plan=plan,
+        )
+        expected = reference_piper_attention(
+            query,
+            key,
+            value,
+            0.125,
+            is_causal,
+            qk_quantization=granularity,
+        )
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.parametrize("architecture", ["sm120", "sm89"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("outer_bias", [0.0, 1.0e9])
+def test_three_chunk_negligible_middle_bias_preserves_weights(
+    architecture: str,
+    head_dim: int,
+    outer_bias: float,
+) -> None:
+    query = torch.zeros((1, 1, 129, head_dim), device="cuda", dtype=torch.bfloat16)
+    query[:, :, :, 0] = 1.0
+    key = torch.zeros((1, 1, 3072, head_dim), device="cuda", dtype=torch.bfloat16)
+    key[:, :, :1024, 0] = outer_bias
+    key[:, :, 1024:2048, 0] = -(2.0**30)
+    key[:, :, 2048:, 0] = outer_bias
+    value = torch.zeros((1, 1, 3072, head_dim), device="cuda", dtype=torch.bfloat16)
+    value[:, :, 2048:, :] = 1.0
+    plan = default_execution_plan(
+        query,
+        False,
+        target=AcceleratorTarget("cuda", architecture),
+    )
+
+    with torch.no_grad():
+        actual = _run_piper_attention(
+            query,
+            key,
+            value,
+            1.0,
+            False,
+            execution_plan=plan,
+        )
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual,
+        torch.full_like(actual, 0.5),
+        atol=0.01,
+        rtol=0.01,
+    )

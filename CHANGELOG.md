@@ -7,6 +7,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- `piper_attention` now centers keys and values independently per `1024`-token
+  KV chunk (`K1024 + V1024`) for both non-causal and causal attention instead of
+  using sequence-wide reductions (and leaving causal V uncentered). Both causal
+  and non-causal numerical outputs differ from prior releases, so callers
+  upgrading should revalidate end-to-end quality.
 - `SparsePiperAttention` / `sparse_piper_attention` and the sparse-Piper
   compiler fusions (`convrot_int8_sparse_piper_compile_options`,
   `nvfp4_sparse_piper_compile_options`, `convrot_nvfp4_sparse_piper_compile_options`)

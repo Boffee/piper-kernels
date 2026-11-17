@@ -19,8 +19,12 @@ attention reductions are numerical work, not implicit input validation.
 Dense V has an FP32 scale per token; sparse V has one per K64 tile. Dense
 attention therefore advances through K64 tiles while loading per-token scale
 metadata. A full sparse route list does not reproduce dense quantization.
-Q/K scale granularity is backend-specific. Non-causal V is centered in FP32 and
-its mean restored in the output; causal V stays uncentered.
+Q/K scale granularity is backend-specific. Both K and V are centered
+independently per 1024-token chunk (`K1024 + V1024`) in FP32 for both non-causal
+and causal attention without sequence-wide reductions: per-chunk K bias is
+computed in FP32 inside each attention kernel from quantized Q and `key_center`
+to compensate centered K scores inside the online softmax maximum, and per-chunk
+V means fold into the FP32 numerator once per chunk.
 
 The recurrence uses signed INT8 QK, unsigned-by-signed INT8 PV, and FP32 online
 softmax. Numerators remain in probability-code units until the final division
@@ -52,11 +56,12 @@ to preserve occupancy. D128 splits PV into two FP32 D64 accumulators.
 
 Exact SM89 uses the Gluon kernel, staging Q/K/V and per-key V multipliers
 through `cp.async` commit groups. It retains per-thread Q/K scales, derives the
-V log-scale bound, and masks the final K tile plus the causal diagonal when
-needed. D64 quantizes Q in the prologue; D128 uses a smaller query tile and a
-register cap to retain occupancy. Ragged lengths reuse one compiled kernel.
-Q quantized by a fused producer skips the prologue. Q128 tiles zero-fill rows past
-Q64-padded storage, and producer K scales and V multipliers span K64-padded storage.
+V log-scale bound, computes per-chunk `k_bias` in FP32 directly from SMEM Q and
+`key_center`, and masks the final K tile plus the causal diagonal when needed. D64 quantizes Q in
+the prologue; D128 uses a smaller query tile and a register cap to retain
+occupancy. Ragged lengths reuse one compiled kernel. Q quantized by a fused
+producer skips the prologue. Q128 tiles zero-fill rows past Q64-padded storage,
+and producer K scales and V multipliers span K64-padded storage.
 
 The plan's `attention_kernel` explicitly selects `triton` or `gluon_async_copy`.
 Capability checks belong to the plan. Exact thresholds and launch choices live

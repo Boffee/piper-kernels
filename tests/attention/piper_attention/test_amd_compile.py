@@ -41,6 +41,7 @@ def _compile_dense_kernel(
             (
                 "query_scale_ptr",
                 "key_scale_ptr",
+                "key_center_ptr",
                 "multiplier_ptr",
                 "log_scale_ptr",
                 "value_mean_ptr",
@@ -48,7 +49,12 @@ def _compile_dense_kernel(
             "*fp32",
         )
     )
-    signature.update(query_ptr="*i8", key_ptr="*i8", value_ptr="*i8", output_ptr=f"*{dtype}")
+    signature.update(
+        query_ptr="*i8",
+        key_ptr="*i8",
+        value_ptr="*i8",
+        output_ptr=f"*{dtype}",
+    )
     if wide:
         signature.update(
             dict.fromkeys(

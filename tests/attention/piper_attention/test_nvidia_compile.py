@@ -12,14 +12,12 @@ from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton.mixed_int8 import _MixedInt8StageHook
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.piper_attention import _quantization
 from piper_kernels.attention.piper_attention._nvidia.gluon_async_copy import (
     _dense_piper_attention_kernel,
 )
 from piper_kernels.attention.piper_attention._nvidia.policy import select_execution_plan
-from piper_kernels.attention.piper_attention._nvidia.triton import (
-    _piper_attention_kernel,
-    _quantize_value_per_key_kernel,
-)
+from piper_kernels.attention.piper_attention._nvidia.triton import _piper_attention_kernel
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="offline compiler coverage on Linux"
@@ -69,6 +67,7 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
         value_ptr="*i8",
         query_scale_ptr="*fp32",
         key_scale_ptr="*fp32",
+        key_center_ptr="*fp32",
         value_scale_multiplier_ptr="*fp32",
         value_log_scale_ptr="*fp16",
         value_mean_ptr="*fp32",
@@ -126,6 +125,7 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(
         value_ptr="*i8",
         query_scale_ptr="constexpr" if plan.fuse_query_quantization else "*fp32",
         key_scale_ptr="*fp32",
+        key_center_ptr="*fp32",
         multiplier_ptr="*fp32",
         value_mean_ptr="*fp32",
         output_ptr="*bf16",
@@ -165,26 +165,23 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(
 
 @pytest.mark.parametrize("architecture", [89, 120])
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("causal", [False, True])
-def test_nvidia_value_preparation_accepts_runtime_head_count(architecture, head_dim, causal):
+def test_nvidia_value_preparation_accepts_runtime_head_count(architecture, head_dim):
     constants = {
-        "is_causal": causal,
         "store_log_scale": True,
+        "pack_wmma": False,
         "head_dim": head_dim,
-        "block_n": 64,
     }
-    signature = {
-        name: "i32" for name in _quantize_value_per_key_kernel.arg_names if name not in constants
-    }
+    kernel = _quantization._quantize_value_k1024_kernel
+    signature = {name: "i32" for name in kernel.arg_names if name not in constants}
     signature.update(
         value_ptr="*fp16",
-        value_mean_ptr="*fp32",
+        output_ptr="*i8",
         scale_multiplier_ptr="*fp32",
         log_scale_ptr="*fp16",
-        output_ptr="*i8",
+        value_mean_ptr="*fp32",
     )
     compiled = triton.compile(
-        ASTSource(_quantize_value_per_key_kernel, signature, constexprs=constants),
+        ASTSource(kernel, signature, constexprs=constants),
         target=GPUTarget("cuda", architecture, 32),
         options={"num_warps": 4},
     )

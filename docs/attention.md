@@ -47,10 +47,13 @@ multi-query attention with one KV head; do not repeat K/V yourself. Sage require
 equal head counts.
 
 Dense Piper uses INT8 Q/K and per-token INT8 V with unsigned INT8 probabilities.
-It centers V for non-causal calls and restores the mean in the output; causal calls
-leave V uncentered so future V values cannot affect earlier outputs through
-quantization. Sage uses INT8 Q/K and FP8 probabilities/V with FP16 tile
-accumulation. Their numerical results are not interchangeable.
+Both non-causal and causal calls center K and V independently per 1024-token
+chunk (`K1024 + V1024`), without sequence-wide mean reductions. K centering adds
+the per-chunk `Q @ H(K_mean)` score bias and per-chunk V means are restored per
+chunk, so token-sharded chunks need no cross-chunk state; future tokens in later
+chunks cannot affect earlier outputs, while tokens sharing one causal chunk share
+its local chunk statistics. Sage uses INT8 Q/K and FP8 probabilities/V with
+FP16 tile accumulation. Their numerical results are not interchangeable.
 
 Dense Piper has native NVIDIA SM8x/SM12x and AMD RDNA4 backends. Sage's optimized
 path requires NVIDIA FP8 tensor cores with FP16 accumulation. See the

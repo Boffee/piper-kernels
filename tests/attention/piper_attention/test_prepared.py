@@ -42,14 +42,16 @@ def _prepared(
         split_pv_head_dim=False,
         use_tensor_descriptors=False,
     )
+    key_chunks = (key_length + 1023) // 1024
     with torch.device("meta"):
         context = backend._PreparedPiperContext(
             key=torch.empty((2, kv_heads, key_length, 64), dtype=torch.int8),
             value=torch.empty((2, kv_heads, 64, key_length), dtype=torch.int8),
             key_scale=torch.empty((2, kv_heads, (key_length + 63) // 64)),
+            key_center=torch.empty((2, kv_heads, key_chunks, 64)),
             value_scale_multiplier=torch.empty((2, kv_heads, key_length)),
             value_log_scale=torch.empty((2, kv_heads, key_length), dtype=torch.float16),
-            value_mean=torch.empty((2, kv_heads, 64)),
+            value_mean=torch.empty((2, kv_heads, key_chunks, 64)),
             key_length=key_length,
             is_causal=False,
             execution_plan=plan,
@@ -131,14 +133,15 @@ def test_launch_reuses_caller_outputs_and_logical_query_metadata_without_allocat
             context.value,
             query.scale,
             context.key_scale,
+            context.key_center,
             context.value_scale_multiplier,
             context.value_log_scale,
             context.value_mean,
             output,
         )
-        operands = zip(args[:10], expected_operands, strict=True)
+        operands = zip(args[:11], expected_operands, strict=True)
         assert all(actual is expected for actual, expected in operands)
-        assert args[10:] == (65, 97, 0, 65, 0, *output.stride()[:3])
+        assert args[11:] == (65, 97, 0, 65, 0, 1, *output.stride()[:3])
         assert kwargs["heads"] == 6
         assert kwargs["query_heads_per_kv_head"] == 3
         assert kwargs["head_dim"] == 64
@@ -272,13 +275,14 @@ def test_window_launch_keeps_local_query_and_global_causal_coordinates(
     [(grid, args, kwargs)] = kernel.calls
     assert grid == ((output_rows + block_m - 1) // block_m, 6, 2)
     assert args[0] is query.data
-    assert args[9] is output
-    assert args[10:] == (
+    assert args[10] is output
+    assert args[11:] == (
         query.shape[2],
         context.key_length,
         start,
         output_rows,
         origin + start,
+        1,
         *output.stride()[:3],
     )
     assert kwargs["is_causal"] is True

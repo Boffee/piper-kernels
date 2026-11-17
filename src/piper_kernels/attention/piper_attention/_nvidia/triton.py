@@ -30,12 +30,18 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 
 from .. import _quantization
-from .._validation import resolve_query_window, validate_output_buffer, validate_query_offset
+from .._validation import (
+    resolve_query_window,
+    validate_output_buffer,
+    validate_query_offset,
+)
 from . import gluon_async_copy as _gluon_async_copy
 from . import policy as _policy
 from ._plan import PiperAttentionExecutionPlan
 
 _BLOCK_N = 64
+_TL_CENTER_CHUNK = tl.constexpr(_quantization.CENTER_CHUNK)
+_K_BIAS_SLICE_D = tl.constexpr(16)
 _P_UINT8_RANGE = tl.constexpr(255.0)
 _P_UINT8_LOG2_RANGE = tl.constexpr(7.994353436858858)
 # Pad the analytical maximum to the next effective FP32 constant so the
@@ -74,61 +80,6 @@ def _conservative_value_log_scale_bound(value_scale_multiplier):
     return multiplier_bits.to(tl.float32) * (1.0 / 8388608.0) - (
         127.0 + _P_UINT8_LOG2_RANGE - _VALUE_LOG_BOUND_CORRECTION
     )
-
-
-@triton.jit(do_not_specialize=["key_length", "heads"])
-def _quantize_value_per_key_kernel(
-    value_ptr,
-    value_mean_ptr,
-    scale_multiplier_ptr,
-    log_scale_ptr,
-    output_ptr,
-    key_length,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    stride_ob,
-    stride_oh,
-    stride_od,
-    stride_ok,
-    is_causal: tl.constexpr,
-    store_log_scale: tl.constexpr,
-    heads,
-    head_dim: tl.constexpr,
-    block_n: tl.constexpr,
-):
-    """Standalone launcher for the shared per-key V component."""
-    _quantization.quantize_value_per_key_block(
-        value_ptr,
-        value_mean_ptr,
-        output_ptr,
-        scale_multiplier_ptr,
-        log_scale_ptr,
-        tl.program_id(0),
-        tl.program_id(1),
-        tl.program_id(2),
-        key_length,
-        stride_vb,
-        stride_vh,
-        stride_vn,
-        stride_ob,
-        stride_oh,
-        stride_od,
-        stride_ok,
-        is_causal,
-        store_log_scale,
-        heads,
-        head_dim,
-        block_n,
-    )
-
-
-# The same launcher without specializing on the key-length-dependent V row
-# stride: one variant for every key length, and on SM89 3-5x faster than the
-# variant that vectorizes stores for a 16-byte-divisible stride.
-_quantize_value_per_key_unspecialized_kernel = triton.jit(
-    do_not_specialize=["key_length", "heads", "stride_od"],
-)(_quantize_value_per_key_kernel.fn)
 
 
 @triton.jit
@@ -191,6 +142,115 @@ def _load_value_tile(
 
 
 @triton.jit
+def _compute_chunk_k_bias(
+    query,
+    raw_query_ptr,
+    query_scale,
+    key_center_ptr,
+    batch_head,
+    query_storage_length,
+    query_tile_start,
+    kv_batch_head,
+    chunk_idx,
+    key_chunks,
+    offsets_d,
+    valid_queries,
+    split_pv_head_dim: tl.constexpr,
+    unmasked_query_tiles: tl.constexpr,
+    head_dim: tl.constexpr,
+):
+    """Compute one K1024 chunk's Q @ H(K_mean) scalar bias vector per query row."""
+    block_m: tl.constexpr = query.shape[0]
+    chunk_offset = (kv_batch_head.to(tl.int64) * key_chunks + chunk_idx.to(tl.int64)) * head_dim
+    key_center_base = key_center_ptr + chunk_offset
+    if split_pv_head_dim and block_m == 128:
+        # Dual D64 FP32 accumulators nearly exhaust SM120's 255-reg file on Q128;
+        # stream 16-col L1 Q slices instead of widening 128x128 INT8 in registers.
+        slice_offsets = tl.arange(0, _K_BIAS_SLICE_D)
+        row_offsets = query_tile_start + tl.arange(0, block_m)
+        query_row_base = (
+            batch_head.to(tl.int64) * query_storage_length + row_offsets[:, None].to(tl.int64)
+        ) * head_dim
+        acc = tl.zeros((block_m, _K_BIAS_SLICE_D), dtype=tl.float32)
+        for feature_start in tl.static_range(  # pyright: ignore[reportGeneralTypeIssues]
+            0, head_dim, _K_BIAS_SLICE_D
+        ):
+            feature_offsets = feature_start + slice_offsets
+            if unmasked_query_tiles:
+                query_slice = tl.load(raw_query_ptr + query_row_base + feature_offsets[None, :])
+            else:
+                query_slice = tl.load(
+                    raw_query_ptr + query_row_base + feature_offsets[None, :],
+                    mask=valid_queries[:, None],
+                    other=0,
+                )
+            center_slice = tl.load(key_center_base + feature_offsets)
+            acc += query_slice.to(tl.float32) * center_slice[None, :]
+        return tl.sum(acc, axis=1) * query_scale
+    key_center = tl.load(key_center_base + offsets_d)
+    if split_pv_head_dim:
+        query_even, query_odd = tl.split(tl.reshape(query, (block_m, head_dim // 2, 2)))
+        center_even, center_odd = tl.split(tl.reshape(key_center, (head_dim // 2, 2)))
+        acc = query_even.to(tl.float32) * center_even[None, :]
+        acc += query_odd.to(tl.float32) * center_odd[None, :]
+        return tl.sum(acc, axis=1) * query_scale
+    return tl.sum(query.to(tl.float32) * key_center[None, :], axis=1) * query_scale
+
+
+@triton.jit
+def _restore_chunk_value_mean(
+    numerator,
+    chunk_denom,
+    value_mean_ptr,
+    kv_batch_head,
+    chunk_idx,
+    key_chunks,
+    offsets_d,
+    offsets_vd,
+    split_pv_head_dim: tl.constexpr,
+    head_dim: tl.constexpr,
+):
+    """Fold one K1024 chunk's softmax mass times its V mean into the FP32 numerator."""
+    chunk_weight_codes = chunk_denom * _P_UINT8_RANGE
+    value_mean_base = (
+        value_mean_ptr + (kv_batch_head.to(tl.int64) * key_chunks + chunk_idx) * head_dim
+    )
+    if split_pv_head_dim:
+        half_head_dim: tl.constexpr = head_dim // 2
+        accumulator_low, accumulator_high = numerator
+        value_mean_low = tl.load(value_mean_base + offsets_vd)
+        value_mean_high = tl.load(value_mean_base + half_head_dim + offsets_vd)
+        accumulator_low += chunk_weight_codes[:, None] * value_mean_low[None, :]
+        accumulator_high += chunk_weight_codes[:, None] * value_mean_high[None, :]
+        return (accumulator_low, accumulator_high)
+    else:
+        accumulator = numerator
+        value_mean = tl.load(value_mean_base + offsets_d)
+        accumulator += chunk_weight_codes[:, None] * value_mean[None, :]
+        return accumulator
+
+
+@triton.jit
+def _advance_tile_max(running_max, running_bias, block_max, k_bias, valid_queries):
+    """Update winner-frame running maximum across chunks without round-tripping."""
+    has_block = block_max != -float("inf")
+    has_running = running_max != -float("inf")
+    raw_delta = (block_max - running_max) + (k_bias - running_bias)
+    delta = tl.where(
+        has_block,
+        tl.where(has_running, raw_delta, float("inf")),
+        -float("inf"),
+    )
+    tile_wins = delta > 0.0
+    next_max = tl.where(tile_wins, block_max, running_max)
+    next_bias = tl.where(tile_wins, k_bias, running_bias)
+    decay = tl.exp2(-tl.abs(delta))
+    old_weight = tl.where(valid_queries, tl.where(tile_wins, decay, 1.0), 0.0)
+    current_weight = tl.where(valid_queries, tl.where(tile_wins, 1.0, decay), 0.0)
+    return next_max, next_bias, old_weight, current_weight
+
+
+@triton.jit
 def _attention_tile(  # noqa: PLR0912, PLR0915
     query,
     query_scale,
@@ -201,7 +261,10 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
     value_log_scale_ptr,
     numerator,
     denominator,
+    chunk_denom,
     running_max,
+    running_bias,
+    k_bias,
     batch_head,
     start_n,
     offsets_m,
@@ -224,8 +287,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
     """Advance online-softmax state by one key tile.
 
     FP32 numerators remain in UINT8 probability-code units for every attention
-    mode. The common scale is removed once in the epilogue, before non-causal
-    value-mean restoration.
+    mode; each K1024 chunk folds its V mean once outside the inner loop.
     """
     current_n = start_n + offsets_n
     key = _load_key_tile(
@@ -241,6 +303,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
         padded_kv=padded_kv,
     )
     integer_scores = tl.dot(query, key, out_dtype=tl.int32)
+    metadata_stride = tl.cdiv(key_length, block_n) * block_n if padded_kv else key_length
     if grouped_qk:
         key_scale = tl.load(
             key_scale_ptr + batch_head * tl.cdiv(key_length, block_n) + start_n // block_n
@@ -248,7 +311,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
         scores = integer_scores.to(tl.float32) * (query_scale * key_scale)[:, None]
     else:
         key_scale = tl.load(
-            key_scale_ptr + batch_head * key_length + current_n,
+            key_scale_ptr + batch_head * metadata_stride + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
@@ -269,18 +332,14 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
 
     if derive_value_log_bound:
         value_scale_multiplier = tl.load(
-            value_scale_multiplier_ptr
-            + batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
-            + current_n,
+            value_scale_multiplier_ptr + batch_head * metadata_stride + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
         value_log_scale = _conservative_value_log_scale_bound(value_scale_multiplier)
     else:
         value_log_scale = tl.load(
-            value_log_scale_ptr
-            + batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
-            + current_n,
+            value_log_scale_ptr + batch_head * metadata_stride + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
@@ -291,28 +350,24 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
         value_log_scale = tl.where(valid_keys, value_log_scale, -float("inf"))
     shifted_scores = scores + value_log_scale[None, :]
     block_max = tl.max(shifted_scores, axis=1)
-    next_max = tl.maximum(running_max, block_max)
-    old_weight = tl.where(
+    next_max, next_bias, old_weight, current_weight = _advance_tile_max(
+        running_max,
+        running_bias,
+        block_max,
+        k_bias,
         valid_queries,
-        tl.exp2(running_max - next_max),
-        0.0,
-    )
-    current_weight = tl.where(
-        valid_queries,
-        tl.exp2(block_max - next_max),
-        0.0,
     )
     probabilities = tl.where(
         valid_queries[:, None] & valid_keys,
         tl.exp2(scores - block_max[:, None]),  # pyright: ignore[reportArgumentType]
         0.0,
     )
-    denominator = denominator * old_weight + tl.sum(probabilities, axis=1) * current_weight
+    row_sum = tl.sum(probabilities, axis=1) * current_weight
+    denominator = denominator * old_weight + row_sum
+    chunk_denom = chunk_denom * old_weight + row_sum
     if not derive_value_log_bound:
         value_scale_multiplier = tl.load(
-            value_scale_multiplier_ptr
-            + batch_head * (tl.cdiv(key_length, 64) * 64 if padded_kv else key_length)
-            + current_n,
+            value_scale_multiplier_ptr + batch_head * metadata_stride + current_n,
             mask=current_n < key_length,
             other=0.0,
         )
@@ -390,16 +445,254 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             accumulator * old_weight[:, None] + partial.to(tl.float32) * current_weight[:, None]
         )
         numerator = accumulator
-    return numerator, denominator, next_max
+    return numerator, denominator, next_max, next_bias, chunk_denom
+
+
+@triton.jit
+def _attention_tile_range(
+    query,
+    query_scale,
+    key_ptr,
+    value_ptr,
+    key_scale_ptr,
+    value_scale_multiplier_ptr,
+    value_log_scale_ptr,
+    numerator,
+    denominator,
+    chunk_denom,
+    running_max,
+    running_bias,
+    k_bias,
+    kv_batch_head,
+    range_start,
+    range_stop,
+    global_rows,
+    offsets_n,
+    offsets_d,
+    valid_queries,
+    key_length,
+    mask_keys: tl.constexpr,
+    is_causal: tl.constexpr,
+    grouped_qk: tl.constexpr,
+    split_pv_head_dim: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    use_tensor_descriptors: tl.constexpr,
+    use_packed_probability_conversion: tl.constexpr,
+    derive_value_log_bound: tl.constexpr,
+    loop_num_stages: tl.constexpr,
+    loop_licm: tl.constexpr,
+    padded_kv: tl.constexpr,
+):
+    """Advance online softmax and chunk denominator over one K64 tile range."""
+    for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
+        range_start,
+        range_stop,
+        block_n,
+        num_stages=loop_num_stages,
+        disable_licm=not loop_licm,
+    ):
+        numerator, denominator, running_max, running_bias, chunk_denom = _attention_tile(
+            query,
+            query_scale,
+            key_ptr,
+            value_ptr,
+            key_scale_ptr,
+            value_scale_multiplier_ptr,
+            value_log_scale_ptr,
+            numerator,
+            denominator,
+            chunk_denom,
+            running_max,
+            running_bias,
+            k_bias,
+            kv_batch_head,
+            start_n,
+            global_rows,
+            offsets_n,
+            offsets_d,
+            valid_queries,
+            key_length,
+            mask_keys=mask_keys,
+            is_causal=is_causal,
+            grouped_qk=grouped_qk,
+            split_pv_head_dim=split_pv_head_dim,
+            head_dim=head_dim,
+            block_m=block_m,
+            block_n=block_n,
+            use_tensor_descriptors=use_tensor_descriptors,
+            use_packed_probability_conversion=use_packed_probability_conversion,
+            derive_value_log_bound=derive_value_log_bound,
+            padded_kv=padded_kv,
+        )
+    return numerator, denominator, chunk_denom, running_max, running_bias
+
+
+@triton.jit
+def _attention_chunk(
+    query,
+    raw_query_ptr,
+    query_scale,
+    key_ptr,
+    value_ptr,
+    key_scale_ptr,
+    key_center_ptr,
+    value_scale_multiplier_ptr,
+    value_log_scale_ptr,
+    value_mean_ptr,
+    numerator,
+    denominator,
+    running_max,
+    running_bias,
+    batch_head,
+    query_storage_length,
+    query_tile_start,
+    kv_batch_head,
+    chunk_idx,
+    key_chunks,
+    prefix_start,
+    prefix_stop,
+    boundary_start,
+    boundary_stop,
+    global_rows,
+    offsets_n,
+    offsets_d,
+    offsets_vd,
+    valid_queries,
+    key_length,
+    prefix_mask_keys: tl.constexpr,
+    has_boundary: tl.constexpr,
+    is_causal: tl.constexpr,
+    grouped_qk: tl.constexpr,
+    split_pv_head_dim: tl.constexpr,
+    unmasked_query_tiles: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    use_tensor_descriptors: tl.constexpr,
+    use_packed_probability_conversion: tl.constexpr,
+    derive_value_log_bound: tl.constexpr,
+    loop_num_stages: tl.constexpr,
+    loop_licm: tl.constexpr,
+    padded_kv: tl.constexpr,
+):
+    """Evaluate one K1024+V1024 chunk: compute K bias, run K64 tiles, and fold V mean."""
+    k_bias = _compute_chunk_k_bias(
+        query,
+        raw_query_ptr,
+        query_scale,
+        key_center_ptr,
+        batch_head,
+        query_storage_length,
+        query_tile_start,
+        kv_batch_head,
+        chunk_idx,
+        key_chunks,
+        offsets_d,
+        valid_queries,
+        split_pv_head_dim,
+        unmasked_query_tiles,
+        head_dim,
+    )
+    chunk_denom = tl.zeros((block_m,), dtype=tl.float32)
+    numerator, denominator, chunk_denom, running_max, running_bias = _attention_tile_range(
+        query,
+        query_scale,
+        key_ptr,
+        value_ptr,
+        key_scale_ptr,
+        value_scale_multiplier_ptr,
+        value_log_scale_ptr,
+        numerator,
+        denominator,
+        chunk_denom,
+        running_max,
+        running_bias,
+        k_bias,
+        kv_batch_head,
+        prefix_start,
+        prefix_stop,
+        global_rows,
+        offsets_n,
+        offsets_d,
+        valid_queries,
+        key_length,
+        mask_keys=prefix_mask_keys,
+        is_causal=is_causal,
+        grouped_qk=grouped_qk,
+        split_pv_head_dim=split_pv_head_dim,
+        head_dim=head_dim,
+        block_m=block_m,
+        block_n=block_n,
+        use_tensor_descriptors=use_tensor_descriptors,
+        use_packed_probability_conversion=use_packed_probability_conversion,
+        derive_value_log_bound=derive_value_log_bound,
+        loop_num_stages=loop_num_stages,
+        loop_licm=loop_licm,
+        padded_kv=padded_kv,
+    )
+    if has_boundary:
+        numerator, denominator, chunk_denom, running_max, running_bias = _attention_tile_range(
+            query,
+            query_scale,
+            key_ptr,
+            value_ptr,
+            key_scale_ptr,
+            value_scale_multiplier_ptr,
+            value_log_scale_ptr,
+            numerator,
+            denominator,
+            chunk_denom,
+            running_max,
+            running_bias,
+            k_bias,
+            kv_batch_head,
+            boundary_start,
+            boundary_stop,
+            global_rows,
+            offsets_n,
+            offsets_d,
+            valid_queries,
+            key_length,
+            mask_keys=tl.constexpr(True),
+            is_causal=is_causal,
+            grouped_qk=grouped_qk,
+            split_pv_head_dim=split_pv_head_dim,
+            head_dim=head_dim,
+            block_m=block_m,
+            block_n=block_n,
+            use_tensor_descriptors=use_tensor_descriptors,
+            use_packed_probability_conversion=use_packed_probability_conversion,
+            derive_value_log_bound=derive_value_log_bound,
+            loop_num_stages=loop_num_stages,
+            loop_licm=loop_licm,
+            padded_kv=padded_kv,
+        )
+    numerator = _restore_chunk_value_mean(
+        numerator,
+        chunk_denom,
+        value_mean_ptr,
+        kv_batch_head,
+        chunk_idx,
+        key_chunks,
+        offsets_d,
+        offsets_vd,
+        split_pv_head_dim=split_pv_head_dim,
+        head_dim=head_dim,
+    )
+    return numerator, denominator, running_max, running_bias
 
 
 @triton.jit
 def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     query_ptr,
+    raw_query_ptr,
     key_ptr,
     value_ptr,
     query_scale_ptr,
     key_scale_ptr,
+    key_center_ptr,
     value_scale_multiplier_ptr,
     value_log_scale_ptr,
     value_mean_ptr,
@@ -411,6 +704,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     query_start,
     query_rows,
     global_query_start,
+    key_chunks,
     stride_ob,
     stride_oh,
     stride_om,
@@ -434,7 +728,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
     use_query_tensor_descriptor: tl.constexpr,
     padded_kv: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
-    """Evaluate one complete or masked query tile with the same FP32 recurrence."""
+    """Evaluate one complete or masked query tile with K1024+V1024 outer chunking."""
     batch = tl.program_id(2)
     batch_head = batch * heads + head
     kv_batch_head = batch * (heads // query_heads_per_kv_head) + head // query_heads_per_kv_head
@@ -476,147 +770,185 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
             other=0.0,
         )
 
+    half_head_dim: tl.constexpr = head_dim // 2
+    offsets_vd = tl.arange(0, half_head_dim)
     if split_pv_head_dim:
-        half_head_dim: tl.constexpr = head_dim // 2
-        offsets_vd = tl.arange(0, half_head_dim)
         accumulator_low = tl.zeros((block_m, half_head_dim), dtype=tl.float32)
         accumulator_high = tl.zeros((block_m, half_head_dim), dtype=tl.float32)
+        numerator = (accumulator_low, accumulator_high)
     else:
-        accumulator = tl.zeros((block_m, head_dim), dtype=tl.float32)
+        numerator = tl.zeros((block_m, head_dim), dtype=tl.float32)
     denominator = tl.zeros((block_m,), dtype=tl.float32)
     running_max = tl.full((block_m,), -float("inf"), dtype=tl.float32)
+    running_bias = tl.zeros((block_m,), dtype=tl.float32)
     end_n = key_length
     if is_causal:
         end_n = tl.minimum(key_length, global_query_start + (query_block + 1) * block_m)
 
+    query_tile_start = query_start + query_block * block_m
+
     if is_causal and optimize_causal_traversal:
-        numerator = (accumulator_low, accumulator_high) if split_pv_head_dim else accumulator  # pyright: ignore[reportPossiblyUnboundVariable]
-        # Only complete K tiles strictly before the first query row are
-        # mask-free. Keep ragged tails and diagonal overlap in the boundary.
+        # Chunks strictly before the diagonal run fully unmasked; chunks from
+        # split_chunk_start handle prefix + diagonal boundary tiles cleanly.
         full_key_end = key_length // block_n * block_n
         causal_prefix_end = (global_query_start + query_block * block_m) // block_n * block_n
         prefix_end = tl.minimum(causal_prefix_end, full_key_end)
-        for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
-            0,
-            prefix_end,
-            block_n,
-            num_stages=loop_num_stages,
-            disable_licm=not loop_licm,
-        ):
-            numerator, denominator, running_max = _attention_tile(
+        split_chunk_start = (prefix_end // _TL_CENTER_CHUNK) * _TL_CENTER_CHUNK
+        mask_free_stop = tl.minimum(split_chunk_start, end_n)
+        for chunk_start in tl.range(0, mask_free_stop, _TL_CENTER_CHUNK, disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
+            chunk_idx = chunk_start // _TL_CENTER_CHUNK
+            chunk_end = chunk_start + _TL_CENTER_CHUNK
+            numerator, denominator, running_max, running_bias = _attention_chunk(
                 query,
+                raw_query_ptr,
                 query_scale,
                 key_ptr,
                 value_ptr,
                 key_scale_ptr,
+                key_center_ptr,
                 value_scale_multiplier_ptr,
                 value_log_scale_ptr,
+                value_mean_ptr,
                 numerator,
                 denominator,
                 running_max,
+                running_bias,
+                batch_head,
+                query_storage_length,
+                query_tile_start,
                 kv_batch_head,
-                start_n,
+                chunk_idx,
+                key_chunks,
+                chunk_start,
+                chunk_end,
+                chunk_end,
+                chunk_end,
                 global_rows,
                 offsets_n,
                 offsets_d,
+                offsets_vd,
                 valid_queries,
                 key_length,
-                mask_keys=tl.constexpr(False),
+                prefix_mask_keys=tl.constexpr(False),
+                has_boundary=tl.constexpr(False),
                 is_causal=is_causal,
                 grouped_qk=grouped_qk,
                 split_pv_head_dim=split_pv_head_dim,
+                unmasked_query_tiles=unmasked_query_tiles,
                 head_dim=head_dim,
                 block_m=block_m,
                 block_n=block_n,
                 use_tensor_descriptors=use_tensor_descriptors,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 derive_value_log_bound=derive_value_log_bound,
+                loop_num_stages=loop_num_stages,
+                loop_licm=loop_licm,
                 padded_kv=padded_kv,
             )
-        for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
-            prefix_end,
-            end_n,
-            block_n,
-            num_stages=loop_num_stages,
-            disable_licm=not loop_licm,
-        ):
-            numerator, denominator, running_max = _attention_tile(
+        for chunk_start in tl.range(mask_free_stop, end_n, _TL_CENTER_CHUNK, disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
+            chunk_idx = chunk_start // _TL_CENTER_CHUNK
+            chunk_end = tl.minimum(chunk_start + _TL_CENTER_CHUNK, end_n)
+            prefix_stop = tl.minimum(chunk_end, prefix_end)
+            boundary_start = tl.maximum(chunk_start, prefix_end)
+            numerator, denominator, running_max, running_bias = _attention_chunk(
                 query,
+                raw_query_ptr,
                 query_scale,
                 key_ptr,
                 value_ptr,
                 key_scale_ptr,
+                key_center_ptr,
                 value_scale_multiplier_ptr,
                 value_log_scale_ptr,
+                value_mean_ptr,
                 numerator,
                 denominator,
                 running_max,
+                running_bias,
+                batch_head,
+                query_storage_length,
+                query_tile_start,
                 kv_batch_head,
-                start_n,
+                chunk_idx,
+                key_chunks,
+                chunk_start,
+                prefix_stop,
+                boundary_start,
+                chunk_end,
                 global_rows,
                 offsets_n,
                 offsets_d,
+                offsets_vd,
                 valid_queries,
                 key_length,
-                mask_keys=tl.constexpr(True),
+                prefix_mask_keys=tl.constexpr(False),
+                has_boundary=tl.constexpr(True),
                 is_causal=is_causal,
                 grouped_qk=grouped_qk,
                 split_pv_head_dim=split_pv_head_dim,
+                unmasked_query_tiles=unmasked_query_tiles,
                 head_dim=head_dim,
                 block_m=block_m,
                 block_n=block_n,
                 use_tensor_descriptors=use_tensor_descriptors,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 derive_value_log_bound=derive_value_log_bound,
+                loop_num_stages=loop_num_stages,
+                loop_licm=loop_licm,
                 padded_kv=padded_kv,
             )
-        if split_pv_head_dim:
-            accumulator_low, accumulator_high = numerator
-        else:
-            accumulator = numerator
     else:
-        numerator = (accumulator_low, accumulator_high) if split_pv_head_dim else accumulator  # pyright: ignore[reportPossiblyUnboundVariable]
-        for start_n in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
-            0,
-            end_n,
-            block_n,
-            num_stages=loop_num_stages,
-            disable_licm=not loop_licm,
-        ):
-            numerator, denominator, running_max = _attention_tile(
+        for chunk_start in tl.range(0, end_n, _TL_CENTER_CHUNK, disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
+            chunk_idx = chunk_start // _TL_CENTER_CHUNK
+            chunk_end = tl.minimum(chunk_start + _TL_CENTER_CHUNK, end_n)
+            numerator, denominator, running_max, running_bias = _attention_chunk(
                 query,
+                raw_query_ptr,
                 query_scale,
                 key_ptr,
                 value_ptr,
                 key_scale_ptr,
+                key_center_ptr,
                 value_scale_multiplier_ptr,
                 value_log_scale_ptr,
+                value_mean_ptr,
                 numerator,
                 denominator,
                 running_max,
+                running_bias,
+                batch_head,
+                query_storage_length,
+                query_tile_start,
                 kv_batch_head,
-                start_n,
+                chunk_idx,
+                key_chunks,
+                chunk_start,
+                chunk_end,
+                chunk_end,
+                chunk_end,
                 global_rows,
                 offsets_n,
                 offsets_d,
+                offsets_vd,
                 valid_queries,
                 key_length,
-                mask_keys=tl.constexpr(not unmasked_key_tiles),
+                prefix_mask_keys=tl.constexpr(not unmasked_key_tiles),
+                has_boundary=tl.constexpr(False),
                 is_causal=is_causal,
                 grouped_qk=grouped_qk,
                 split_pv_head_dim=split_pv_head_dim,
+                unmasked_query_tiles=unmasked_query_tiles,
                 head_dim=head_dim,
                 block_m=block_m,
                 block_n=block_n,
                 use_tensor_descriptors=use_tensor_descriptors,
                 use_packed_probability_conversion=use_packed_probability_conversion,
                 derive_value_log_bound=derive_value_log_bound,
+                loop_num_stages=loop_num_stages,
+                loop_licm=loop_licm,
                 padded_kv=padded_kv,
             )
-        if split_pv_head_dim:
-            accumulator_low, accumulator_high = numerator
-        else:
-            accumulator = numerator
+
     denominator_safe = tl.maximum(denominator, 1e-30)[:, None]
     denominator_code_units = denominator_safe * _P_UINT8_RANGE
     if contiguous_output:
@@ -631,12 +963,9 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
             + output_rows[:, None].to(tl.int64) * stride_om
         )
     if split_pv_head_dim:
+        accumulator_low, accumulator_high = numerator
         output_low = accumulator_low / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
         output_high = accumulator_high / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
-        if not is_causal:
-            value_mean_base = value_mean_ptr + kv_batch_head * head_dim
-            output_low += tl.load(value_mean_base + offsets_vd)[None, :]  # pyright: ignore[reportPossiblyUnboundVariable]
-            output_high += tl.load(value_mean_base + half_head_dim + offsets_vd)[None, :]  # pyright: ignore[reportPossiblyUnboundVariable]
         tl.store(
             output_base + offsets_vd[None, :],  # pyright: ignore[reportPossiblyUnboundVariable]
             output_low,
@@ -648,9 +977,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
             mask=valid_queries[:, None],
         )
     else:
-        output = accumulator / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
-        if not is_causal:
-            output += tl.load(value_mean_ptr + kv_batch_head * head_dim + offsets_d)[None, :]
+        output = numerator / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
         tl.store(
             output_base + offsets_d[None, :],
             output,
@@ -666,6 +993,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
         "query_start",
         "query_rows",
         "global_query_start",
+        "key_chunks",
         "stride_ob",
         "stride_oh",
         "stride_om",
@@ -678,6 +1006,7 @@ def _piper_attention_kernel(
     value_ptr,
     query_scale_ptr,
     key_scale_ptr,
+    key_center_ptr,
     value_scale_multiplier_ptr,
     value_log_scale_ptr,
     value_mean_ptr,
@@ -687,6 +1016,7 @@ def _piper_attention_kernel(
     query_start,
     query_rows,
     global_query_start,
+    key_chunks,
     stride_ob,
     stride_oh,
     stride_om,
@@ -713,9 +1043,6 @@ def _piper_attention_kernel(
     query_group_size: tl.constexpr = 0,  # pyright: ignore[reportArgumentType]
 ):
     """Cover full query tiles and their ragged tail in one grid."""
-    # Preserve the measured full-launch path instead of carrying window
-    # coordinates through every Q load. Contiguous outputs likewise retain
-    # flattened indexing in the tile epilogue.
     if full_query:
         query_start = 0
         global_query_start = 0
@@ -723,9 +1050,6 @@ def _piper_attention_kernel(
     query_block = tl.program_id(0)
     head = tl.program_id(1)
     if query_group_size > 0:
-        # Visit a small group of Q tiles across all heads before the next
-        # group. The final group may contain fewer tiles; map it densely so
-        # every (head, query tile) occurs exactly once without padding CTAs.
         query_tiles = tl.num_programs(0)
         linear = head * query_tiles + query_block
         group = linear // (query_group_size * heads)
@@ -740,6 +1064,7 @@ def _piper_attention_kernel(
         value_ptr,
         query_scale_ptr,
         key_scale_ptr,
+        key_center_ptr,
         value_scale_multiplier_ptr,
         value_log_scale_ptr,
         value_mean_ptr,
@@ -751,6 +1076,7 @@ def _piper_attention_kernel(
         query_start,
         query_rows,
         global_query_start,
+        key_chunks,
         stride_ob,
         stride_oh,
         stride_om,
@@ -780,6 +1106,7 @@ def _piper_attention_kernel(
     if aligned_queries or query_block < query_rows // block_m:
         _piper_attention_query_tile(
             query_descriptor if use_query_tensor_descriptor else query_ptr,
+            query_ptr,
             *tile_args,
             *tile_options,
             unmasked_query_tiles=tl.constexpr(True),
@@ -788,6 +1115,7 @@ def _piper_attention_kernel(
         )
     else:
         _piper_attention_query_tile(
+            query_ptr,
             query_ptr,
             *tile_args,
             *tile_options,
@@ -865,6 +1193,7 @@ class _PreparedPiperContext:
     key: torch.Tensor | TensorDescriptor
     value: torch.Tensor | TensorDescriptor
     key_scale: torch.Tensor
+    key_center: torch.Tensor
     value_scale_multiplier: torch.Tensor
     value_log_scale: torch.Tensor
     value_mean: torch.Tensor
@@ -908,7 +1237,7 @@ def _prepare_piper_context(
     execution_plan: PiperAttentionExecutionPlan,
 ) -> _PreparedPiperContext:
     """Prepare validated K/V once, independently of Q and output storage."""
-    batch, kv_heads, key_length, head_dim = key.shape
+    _batch, _kv_heads, key_length, head_dim = key.shape
     plan = execution_plan
     if plan.split_pv_head_dim and head_dim != 128:
         raise ValueError("split-PV Piper Attention requires head_dim=128")
@@ -922,61 +1251,18 @@ def _prepare_piper_context(
         pad_storage = plan.use_tensor_descriptors or plan.attention_kernel == "gluon_async_copy"
         storage_key_length = padded_key_length if pad_storage else key_length
 
-        # A sequence-wide V mean is valid only for non-causal attention. Per-row
-        # INT8 rounding would otherwise let future V rows perturb earlier outputs.
-        key_mean, value_mean = _quantization.compute_kv_means(
+        key_int8, key_scale, key_center = _quantization.prepare_chunk_centered_key(
             key,
-            value,
-            is_causal=is_causal,
-        )
-        key_int8, key_scale = qk_quantization.prepare_key(
-            key,
-            key_mean,
             grouped=plan.grouped_qk,
             storage_key_length=storage_key_length,
         )
-
-        value_shape = (batch, kv_heads, head_dim, storage_key_length)
-        value_int8 = (
-            torch.zeros(value_shape, device=value.device, dtype=torch.int8)
-            if storage_key_length != key_length
-            else torch.empty(value_shape, device=value.device, dtype=torch.int8)
-        )
-        value_scale_multiplier = torch.empty(
-            (batch, kv_heads, key_length),
-            device=value.device,
-            dtype=torch.float32,
-        )
-        value_log_scale = torch.empty(
-            (1,) if plan.derive_value_log_bound else (batch, kv_heads, key_length),
-            device=value.device,
-            dtype=torch.float16,
-        )
-        value_kernel = (
-            _quantize_value_per_key_unspecialized_kernel
-            if plan.unspecialized_value_stride
-            else _quantize_value_per_key_kernel
-        )
-        value_kernel[(triton.cdiv(key_length, _BLOCK_N), kv_heads, batch)](
-            value,
-            value_mean,
-            value_scale_multiplier,
-            value_log_scale,
-            value_int8,
-            key_length,
-            value.stride(0),
-            value.stride(1),
-            value.stride(2),
-            value_int8.stride(0),
-            value_int8.stride(1),
-            value_int8.stride(2),
-            value_int8.stride(3),
-            is_causal=is_causal,
-            store_log_scale=not plan.derive_value_log_bound,
-            heads=kv_heads,
-            head_dim=head_dim,
-            block_n=_BLOCK_N,
-            num_warps=4,
+        value_int8, value_scale_multiplier, value_log_scale, value_mean = (
+            _quantization.prepare_chunk_centered_value(
+                value,
+                storage_key_length=storage_key_length,
+                store_log_scale=not plan.derive_value_log_bound,
+                unspecialized_value_stride=plan.unspecialized_value_stride,
+            )
         )
 
         key_argument: torch.Tensor | TensorDescriptor = key_int8
@@ -991,6 +1277,7 @@ def _prepare_piper_context(
             key=key_argument,
             value=value_argument,
             key_scale=key_scale,
+            key_center=key_center,
             value_scale_multiplier=value_scale_multiplier,
             value_log_scale=value_log_scale,
             value_mean=value_mean,
@@ -1071,63 +1358,16 @@ def _prepare_piper_attention(
     return _PreparedPiperAttention(context=context, query=prepared_query, output=output)
 
 
-def _launch_piper_attention_into(
+def _launch_triton_window_into(
     context: _PreparedPiperContext,
     query: _PreparedPiperQuery,
     output: torch.Tensor,
     *,
-    query_start: int = 0,
-    query_rows: int | None = None,
+    query_start: int,
+    rows: int,
 ) -> torch.Tensor:
-    """Launch a local Q window into caller-owned BHSD output storage.
-
-    Q and K/V must match in batch, head dimension, device, and execution plan;
-    Q heads must be divisible by K/V heads. The local start and global origin
-    are aligned to plan.block_m; rows may include a ragged tail. Causal masking
-    uses the global origin plus local start. query_start is local to prepared Q;
-    query_rows=None selects its remaining logical rows. Output may have padded
-    or permuted outer strides, with contiguous head features and no overlap.
-    """
-    batch, heads, query_length, head_dim = query.shape
+    batch, heads, _, head_dim = query.shape
     plan = context.execution_plan
-    rows = resolve_query_window(
-        query_length,
-        query_start=query_start,
-        query_rows=query_rows,
-        global_row_offset=query.global_row_offset,
-        block_rows=plan.block_m,
-        key_length=context.key_length,
-        is_causal=context.is_causal,
-    )
-    validate_output_buffer(
-        output,
-        shape=(batch, heads, rows, head_dim),
-        dtype=query.dtype,
-        device=query.data.device,
-    )
-    if plan.attention_kernel == "gluon_async_copy":
-        assert isinstance(context.key, torch.Tensor)
-        assert isinstance(context.value, torch.Tensor)
-        return _gluon_async_copy.launch_attention(
-            query.data,
-            context.key,
-            context.value,
-            query.scale,
-            context.key_scale,
-            context.value_scale_multiplier,
-            context.value_mean,
-            output,
-            softmax_scale=query.softmax_scale,
-            query_length=query.shape[2],
-            key_length=context.key_length,
-            is_causal=context.is_causal,
-            block_q=plan.block_m,
-            quantize_query=plan.fuse_query_quantization,
-            max_registers=plan.max_registers,
-            query_start=query_start,
-            global_query_start=query.global_row_offset + query_start,
-            padded_kv=context.padded_kv,
-        )
     attention_kernel = cast(Any, _piper_attention_kernel)
     use_query_tensor_descriptor = query.descriptor is not None
     contiguous_output = output.is_contiguous()
@@ -1149,6 +1389,7 @@ def _launch_piper_attention_into(
             context.value,
             query.scale,
             context.key_scale,
+            context.key_center,
             context.value_scale_multiplier,
             context.value_log_scale,
             context.value_mean,
@@ -1158,6 +1399,7 @@ def _launch_piper_attention_into(
             query_start,
             rows,
             query.global_row_offset + query_start,
+            context.key_center.shape[2],
             output.stride(0),
             output.stride(1),
             output.stride(2),
@@ -1193,6 +1435,65 @@ def _launch_piper_attention_into(
             ),
         )
     return output
+
+
+def _launch_piper_attention_into(
+    context: _PreparedPiperContext,
+    query: _PreparedPiperQuery,
+    output: torch.Tensor,
+    *,
+    query_start: int = 0,
+    query_rows: int | None = None,
+) -> torch.Tensor:
+    """Launch a local Q window into caller-owned BHSD output storage."""
+    batch, heads, query_length, head_dim = query.shape
+    plan = context.execution_plan
+    rows = resolve_query_window(
+        query_length,
+        query_start=query_start,
+        query_rows=query_rows,
+        global_row_offset=query.global_row_offset,
+        block_rows=plan.block_m,
+        key_length=context.key_length,
+        is_causal=context.is_causal,
+    )
+    validate_output_buffer(
+        output,
+        shape=(batch, heads, rows, head_dim),
+        dtype=query.dtype,
+        device=query.data.device,
+    )
+    if plan.attention_kernel == "gluon_async_copy":
+        assert isinstance(context.key, torch.Tensor)
+        assert isinstance(context.value, torch.Tensor)
+        return _gluon_async_copy.launch_attention(
+            query.data,
+            context.key,
+            context.value,
+            query.scale,
+            context.key_scale,
+            context.key_center,
+            context.value_scale_multiplier,
+            context.value_mean,
+            output,
+            softmax_scale=query.softmax_scale,
+            query_length=query.shape[2],
+            key_length=context.key_length,
+            is_causal=context.is_causal,
+            block_q=plan.block_m,
+            quantize_query=plan.fuse_query_quantization,
+            max_registers=plan.max_registers,
+            query_start=query_start,
+            global_query_start=query.global_row_offset + query_start,
+            padded_kv=context.padded_kv,
+        )
+    return _launch_triton_window_into(
+        context,
+        query,
+        output,
+        query_start=query_start,
+        rows=rows,
+    )
 
 
 def _launch_piper_attention(prepared: _PreparedPiperAttention) -> torch.Tensor:

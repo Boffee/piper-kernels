@@ -289,6 +289,33 @@ def qk_center_bias_pair(
 
 
 @gluon.jit
+def qk_fp32_center_bias(
+    query_ptr,
+    stored_query_block,
+    key_center_ptr,
+    query_scale,
+    rows,
+    use_64bit_query_offsets: gl.constexpr,
+    head_dim: gl.constexpr,
+    row_layout: gl.constexpr,
+):
+    """Compute Q64 @ H(K_mean)^T * Q_scale bias in FP32 via L1-cached packed Q reads."""
+    offset_type: gl.constexpr = gl.int64 if use_64bit_query_offsets else gl.uint32
+    words = query_ptr.to(gl.pointer_type(gl.uint32))
+    row_words = (stored_query_block.to(offset_type) * 64 + rows[None, :].to(offset_type)) * (
+        head_dim // 4
+    )
+    acc = gl.full([1, 64], 0.0, gl.float32, row_layout)
+    for d_word in range(head_dim // 4):
+        word32 = gl.load(words + row_words + d_word)
+        d_base = d_word * 4
+        for byte in gl.static_range(4):
+            q_val = (word32 >> (byte * 8)).to(gl.int8).to(gl.float32)
+            acc = gl.fma(q_val, gl.load(key_center_ptr + d_base + byte), acc)
+    return acc * query_scale
+
+
+@gluon.jit
 def softmax_fragment(scores, maximum, scale, inverse_multiplier, log_multiplier, k_bias=None):
     """Pack a sparse fragment with a tile-wide V scale and unrounded denominator."""
     row_layout: gl.constexpr = maximum.type.layout

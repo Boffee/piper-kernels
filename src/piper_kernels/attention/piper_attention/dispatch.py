@@ -66,8 +66,9 @@ def piper_attention(
     ``torch.no_grad()`` / ``torch.inference_mode()`` when they require gradients.
 
     INT8 Q/K/V and UINT8 probabilities approximate floating-point attention.
-    Non-causal calls center V and restore its mean in the result; causal calls
-    leave V uncentered so future values cannot affect earlier quantization.
+    K and V are centered independently per 1024-token chunk in both non-causal
+    and causal attention, making KV preparation token-sharding friendly across
+    1024-token shard boundaries while eliminating global cross-token reductions.
     Native backends cover NVIDIA SM8x/SM12x and AMD RDNA4 (gfx1200/gfx1201)
     with the required backend installed. Other configurations use a slower
     reference for the same quantized algorithm, not exact floating-point SDPA.

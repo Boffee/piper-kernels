@@ -43,6 +43,8 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import 
     SIGNED_HADAMARD_MASK,
 )
 
+from .._quantization import _TILES_PER_CHUNK
+
 if TYPE_CHECKING:
     import torch
 
@@ -52,6 +54,7 @@ _NUM_WARPS = 4
 _COPY_BYTES = 16
 
 _GL_BLOCK = gl.constexpr(_BLOCK_N)
+_GL_TILES_PER_CHUNK = gl.constexpr(_TILES_PER_CHUNK)
 _GL_NUM_WARPS = gl.constexpr(_NUM_WARPS)
 _GL_COPY_BYTES = gl.constexpr(_COPY_BYTES)
 _GL_LOG2_255 = gl.constexpr(7.994353436858858)
@@ -173,6 +176,26 @@ def _copy_key_metadata(base, start_n, key_length, shared, copy_layout: gl.conste
 
 
 @gluon.jit
+def _advance_tile_max(running_max, running_bias, block_max, k_bias):
+    """Update winner-frame running maximum across chunks without round-tripping."""
+    has_block = block_max != -float("inf")
+    has_running = running_max != -float("inf")
+    raw_delta = (block_max - running_max) + (k_bias - running_bias)
+    delta = gl.where(
+        has_block,
+        gl.where(has_running, raw_delta, float("inf")),
+        -float("inf"),
+    )
+    tile_wins = delta > 0.0
+    next_max = gl.where(tile_wins, block_max, running_max)
+    next_bias = gl.where(tile_wins, k_bias, running_bias)
+    decay = gl.exp2(-gl.abs(delta))
+    old_weight = gl.where(tile_wins, decay, 1.0)
+    current_weight = gl.where(tile_wins, 1.0, decay)
+    return next_max, next_bias, old_weight, current_weight
+
+
+@gluon.jit
 def _probability_tile(
     query,
     key_shared,
@@ -180,7 +203,10 @@ def _probability_tile(
     key_scale_base,
     multiplier_shared,
     denominator,
+    chunk_denom,
     running_max,
+    running_bias,
+    k_bias,
     start_n,
     global_rows,
     key_length,
@@ -190,7 +216,7 @@ def _probability_tile(
     masked: gl.constexpr,
     is_causal: gl.constexpr,
 ):
-    """Advance the running maximum and denominator over one K64 tile."""
+    """Advance the running maximum, total denominator, and chunk denominator over one K64 tile."""
     block_m: gl.constexpr = query.shape[0]
     key = key_shared.permute([1, 0]).load(key_layout)
     integer_scores = mma_v2(query, key, gl.zeros([block_m, _GL_BLOCK], gl.int32, mma_layout))
@@ -228,20 +254,25 @@ def _probability_tile(
         if is_causal:
             valid = valid & (keys[None, :] <= global_rows[:, None])
         shifted = gl.where(valid, shifted, -float("inf"))
-    # The final tile of every row holds at least one valid key, so each block
-    # maximum is finite.
+    # Each K64 tile normalizes in its chunk's unbiased frame; only the winning
+    # running maximum and its chunk bias are retained across chunk boundaries.
     block_max = gl.max(shifted, axis=1)
-    next_max = gl.maximum(running_max, block_max)
-    old_weight = gl.exp2(running_max - next_max)
-    current_weight = gl.exp2(block_max - next_max)
+    next_max, next_bias, old_weight, current_weight = _advance_tile_max(
+        running_max,
+        running_bias,
+        block_max,
+        k_bias,
+    )
     exponent = scores - block_max[:, None]
     if masked:
         exponent = gl.where(valid, exponent, -float("inf"))
     probabilities = gl.exp2(exponent)
-    denominator = denominator * old_weight + gl.sum(probabilities, axis=1) * current_weight
+    row_sum = gl.sum(probabilities, axis=1) * current_weight
+    denominator = denominator * old_weight + row_sum
+    chunk_denom = chunk_denom * old_weight + row_sum
     codes = packed_float32_to_uint8(probabilities * multiplier[None, :] + 0.5)
     codes = gl.convert_layout(codes, probability_layout)
-    return codes, denominator, next_max, old_weight, current_weight
+    return codes, denominator, chunk_denom, next_max, next_bias, old_weight, current_weight
 
 
 @gluon.jit
@@ -260,6 +291,27 @@ def _pv_tile(
     return rescale_packed(partial, accumulator, old_weight, current_weight)
 
 
+@gluon.jit
+def _compute_chunk_k_bias(
+    query_shared,
+    query_scale,
+    key_center_base,
+    chunk,
+    center_layout: gl.constexpr,
+    row_layout: gl.constexpr,
+    head_dim: gl.constexpr,
+):
+    """Compute one K1024 chunk's Q @ H(K_mean) bias in FP32 from SMEM Q."""
+    query_center = query_shared.load(center_layout)
+    key_center = gl.load(
+        key_center_base
+        + chunk.to(gl.int64) * head_dim
+        + gl.arange(0, head_dim, gl.SliceLayout(0, center_layout))
+    )
+    dot = gl.sum(query_center.to(gl.float32) * key_center[None, :], axis=1)
+    return gl.convert_layout(dot, row_layout) * query_scale
+
+
 # Storage lengths are whole K64/Q64 blocks, so their specialization never varies
 # and proves the 16-byte alignment every ``cp.async`` copy needs. Window
 # coordinates and output strides stay runtime values.
@@ -269,6 +321,7 @@ def _pv_tile(
         "query_length",
         "key_length",
         "heads",
+        "key_chunks",
         "query_start",
         "global_query_start",
         "stride_ob",
@@ -282,6 +335,7 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
     value_ptr,
     query_scale_ptr,
     key_scale_ptr,
+    key_center_ptr,
     multiplier_ptr,
     value_mean_ptr,
     output_ptr,
@@ -292,6 +346,7 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
     query_storage,
     key_storage,
     heads,
+    key_chunks,
     query_start,
     global_query_start,
     stride_qb,
@@ -309,26 +364,7 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
     contiguous_output: gl.constexpr,
     padded_kv: gl.constexpr,
 ):
-    """Fused UINT8-P/INT8-V online attention for one query tile.
-
-    ``query_ptr`` holds FP16/BF16 Q when ``quantize_query`` is set, and prepared
-    INT8 Q with ``query_scale_ptr`` otherwise; the strides describe either. The
-    launch covers ``query_rows`` rows of the ``query_length`` rows of Q from local
-    row ``query_start``, whose global row is ``global_query_start``; output rows
-    are local to the launch. ``full_query`` launches cover all of Q from row zero,
-    and ``contiguous_output`` launches store into a contiguous output. Per-key K
-    scales and V multipliers span the K64-padded key storage with ``padded_kv``,
-    and the logical key length otherwise.
-
-    Each warp owns ``block_q // 4`` rows: 128-row tiles reuse every K and V
-    operand fragment for two 16-row MMA tiles and halve per-key work per row.
-
-    The next K tile and its V multipliers are copied while the current
-    probabilities are computed, and the next V tile while the current PV product
-    accumulates, so one K and one V commit group are in flight across each wait.
-    A CTA barrier after each wait publishes every thread's copies, and one before
-    each reissue retires the reads of the buffer being overwritten.
-    """
+    """Fused UINT8-P/INT8-V online attention with K1024+V1024 centering for one query tile."""
     # Full launches fold window coordinates away, so row indices derive from
     # tile-aligned origins alone.
     if full_query:
@@ -360,6 +396,8 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
         metadata_base = kv_batch_head * key_length
     key_scale_base = key_scale_ptr + metadata_base
     multiplier_base = multiplier_ptr + metadata_base
+    key_center_base = key_center_ptr + kv_batch_head * key_chunks.to(gl.int64) * head_dim
+    value_mean_base = value_mean_ptr + kv_batch_head * key_chunks.to(gl.int64) * head_dim
     # Prepared Q is padded to whole Q64 tiles, so a Q128 tile may extend 64 rows
     # past its storage; those rows read as zero codes and scales.
     mask_query_storage: gl.constexpr = not quantize_query and block_q > _GL_BLOCK
@@ -413,6 +451,14 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
         # Every K64 tile that meets this block's rows on the diagonal is masked.
         mask_from = gl.minimum(tile_count - 1, global_row // _GL_BLOCK)
 
+    # Match the D64 quantized-Q final reduction layout so block_q=64 and block_q=128
+    # sum head columns in identical order and agree bit for bit across SM89 plans.
+    center_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 32],
+        [32, 1],
+        [_GL_NUM_WARPS, 1],
+        [1, 0],
+    )
     if quantize_query:
         # Each Q row spans 128 // block_q threads. Loading Q before the first K
         # and V copies keeps its latency ahead of theirs.
@@ -479,113 +525,124 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
         )
     accumulator = gl.zeros([block_q, head_dim], gl.float32, mma_layout)
     denominator = gl.zeros([block_q], gl.float32, row_layout)
+    chunk_denom = gl.zeros([block_q], gl.float32, row_layout)
     running_max = gl.full([block_q], -float("inf"), gl.float32, row_layout)
+    running_bias = gl.zeros([block_q], gl.float32, row_layout)
+    features = gl.arange(0, head_dim, column_layout)
+    chunk_count = gl.cdiv(tile_count, _GL_TILES_PER_CHUNK)
 
-    for tile in range(tile_count - 1):
-        start_n = tile * _GL_BLOCK
-        # The consumed K group is followed only by its V group.
-        async_copy.wait_group(1)
-        gl.barrier()
-        if is_causal and block_q > _GL_BLOCK and tile >= mask_from:
-            codes, denominator, running_max, old_weight, current_weight = _probability_tile(
-                query,
-                key_shared,
-                query_scale,
-                key_scale_base,
-                multiplier_shared,
-                denominator,
-                running_max,
-                start_n,
-                global_rows,
-                key_length,
+    for chunk in range(chunk_count):
+        k_bias = _compute_chunk_k_bias(
+            query_shared,
+            query_scale,
+            key_center_base,
+            chunk,
+            center_layout,
+            row_layout,
+            head_dim,
+        )
+        chunk_start = chunk * _GL_TILES_PER_CHUNK
+        chunk_end = gl.minimum(chunk_start + _GL_TILES_PER_CHUNK, tile_count)
+        for tile in range(chunk_start, chunk_end):
+            start_n = tile * _GL_BLOCK
+            # The consumed K group is followed only by its V group.
+            async_copy.wait_group(1)
+            gl.barrier()
+            if tile == tile_count - 1 or (is_causal and block_q > _GL_BLOCK and tile >= mask_from):
+                (
+                    codes,
+                    denominator,
+                    chunk_denom,
+                    running_max,
+                    running_bias,
+                    old_weight,
+                    current_weight,
+                ) = _probability_tile(
+                    query,
+                    key_shared,
+                    query_scale,
+                    key_scale_base,
+                    multiplier_shared,
+                    denominator,
+                    chunk_denom,
+                    running_max,
+                    running_bias,
+                    k_bias,
+                    start_n,
+                    global_rows,
+                    key_length,
+                    mma_layout,
+                    key_layout,
+                    probability_layout,
+                    True,
+                    is_causal,
+                )
+            else:
+                (
+                    codes,
+                    denominator,
+                    chunk_denom,
+                    running_max,
+                    running_bias,
+                    old_weight,
+                    current_weight,
+                ) = _probability_tile(
+                    query,
+                    key_shared,
+                    query_scale,
+                    key_scale_base,
+                    multiplier_shared,
+                    denominator,
+                    chunk_denom,
+                    running_max,
+                    running_bias,
+                    k_bias,
+                    start_n,
+                    global_rows,
+                    key_length,
+                    mma_layout,
+                    key_layout,
+                    probability_layout,
+                    False,
+                    is_causal,
+                )
+            if tile + 1 < tile_count:
+                gl.barrier()
+                _copy_rows(key_base, start_n + _GL_BLOCK, key_shared, row_copy_layout)
+                _copy_key_metadata(
+                    multiplier_base,
+                    start_n + _GL_BLOCK,
+                    key_length,
+                    multiplier_shared,
+                    metadata_copy_layout,
+                )
+                async_copy.commit_group()
+                # The consumed V group is followed only by the next K group.
+                async_copy.wait_group(1)
+            else:
+                async_copy.wait_group(0)
+            gl.barrier()
+            accumulator = _pv_tile(
+                codes,
+                value_shared,
+                accumulator,
+                old_weight,
+                current_weight,
                 mma_layout,
-                key_layout,
-                probability_layout,
-                True,
-                is_causal,
+                value_layout,
             )
-        else:
-            codes, denominator, running_max, old_weight, current_weight = _probability_tile(
-                query,
-                key_shared,
-                query_scale,
-                key_scale_base,
-                multiplier_shared,
-                denominator,
-                running_max,
-                start_n,
-                global_rows,
-                key_length,
-                mma_layout,
-                key_layout,
-                probability_layout,
-                False,
-                is_causal,
-            )
-        gl.barrier()
-        _copy_rows(key_base, start_n + _GL_BLOCK, key_shared, row_copy_layout)
-        _copy_key_metadata(
-            multiplier_base,
-            start_n + _GL_BLOCK,
-            key_length,
-            multiplier_shared,
-            metadata_copy_layout,
-        )
-        async_copy.commit_group()
-        # The consumed V group is followed only by the next K group.
-        async_copy.wait_group(1)
-        gl.barrier()
-        accumulator = _pv_tile(
-            codes,
-            value_shared,
-            accumulator,
-            old_weight,
-            current_weight,
-            mma_layout,
-            value_layout,
-        )
-        gl.barrier()
-        _copy_value_tile(
-            value_base, key_storage, start_n + _GL_BLOCK, value_shared, value_copy_layout
-        )
-        async_copy.commit_group()
-
-    # The final tile holds the key tail and, for causal attention, the diagonal.
-    async_copy.wait_group(1)
-    gl.barrier()
-    codes, denominator, running_max, old_weight, current_weight = _probability_tile(
-        query,
-        key_shared,
-        query_scale,
-        key_scale_base,
-        multiplier_shared,
-        denominator,
-        running_max,
-        (tile_count - 1) * _GL_BLOCK,
-        global_rows,
-        key_length,
-        mma_layout,
-        key_layout,
-        probability_layout,
-        True,
-        is_causal,
-    )
-    async_copy.wait_group(0)
-    gl.barrier()
-    accumulator = _pv_tile(
-        codes,
-        value_shared,
-        accumulator,
-        old_weight,
-        current_weight,
-        mma_layout,
-        value_layout,
-    )
+            if tile + 1 < tile_count:
+                gl.barrier()
+                _copy_value_tile(
+                    value_base, key_storage, start_n + _GL_BLOCK, value_shared, value_copy_layout
+                )
+                async_copy.commit_group()
+        value_mean = gl.load(value_mean_base + chunk.to(gl.int64) * head_dim + features)
+        accumulator += (chunk_denom * 255.0)[:, None] * value_mean[None, :]
+        if chunk + 1 < chunk_count:
+            chunk_denom = gl.zeros([block_q], gl.float32, row_layout)
 
     output = accumulator / (gl.maximum(denominator, 1e-30) * 255.0)[:, None]
-    features = gl.arange(0, head_dim, column_layout)
-    if not is_causal:
-        output += gl.load(value_mean_ptr + kv_batch_head * head_dim + features)[None, :]
     if contiguous_output:
         # Flattened indexing proves the alignment of paired feature stores.
         output_base = output_ptr + (batch_head * query_rows + output_rows[:, None]) * head_dim
@@ -609,6 +666,7 @@ def launch_attention(
     value: torch.Tensor,
     query_scale: torch.Tensor | None,
     key_scale: torch.Tensor,
+    key_center: torch.Tensor,
     value_scale_multiplier: torch.Tensor,
     value_mean: torch.Tensor,
     output: torch.Tensor,
@@ -624,24 +682,8 @@ def launch_attention(
     global_query_start: int = 0,
     padded_kv: bool = False,
 ) -> torch.Tensor:
-    """Launch the recurrence on INT8 K/V stored in whole K64 tiles.
-
-    With ``quantize_query``, ``query`` is the FP16/BF16 ``[batch, heads,
-    query_length, head_dim]`` input and ``query_scale`` is None. Otherwise it is
-    prepared INT8 ``[batch, heads, query_storage, head_dim]`` storage with rows,
-    and per-row Q scales, padded to a multiple of 64. ``key`` is ``[batch,
-    kv_heads, key_storage, head_dim]`` and ``value`` its transposed ``[batch,
-    kv_heads, head_dim, key_storage]``, padded to a multiple of 64 keys. Per-key
-    K scales and V multipliers cover the logical key length, or the key storage
-    with ``padded_kv``.
-
-    ``output`` is ``[batch, heads, rows, head_dim]`` with contiguous features. Its
-    rows start at local Q row ``query_start`` and global row ``global_query_start``;
-    both are multiples of ``block_q``. ``query_length`` counts the logical Q rows.
-    """
+    """Launch the recurrence on INT8 K/V stored in whole K64 tiles."""
     batch, heads, query_rows, head_dim = output.shape
-    # Raw Q is read through its strides; its length stays a runtime value, and the
-    # storage argument keeps a length-independent specialization.
     query_storage = (
         triton.cdiv(query_length, block_q) * block_q if quantize_query else query.shape[2]
     )
@@ -656,6 +698,7 @@ def launch_attention(
             value,
             query_scale,
             key_scale,
+            key_center,
             value_scale_multiplier,
             value_mean,
             output,
@@ -666,6 +709,7 @@ def launch_attention(
             query_storage,
             key_storage,
             heads,
+            value_mean.shape[2],
             query_start,
             global_query_start,
             query.stride(0),
