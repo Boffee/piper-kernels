@@ -13,7 +13,6 @@ from piper_kernels.attention.sparse_piper_attention._amd import gluon as amd_att
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_sparse_piper import _backend, key, output, query, value
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy
-from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 
 from ._reference import (
@@ -83,10 +82,14 @@ def test_grouped_order_preserves_complete_outputs_with_partial_groups_and_query_
         )
 
     actual = run()
-    for launch in (amd.project_query, amd.project_key, amd.project_value):
-        monkeypatch.setitem(
-            launch.keywords, "execution_plan", replace(launch.keywords["execution_plan"], group_m=0)
-        )
+    select_plan = policy.select_execution_plan
+    monkeypatch.setattr(
+        policy,
+        "select_execution_plan",
+        lambda operation, *, head_dim: replace(
+            select_plan(operation, head_dim=head_dim), group_m=0
+        ),
+    )
     expected = run()
     for index, (left, right) in enumerate(zip(actual, expected, strict=True)):
         assert_int8_codes_close(left[0], right[0])
