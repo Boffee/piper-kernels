@@ -44,11 +44,11 @@ from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
 from piper_kernels.fusions.sparse_piper import _output as output_common
 
 
-def _operands(sequence=193, heads=3, head_dim=128):
+def _operands(sequence=193, heads=3, head_dim=128, input_features=272):
     return (
-        torch.empty((2, sequence, 272), device="cuda:1", dtype=torch.int8),
+        torch.empty((2, sequence, input_features), device="cuda:1", dtype=torch.int8),
         torch.empty((2, sequence), device="cuda:1"),
-        torch.empty((heads * head_dim, 272), device="cuda:1", dtype=torch.int8),
+        torch.empty((heads * head_dim, input_features), device="cuda:1", dtype=torch.int8),
         torch.empty((heads * head_dim, 1), device="cuda:1"),
         torch.empty(head_dim, device="cuda:1", dtype=torch.bfloat16),
         torch.empty((sequence, head_dim * 3 // 4), device="cuda:1"),
@@ -608,7 +608,16 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
 
 
 def _capture_projection(
-    monkeypatch, operation, implementation=nvidia, head_dim=128, *, with_bias=False, target=None
+    monkeypatch,
+    operation,
+    implementation=nvidia,
+    head_dim=128,
+    *,
+    with_bias=False,
+    target=None,
+    sequence=193,
+    heads=3,
+    input_features=272,
 ):
     monkeypatch.setattr(nvidia.linear_gluon, "operands_aligned", lambda *operands: True)
     if target is None:
@@ -626,8 +635,13 @@ def _capture_projection(
     guard = Mock(side_effect=lambda device: nullcontext())
     monkeypatch.setattr(projection, "device_context", guard)
     with FakeTensorMode():
-        operands = _operands(head_dim=head_dim)
-        bias = operands[3].new_empty((3 * head_dim,)) if with_bias else None
+        operands = _operands(
+            sequence=sequence,
+            heads=heads,
+            head_dim=head_dim,
+            input_features=input_features,
+        )
+        bias = operands[3].new_empty((heads * head_dim,)) if with_bias else None
         _call(
             operation,
             operands,
@@ -659,7 +673,12 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
     # These operands' 272 input features fall outside the Gluon kernels, so each target runs
     # its Triton schedule. SM8x's is 64 rows by one head for Q, K, and V.
     is_sm8x = target.is_cuda_capability(8)
-    heads_per_program = 1 if is_sm8x or (is_amd and operation != "value") else 2
+    if is_sm8x:
+        heads_per_program = 1
+    elif is_amd:
+        heads_per_program = 2 if operation == "value" and head_dim == 64 else 1
+    else:
+        heads_per_program = 2
     block_m = 64 if is_sm8x or operation == "query" or (is_amd and operation == "key") else 128
     warps = 4 if is_sm8x or (is_amd and operation != "value") else 8
     rows = 129 if operation == "query" else 193
@@ -683,6 +702,44 @@ def test_backend_launch_schedule_and_fp32_math_are_preserved(
             assert call.kwargs["mask_ragged_tail"] is (index == 1)
         if operation != "query":
             assert call.args[-1] == (0 if index == 0 else rows // block_m)
+
+
+def _compile_projection_call(function, call, target, *, operation, affine=True):
+    arguments = dict(zip(function.arg_names, call.args, strict=False))
+    arguments.update(
+        {name: item for name, item in call.kwargs.items() if name in function.arg_names}
+    )
+    arguments.setdefault("round_rsqrt_to_nearest", False)
+    arguments.setdefault("group_m", 0)
+    if not affine and operation != "value":
+        arguments["norm_weight_ptr"] = None
+    constants, signature = {}, {}
+    types = {
+        torch.int8: "*i8",
+        torch.int32: "*i32",
+        torch.float32: "*fp32",
+        torch.bfloat16: "*bf16",
+    }
+    for parameter in function.params:
+        argument = arguments[parameter.name]
+        if parameter.is_constexpr:
+            constants[parameter.name] = argument
+        elif argument is None:
+            constants[parameter.name] = None
+            signature[parameter.name] = "constexpr"
+        else:
+            signature[parameter.name] = (
+                types[argument.dtype] if isinstance(argument, torch.Tensor) else "i32"
+            )
+    return triton.compile(
+        ASTSource(function, signature, constexprs=constants),
+        target=target,
+        options={
+            name: call.kwargs[name]
+            for name in ("num_warps", "num_stages", "llvm_fn_attrs")
+            if name in call.kwargs
+        },
+    )
 
 
 @pytest.mark.parametrize(
@@ -716,40 +773,8 @@ def test_production_launches_compile_with_expected_storage_precision(
         ),
     )
     for call in kernel.__getitem__.return_value.call_args_list:
-        arguments = dict(zip(function.arg_names, call.args, strict=False))
-        arguments.update(
-            {name: item for name, item in call.kwargs.items() if name in function.arg_names}
-        )
-        arguments.setdefault("round_rsqrt_to_nearest", False)
-        arguments.setdefault("group_m", 0)
-        if not affine and operation != "value":
-            arguments["norm_weight_ptr"] = None
-        constants, signature = {}, {}
-        types = {
-            torch.int8: "*i8",
-            torch.int32: "*i32",
-            torch.float32: "*fp32",
-            torch.bfloat16: "*bf16",
-        }
-        for parameter in function.params:
-            argument = arguments[parameter.name]
-            if parameter.is_constexpr:
-                constants[parameter.name] = argument
-            elif argument is None:
-                constants[parameter.name] = None
-                signature[parameter.name] = "constexpr"
-            else:
-                signature[parameter.name] = (
-                    types[argument.dtype] if isinstance(argument, torch.Tensor) else "i32"
-                )
-        compiled = triton.compile(
-            ASTSource(function, signature, constexprs=constants),
-            target=target,
-            options={
-                name: call.kwargs[name]
-                for name in ("num_warps", "num_stages", "llvm_fn_attrs")
-                if name in call.kwargs
-            },
+        compiled = _compile_projection_call(
+            function, call, target, operation=operation, affine=affine
         )
         if target.backend == "cuda":
             assert compiled.asm["cubin"]
@@ -766,6 +791,31 @@ def test_production_launches_compile_with_expected_storage_precision(
         ]
         assert bool(truncations) is (operation == "value")
         assert all("f32" in line and "bf16" in line for line in truncations)
+
+
+@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_amd_aligned_value_projection_compiles_without_vgpr_spills(
+    monkeypatch, architecture, head_dim
+):
+    if sys.platform != "linux":
+        pytest.skip("ROCm support is Linux-only")
+    function, kernel = _capture_projection(
+        monkeypatch,
+        "value",
+        amd,
+        head_dim,
+        target=AcceleratorTarget("hip", architecture),
+        sequence=256,
+        heads=4,
+        input_features=256,
+    )
+    target = GPUTarget("hip", architecture, 32)
+    calls = kernel.__getitem__.return_value.call_args_list
+    assert len(calls) == 1
+    assert calls[0].kwargs["aligned_projection"] is True
+    compiled = _compile_projection_call(function, calls[0], target, operation="value")
+    assert ".vgpr_spill_count: 0" in compiled.asm["amdgcn"]
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])

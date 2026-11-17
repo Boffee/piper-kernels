@@ -24,6 +24,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - On RX 9070 XT, ConvRot INT8 linears run 1–5% faster (4–6% with Triton 3.9), fused
   sparse Piper Q/K/V projections about 8% faster, and H3 VAE Conv3D about 1.5% faster,
   with bitwise-identical outputs. ROCm Triton kernels recompile once after upgrading.
+- On RX 9070 XT (Triton 3.9), `sparse_piper_attention` runs 2–10% faster, `D=128`
+  `convrot_int8_sparse_piper` V projections run 4–18% faster, and `piper_attention` runs
+  up to 2.4% faster standalone (~6% in D=128 H3 blocks); batched `value_mean`
+  accumulation slightly reassociates sparse FP32 contraction within INT8 tolerances,
+  while dense attention and sparse V projection outputs are unchanged.
 
 ### Removed
 

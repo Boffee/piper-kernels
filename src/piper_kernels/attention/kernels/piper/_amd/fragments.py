@@ -8,6 +8,7 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import AMDWMMALayout
+from triton.experimental.gluon.language.amd.rdna4 import wmma
 
 from piper_kernels._triton import amd_compiler_workarounds
 
@@ -238,54 +239,131 @@ def qk_tiles(
 
 
 @gluon.jit
-def qk_center_bias_pair(
+def _split_bf16_pair(value):
+    """Split finite non-negative FP32 values into two BF16 terms (high + low)."""
+    # Bitwise shifts avoid tt.fp_to_fp and extra arith.truncf ops in TTGIR.
+    bits = value.to(gl.uint32, bitcast=True)
+    high = (bits >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+    high_fp32 = (bits & 0xFFFF0000).to(gl.float32, bitcast=True)
+    residual_bits = (value - high_fp32).to(gl.uint32, bitcast=True)
+    low = ((residual_bits + 0x8000) >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+    return high, low
+
+
+@gluon.jit
+def compute_chunk_key_biases(
     query,
     key_center_ptr,
     key_center_scale_ptr,
-    tile_0,
-    tile_1,
+    tiles_shared,
+    key_bias_shared,
     query_scale,
     use_64bit_context_offsets: gl.constexpr,
     head_dim: gl.constexpr,
 ):
-    """Compute Q64 @ H(K_mean)^T * Q_scale score biases for two K64 tiles."""
+    """Precompute Q64 @ H(K_center)^T * Q_scale score biases for 16 tiles into LDS."""
     offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
     lane = gl.arange(0, 128, gl.SliceLayout(0, VECTOR_LAYOUT)) % 32
-    tile_0_index = gl.sum(tile_0, 0).to(offset_type)
-    tile_1_index = gl.sum(tile_1, 0).to(offset_type)
-    col = lane % 16
-    base_0 = tile_0_index * (2 * head_dim)
-    base_1 = tile_1_index * (2 * head_dim)
-    # Output columns 0..1 hold tile_0's 2-term H(K_mean) rows; 2..3 hold tile_1's.
-    row_offset = gl.where(
-        col < 2,
-        base_0 + col * head_dim,
-        gl.where(col < 4, base_1 + (col - 2) * head_dim, base_0),
-    ).to(offset_type)
-    bias = gl.full([1, 128], _INTEGER_SUM_BIAS, gl.int32, VECTOR_LAYOUT)
-    acc = (bias, bias, bias, bias, bias, bias, bias, bias)
-    for k in gl.static_range(head_dim // 16):
-        offset = (
-            row_offset[None, :] + (k // 2) * 32 + (lane[None, :] // 16) * 16 + (k % 2) * 8
-        ).to(offset_type)
-        key = gl.load((key_center_ptr + offset).to(gl.pointer_type(gl.uint64)))
-        acc = int8_wmma(query[k], key, acc, 0)
-    recovered = _recover_scores(_matrix_fragment(acc).to(gl.float32, bitcast=True), False)
-    col_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT))
-    col_idx = gl.arange(0, 16, col_layout)[None, None, :]
-    row_layout: gl.constexpr = query_scale.type.layout
-    dot_0 = gl.convert_layout(gl.sum(gl.where(col_idx == 0, recovered, 0.0), axis=2), row_layout)
-    dot_1 = gl.convert_layout(gl.sum(gl.where(col_idx == 1, recovered, 0.0), axis=2), row_layout)
-    dot_2 = gl.convert_layout(gl.sum(gl.where(col_idx == 2, recovered, 0.0), axis=2), row_layout)
-    dot_3 = gl.convert_layout(gl.sum(gl.where(col_idx == 3, recovered, 0.0), axis=2), row_layout)
-    scale_00 = gl.load(key_center_scale_ptr + tile_0_index * 2)
-    scale_01 = gl.load(key_center_scale_ptr + tile_0_index * 2 + 1)
-    scale_10 = gl.load(key_center_scale_ptr + tile_1_index * 2)
-    scale_11 = gl.load(key_center_scale_ptr + tile_1_index * 2 + 1)
-    return (
-        gl.fma(dot_0, scale_00, dot_1 * scale_01) * query_scale,
-        gl.fma(dot_2, scale_10, dot_3 * scale_11) * query_scale,
+    column_in_mma = lane % 16
+    center_term = column_in_mma % 2
+    scale_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT))
+    store_layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 2], [4, 1], [1, 0])
+    row_query_scale = gl.convert_layout(query_scale.reshape([64]), gl.SliceLayout(1, store_layout))[
+        :, None
+    ]
+
+    for half in gl.static_range(2):
+        tile_slot = half * 8 + column_in_mma // 2
+        tile_index = tiles_shared.gather(tile_slot, 0).to(offset_type)[None, :]
+        row_offset = (tile_index * (2 * head_dim) + center_term[None, :] * head_dim).to(offset_type)
+        bias = gl.full([1, 128], _INTEGER_SUM_BIAS, gl.int32, VECTOR_LAYOUT)
+        acc = (bias, bias, bias, bias, bias, bias, bias, bias)
+        for k in gl.static_range(head_dim // 16):
+            offset = (row_offset + (k // 2) * 32 + (lane[None, :] // 16) * 16 + (k % 2) * 8).to(
+                offset_type
+            )
+            center = gl.load((key_center_ptr + offset).to(gl.pointer_type(gl.uint64)))
+            acc = int8_wmma(query[k], center, acc, 0)
+        recovered = _recover_scores(_matrix_fragment(acc).to(gl.float32, bitcast=True), False)
+        column = gl.arange(0, 16, scale_layout)
+        column_tile_index = tiles_shared.gather(half * 8 + column // 2, 0).to(offset_type)
+        center_scales = gl.load(
+            key_center_scale_ptr + column_tile_index * 2 + (column % 2).to(offset_type)
+        )
+        weighted = recovered * center_scales[None, None, :]
+        dots = gl.convert_layout(
+            gl.sum(weighted.reshape([1, 64, 8, 2]), axis=3).reshape([64, 8]),
+            store_layout,
+        )
+        key_bias_shared.slice(half * 8, 8, dim=1).store(dots * row_query_scale)
+
+
+@gluon.jit
+def accumulate_chunk_value_means(
+    numerator,
+    tile_masses_shared,
+    pair_max_shared,
+    tiles_shared,
+    running_max,
+    value_mean_ptr,
+    num_valid_tiles,
+    use_64bit_context_offsets: gl.constexpr,
+    head_dim: gl.constexpr,
+):
+    """Accumulate up to 16 buffered per-tile value_mean contributions using BF16 WMMA."""
+    offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
+    mma_2d_layout: gl.constexpr = AMDWMMALayout(
+        version=2, transposed=True, warp_bases=[[1, 0], [2, 0]], rank=2
     )
+    lhs_layout: gl.constexpr = gl.DotOperandLayout(0, mma_2d_layout, k_width=8)
+    rhs_layout: gl.constexpr = gl.DotOperandLayout(1, mma_2d_layout, k_width=8)
+    mass_layout: gl.constexpr = gl.BlockedLayout([1, 8], [16, 2], [4, 1], [1, 0])
+    max_layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 2], [4, 1], [1, 0])
+    mean_layout: gl.constexpr = gl.BlockedLayout([8, 1], [2, 16], [1, 4], [0, 1])
+
+    tile_masses = tile_masses_shared.load(mass_layout)
+    pair_max = gl.convert_layout(
+        pair_max_shared.load(max_layout)
+        .reshape([64, 8, 1])
+        .broadcast_to([64, 8, 2])
+        .reshape([64, 16]),
+        mass_layout,
+    )
+    row_running_max = gl.convert_layout(running_max.reshape([64]), gl.SliceLayout(1, mass_layout))[
+        :, None
+    ]
+    tile_slots = gl.arange(0, 16, gl.SliceLayout(0, mass_layout))[None, :]
+    has_valid_scores = (tile_slots < num_valid_tiles) & (pair_max != -float("inf"))
+    pair_decay = gl.where(has_valid_scores, gl.exp2(pair_max - row_running_max), 0.0)
+    # Gate invalid/masked slots outside the product so uninitialized or NaN masses become 0.0.
+    scaled_masses = gl.where(has_valid_scores, tile_masses * pair_decay * 255.0, 0.0)
+    masses_high, masses_low = _split_bf16_pair(scaled_masses)
+    lhs_high = gl.convert_layout(masses_high, lhs_layout)
+    lhs_low = gl.convert_layout(masses_low, lhs_layout)
+
+    mean_slots = gl.arange(0, 16, gl.SliceLayout(1, mean_layout))
+    tile_indices = gl.where(
+        mean_slots < num_valid_tiles,
+        tiles_shared.load(gl.SliceLayout(1, mean_layout)),
+        0,
+    ).to(offset_type)
+    numerator_slices = four_fragments(numerator) if head_dim == 64 else eight_fragments(numerator)
+    results = ()
+    for column_tile in gl.static_range(head_dim // 16):
+        feature_offsets = column_tile * 16 + gl.arange(0, 16, gl.SliceLayout(0, mean_layout)).to(
+            offset_type
+        )
+        tile_means = gl.load(
+            value_mean_ptr + tile_indices[:, None] * head_dim + feature_offsets[None, :]
+        )
+        rhs_means = gl.convert_layout(tile_means, rhs_layout)
+        acc_slice = gl.convert_layout(
+            numerator_slices[column_tile].reshape([64, 16]), mma_2d_layout
+        )
+        acc_slice = wmma(lhs_high, rhs_means, acc_slice)
+        acc_slice = wmma(lhs_low, rhs_means, acc_slice)
+        results += (gl.convert_layout(acc_slice.reshape([1, 64, 16]), MMA_LAYOUT),)
+    return gl.convert_layout(_join_matrix(results), MMA_LAYOUT)
 
 
 @gluon.jit

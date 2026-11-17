@@ -87,8 +87,20 @@ def test_long_context_local_query_matches_fp64(global_query_block, head_dim):
     generator = torch.Generator(device="cuda").manual_seed(2137)
     sequence, padded, heads = 100000, 100032, 3
     keep = [391, 390, 1]
+    tiles = padded // 64
     key = torch.randint(
         -31, 32, (1, heads, padded, head_dim), dtype=torch.int8, device="cuda", generator=generator
+    )
+    key_center = torch.randint(
+        -31,
+        32,
+        (1, heads, tiles, 2, head_dim),
+        dtype=torch.int8,
+        device="cuda",
+        generator=generator,
+    )
+    key_center_scale = (
+        torch.tensor([0.05, 0.0005], device="cuda").expand(1, heads, tiles, 2).contiguous()
     )
     value = torch.randint(
         -128,
@@ -99,16 +111,19 @@ def test_long_context_local_query_matches_fp64(global_query_block, head_dim):
         generator=generator,
     )
     multiplier = torch.exp2(
-        torch.empty((1, heads, padded // 64, 1), device="cuda").uniform_(
-            -12, 12, generator=generator
-        )
+        torch.empty((1, heads, tiles, 1), device="cuda").uniform_(-12, 12, generator=generator)
     )
+    value_mean = torch.randn(
+        (1, heads, tiles, head_dim), device="cuda", generator=generator
+    ).bfloat16()
     context = _prepare_sparse_piper_context_from_quantized(
         key,
-        torch.full((1, heads, padded // 64), 0.1, device="cuda"),
+        torch.full((1, heads, tiles), 0.1, device="cuda"),
+        key_center,
+        key_center_scale,
         reference_value_storage(value, ValueFormat.AMD_WMMA),
         multiplier,
-        torch.randn((1, heads, head_dim), device="cuda", generator=generator),
+        value_mean,
         torch.tensor(keep, device="cuda", dtype=torch.int32),
         torch.tensor([0, 391, 781, 782], device="cuda", dtype=torch.int32),
         sparse_key_blocks=sequence // 64,

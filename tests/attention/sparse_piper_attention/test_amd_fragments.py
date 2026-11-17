@@ -272,6 +272,7 @@ def test_rescale_is_exact_for_every_row_predicate_and_layout_mapping(head_dim):
 
 def _constant_context(batch, heads, sequence, head_dim=128):
     storage = (sequence + 63) // 64 * 64
+    tiles = storage // 64
     # One allocation backs both INT8 K and V. Query=0 makes scores uniform;
     # distinct per-head V constants exercise global addressing independently.
     value = torch.empty(
@@ -281,13 +282,15 @@ def _constant_context(batch, heads, sequence, head_dim=128):
     value.copy_(constants.view(batch, heads, 1, 1, 1))
     context = _prepare_sparse_piper_context_from_quantized(
         value.view(batch, heads, storage, head_dim),
-        torch.ones((batch, heads, storage // 64), device="cuda"),
+        torch.ones((batch, heads, tiles), device="cuda"),
+        torch.zeros((batch, heads, tiles, 2, head_dim), dtype=torch.int8, device="cuda"),
+        torch.zeros((batch, heads, tiles, 2), device="cuda"),
         value,
-        torch.full((batch, heads, storage // 64, 1), 255.0, device="cuda"),
-        torch.zeros((batch, heads, head_dim), device="cuda"),
+        torch.full((batch, heads, tiles, 1), 255.0, device="cuda"),
+        torch.zeros((batch, heads, tiles, head_dim), dtype=torch.bfloat16, device="cuda"),
         torch.ones(heads, dtype=torch.int32, device="cuda"),
         torch.arange(heads + 1, dtype=torch.int32, device="cuda"),
-        sparse_key_blocks=storage // 64,
+        sparse_key_blocks=sequence // 64,
         routes_per_query=heads,
         value_format=ValueFormat.AMD_WMMA,
         logical_sequence_length=sequence,
@@ -295,7 +298,7 @@ def _constant_context(batch, heads, sequence, head_dim=128):
     query = _prepare_sparse_piper_query_from_quantized(
         torch.zeros((batch, heads, 64, head_dim), dtype=torch.int8, device="cuda"),
         torch.ones((batch, heads, 2), device="cuda"),
-        torch.full((batch, 1, heads), storage // 64 - 1, dtype=torch.uint16, device="cuda"),
+        torch.full((batch, 1, heads), sequence // 64 - 1, dtype=torch.uint16, device="cuda"),
         context,
     )
     return _PreparedSparsePiperAttention(bind_context(context), query), constants.view(
