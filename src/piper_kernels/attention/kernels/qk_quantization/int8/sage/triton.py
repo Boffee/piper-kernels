@@ -208,6 +208,12 @@ def store_key_center_tile(
 
 
 @triton.jit
+def _maximum_and_minimum(maximum_a, minimum_a, maximum_b, minimum_b):
+    """Combine ``tl.reduce`` partials with the same semantics as ``tl.max`` and ``tl.min``."""
+    return tl.maximum(maximum_a, maximum_b), tl.minimum(minimum_a, minimum_b)
+
+
+@triton.jit
 def quantize_tile_centered_key_tile(
     values,
     valid,
@@ -235,9 +241,14 @@ def quantize_tile_centered_key_tile(
     )
     grouped_valid = tl.reshape(valid, (num_tiles, scale_rows))
     valid_mask = grouped_valid[None, :, :, None]
-    has_valid = tl.sum(grouped_valid.to(tl.int32), axis=1)[None, :, None] > 0
-    rotated_max = tl.max(tl.where(valid_mask, grouped, -float("inf")), axis=2)  # pyright: ignore[reportArgumentType]
-    rotated_min = tl.min(tl.where(valid_mask, grouped, float("inf")), axis=2)  # pyright: ignore[reportArgumentType]
+    has_valid = tl.sum(grouped_valid.to(tl.int32), axis=1)[None, :, None] > 0  # pyright: ignore[reportArgumentType]
+    # One two-operand reduction rather than separate tl.max/tl.min: with one warp per
+    # D64 tile, two reductions keep both masked copies live and spill registers.
+    rotated_max, rotated_min = tl.reduce(
+        (tl.where(valid_mask, grouped, -float("inf")), tl.where(valid_mask, grouped, float("inf"))),
+        2,
+        _maximum_and_minimum,
+    )
     rotated_midpoint = 0.5 * (rotated_max + rotated_min)  # pyright: ignore[reportOperatorIssue]
     rotated_center = tl.where(has_valid, rotated_midpoint, 0.0)
     centered = tl.where(valid_mask, grouped - rotated_center[:, :, None, :], 0.0)
