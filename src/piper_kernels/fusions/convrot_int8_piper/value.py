@@ -43,11 +43,12 @@ def _validate_inputs(
 def _new_outputs(input_qdata: torch.Tensor, shape: tuple[int, int, int, int]) -> ValueOutput:
     batch, sequence, heads, head_dim = shape
     storage = (sequence + 63) // 64 * 64
+    chunks = (sequence + 1023) // 1024
     return (
         input_qdata.new_empty((batch, heads, head_dim, storage)),
         input_qdata.new_empty((batch, heads, storage), dtype=torch.float32),
         input_qdata.new_empty((batch, heads, storage), dtype=torch.float32),
-        input_qdata.new_empty((batch, heads, head_dim), dtype=torch.float32),
+        input_qdata.new_empty((batch, heads, chunks, head_dim), dtype=torch.float32),
     )
 
 
@@ -62,11 +63,11 @@ def _project_value_op(
     head_dim: int,
     is_causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return native V codes, per-token multipliers/logs, and the non-causal mean.
+    """Return native V1024-centered V codes, multipliers/logs, and chunk means.
 
     Storage is K64 padded. On RDNA4, codes use the packed WMMA tile order in
-    the same allocation shape. NVIDIA log scales retain FP16 rounding. Causal
-    means are zero; no sequence-wide V reduction runs for causal attention.
+    the same allocation shape. NVIDIA log scales retain FP16 rounding. Both causal
+    and non-causal paths center each 1024-token chunk without global reductions.
     """
     shape = _validate_inputs(
         input_qdata, input_scale, weight_qdata, weight_scale, bias, head_dim, is_causal

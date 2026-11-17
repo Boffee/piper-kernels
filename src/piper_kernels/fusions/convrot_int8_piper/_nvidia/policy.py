@@ -13,11 +13,11 @@ _SM120_EXECUTION_PLAN = NvidiaExecutionPlan(
     num_warps=8,
     num_stages=3,
     round_rsqrt_to_nearest=True,
+    # The compact mean projection needs more CTAs than the full matrix projection.
+    value_mean_block_n=32,
 )
 
 PACKED_VALUE = False
-# The compact mean projection needs more CTAs than the full matrix projection.
-VALUE_MEAN_BLOCK_N = 32
 
 
 def supports_target(target: AcceleratorTarget) -> bool:

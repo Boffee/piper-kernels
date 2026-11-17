@@ -7,7 +7,10 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.convrot_int8_piper import _schedule
-from piper_kernels.fusions.convrot_int8_piper._schedule import _balanced_query_chunk_rows
+from piper_kernels.fusions.convrot_int8_piper._schedule import (
+    _balanced_query_chunk_rows,
+    _wave_query_chunk_rows,
+)
 
 
 @pytest.mark.parametrize(
@@ -66,7 +69,7 @@ def test_query_windows_account_for_device_waves(
     sequence, parallel_heads, concurrent_blocks, expected
 ):
     assert (
-        _schedule._wave_query_chunk_rows(
+        _wave_query_chunk_rows(
             sequence,
             16384,
             block_rows=128,
@@ -87,7 +90,7 @@ def test_wave_windows_stay_bounded_and_never_increase_predicted_waves(maximum, p
         )
 
     for sequence in (maximum - 1, maximum + 1, 2 * maximum + 1, 129 * maximum + 1):
-        rows = _schedule._wave_query_chunk_rows(
+        rows = _wave_query_chunk_rows(
             sequence,
             maximum,
             block_rows=128,

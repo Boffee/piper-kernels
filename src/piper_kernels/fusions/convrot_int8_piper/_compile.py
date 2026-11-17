@@ -393,6 +393,7 @@ def _emit_context_projection(
     assert output_value is not None
     batch, heads, sequence, head_dim = output_value.shape
     storage = (sequence + 63) // 64 * 64
+    chunks = (sequence + 1023) // 1024
     prepared, scales = _prepared_context_input(graph, arguments, before)
     common_args = (prepared, scales, arguments["weight_qdata"], arguments["weight_scale"])
     if normalized:
@@ -414,6 +415,7 @@ def _emit_context_projection(
                     (batch, heads, count_key_scales(storage, qk_quantization)),
                     dtype=torch.float32,
                 ),
+                input_value.new_empty((batch, heads, chunks, head_dim), dtype=torch.float32),
             ),
             kwargs={"head_dim": head_dim, "qk_quantization": qk_quantization},
         )
@@ -425,7 +427,7 @@ def _emit_context_projection(
             input_value.new_empty((batch, heads, head_dim, storage), dtype=torch.int8),
             input_value.new_empty((batch, heads, storage), dtype=torch.float32),
             input_value.new_empty((batch, heads, storage), dtype=torch.float32),
-            input_value.new_empty((batch, heads, head_dim), dtype=torch.float32),
+            input_value.new_empty((batch, heads, chunks, head_dim), dtype=torch.float32),
         ),
         kwargs={"head_dim": head_dim, "is_causal": is_causal},
     )
@@ -451,7 +453,7 @@ def _fuse_context(graph: torch.fx.Graph) -> bool:
         assert key_value is not None
         assert isinstance(is_causal, bool)
         with graph.inserting_before(node):
-            key_data, key_scale = _emit_context_projection(
+            key_data, key_scale, key_center = _emit_context_projection(
                 graph, key_match, normalized=True, is_causal=is_causal, before=node
             )
             value_data, multiplier, logs, mean = _emit_context_projection(
@@ -468,6 +470,7 @@ def _fuse_context(graph: torch.fx.Graph) -> bool:
                     query_scale,
                     key_data,
                     key_scale,
+                    key_center,
                     value_data,
                     multiplier,
                     logs,
@@ -511,7 +514,7 @@ _kernels = torch.ops.piper_kernels
 # Which residual-add and K/V projection arguments hold rows per head, for head slices.
 _HEAD_SLICING = head_slices.HeadSlicing(
     producers=(
-        {_kernels.convrot_int8_piper_project_key.default: ("key", "key_scale")},
+        {_kernels.convrot_int8_piper_project_key.default: ("key", "key_scale", "key_center")},
         {
             _kernels.convrot_int8_piper_project_value.default: (
                 "value",

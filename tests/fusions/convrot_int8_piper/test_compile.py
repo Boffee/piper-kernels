@@ -463,7 +463,7 @@ def _explicit_qkv(model, arguments):
         head_dim=model.head_dim,
         qk_quantization=_qk_quantization(),
     )
-    k, kscale = key_projection._project_key_op(
+    k, kscale, kcenter = key_projection._project_key_op(
         data,
         scales,
         model.key_weight,
@@ -488,6 +488,7 @@ def _explicit_qkv(model, arguments):
         qscale,
         k,
         kscale,
+        kcenter,
         v,
         mult,
         logs,

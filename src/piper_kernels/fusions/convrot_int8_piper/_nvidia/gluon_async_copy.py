@@ -6,10 +6,10 @@ fragments. Programs run at the 255-register limit.
 Q quantizes its RMSNorm/RoPE tile after the signed Hadamard, with per-thread or
 Q32 scales. Per-thread groups (rows 32b + 8i + t) lie in one thread's registers,
 so their scales need no data exchange and are stored per row from that layout.
-K stores BF16 rows and FP32 tile sums for the shared encoder, which centers K by
-its global mean.
+K stores BF16 rows for the shared K1024 encoder.
 
-V projects its tiles through the shared value-tile fragment and quantizes each token.
+V projects its tiles through the shared value-tile fragment, subtracts each
+1024-token chunk mean, and quantizes each token.
 
 The policy module selects shared Triton launchers for other shapes or unaligned operands.
 """
@@ -26,15 +26,14 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
     resolve_qk_quantization,
 )
-from piper_kernels.fusions.convrot_int8_centered_projection import triton as centered_projection
+from piper_kernels.attention.piper_attention import _quantization as piper_quantization
+from piper_kernels.fusions.convrot_int8_projection import triton as shared_projection
 from piper_kernels.fusions.convrot_int8_projection._nvidia import fragments
 from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import NvidiaExecutionPlan
 
-from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 
 # K/V storage and K tile sums use K64 tiles.
@@ -46,6 +45,7 @@ _GL_BLOCK_M = gl.constexpr(fragments.BLOCK_M)
 _GL_TILE_ROWS = gl.constexpr(_TILE_ROWS)
 _GL_QUERY_SCALE_ROWS = gl.constexpr(32)
 _GL_P_UINT8_RANGE = gl.constexpr(255.0)
+_GL_VALUE_MEAN_SCALE_FLOOR = gl.constexpr(2.0**-80)
 _GL_LOG2_E = gl.constexpr(1.4426950408889634)
 _GL_FEATURE_LAYOUT = fragments.FEATURE_LAYOUT
 
@@ -53,6 +53,7 @@ _GL_FEATURE_LAYOUT = fragments.FEATURE_LAYOUT
 # kernel per divisibility class. Storage extents arrive as K64 tile counts, so the
 # kernels still know that row strides are multiples of 64.
 _DO_NOT_SPECIALIZE = ("logical_sequence_length", "row_block_offset", "storage_tiles")
+_DO_NOT_SPECIALIZE_VALUE = (*_DO_NOT_SPECIALIZE, "chunk_count")
 _DO_NOT_SPECIALIZE_QUERY = (*_DO_NOT_SPECIALIZE, "chunk_start", "query_sequence_end")
 
 
@@ -171,7 +172,6 @@ def _key_kernel(
     cos_ptr,
     sin_ptr,
     stored_ptr,
-    partial_ptr,
     logical_sequence_length,
     row_block_offset,
     storage_tiles,
@@ -181,7 +181,7 @@ def _key_kernel(
     norm_epsilon: gl.constexpr,
     mask_rows: gl.constexpr,
 ):
-    """Project a K tile and emit BF16 rows and FP32 tile sums; padding rows are zero."""
+    """Project a K tile and emit BF16 rows for K1024 chunk quantization."""
     head = gl.program_id(0)
     row_block = row_block_offset + gl.program_id(1)
     batch = gl.program_id(2)
@@ -208,21 +208,18 @@ def _key_kernel(
         rows = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, _GL_FEATURE_LAYOUT))
         valid = (rows < logical_sequence_length)[:, None] & (features >= 0)[None, :]
         values = gl.where(valid, values, 0.0)
-    fragments.store_centered_key(
-        stored_ptr,
-        partial_ptr,
-        values,
-        batch,
-        heads,
-        head,
-        row_block,
-        storage_tiles,
-        _GL_TILE_ROWS,
+    batch_head = batch * heads + head
+    storage_rows = storage_tiles * _GL_TILE_ROWS
+    fragments.store_rows(
+        stored_ptr + batch_head.to(gl.int64) * storage_rows * _GL_HEAD_DIM,
+        values.to(gl.bfloat16),
+        first_row,
+        storage_rows,
         mask_rows,
     )
 
 
-@gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE)
+@gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_VALUE)
 def _value_kernel(
     input_ptr,
     input_scale_ptr,
@@ -236,16 +233,12 @@ def _value_kernel(
     logical_sequence_length,
     row_block_offset,
     storage_tiles,
+    chunk_count,
     input_features: gl.constexpr,
     heads: gl.constexpr,
-    is_causal: gl.constexpr,
     mask_rows: gl.constexpr,
 ):
-    """Project a V tile and emit transposed per-token INT8 values with their metadata.
-
-    Non-causal V subtracts the projected input mean; causal V stays uncentered, and
-    its first row block writes the zero mean.
-    """
+    """Project a V tile, subtract its V1024 chunk mean, and emit transposed INT8 values."""
     head = gl.program_id(0)
     row_block = row_block_offset + gl.program_id(1)
     batch = gl.program_id(2)
@@ -265,15 +258,19 @@ def _value_kernel(
     )
 
     batch_head = batch * heads + head
-    mean_pointers = mean_ptr + batch_head * _GL_HEAD_DIM + features
-    if is_causal:
-        if row_block == 0:
-            gl.store(mean_pointers, gl.zeros(features.shape, gl.float32, features.type.layout))
-    else:
-        value -= gl.load(mean_pointers)[None, None, :]
+    chunk = (row_block * _GL_BLOCK_M) // 1024
+    mean_pointers = (
+        mean_ptr
+        + (batch_head.to(gl.int64) * chunk_count.to(gl.int64) + chunk.to(gl.int64)) * _GL_HEAD_DIM
+        + features
+    )
+    chunk_mean = gl.load(mean_pointers)
+    value -= chunk_mean[None, None, :]
     if mask_rows:
         value = gl.where((sequence < logical_sequence_length)[:, :, None], value, 0.0)
-    value_scale = fragments.int8_scale(gl.max(gl.abs(value), axis=2))
+    residual_scale = fragments.int8_scale(gl.max(gl.abs(value), axis=2))
+    mean_floor = gl.max(gl.abs(chunk_mean), axis=0) * _GL_VALUE_MEAN_SCALE_FLOOR
+    value_scale = gl.maximum(residual_scale, mean_floor)
     quantized = fragments.round_to_int8(value / value_scale[:, :, None])
     # NVIDIA attention reads FP16-rounded log scales.
     log_scale = gl.log2(value_scale).to(gl.float16).to(gl.float32)
@@ -370,15 +367,13 @@ def project_key(
     out: KeyOutput,
     execution_plan: NvidiaExecutionPlan,
 ) -> None:
-    """Fill centered INT8 keys with K64 or per-key scales for supported operands."""
-    key, key_scale = out
+    """Fill K1024-centered INT8 keys, scales, and rotated centers for supported operands."""
+    key, key_scale, key_center = out
     batch, heads, storage_length, head_dim = key.shape
     sequence_length = input_qdata.shape[1]
     if batch == 0:
         return
-    stored, partials, mean = centered_projection.allocate_workspace(
-        input_qdata, (batch, heads, storage_length, head_dim), tile_rows=_TILE_ROWS
-    )
+    stored = input_qdata.new_empty((batch, heads, storage_length, head_dim), dtype=torch.bfloat16)
 
     with device_context(input_qdata.device):
 
@@ -393,7 +388,6 @@ def project_key(
                 cos,
                 sin,
                 stored,
-                partials,
                 sequence_length,
                 row_block_offset,
                 storage_length // _TILE_ROWS,
@@ -406,13 +400,11 @@ def project_key(
             )
 
         fragments.launch_row_blocks(sequence_length, launch, mask_full_tiles=False)
-        centered_projection.finalize_mean(partials, sequence_length, out=mean)
-        qk_quantization.prepare_key(
+        piper_quantization.prepare_chunk_centered_key(
             stored.narrow(2, 0, sequence_length),
-            mean,
             grouped=resolve_qk_quantization(key_scale, storage_length) == "per_warp",
             storage_key_length=storage_length,
-            out=out,
+            out=(key, key_scale, key_center),
         )
 
 
@@ -424,30 +416,29 @@ def project_value(
     bias: torch.Tensor | None = None,
     *,
     is_causal: bool,
-    mean_block_n: int,
     out: ValueOutput,
     execution_plan: NvidiaExecutionPlan,
 ) -> None:
-    """Fill transposed per-token INT8 values, multipliers, logs, and the V mean."""
+    """Fill transposed per-token V1024-centered INT8 values, multipliers, logs, and means."""
+    del is_causal
     value, multiplier, log_scale, mean = out
-    batch, heads, _head_dim, storage_length = value.shape
+    batch, heads, head_dim, storage_length = value.shape
     sequence_length = input_qdata.shape[1]
     if batch == 0:
         return
 
     with device_context(input_qdata.device):
-        if not is_causal:
-            # Gluon plans tile K by 64 for the GEMM; the one-row mean keeps K128 tiles.
-            projection.project_value_mean(
-                input_qdata,
-                input_scale,
-                weight_qdata,
-                weight_scale,
-                bias,
-                block_n=mean_block_n,
-                block_k=_MEAN_BLOCK_K,
-                out=mean,
-            )
+        # Gluon plans tile K by 64 for the GEMM; the compact chunk means keep K128 tiles.
+        shared_projection.project_value_chunk_means(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            bias,
+            block_n=execution_plan.resolve_value_mean_block_n(head_dim),
+            block_k=_MEAN_BLOCK_K,
+            out=mean,
+        )
 
         def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
             _value_kernel[(heads, row_blocks, batch)](
@@ -463,9 +454,9 @@ def project_value(
                 sequence_length,
                 row_block_offset,
                 storage_length // _TILE_ROWS,
+                mean.shape[2],
                 input_features=input_qdata.shape[2],
                 heads=heads,
-                is_causal=is_causal,
                 mask_rows=mask_rows,
                 num_warps=execution_plan.num_warps,
             )

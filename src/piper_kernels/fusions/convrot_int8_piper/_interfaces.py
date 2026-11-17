@@ -5,7 +5,7 @@ from typing import Protocol
 import torch
 
 type QueryOutput = tuple[torch.Tensor, torch.Tensor]
-type KeyOutput = tuple[torch.Tensor, torch.Tensor]
+type KeyOutput = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 type ValueOutput = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
 
@@ -15,8 +15,9 @@ class ProjectionBackend(Protocol):
     All storage is contiguous on one device. Q is local to its aligned global
     input window; K/V cover the complete sequence. Q/K storage is padded to 64
     rows, with FP32 scales per Q32/K64 group or per row as ``out`` is sized; see
-    ``count_query_scales`` and ``count_key_scales``. V uses target-native codes
-    and per-token FP32 multipliers/logs, plus a per-head mean.
+    ``count_query_scales`` and ``count_key_scales``. K also emits FP32 K1024
+    rotated chunk centers ``[B, H, C, D]``. V uses target-native codes and
+    per-token FP32 multipliers/logs, plus FP32 V1024 chunk means ``[B, H, C, D]``.
     """
 
     def project_query(  # noqa: PLR0913

@@ -1,4 +1,4 @@
-"""ConvRot INT8 K projection with a global post-RMSNorm/RoPE mean."""
+"""ConvRot INT8 K projection with K1024 chunk centering."""
 
 import torch
 
@@ -17,10 +17,12 @@ def _new_outputs(
 ) -> KeyOutput:
     batch, sequence, heads, head_dim = shape
     storage = (sequence + 63) // 64 * 64
+    chunks = (sequence + 1023) // 1024
     num_scales = count_key_scales(storage, validate_qk_quantization(qk_quantization))
     return (
         input_qdata.new_empty((batch, heads, storage, head_dim)),
         input_qdata.new_empty((batch, heads, num_scales), dtype=torch.float32),
+        input_qdata.new_empty((batch, heads, chunks, head_dim), dtype=torch.float32),
     )
 
 
@@ -38,8 +40,8 @@ def _project_key_op(  # noqa: PLR0913
     *,
     head_dim: int | None = None,
     qk_quantization: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Produce INT8 K after centering the complete transformed sequence.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Produce K1024-centered INT8 K, scales, and rotated chunk centers.
 
     ``qk_quantization`` selects K64 scales (``per_warp``) or per-thread groups
     stored per key (``per_thread``). Pass the granularity the target's quantized attention
@@ -93,7 +95,7 @@ def _project_key_op_fake(  # noqa: PLR0913
     *,
     head_dim: int | None = None,
     qk_quantization: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     shape = validate_qk_inputs(
         input_qdata,
         input_scale,

@@ -180,7 +180,7 @@ def test_output_rewrite_keeps_a_different_logical_query_extent(monkeypatch):
     )
     # Q storage can describe a different logical extent within its final Q64 tile.
     # The output fusion must retain the extent actually consumed by attention.
-    attention.args = (*attention.args[:8], 96, *attention.args[9:])
+    attention.args = (*attention.args[:9], 96, *attention.args[10:])
     reshaped = linear.args[0]
     cloned = reshaped.args[0]
     with attention.meta["val"].fake_mode:

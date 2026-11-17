@@ -25,13 +25,12 @@ _OPERATION_GRANULARITIES = [
     ("key", "per_thread"),
     ("value", "per_warp"),
 ]
-# Each kernel varies only the constexprs it reads: Q its scale granularity, V causality.
+# Each kernel varies only the constexprs it reads: Q its scale granularity.
 _COMPILE_VARIANTS = [
     *(("query", variant) for variant in ("full_tiles", "masked_tail", "per_warp")),
     ("query", "bias_without_norm"),
     *(("key", variant) for variant in ("full_tiles", "masked_tail", "bias_without_norm")),
-    *(("value", variant) for variant in ("full_tiles", "masked_tail", "causal")),
-    ("value", "bias_without_norm"),
+    *(("value", variant) for variant in ("full_tiles", "masked_tail", "bias_without_norm")),
 ]
 _NVIDIA = torch.cuda.is_available() and AcceleratorTarget.from_device(
     torch.device("cuda")
@@ -85,8 +84,6 @@ def _launch(
     **options,
 ):
     input_qdata, input_scale, weight_qdata, weight_scale, *_ = operands
-    if module is gluon_async_copy and operation == "value":
-        options.setdefault("mean_block_n", policy.VALUE_MEAN_BLOCK_N)
     if module in (dispatch, gluon_async_copy) and "execution_plan" not in options:
         metadata = {
             "operation": operation,
@@ -210,29 +207,32 @@ def test_other_nvidia_targets_have_no_dense_projection_policy(architecture):
 
 
 @pytest.mark.parametrize(
-    ("operation", "granularity", "causal"),
-    [(*case, False) for case in _OPERATION_GRANULARITIES] + [("value", "per_warp", True)],
+    ("operation", "granularity"),
+    _OPERATION_GRANULARITIES,
 )
-def test_gluon_launches_full_tiles_then_one_masked_tail(  # noqa: PLR0915
-    monkeypatch, operation, granularity, causal
-):
+def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, granularity):
     function = getattr(gluon_async_copy, f"_{operation}_kernel")
     kernel = MagicMock()
     monkeypatch.setattr(gluon_async_copy, function.__name__, kernel)
-    project_value_mean = Mock()
-    monkeypatch.setattr(gluon_async_copy.projection, "project_value_mean", project_value_mean)
+    project_value_chunk_means = Mock()
+    monkeypatch.setattr(
+        gluon_async_copy.shared_projection,
+        "project_value_chunk_means",
+        project_value_chunk_means,
+    )
     guard = Mock(side_effect=lambda device: nullcontext())
     monkeypatch.setattr(gluon_async_copy, "device_context", guard)
-    finalize_mean, encode_key = Mock(), Mock()
-    monkeypatch.setattr(gluon_async_copy.centered_projection, "finalize_mean", finalize_mean)
-    monkeypatch.setattr(gluon_async_copy.qk_quantization, "prepare_key", encode_key)
+    encode_key = Mock()
+    monkeypatch.setattr(
+        gluon_async_copy.piper_quantization, "prepare_chunk_centered_key", encode_key
+    )
     sequence, window = 448, (128, 300)
     rows = window[1] if operation == "query" else sequence
     storage = (rows + 63) // 64 * 64
     with FakeTensorMode():
         operands = _operands("cuda:1", sequence=sequence)
         out = _outputs(operation, "cuda:1", rows=rows, granularity=granularity)
-        _launch(gluon_async_copy, operation, operands, out, window=window, causal=causal)
+        _launch(gluon_async_copy, operation, operands, out, window=window, causal=False)
 
     guard.assert_called_once_with(torch.device("cuda:1"))
     # Heads vary fastest, then 128-row blocks, then the batch.
@@ -251,27 +251,32 @@ def test_gluon_launches_full_tiles_then_one_masked_tail(  # noqa: PLR0915
             assert arguments["query_sequence_end"] == sum(window)
             assert arguments["per_thread_scales"] is (granularity == "per_thread")
         if operation == "value":
-            assert arguments["is_causal"] is causal
-    # The shared Triton launcher projects the V mean that non-causal V subtracts.
-    if operation == "value" and not causal:
-        project_value_mean.assert_called_once()
-        assert project_value_mean.call_args.kwargs["block_n"] == policy.VALUE_MEAN_BLOCK_N
-        assert project_value_mean.call_args.kwargs["out"] is out[3]
+            assert arguments["chunk_count"] == 1
+    if operation == "value":
+        expected_plan = policy.select_execution_plan(
+            _SM89_TARGET,
+            operation="value",
+            input_features=operands[0].shape[2],
+            head_dim=128,
+            operands_aligned=True,
+        )
+        project_value_chunk_means.assert_called_once()
+        assert (
+            project_value_chunk_means.call_args.kwargs["block_n"]
+            == expected_plan.value_mean_block_n
+        )
+        assert project_value_chunk_means.call_args.kwargs["out"] is out[3]
     else:
-        project_value_mean.assert_not_called()
+        project_value_chunk_means.assert_not_called()
     if operation == "key":
-        stored, partials = calls[0].args[8:10]
+        stored = calls[0].args[8]
         assert stored.dtype is torch.bfloat16
         assert stored.shape == out[0].shape
-        assert partials.shape == (2, 3, storage // 64, 128)
-        finalize_mean.assert_called_once()
-        assert finalize_mean.call_args.args == (partials, sequence)
         encode_key.assert_called_once()
         assert encode_key.call_args.kwargs["grouped"] is (granularity == "per_warp")
         assert encode_key.call_args.kwargs["storage_key_length"] == storage
         assert encode_key.call_args.kwargs["out"] == out
     else:
-        finalize_mean.assert_not_called()
         encode_key.assert_not_called()
 
 
@@ -349,6 +354,8 @@ def _assert_matches(operation, actual, expected):
     torch.testing.assert_close(
         actual[1], expected[1], rtol=3e-3 if operation == "key" else 1e-5, atol=0
     )
+    if operation == "key":
+        torch.testing.assert_close(actual[2], expected[2], rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.gpu
@@ -386,11 +393,7 @@ def test_gluon_projections_match_the_triton_launchers(operation, granularity, ca
     allocation = {"rows": rows, "batch": batch, "granularity": granularity}
     expected = _outputs(operation, "cuda", **allocation)
     actual = _outputs(operation, "cuda", **allocation)
-    triton_options = (
-        {"packed_amd": False, "mean_block_n": policy.VALUE_MEAN_BLOCK_N}
-        if operation == "value"
-        else {}
-    )
+    triton_options = {"packed_amd": False} if operation == "value" else {}
 
     _launch(
         projection,

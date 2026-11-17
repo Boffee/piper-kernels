@@ -18,23 +18,23 @@ def test_output_rejects_invalid_metadata_without_tensor_operations(invalid):
     args = list(_arguments(device="meta", sequence=65))
     chunk_rows = 128
     if invalid == "width":
-        args[19] = torch.empty(80, 64, device="meta", dtype=torch.int8)
+        args[20] = torch.empty(80, 64, device="meta", dtype=torch.int8)
     elif invalid == "bias":
-        args[21] = torch.empty(79, device="meta")
+        args[22] = torch.empty(79, device="meta")
     elif invalid == "scale":
-        args[23] = torch.empty(1, device="meta")
+        args[24] = torch.empty(1, device="meta")
     elif invalid == "group":
-        args[22] = 32
+        args[23] = 32
     elif invalid == "device":
-        args[20] = torch.empty(80, 1)
+        args[21] = torch.empty(80, 1)
     elif invalid == "causal":
-        args[17] = True
+        args[18] = True
     elif invalid == "dtype":
-        args[18] = torch.float32
+        args[19] = torch.float32
     elif invalid == "chunk":
         chunk_rows = 64
     elif invalid == "grad":
-        args[20].requires_grad_()
+        args[21].requires_grad_()
     with _MetadataOnly(), pytest.raises((ValueError, TypeError, RuntimeError)):
         output._validate_inputs(*args, head_dim=64, query_chunk_rows=chunk_rows)
 
@@ -42,7 +42,7 @@ def test_output_rejects_invalid_metadata_without_tensor_operations(invalid):
 @pytest.mark.parametrize("batch", [0, 2])
 def test_output_fake_allocates_only_final_output_and_empty_batch_skips_hardware(monkeypatch, batch):
     args = list(_arguments(device="meta", sequence=65))
-    for index in (0, 1, 10, 11, 12, 13, 14, 15):
+    for index in (0, 1, 10, 11, 12, 13, 14, 15, 16):
         args[index] = args[index][:batch]
 
     def forbidden(*args, **kwargs):

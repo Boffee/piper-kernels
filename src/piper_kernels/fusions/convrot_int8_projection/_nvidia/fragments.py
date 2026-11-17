@@ -8,8 +8,8 @@ Q and K split warps only across rows and permute the weight rows, so each thread
 holds 4 consecutive features of every row it owns, with the other feature bits in
 registers or its lane quad. Loads of cos/sin are then 16 bytes wide, and RoPE
 pairs stay in registers. The signed Hadamard runs five of its seven stages in
-registers and the other two as butterfly shuffles. K stores BF16 rows and FP32
-tile sums for the shared encoder, which centers K by its global mean.
+registers and the other two as butterfly shuffles. K stores rotated BF16 rows
+for sparse (K64) or dense (K1024) key quantization.
 
 V keeps a 2x2 warp grid; ``project_value_tiles`` owns its epilogue layout, and
 ``store_value_codes`` its transposed ``[D128, S]`` code storage.
@@ -348,46 +348,6 @@ def store_summaries(pointer, summaries, first_block, storage_blocks, mask_rows: 
         gl.store(pointers, summaries, mask=(blocks < storage_blocks)[:, None])
     else:
         gl.store(pointers, summaries)
-
-
-@gluon.jit
-def store_centered_key(
-    stored_ptr,
-    partial_ptr,
-    values,
-    batch,
-    heads: gl.constexpr,
-    head,
-    row_block,
-    storage_tiles,
-    tile_rows: gl.constexpr,
-    mask_rows: gl.constexpr,
-):
-    """Store the 128-row K tile ``row_block`` for the centered encoder.
-
-    Rows are stored as BF16, with FP32 sums of each stored tile's values; the shared
-    encoder reduces the sums to the global mean that centers K.
-    """
-    tiles: gl.constexpr = _GL_BLOCK_M // tile_rows
-    stored = values.to(gl.bfloat16)
-    stored_tiles = gl.reshape(stored.to(gl.float32), [tiles, tile_rows, _GL_HEAD_DIM])
-    tile_sums = gl.sum(stored_tiles, axis=1)
-    batch_head = batch * heads + head
-    storage_rows = storage_tiles * tile_rows
-    store_rows(
-        stored_ptr + batch_head.to(gl.int64) * storage_rows * _GL_HEAD_DIM,
-        stored,
-        row_block * _GL_BLOCK_M,
-        storage_rows,
-        mask_rows,
-    )
-    store_summaries(
-        partial_ptr + batch_head * storage_tiles * _GL_HEAD_DIM,
-        tile_sums,
-        row_block * tiles,
-        storage_tiles,
-        mask_rows,
-    )
 
 
 @gluon.jit

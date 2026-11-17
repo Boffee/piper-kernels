@@ -8,12 +8,12 @@ from piper_kernels.fusions.convrot_int8_piper import output
 from .test_output import _arguments
 from .test_query import _NATIVE
 
-_OUTPUT_DTYPE_INDEX = 18
+_OUTPUT_DTYPE_INDEX = 19
 
 
 def _residual_operands(arguments, device):
     batch, sequence = arguments[0].shape[:2]
-    output_features = arguments[19].shape[0]
+    output_features = arguments[20].shape[0]
     dtype = arguments[_OUTPUT_DTYPE_INDEX]
     torch.manual_seed(911)
     base = torch.randn(batch, sequence, output_features, device=device, dtype=dtype)
@@ -86,7 +86,7 @@ def test_residual_add_requires_one_base_row_per_query_token():
 def test_residual_add_validates_attention_operands_from_metadata():
     # Causal attention needs equal query and key lengths; these keys are 17 rows longer.
     arguments = list(_arguments(sequence=65, device="meta"))
-    arguments[17] = True
+    arguments[18] = True
     base, gate, gate_indices = _residual_operands(arguments, "meta")
     with pytest.raises(ValueError, match="square causal attention"):
         output._projected_query_attention_residual_add_op_fake(

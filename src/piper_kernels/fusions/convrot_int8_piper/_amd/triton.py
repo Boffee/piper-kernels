@@ -11,5 +11,4 @@ project_value = partial(
     projection.project_value,
     execution_plan=policy.EXECUTION_PLAN,
     packed_amd=policy.PACKED_VALUE,
-    mean_block_n=policy.VALUE_MEAN_BLOCK_N,
 )

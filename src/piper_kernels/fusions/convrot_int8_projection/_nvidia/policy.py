@@ -24,6 +24,8 @@ SM8X_TRITON_EXECUTION_PLAN = NvidiaExecutionPlan(
     num_stages=3,
     group_m=8,
     round_rsqrt_to_nearest=True,
+    # The compact mean projection needs more CTAs than the full matrix projection.
+    value_mean_block_n=32,
 )
 _GLUON_EXECUTION_PLAN = NvidiaExecutionPlan(
     block_m=GLUON_BLOCK_M,
@@ -32,6 +34,7 @@ _GLUON_EXECUTION_PLAN = NvidiaExecutionPlan(
     num_warps=GLUON_NUM_WARPS,
     num_stages=GLUON_NUM_STAGES,
     round_rsqrt_to_nearest=True,
+    value_mean_block_n=32,
     kernel="gluon_async_copy",
 )
 

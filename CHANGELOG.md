@@ -19,6 +19,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   instead of using sequence-wide global mean reductions. Numerical outputs
   differ from prior releases (including full-keep configurations), so callers
   upgrading should revalidate end-to-end quality.
+- Replaced sequence-wide K/V mean centering in `piper_attention` and `convrot_int8_piper` with independent `1024`-token chunk centering (`K1024 + V1024`) across both causal and non-causal paths, updating `piper_kernels::piper_attention_from_quantized` and its offline SM8x/SM120/RDNA4 compiler paths.
+
+### Removed
+
+- Removed `convrot_int8_centered_projection` and `convrot_int8_sage_qk`; global key-mean centering helpers were superseded by chunk-centered KV projection, and the shared RMSNorm/RoPE Q/K helpers were folded into `convrot_int8_projection`.
 
 ## [0.8.0rc6] - 2026-11-12
 

@@ -32,12 +32,12 @@ def _wave_query_chunk_rows(
     ties retain balanced storage and its minimum launch count.
     """
     balanced = _balanced_query_chunk_rows(sequence, maximum)
-    if sequence <= maximum:
+    if sequence <= maximum or concurrent_blocks < 1:
         return balanced
     waves = (maximum // block_rows * parallel_heads) // concurrent_blocks
     wave_rows = waves * concurrent_blocks // parallel_heads * block_rows
     wave_rows = wave_rows // _ALIGNMENT * _ALIGNMENT
-    if wave_rows == 0:
+    if wave_rows < _ALIGNMENT:
         return balanced
 
     def total_waves(rows: int) -> int:

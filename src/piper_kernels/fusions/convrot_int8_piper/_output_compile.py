@@ -43,7 +43,7 @@ def _attention_source(node: object) -> torch.fx.Node | None:  # noqa: PLR0911
         if attention.target is torch.ops.piper_kernels.piper_attention_from_quantized.default
         and len(attention.users) == 1
         and not attention.kwargs
-        and len(attention.args) == 12
+        and len(attention.args) == 13
         else None
     )
 
@@ -102,11 +102,12 @@ def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple, dict] | None:  # noq
     ):
         return None
     # Native operands were validated by the preceding projection/attention rewrite.
-    key, ks, value, multiplier, logs, mean, _query_length, key_length, causal, dtype = context
+    key, ks, kc, value, multiplier, logs, mean, _query_length, key_length, causal, dtype = context
     arguments = (
         *producer.args,
         key,
         ks,
+        kc,
         value,
         multiplier,
         logs,
@@ -133,7 +134,7 @@ def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple, dict] | None:  # noq
         return None
     if not all(
         statically_known_true(a == b)
-        for a, b in zip(projected.shape, (batch, sequence, values[19].shape[0]), strict=True)
+        for a, b in zip(projected.shape, (batch, sequence, values[20].shape[0]), strict=True)
     ):
         return None
     if linear_backend.select_linear_backend(input_value) is None:
