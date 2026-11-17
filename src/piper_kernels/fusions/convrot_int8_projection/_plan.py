@@ -15,6 +15,8 @@ class ProjectionExecutionPlan:
     group_m: int = 0
     round_rsqrt_to_nearest: bool = False
     value_mean_block_n: int | None = None
+    # Fence only LDS at barriers; an RDNA workaround in _triton.amd_compiler_workarounds.
+    lds_only_fences: bool = False
 
     def resolve_value_mean_block_n(self, head_dim: int) -> int:
         """Return explicit chunk-mean N tiling or fall back to one CTA per head."""

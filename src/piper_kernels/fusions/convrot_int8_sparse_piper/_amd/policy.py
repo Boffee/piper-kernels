@@ -28,6 +28,7 @@ QK_EXECUTION_PLAN = ProjectionExecutionPlan(
     num_warps=4,
     num_stages=2,
     group_m=8,
+    lds_only_fences=True,
 )
 VALUE_EXECUTION_PLAN = ProjectionExecutionPlan(
     block_m=2 * TILE_ROWS,
@@ -36,4 +37,5 @@ VALUE_EXECUTION_PLAN = ProjectionExecutionPlan(
     num_warps=8,
     num_stages=2,
     group_m=8,
+    lds_only_fences=True,
 )

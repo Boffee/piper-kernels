@@ -21,6 +21,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   (including full-keep configurations), so callers upgrading should revalidate
   end-to-end quality.
 - Replaced sequence-wide K/V mean centering in `piper_attention` and `convrot_int8_piper` with independent `1024`-token chunk centering (`K1024 + V1024`) across both causal and non-causal paths, updating `piper_kernels::piper_attention_from_quantized` and its offline SM8x/SM120/RDNA4 compiler paths.
+- On RX 9070 XT, ConvRot INT8 linears run 1–5% faster (4–6% with Triton 3.9), fused
+  sparse Piper Q/K/V projections about 8% faster, and H3 VAE Conv3D about 1.5% faster,
+  with bitwise-identical outputs. ROCm Triton kernels recompile once after upgrading.
 
 ### Removed
 

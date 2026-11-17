@@ -40,8 +40,8 @@ uv --no-config pip install --python .venv-rocm/bin/python --group test \
 
 PyTorch 2.15 for ROCm 10.0 (`torch==2.15.0+rocm10.0` from PyTorch's `rocm10.0`
 index) with Triton 3.9 also passes the regressions. Attention uses RDNA4 codegen
-workarounds there ([dense implementation guide](../src/piper_kernels/attention/piper_attention/README.md#rdna4-behavior)),
-and ConvRot INT8 linear/FFN kernels remain 2–5% slower with Triton 3.9 than 3.8.
+workarounds there ([dense implementation guide](../src/piper_kernels/attention/piper_attention/README.md#rdna4-behavior)).
+ConvRot INT8 linear and FFN kernels run within about 3% of Triton 3.8.
 
 AMD dispatch accepts Linux and Windows within the same architecture limits,
 though on-device INT8 validation currently covers Linux RX 9070 XT (`gfx1201`)

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from _accelerators import rocm_fences_only_lds
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.convrot_int8_piper import _backend, _kernels, key, value
@@ -78,3 +79,5 @@ def test_context_launches_compile_for_rdna4(monkeypatch, arch, head_dim, operati
         assert "v_wmma_i32_16x16x16_iu8" in compiled.asm["amdgcn"]
         assert compiled.metadata.shared <= 65536
         assert ("arith.truncf" in compiled.asm["ttgir"]) is (operation == "key")
+        if rocm_fences_only_lds():
+            assert "global_inv" not in compiled.asm["amdgcn"]

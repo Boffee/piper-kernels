@@ -60,4 +60,5 @@ def select_execution_plan(
             else convolution_schedule
         ),
         use_weight_descriptor=False,
+        lds_only_fences=True,
     )

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 import triton
+from _accelerators import rocm_fences_only_lds
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
@@ -744,7 +745,11 @@ def test_production_launches_compile_with_expected_storage_precision(
         compiled = triton.compile(
             ASTSource(function, signature, constexprs=constants),
             target=target,
-            options={name: call.kwargs[name] for name in ("num_warps", "num_stages")},
+            options={
+                name: call.kwargs[name]
+                for name in ("num_warps", "num_stages", "llvm_fn_attrs")
+                if name in call.kwargs
+            },
         )
         if target.backend == "cuda":
             assert compiled.asm["cubin"]
@@ -754,6 +759,8 @@ def test_production_launches_compile_with_expected_storage_precision(
         else:
             assert "v_wmma_i32_16x16x16_iu8" in compiled.asm["amdgcn"]
             assert compiled.metadata.shared <= 65536
+            if rocm_fences_only_lds():
+                assert "global_inv" not in compiled.asm["amdgcn"]
         truncations = [
             line for line in compiled.asm["ttgir"].splitlines() if "arith.truncf" in line
         ]

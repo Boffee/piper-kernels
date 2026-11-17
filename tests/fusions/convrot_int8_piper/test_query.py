@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import triton
+from _accelerators import rocm_fences_only_lds
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
@@ -322,6 +323,8 @@ def test_production_query_launches_compile_for_rdna4(monkeypatch, arch, head_dim
         assert "v_wmma_i32_16x16x16_iu8" in compiled.asm["amdgcn"]
         assert compiled.metadata.shared <= 65536
         assert "arith.truncf" not in compiled.asm["ttgir"]
+        if rocm_fences_only_lds():
+            assert "global_inv" not in compiled.asm["amdgcn"]
 
 
 def _compile_rdna4_launch(function, call, arch):
@@ -346,7 +349,9 @@ def _compile_rdna4_launch(function, call, arch):
         ASTSource(function, signature, constexprs=constants),
         target=GPUTarget("hip", arch, 32),
         options={
-            name: call.kwargs[name] for name in ("num_warps", "num_stages") if name in call.kwargs
+            name: call.kwargs[name]
+            for name in ("num_warps", "num_stages", "llvm_fn_attrs")
+            if name in call.kwargs
         },
     )
     return compiled

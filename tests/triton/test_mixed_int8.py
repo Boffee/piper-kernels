@@ -200,6 +200,8 @@ import torch
 from triton import knobs
 
 torch.version.cuda = '13.0' if {cuda_build!r} else None
+# ROCm builds also install the RDNA4 compiler-workaround hook; isolate the CUDA hook here.
+torch.version.hip = None
 
 def forbidden(*args, **kwargs):
     raise AssertionError('import must not initialize or probe a device')

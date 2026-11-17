@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.weights.convrot import triton as rotation_backend
 from piper_kernels.weights.convrot.int8 import triton as int8_kernels
@@ -573,6 +574,7 @@ def _conv3d_prepared(
             loop_num_stages=schedule.num_stages,
             num_warps=schedule.num_warps,
             num_stages=schedule.num_stages,
+            **lds_only_fence_options(execution_plan.lds_only_fences),
         )
     return output
 
