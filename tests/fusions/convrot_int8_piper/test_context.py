@@ -270,3 +270,80 @@ def test_zero_projection_retains_usable_scales_and_opcheck(causal):
     torch.library.opcheck(
         value._project_value_op, tuple(operands[:4]), kwargs={"head_dim": 64, "is_causal": causal}
     )
+
+
+@pytest.mark.gpu
+@_NATIVE
+@pytest.mark.parametrize("granularity", ["per_warp", "per_thread"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_key_chunk_does_not_depend_on_future_chunks(granularity, head_dim):
+    operands = _operands("cuda", sequence=1057, head_dim=head_dim)
+    first = key._project_key_op(*operands, 1e-6, head_dim=head_dim, qk_quantization=granularity)
+    operands[0][:, 1024:].zero_()
+    second = key._project_key_op(*operands, 1e-6, head_dim=head_dim, qk_quantization=granularity)
+    scale_count = 16 if granularity == "per_warp" else 1024
+    torch.testing.assert_close(first[0][:, :, :1024], second[0][:, :, :1024], atol=0, rtol=0)
+    torch.testing.assert_close(
+        first[1][:, :, :scale_count], second[1][:, :, :scale_count], atol=0, rtol=0
+    )
+    torch.testing.assert_close(first[2][:, :, :1], second[2][:, :, :1], atol=0, rtol=0)
+
+
+@pytest.mark.gpu
+@_NATIVE
+@pytest.mark.parametrize("input_features", [256, 272])
+@pytest.mark.parametrize("constant_value", [2.0**100, -(2.0**100)])
+def test_value_bounds_large_constant_chunk_scale(input_features, constant_value):
+    input_qdata = torch.zeros((1, 1088, input_features), device="cuda", dtype=torch.int8)
+    input_scale = torch.ones((1, 1088), device="cuda", dtype=torch.float32)
+    weight_qdata = torch.zeros((2 * 128, input_features), device="cuda", dtype=torch.int8)
+    weight_qdata[:, 0] = 1
+    input_qdata[:, 1024:, 0] = 1
+    weight_scale = torch.ones((2 * 128, 1), device="cuda", dtype=torch.float32)
+    bias = torch.full((2 * 128,), constant_value, device="cuda", dtype=torch.bfloat16)
+
+    v, multipliers, logs, mean = value._project_value_op(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias=bias,
+        head_dim=128,
+        is_causal=False,
+    )
+
+    assert not bool(v.any())
+    torch.testing.assert_close(mean, torch.full_like(mean, constant_value), atol=0, rtol=0)
+    assert bool((multipliers >= abs(constant_value) * (2.0**-80) * 255.0).all())
+    assert torch.isfinite(logs).all()
+    target = AcceleratorTarget.from_device(v.device)
+    if target.is_nvidia_cuda and dispatch.supports_quantized_query(target):
+        granularity = dispatch.select_qk_quantization(target)
+        q = torch.zeros((1, 2, 1088, 128), device="cuda", dtype=torch.bfloat16)
+        qdata, qs = quantization.prepare_query(
+            q, 128**-0.5, grouped=granularity == "per_warp", storage_query_length=1088
+        )
+        k_int8 = torch.zeros((1, 2, 1088, 128), device="cuda", dtype=torch.int8)
+        k_scales = torch.ones(
+            (1, 2, 1088 // 64 if granularity == "per_warp" else 1088),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        k_center = torch.zeros((1, 2, 2, 128), device="cuda", dtype=torch.float32)
+        out = dispatch._piper_attention_from_quantized_op(
+            qdata,
+            qs,
+            k_int8,
+            k_scales,
+            k_center,
+            v,
+            multipliers,
+            logs,
+            mean,
+            1088,
+            1088,
+            False,
+            torch.bfloat16,
+        )
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out, torch.full_like(out, constant_value), atol=0, rtol=0)

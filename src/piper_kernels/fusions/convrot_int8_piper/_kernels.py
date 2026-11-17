@@ -274,8 +274,13 @@ def _project_value_kernel(  # noqa: PLR0913, PLR0917
     mean = tl.load(mean_ptr + mean_offsets, head_offsets[:, None] < heads, 0.0)
     value_3d = value.reshape((block_m, heads_per_program, head_dim)) - mean[None, :, :]
     value_3d = tl.where(rows[:, None, None] < sequence_length, value_3d, 0.0)
+    scale_floor_per_head = tl.max(tl.abs(mean), axis=1) * _quantization._VALUE_MEAN_SCALE_FLOOR
+    scale_floor = tl.broadcast_to(
+        scale_floor_per_head[None, :], (block_m, heads_per_program)
+    ).reshape((block_m * heads_per_program,))
     codes, scales = _quantization.quantize_value_rows(
-        value_3d.reshape((block_m * heads_per_program, head_dim))
+        value_3d.reshape((block_m * heads_per_program, head_dim)),
+        scale_floor=scale_floor,
     )
     codes = codes.reshape((block_m, heads_per_program, head_dim)).permute((1, 0, 2))
     scales = scales.reshape((block_m, heads_per_program)).T

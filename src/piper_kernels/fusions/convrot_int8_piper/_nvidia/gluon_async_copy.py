@@ -30,10 +30,10 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
     resolve_qk_quantization,
 )
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
+from piper_kernels.fusions.convrot_int8_projection import triton as shared_projection
 from piper_kernels.fusions.convrot_int8_projection._nvidia import fragments
 from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import NvidiaExecutionPlan
 
-from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 
 # K/V storage and K tile sums use K64 tiles.
@@ -45,6 +45,7 @@ _GL_BLOCK_M = gl.constexpr(fragments.BLOCK_M)
 _GL_TILE_ROWS = gl.constexpr(_TILE_ROWS)
 _GL_QUERY_SCALE_ROWS = gl.constexpr(32)
 _GL_P_UINT8_RANGE = gl.constexpr(255.0)
+_GL_VALUE_MEAN_SCALE_FLOOR = gl.constexpr(2.0**-80)
 _GL_LOG2_E = gl.constexpr(1.4426950408889634)
 _GL_FEATURE_LAYOUT = fragments.FEATURE_LAYOUT
 
@@ -263,10 +264,13 @@ def _value_kernel(
         + (batch_head.to(gl.int64) * chunk_count.to(gl.int64) + chunk.to(gl.int64)) * _GL_HEAD_DIM
         + features
     )
-    value -= gl.load(mean_pointers)[None, None, :]
+    chunk_mean = gl.load(mean_pointers)
+    value -= chunk_mean[None, None, :]
     if mask_rows:
         value = gl.where((sequence < logical_sequence_length)[:, :, None], value, 0.0)
-    value_scale = fragments.int8_scale(gl.max(gl.abs(value), axis=2))
+    residual_scale = fragments.int8_scale(gl.max(gl.abs(value), axis=2))
+    mean_floor = gl.max(gl.abs(chunk_mean), axis=0) * _GL_VALUE_MEAN_SCALE_FLOOR
+    value_scale = gl.maximum(residual_scale, mean_floor)
     quantized = fragments.round_to_int8(value / value_scale[:, :, None])
     # NVIDIA attention reads FP16-rounded log scales.
     log_scale = gl.log2(value_scale).to(gl.float16).to(gl.float32)
@@ -425,7 +429,7 @@ def project_value(
 
     with device_context(input_qdata.device):
         # Gluon plans tile K by 64 for the GEMM; the compact chunk means keep K128 tiles.
-        projection.project_value_chunk_means(
+        shared_projection.project_value_chunk_means(
             input_qdata,
             input_scale,
             weight_qdata,

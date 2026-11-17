@@ -216,7 +216,9 @@ def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, 
     monkeypatch.setattr(gluon_async_copy, function.__name__, kernel)
     project_value_chunk_means = Mock()
     monkeypatch.setattr(
-        gluon_async_copy.projection, "project_value_chunk_means", project_value_chunk_means
+        gluon_async_copy.shared_projection,
+        "project_value_chunk_means",
+        project_value_chunk_means,
     )
     guard = Mock(side_effect=lambda device: nullcontext())
     monkeypatch.setattr(gluon_async_copy, "device_context", guard)

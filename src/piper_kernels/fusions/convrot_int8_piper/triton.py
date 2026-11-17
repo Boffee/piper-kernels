@@ -12,9 +12,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 )
 from piper_kernels.attention.piper_attention import _quantization
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
-from piper_kernels.fusions.convrot_int8_projection.triton import (
-    project_value_chunk_means as project_prepared_chunk_means,
-)
+from piper_kernels.fusions.convrot_int8_projection.triton import project_value_chunk_means
 
 from . import _kernels
 from ._interfaces import KeyOutput, QueryOutput, ValueOutput
@@ -171,30 +169,6 @@ def project_key(
             storage_key_length=storage_length,
             out=(key_int8, key_scale, key_center),
         )
-
-
-def project_value_chunk_means(
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    *,
-    block_n: int,
-    block_k: int,
-    out: torch.Tensor,
-) -> None:
-    """Project each 1024-token dequantized input mean into ``out[B, H, C, D]``."""
-    project_prepared_chunk_means(
-        input_qdata,
-        input_scale,
-        weight_qdata,
-        weight_scale,
-        bias,
-        block_n=block_n,
-        block_k=block_k,
-        out=out,
-    )
 
 
 def project_value(
