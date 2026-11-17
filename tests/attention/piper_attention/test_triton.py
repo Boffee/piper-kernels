@@ -1381,3 +1381,44 @@ def test_multi_chunk_shifted_key_means_match_reference(
 
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.parametrize("architecture", ["sm120", "sm89"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("outer_bias", [0.0, 1.0e9])
+def test_three_chunk_negligible_middle_bias_preserves_weights(
+    architecture: str,
+    head_dim: int,
+    outer_bias: float,
+) -> None:
+    query = torch.zeros((1, 1, 129, head_dim), device="cuda", dtype=torch.bfloat16)
+    query[:, :, :, 0] = 1.0
+    key = torch.zeros((1, 1, 3072, head_dim), device="cuda", dtype=torch.bfloat16)
+    key[:, :, :1024, 0] = outer_bias
+    key[:, :, 1024:2048, 0] = -(2.0**30)
+    key[:, :, 2048:, 0] = outer_bias
+    value = torch.zeros((1, 1, 3072, head_dim), device="cuda", dtype=torch.bfloat16)
+    value[:, :, 2048:, :] = 1.0
+    plan = default_execution_plan(
+        query,
+        False,
+        target=AcceleratorTarget("cuda", architecture),
+    )
+
+    with torch.no_grad():
+        actual = _run_piper_attention(
+            query,
+            key,
+            value,
+            1.0,
+            False,
+            execution_plan=plan,
+        )
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual,
+        torch.full_like(actual, 0.5),
+        atol=0.01,
+        rtol=0.01,
+    )

@@ -176,6 +176,26 @@ def _copy_key_metadata(base, start_n, key_length, shared, copy_layout: gl.conste
 
 
 @gluon.jit
+def _advance_tile_max(running_max, running_bias, block_max, k_bias):
+    """Update winner-frame running maximum across chunks without round-tripping."""
+    has_block = block_max != -float("inf")
+    has_running = running_max != -float("inf")
+    raw_delta = (block_max - running_max) + (k_bias - running_bias)
+    delta = gl.where(
+        has_block,
+        gl.where(has_running, raw_delta, float("inf")),
+        -float("inf"),
+    )
+    tile_wins = delta > 0.0
+    next_max = gl.where(tile_wins, block_max, running_max)
+    next_bias = gl.where(tile_wins, k_bias, running_bias)
+    decay = gl.exp2(-gl.abs(delta))
+    old_weight = gl.where(tile_wins, decay, 1.0)
+    current_weight = gl.where(tile_wins, 1.0, decay)
+    return next_max, next_bias, old_weight, current_weight
+
+
+@gluon.jit
 def _probability_tile(
     query,
     key_shared,
@@ -185,6 +205,8 @@ def _probability_tile(
     denominator,
     chunk_denom,
     running_max,
+    running_bias,
+    k_bias,
     start_n,
     global_rows,
     key_length,
@@ -232,12 +254,15 @@ def _probability_tile(
         if is_causal:
             valid = valid & (keys[None, :] <= global_rows[:, None])
         shifted = gl.where(valid, shifted, -float("inf"))
-    # The final tile of every row holds at least one valid key, so each block
-    # maximum is finite. Chunk biases are incorporated once per chunk boundary.
+    # Each K64 tile normalizes in its chunk's unbiased frame; only the winning
+    # running maximum and its chunk bias are retained across chunk boundaries.
     block_max = gl.max(shifted, axis=1)
-    next_max = gl.maximum(running_max, block_max)
-    old_weight = gl.exp2(running_max - next_max)
-    current_weight = gl.exp2(block_max - next_max)
+    next_max, next_bias, old_weight, current_weight = _advance_tile_max(
+        running_max,
+        running_bias,
+        block_max,
+        k_bias,
+    )
     exponent = scores - block_max[:, None]
     if masked:
         exponent = gl.where(valid, exponent, -float("inf"))
@@ -247,7 +272,7 @@ def _probability_tile(
     chunk_denom = chunk_denom * old_weight + row_sum
     codes = packed_float32_to_uint8(probabilities * multiplier[None, :] + 0.5)
     codes = gl.convert_layout(codes, probability_layout)
-    return codes, denominator, chunk_denom, next_max, old_weight, current_weight
+    return codes, denominator, chunk_denom, next_max, next_bias, old_weight, current_weight
 
 
 @gluon.jit
@@ -516,12 +541,6 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
             row_layout,
             head_dim,
         )
-        if chunk > 0:
-            running_max = gl.where(
-                running_max == -float("inf"),
-                running_max,
-                running_max + (running_bias - k_bias),
-            )
         chunk_start = chunk * _GL_TILES_PER_CHUNK
         chunk_end = gl.minimum(chunk_start + _GL_TILES_PER_CHUNK, tile_count)
         for tile in range(chunk_start, chunk_end):
@@ -530,46 +549,62 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
             async_copy.wait_group(1)
             gl.barrier()
             if tile == tile_count - 1 or (is_causal and block_q > _GL_BLOCK and tile >= mask_from):
-                codes, denominator, chunk_denom, running_max, old_weight, current_weight = (
-                    _probability_tile(
-                        query,
-                        key_shared,
-                        query_scale,
-                        key_scale_base,
-                        multiplier_shared,
-                        denominator,
-                        chunk_denom,
-                        running_max,
-                        start_n,
-                        global_rows,
-                        key_length,
-                        mma_layout,
-                        key_layout,
-                        probability_layout,
-                        True,
-                        is_causal,
-                    )
+                (
+                    codes,
+                    denominator,
+                    chunk_denom,
+                    running_max,
+                    running_bias,
+                    old_weight,
+                    current_weight,
+                ) = _probability_tile(
+                    query,
+                    key_shared,
+                    query_scale,
+                    key_scale_base,
+                    multiplier_shared,
+                    denominator,
+                    chunk_denom,
+                    running_max,
+                    running_bias,
+                    k_bias,
+                    start_n,
+                    global_rows,
+                    key_length,
+                    mma_layout,
+                    key_layout,
+                    probability_layout,
+                    True,
+                    is_causal,
                 )
             else:
-                codes, denominator, chunk_denom, running_max, old_weight, current_weight = (
-                    _probability_tile(
-                        query,
-                        key_shared,
-                        query_scale,
-                        key_scale_base,
-                        multiplier_shared,
-                        denominator,
-                        chunk_denom,
-                        running_max,
-                        start_n,
-                        global_rows,
-                        key_length,
-                        mma_layout,
-                        key_layout,
-                        probability_layout,
-                        False,
-                        is_causal,
-                    )
+                (
+                    codes,
+                    denominator,
+                    chunk_denom,
+                    running_max,
+                    running_bias,
+                    old_weight,
+                    current_weight,
+                ) = _probability_tile(
+                    query,
+                    key_shared,
+                    query_scale,
+                    key_scale_base,
+                    multiplier_shared,
+                    denominator,
+                    chunk_denom,
+                    running_max,
+                    running_bias,
+                    k_bias,
+                    start_n,
+                    global_rows,
+                    key_length,
+                    mma_layout,
+                    key_layout,
+                    probability_layout,
+                    False,
+                    is_causal,
                 )
             if tile + 1 < tile_count:
                 gl.barrier()
@@ -604,7 +639,6 @@ def _dense_piper_attention_kernel(  # noqa: PLR0912 - constexpr launch variants
                 async_copy.commit_group()
         value_mean = gl.load(value_mean_base + chunk.to(gl.int64) * head_dim + features)
         accumulator += (chunk_denom * 255.0)[:, None] * value_mean[None, :]
-        running_bias = k_bias
         if chunk + 1 < chunk_count:
             chunk_denom = gl.zeros([block_q], gl.float32, row_layout)
 

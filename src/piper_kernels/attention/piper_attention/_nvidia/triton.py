@@ -231,6 +231,26 @@ def _restore_chunk_value_mean(
 
 
 @triton.jit
+def _advance_tile_max(running_max, running_bias, block_max, k_bias, valid_queries):
+    """Update winner-frame running maximum across chunks without round-tripping."""
+    has_block = block_max != -float("inf")
+    has_running = running_max != -float("inf")
+    raw_delta = (block_max - running_max) + (k_bias - running_bias)
+    delta = tl.where(
+        has_block,
+        tl.where(has_running, raw_delta, float("inf")),
+        -float("inf"),
+    )
+    tile_wins = delta > 0.0
+    next_max = tl.where(tile_wins, block_max, running_max)
+    next_bias = tl.where(tile_wins, k_bias, running_bias)
+    decay = tl.exp2(-tl.abs(delta))
+    old_weight = tl.where(valid_queries, tl.where(tile_wins, decay, 1.0), 0.0)
+    current_weight = tl.where(valid_queries, tl.where(tile_wins, 1.0, decay), 0.0)
+    return next_max, next_bias, old_weight, current_weight
+
+
+@triton.jit
 def _attention_tile(  # noqa: PLR0912, PLR0915
     query,
     query_scale,
@@ -243,6 +263,8 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
     denominator,
     chunk_denom,
     running_max,
+    running_bias,
+    k_bias,
     batch_head,
     start_n,
     offsets_m,
@@ -328,16 +350,12 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
         value_log_scale = tl.where(valid_keys, value_log_scale, -float("inf"))
     shifted_scores = scores + value_log_scale[None, :]
     block_max = tl.max(shifted_scores, axis=1)
-    next_max = tl.maximum(running_max, block_max)
-    old_weight = tl.where(
+    next_max, next_bias, old_weight, current_weight = _advance_tile_max(
+        running_max,
+        running_bias,
+        block_max,
+        k_bias,
         valid_queries,
-        tl.exp2(running_max - next_max),
-        0.0,
-    )
-    current_weight = tl.where(
-        valid_queries,
-        tl.exp2(block_max - next_max),
-        0.0,
     )
     probabilities = tl.where(
         valid_queries[:, None] & valid_keys,
@@ -427,7 +445,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             accumulator * old_weight[:, None] + partial.to(tl.float32) * current_weight[:, None]
         )
         numerator = accumulator
-    return numerator, denominator, next_max, chunk_denom
+    return numerator, denominator, next_max, next_bias, chunk_denom
 
 
 @triton.jit
@@ -443,6 +461,8 @@ def _attention_tile_range(
     denominator,
     chunk_denom,
     running_max,
+    running_bias,
+    k_bias,
     kv_batch_head,
     range_start,
     range_stop,
@@ -473,7 +493,7 @@ def _attention_tile_range(
         num_stages=loop_num_stages,
         disable_licm=not loop_licm,
     ):
-        numerator, denominator, running_max, chunk_denom = _attention_tile(
+        numerator, denominator, running_max, running_bias, chunk_denom = _attention_tile(
             query,
             query_scale,
             key_ptr,
@@ -485,6 +505,8 @@ def _attention_tile_range(
             denominator,
             chunk_denom,
             running_max,
+            running_bias,
+            k_bias,
             kv_batch_head,
             start_n,
             global_rows,
@@ -504,7 +526,7 @@ def _attention_tile_range(
             derive_value_log_bound=derive_value_log_bound,
             padded_kv=padded_kv,
         )
-    return numerator, denominator, chunk_denom, running_max
+    return numerator, denominator, chunk_denom, running_max, running_bias
 
 
 @triton.jit
@@ -573,16 +595,8 @@ def _attention_chunk(
         unmasked_query_tiles,
         head_dim,
     )
-    if chunk_idx > 0:
-        # Shift running_max into this chunk's unbiased gauge once so large chunk offsets
-        # cancel via running_bias - k_bias without rounding intra-chunk tile weights.
-        running_max = tl.where(
-            running_max == -float("inf"),
-            running_max,
-            running_max + (running_bias - k_bias),
-        )
     chunk_denom = tl.zeros((block_m,), dtype=tl.float32)
-    numerator, denominator, chunk_denom, running_max = _attention_tile_range(
+    numerator, denominator, chunk_denom, running_max, running_bias = _attention_tile_range(
         query,
         query_scale,
         key_ptr,
@@ -594,6 +608,8 @@ def _attention_chunk(
         denominator,
         chunk_denom,
         running_max,
+        running_bias,
+        k_bias,
         kv_batch_head,
         prefix_start,
         prefix_stop,
@@ -617,7 +633,7 @@ def _attention_chunk(
         padded_kv=padded_kv,
     )
     if has_boundary:
-        numerator, denominator, chunk_denom, running_max = _attention_tile_range(
+        numerator, denominator, chunk_denom, running_max, running_bias = _attention_tile_range(
             query,
             query_scale,
             key_ptr,
@@ -629,6 +645,8 @@ def _attention_chunk(
             denominator,
             chunk_denom,
             running_max,
+            running_bias,
+            k_bias,
             kv_batch_head,
             boundary_start,
             boundary_stop,
@@ -663,7 +681,7 @@ def _attention_chunk(
         split_pv_head_dim=split_pv_head_dim,
         head_dim=head_dim,
     )
-    return numerator, denominator, running_max, k_bias
+    return numerator, denominator, running_max, running_bias
 
 
 @triton.jit

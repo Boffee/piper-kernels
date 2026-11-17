@@ -80,6 +80,26 @@ def _softmax_tile(scores, block_max, scale, multiplier):
     return packed, (sums[0] + sums[1]) + (sums[2] + sums[3])
 
 
+@gluon.jit
+def _advance_tile_max(running_max, running_bias, block_max, k_bias):
+    """Update winner-frame running maximum across chunks without round-tripping."""
+    has_block = block_max != -float("inf")
+    has_running = running_max != -float("inf")
+    raw_delta = (block_max - running_max) + (k_bias - running_bias)
+    delta = gl.where(
+        has_block,
+        gl.where(has_running, raw_delta, float("inf")),
+        -float("inf"),
+    )
+    tile_wins = delta > 0.0
+    next_max = gl.where(tile_wins, block_max, running_max)
+    next_bias = gl.where(tile_wins, k_bias, running_bias)
+    decay = gl.exp2(-gl.abs(delta))
+    old_weight = gl.where(tile_wins, decay, 1.0)
+    current_weight = gl.where(tile_wins, 1.0, decay)
+    return next_max, next_bias, old_weight, current_weight
+
+
 @gluon.jit(
     do_not_specialize=[
         "query_start",
@@ -170,14 +190,6 @@ def _dense_piper_kernel(  # noqa: PLR0915
             head_dim,
             row_layout,
         )
-        if chunk > 0:
-            # Shift running_max into this chunk's unbiased coordinate frame once so large
-            # shared chunk offsets cancel before entering intra-chunk tile weights.
-            running_max = gl.where(
-                running_max == -float("inf"),
-                running_max,
-                running_max + (running_bias - k_bias),
-            )
         chunk_denom = gl.zeros([1, 64], gl.float32, row_layout)
         tile_start = chunk * _GL_TILES_PER_CHUNK
         tile_stop = gl.minimum(tile_start + _GL_TILES_PER_CHUNK, tile_count)
@@ -215,9 +227,12 @@ def _dense_piper_kernel(  # noqa: PLR0915
                 scalar_fma(scores, scale[:, :, None], log_scale[:, None, :]),
                 2,
             )
-            next_max = gl.maximum(running_max, block_max)
-            old_weight = gl.exp2(running_max - next_max)
-            current_weight = gl.exp2(block_max - next_max)
+            next_max, next_bias, old_weight, current_weight = _advance_tile_max(
+                running_max,
+                running_bias,
+                block_max,
+                k_bias,
+            )
             packed, total = _softmax_tile(scores, block_max, scale, multiplier)
             row_sum = total * current_weight
             denominator = denominator * old_weight + row_sum
@@ -233,11 +248,11 @@ def _dense_piper_kernel(  # noqa: PLR0915
                 two_tiles=False,
             )
             running_max = next_max
+            running_bias = next_bias
         value_mean = gl.load(
             value_mean_ptr + (kv_batch_head * key_chunks + chunk) * head_dim + features[None, :]
         )
         numerator += (chunk_denom * 255.0)[:, :, None] * value_mean[:, None, :]
-        running_bias = k_bias
     output = numerator / (gl.maximum(denominator, 1e-30)[:, :, None] * 255.0)
     offsets = batch * stride_ob + head * stride_oh + output_rows[None, :, None] * stride_om
     gl.store(

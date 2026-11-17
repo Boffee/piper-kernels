@@ -390,3 +390,29 @@ def test_window_graph_replay_updates_live_query_data_and_strided_output(causal):
     graph.replay()
     torch.testing.assert_close(output, expected, atol=0, rtol=0)
     assert torch.isnan(backing[:, 65:]).all()
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("outer_bias", [0.0, 1.0e9])
+def test_three_chunk_negligible_middle_bias_preserves_weights(
+    head_dim: int,
+    outer_bias: float,
+) -> None:
+    query = torch.zeros((1, 1, 65, head_dim), device="cuda", dtype=torch.bfloat16)
+    query[:, :, :, 0] = 1.0
+    key = torch.zeros((1, 1, 3072, head_dim), device="cuda", dtype=torch.bfloat16)
+    key[:, :, :1024, 0] = outer_bias
+    key[:, :, 1024:2048, 0] = -(2.0**30)
+    key[:, :, 2048:, 0] = outer_bias
+    value = torch.zeros((1, 1, 3072, head_dim), device="cuda", dtype=torch.bfloat16)
+    value[:, :, 2048:, :] = 1.0
+
+    actual = piper_attention(query, key, value, scale=1.0, is_causal=False)
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual,
+        torch.full_like(actual, 0.5),
+        atol=0.01,
+        rtol=0.01,
+    )

@@ -99,6 +99,30 @@ def _prepare_reference_operands(
     return query_int8, key_int8, query_scale, key_scale, k_bias, value_int8, value_scale, value_mean
 
 
+def _advance_tile_max(
+    running_max: torch.Tensor,
+    running_bias: torch.Tensor,
+    block_max: torch.Tensor,
+    chunk_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Update winner-frame running maximum across chunks without round-tripping."""
+    has_block = block_max != -float("inf")
+    has_running = running_max != -float("inf")
+    raw_delta = (block_max - running_max) + (chunk_bias - running_bias)
+    delta = torch.where(
+        has_block,
+        torch.where(has_running, raw_delta, float("inf")),
+        -float("inf"),
+    )
+    tile_wins = delta > 0.0
+    next_max = torch.where(tile_wins, block_max, running_max)
+    next_bias = torch.where(tile_wins, chunk_bias, running_bias)
+    decay = torch.exp(-torch.abs(delta))
+    old_weight = torch.where(tile_wins, decay, 1.0)
+    current_weight = torch.where(tile_wins, 1.0, decay)
+    return next_max, next_bias, old_weight, current_weight
+
+
 def reference_piper_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -141,14 +165,6 @@ def reference_piper_attention(
         chunk = chunk_start // _CENTER_CHUNK
         chunk_end = min(chunk_start + _CENTER_CHUNK, key_length)
         chunk_bias = k_bias[:, :, :, chunk]
-        if chunk > 0:
-            # Shift running_max into the new chunk's unbiased coordinate frame once so
-            # large shared chunk offsets never enter intra-chunk max/exp normalization.
-            running_max = torch.where(
-                running_max == -float("inf"),
-                running_max,
-                running_max + (running_bias - chunk_bias),
-            )
         chunk_denom = torch.zeros_like(denominator)
         for start in range(chunk_start, chunk_end, _PV_BLOCK):
             stop = min(start + _PV_BLOCK, chunk_end)
@@ -173,9 +189,12 @@ def reference_piper_attention(
             block_value_scale = value_scale[:, :, start:stop]
             shifted_scores = scores + torch.log(block_value_scale[:, :, None, :])
             block_max = shifted_scores.amax(dim=-1)
-            next_max = torch.maximum(running_max, block_max)
-            old_weight = torch.exp(running_max - next_max)
-            current_weight = torch.exp(block_max - next_max)
+            next_max, next_bias, old_weight, current_weight = _advance_tile_max(
+                running_max,
+                running_bias,
+                block_max,
+                chunk_bias,
+            )
             probabilities = torch.nan_to_num(torch.exp(scores - block_max[..., None]))
 
             row_sum = probabilities.sum(dim=-1) * current_weight
@@ -193,8 +212,8 @@ def reference_piper_attention(
             )
             numerator += partial * current_weight[..., None]
             running_max = next_max
+            running_bias = next_bias
         numerator += (chunk_denom * _P_UINT8_RANGE)[..., None] * value_mean[:, :, chunk : chunk + 1]
-        running_bias = chunk_bias
 
     output = numerator / (denominator.clamp_min(1e-30)[..., None] * _P_UINT8_RANGE)
     return output.reshape(query.shape).to(output_dtype)
