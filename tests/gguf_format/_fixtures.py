@@ -1,12 +1,15 @@
-"""Finite packed GGUF fixtures independent of a GGUF parser."""
+"""Finite packed GGUF inputs and independently decoded reference tensors."""
 
 from __future__ import annotations
 
-import gguf
-import numpy as np
+from pathlib import Path
+from zipfile import ZipFile
+
 import torch
 
-from piper_kernels.gguf import GGUF_QUANT_SIZES, GGUFQuantizationType, logical_shape
+from piper_kernels.gguf import GGUF_QUANT_SIZES, GGUFQuantizationType
+
+REFERENCE_PATH = Path(__file__).with_name("reference.zip")
 
 _SCALE_OFFSETS = {
     GGUFQuantizationType.Q4_0: (0,),
@@ -58,22 +61,18 @@ def finite_packed(
     return raw
 
 
-def dequantize_reference(
-    packed: torch.Tensor,
-    quant_type: GGUFQuantizationType,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Decode a fixture with the official GGUF implementation."""
-    dense = gguf.dequantize(
-        packed.numpy(),
-        gguf.GGMLQuantizationType(int(quant_type)),
-    )
-    return (
-        torch.from_numpy(np.asarray(dense).copy())
-        .reshape(logical_shape(tuple(packed.shape), quant_type))
-        .to(dtype)
-    )
+def reference_key(quant_type: GGUFQuantizationType, *, rows: int, features: int, seed: int) -> str:
+    return f"{quant_type.name}-{rows}x{features}-seed{seed}"
 
 
-__all__ = ["dequantize_reference", "finite_packed"]
+def reference_case(
+    quant_type: GGUFQuantizationType, *, seed: int, rows: int = 2, features: int = 256
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load packed rows and their upstream-decoded FP32 values."""
+    key = reference_key(quant_type, rows=rows, features=features, seed=seed)
+    with ZipFile(REFERENCE_PATH) as archive:
+        packed = torch.frombuffer(bytearray(archive.read(f"{key}/packed")), dtype=torch.uint8)
+        dense = torch.frombuffer(
+            bytearray(archive.read(f"{key}/decoded-fp32")), dtype=torch.float32
+        )
+    return packed.reshape(rows, -1), dense.reshape(rows, features)
