@@ -187,7 +187,7 @@ def test_preparation_retains_per_token_scales_and_compact_gqa_storage(head_dim, 
         prepared.context.log_scale,
     ):
         assert tensor.shape[1] == 2
-    centered = value.float() if causal else value.float() - value.float().mean(2, keepdim=True)
+    centered = value.float() - value.float().mean(2, keepdim=True)
     scale = centered.abs().amax(-1) / 127 + 1e-7
     torch.testing.assert_close(
         prepared.context.multiplier[..., :65], scale * 255, rtol=2e-6, atol=1e-7
@@ -235,12 +235,12 @@ def test_prepared_context_can_fill_independent_outputs_for_reused_queries(head_d
 def test_causal_outputs_do_not_depend_on_future_values(head_dim):
     torch.manual_seed(994)
     query, key, value = [
-        torch.randn(1, 2, 129, head_dim, device="cuda", dtype=torch.float16) for _ in range(3)
+        torch.randn(1, 2, 1057, head_dim, device="cuda", dtype=torch.float16) for _ in range(3)
     ]
     expected = piper_attention(query, key, value, is_causal=True)
-    value[:, :, 47:] *= 16
+    value[:, :, 1024:] *= 16
     actual = piper_attention(query, key, value, is_causal=True)
-    torch.testing.assert_close(actual[:, :, :47], expected[:, :, :47], atol=0, rtol=0)
+    torch.testing.assert_close(actual[:, :, :1024], expected[:, :, :1024], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
