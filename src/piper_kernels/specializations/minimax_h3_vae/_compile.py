@@ -34,13 +34,12 @@ _SM120_MATMUL_SCHEDULES: dict[_LinearShape, _MatmulSchedule] = {
     (7_188, 2_048, 8_192): (128, 128, 128, 4, 2),
 }
 
-# RX 9070 XT measurements retain the generic RDNA4 plan for H3's wider FFN
-# expansion and larger projection batches. Only these exact small-output shapes
-# benefit from halving the output tile width.
-_RDNA4_MATMUL_SCHEDULES: dict[_LinearShape, _MatmulSchedule] = {
-    (1_797, 2_048, 2_048): (128, 128, 64, 8, 2),
-    (1_797, 2_048, 8_192): (128, 128, 64, 8, 2),
-    (3_594, 2_048, 8_192): (128, 128, 64, 8, 2),
+# The narrow N128 tile helps the small square projection. For the two down
+# projections, gfx1201's ordinary wide-K GEMM is faster than this override.
+_RDNA4_N128_ARCHITECTURES: dict[_LinearShape, tuple[str, ...]] = {
+    (1_797, 2_048, 2_048): ("gfx1200", "gfx1201"),
+    (1_797, 2_048, 8_192): ("gfx1200",),
+    (3_594, 2_048, 8_192): ("gfx1200",),
 }
 
 _LINEAR_TARGET = torch.ops.piper_kernels.convrot_int8_linear.default
@@ -87,8 +86,8 @@ def _schedule_for(
 ) -> _MatmulSchedule | None:
     if target.is_cuda_capability(12, 0):
         return _SM120_MATMUL_SCHEDULES.get(shape)
-    if target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201"):
-        return _RDNA4_MATMUL_SCHEDULES.get(shape)
+    if target.is_amd_hip and target.is_architecture(*_RDNA4_N128_ARCHITECTURES.get(shape, ())):
+        return (128, 128, 64, 8, 2)
     return None
 
 

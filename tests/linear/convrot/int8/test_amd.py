@@ -96,6 +96,28 @@ def test_rdna4_preparation_policy(width, blocks, warps, fused):
     assert plan.matmul_num_stages == 2
 
 
+@pytest.mark.parametrize(
+    ("architecture", "rows", "outputs", "width", "expected_nk"),
+    [
+        ("gfx1201", 4096, 6144, 16384, (128, 128)),
+        ("gfx1201", 4096, 6144, 16448, (256, 64)),
+        ("gfx1201", 2048, 2048, 8192, (128, 128)),
+        ("gfx1201", 4096, 16384, 8192, (128, 128)),
+        ("gfx1201", 4096, 2048, 24576, (128, 128)),
+        ("gfx1201", 1024, 1024, 16384, (256, 64)),
+        ("gfx1200", 4096, 6144, 16384, (256, 64)),
+    ],
+)
+def test_amd_matmul_selects_wide_k_for_aligned_strides(
+    architecture, rows, outputs, width, expected_nk
+):
+    plan = policy.select_execution_plan(
+        AcceleratorTarget("hip", architecture), in_features=width, rows=rows, out_features=outputs
+    )
+    assert (plan.matmul_block_n, plan.matmul_block_k) == expected_nk
+    assert policy.matmul_group_m(plan) == 8
+
+
 def test_optional_amd_compiler_option_compatibility(monkeypatch):
     target = AcceleratorTarget("hip", "gfx1201")
     monkeypatch.setattr(amd.importlib, "import_module", Mock(return_value=object()))
@@ -104,11 +126,13 @@ def test_optional_amd_compiler_option_compatibility(monkeypatch):
 
 @pytest.mark.gpu
 @_gpu
-@pytest.mark.parametrize("rows", [1023, 1024, 1025, 2049])
+@pytest.mark.parametrize(
+    ("rows", "width", "columns"),
+    [(1023, 256, 335), (1024, 256, 335), (1025, 256, 335), (2049, 256, 335), (1025, 8192, 2049)],
+)
 @pytest.mark.parametrize("paired", [False, True])
-def test_amd_projection_crosses_cache_group_and_tail_boundaries(rows, paired):
+def test_amd_projection_crosses_cache_group_and_tail_boundaries(rows, width, columns, paired):
     torch.manual_seed(893)
-    width, columns = 256, 335
     qdata = torch.randint(-127, 128, (rows, width), device="cuda", dtype=torch.int8)
     scale = torch.rand(rows, device="cuda") * 0.01
     weights = [

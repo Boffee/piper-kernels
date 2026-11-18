@@ -29,9 +29,6 @@ from .._kernels.triton import int8_matmul_kernel
 from .._plan import LinearExecutionPlan
 from . import policy
 
-# Smaller row groups improve cache reuse at the validated large/wide RDNA4 shapes.
-_LARGE_MATMUL_GROUP_M_TILES = 8
-
 
 @triton.jit
 def _normalize_rotated_values(
@@ -436,12 +433,15 @@ def default_execution_plan(
     weight_qdata: torch.Tensor,
     *,
     target: AcceleratorTarget | None = None,
+    rows: int | None = None,
 ) -> LinearExecutionPlan:
     """Resolve production policy, accepting an explicit target for offline tuning."""
     target = AcceleratorTarget.from_device(weight_qdata.device) if target is None else target
     return policy.select_execution_plan(
         target,
         in_features=weight_qdata.shape[1],
+        rows=rows,
+        out_features=weight_qdata.shape[0],
     )
 
 
@@ -548,12 +548,7 @@ def execute_prepared_linear(
         raise ValueError("prepared INT8 GEMM output must be column-contiguous")
     plan = execution_plan
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
-    # Cache grouping is intrinsic to the large-tile family.
-    group_m = (
-        _LARGE_MATMUL_GROUP_M_TILES
-        if plan.matmul_block_m == 128 and plan.matmul_block_n == 256
-        else 0
-    )
+    group_m = policy.matmul_group_m(plan)
     compiler_options = _amd_matmul_compiler_options(
         AcceleratorTarget.from_device(input_qdata.device)
     )
@@ -620,7 +615,9 @@ def run_linear(
     plan = (
         execution_plan
         if execution_plan is not None
-        else default_execution_plan(weight_qdata, target=target)
+        else default_execution_plan(
+            weight_qdata, target=target, rows=math.prod(original_shape[:-1])
+        )
     )
     input_qdata, row_scales = prepare_input_with_plan(
         input,
@@ -702,7 +699,7 @@ def linear_prepared(
     second_projection: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """Apply one weight to an input prepared by the matching operator."""
-    plan = default_execution_plan(weight_qdata)
+    plan = default_execution_plan(weight_qdata, rows=math.prod(input_qdata.shape[:-1]))
     return execute_prepared_linear(
         input_qdata,
         input_scale,

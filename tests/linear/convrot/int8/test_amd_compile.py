@@ -23,11 +23,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is
 @pytest.mark.parametrize("aligned_nk", [False, True])
 def test_amd_paired_projection_compiles_to_matrix_instructions(architecture, aligned_nk):
     plan = policy.select_execution_plan(AcceleratorTarget("hip", architecture), in_features=512)
-    group_m = (
-        amd._LARGE_MATMUL_GROUP_M_TILES
-        if plan.matmul_block_m == 128 and plan.matmul_block_n == 256
-        else 0
-    )
+    group_m = policy.matmul_group_m(plan)
     source = ASTSource(
         kernels.int8_matmul_kernel,
         {
@@ -149,7 +145,7 @@ def test_rdna4_projection_barriers_fence_only_lds():
         "gfx1201",
         plan,
         aligned_nk=True,
-        group_m=amd._LARGE_MATMUL_GROUP_M_TILES,
+        group_m=policy.matmul_group_m(plan),
     )
     # The first check fails if Triton stops fencing global memory at its LDS
     # barriers: then retire the workaround as amd_compiler_workarounds describes.

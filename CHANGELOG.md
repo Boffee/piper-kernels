@@ -7,6 +7,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- On RX 9070 XT with Triton 3.9, ConvRot INT8 image FFN down projections with
+  16,384 input features take 10–17% less time. Complete fused GELU and SwiGLU
+  FFNs take 4–11% less time at the measured image sequence lengths.
 - `piper_attention` now centers keys and values independently per `1024`-token
   KV chunk (`K1024 + V1024`) for both non-causal and causal attention instead of
   using sequence-wide reductions (and leaving causal V uncentered). Both causal

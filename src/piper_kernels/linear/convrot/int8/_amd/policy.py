@@ -4,6 +4,7 @@ import sys
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
+from .._plan import LinearExecutionPlan
 from ._plan import AmdExecutionPlan
 
 # gfx1201 has hardware correctness/performance coverage; the remaining targets
@@ -40,8 +41,23 @@ def preparation_blocks(row_width: int) -> tuple[int, int, int]:
     return leading_tail
 
 
-def select_execution_plan(target: AcceleratorTarget, *, in_features: int) -> AmdExecutionPlan:
-    """Keep input preparation independent of the weights and output width."""
+def matmul_group_m(plan: LinearExecutionPlan) -> int:
+    """Reuse each weight tile across eight row tiles in the large GEMM schedules."""
+    if plan.matmul_block_m == 128 and (
+        plan.matmul_block_n == 256 or (plan.matmul_block_n, plan.matmul_block_k) == (128, 128)
+    ):
+        return 8
+    return 0
+
+
+def select_execution_plan(
+    target: AcceleratorTarget,
+    *,
+    in_features: int,
+    rows: int | None = None,
+    out_features: int | None = None,
+) -> AmdExecutionPlan:
+    """Select preparation by input width and GEMM tiling by operand shape."""
     if not supports_target(target):
         raise ValueError(f"ConvRot INT8 execution has no optimized policy for {target}")
     if in_features <= 0:
@@ -54,14 +70,28 @@ def select_execution_plan(target: AcceleratorTarget, *, in_features: int) -> Amd
             fused_num_warps = 16 if block_size > 8192 else 4
         else:
             fused_num_warps = 32 if block_size > 8192 else 8
+    # At 8 KiB row-stride multiples, fetching 128 adjacent K bytes improves
+    # throughput on gfx1201. Halve N to keep the accumulator spill-free.
+    # Keep the existing tile for underfilled grids: below two workgroups per
+    # WGP, the final wave can dominate the benefit of wider loads.
+    wide_k = (
+        target.is_architecture("gfx1201")
+        and in_features % 8192 == 0
+        and rows is not None
+        and out_features is not None
+        and ((rows + 127) // 128) * ((out_features + 255) // 256) >= 64
+    )
+    block_n, block_k = (256, 64) if rdna4 else (64, 64)
+    if wide_k:
+        block_n, block_k = 128, 128
     return AmdExecutionPlan(
         fuse_rotation_quantization=block_size <= 16384,
         fused_num_warps=fused_num_warps,
         rotation_num_warps=4,
         quantization_num_warps=4,
         matmul_block_m=128 if rdna4 else 64,
-        matmul_block_n=256 if rdna4 else 64,
-        matmul_block_k=64,
+        matmul_block_n=block_n,
+        matmul_block_k=block_k,
         matmul_num_warps=8 if rdna4 else 4,
         matmul_num_stages=2 if rdna4 else 1,
     )
