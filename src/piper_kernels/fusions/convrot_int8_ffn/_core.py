@@ -17,6 +17,8 @@ from piper_kernels.weights.convrot.int8._quantization import (
     validate_storage,
 )
 
+from ._dispatch import prepare_swiglu_projections
+
 DEFAULT_CHUNK_ROWS = 4_096
 
 
@@ -176,6 +178,11 @@ def run_chunked_ffn(
         if shared_source and len(sources) == 2
         else None
     )
+    packed = (
+        prepare_swiglu_projections(output_2d, sources, down, chunk_rows)
+        if residual_add is None and second_projection is not None
+        else None
+    )
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)
         chunk_row_count = stop - start
@@ -193,16 +200,19 @@ def run_chunked_ffn(
                 input_scale=source.input_scale,
                 out=(prepared_input, prepared_scale),
             )
-            backend.linear_prepared(
-                prepared_input,
-                prepared_scale,
-                source.weight_qdata,
-                source.weight_scale,
-                source.bias,
-                input.dtype,
-                out=projections,
-                second_projection=second_projection,
-            )
+            if packed is not None:
+                packed.project(prepared_input, prepared_scale, projections, start, paired=True)
+            else:
+                backend.linear_prepared(
+                    prepared_input,
+                    prepared_scale,
+                    source.weight_qdata,
+                    source.weight_scale,
+                    source.bias,
+                    input.dtype,
+                    out=projections,
+                    second_projection=second_projection,
+                )
         else:
             first, second = sources
             backend.prepare_input(
@@ -248,7 +258,11 @@ def run_chunked_ffn(
             input_scale=down.input_scale,
             out=(prepared_activation, prepared_scale),
         )
-        if residual_add is None:
+        if packed is not None:
+            packed.project(
+                prepared_activation, prepared_scale, output_2d[start:stop], start, paired=False
+            )
+        elif residual_add is None:
             backend.linear_prepared(
                 prepared_activation,
                 prepared_scale,

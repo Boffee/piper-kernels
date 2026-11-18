@@ -4,6 +4,8 @@ import pytest
 import torch
 from torch.nn import functional as F  # noqa: N812
 
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.fusions.convrot_int8_ffn._amd import policy as amd_ffn_policy
 from piper_kernels.fusions.convrot_int8_swiglu_ffn.triton import (
     _chunked_swiglu_ffn_gated_updates_op,
     _chunked_swiglu_ffn_op,
@@ -314,3 +316,27 @@ def test_chunked_ffn_residual_add_adds_into_base(python_indexing: bool) -> None:
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert result is None
     assert relative_l2 < 0.01
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is None, reason="requires ROCm"
+)
+def test_rdna4_ffn_reclaims_output_suffix_after_packed_chunks(monkeypatch):
+    if not AcceleratorTarget.from_device(torch.device("cuda")).is_architecture("gfx1201"):
+        pytest.skip("requires RDNA4 gfx1201")
+    # The three weights fill exactly 1,920 output rows. The raw suffix starts
+    # after two packed chunks and includes a single-row final chunk.
+    rows, chunk = 2177, 128
+    torch.manual_seed(372)
+    operands = make_operands(
+        rows=rows,
+        input_features=768,
+        intermediate_features=1280,
+        output_features=768,
+        bias_dtype=None,
+    )
+    expected = _chunked_swiglu_ffn_op(*operands.arguments(chunk))
+    monkeypatch.setattr(amd_ffn_policy, "packed_prefix_rows", lambda *_: 2 * chunk)
+    actual = _chunked_swiglu_ffn_op(*operands.arguments(chunk))
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))

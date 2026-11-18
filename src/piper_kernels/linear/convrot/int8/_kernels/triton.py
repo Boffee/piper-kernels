@@ -25,14 +25,27 @@ def _row_scaled_int8_matmul(
     block_k: tl.constexpr,
     aligned_tiles: tl.constexpr,
     accumulator_seed: tl.constexpr = 0,
+    weight_pack_k: tl.constexpr = 0,
 ):
-    """Return the exact INT32 tile product scaled by input rows, and the weight scales."""
+    """Return the row-scaled INT32 dot product and column scales.
+
+    Packed weights have physical shape [K / pack, N, pack], with pack dividing
+    block_k. The FFN launcher supplies aligned N and K for that layout.
+    """
     offsets_k = tl.arange(0, block_k)
     offsets_m_i64 = offsets_m.to(tl.int64)
     offsets_n_i64 = offsets_n.to(tl.int64)
     offsets_k_i64 = offsets_k.to(tl.int64)
     input_pointers = input_ptr + offsets_m_i64[:, None] * k + offsets_k_i64[None, :]
-    weight_pointers = weight_ptr + offsets_n_i64[None, :] * k + offsets_k_i64[:, None]
+    if weight_pack_k:
+        weight_pointers = (
+            weight_ptr
+            + (offsets_k_i64 // weight_pack_k)[:, None] * (n * weight_pack_k)
+            + offsets_n_i64[None, :] * weight_pack_k
+            + (offsets_k_i64 % weight_pack_k)[:, None]
+        )
+    else:
+        weight_pointers = weight_ptr + offsets_n_i64[None, :] * k + offsets_k_i64[:, None]
     accumulator = tl.full((block_m, block_n), accumulator_seed, tl.int32)
 
     for k_offset in range(tl.cdiv(k, block_k)):
@@ -56,7 +69,7 @@ def _row_scaled_int8_matmul(
         else:
             accumulator += tl.dot(input_values, weight)
         input_pointers += block_k
-        weight_pointers += block_k
+        weight_pointers += block_k * n if weight_pack_k else block_k
 
     if aligned_tiles:
         input_scale = tl.load(input_scale_ptr + offsets_m)
