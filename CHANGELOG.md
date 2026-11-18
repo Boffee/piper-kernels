@@ -8,7 +8,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 ### Changed
 
 - On RX 9070 XT with Triton 3.9, MiniMax H3 ConvRot INT8 SwiGLU FFNs take
-  about 3% less time at 4,096–32,768 tokens and 5% less time at 100,000
+  about 3% less time at 4,096–32,768 tokens and 7% less time at 100,000
   tokens with the same peak allocation.
 - On RX 9070 XT with Triton 3.9, ConvRot INT8 image FFN down projections with
   16,384 input features take 10–17% less time. Complete fused GELU and SwiGLU

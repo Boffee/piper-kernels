@@ -2,6 +2,8 @@
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
+PACKED_CHUNK_ROWS = 4096
+
 
 def packed_prefix_rows(
     target: AcceleratorTarget,
@@ -15,7 +17,7 @@ def packed_prefix_rows(
     widths = (input_features, intermediate_features, output_features)
     if (
         not target.is_architecture("gfx1201")
-        or chunk_rows != 4096
+        or chunk_rows != PACKED_CHUNK_ROWS
         or min(widths) < 4096
         # Wider rows use a separate rotation and quantization schedule.
         or max(input_features, intermediate_features) > 16384

@@ -322,12 +322,13 @@ def test_chunked_ffn_residual_add_adds_into_base(python_indexing: bool) -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None, reason="requires ROCm"
 )
-def test_rdna4_ffn_reclaims_output_suffix_after_packed_chunks(monkeypatch):
+@pytest.mark.parametrize("chunk", [128, 4096])
+def test_rdna4_ffn_reclaims_output_suffix_after_packed_chunks(monkeypatch, chunk):
     if not AcceleratorTarget.from_device(torch.device("cuda")).is_architecture("gfx1201"):
         pytest.skip("requires RDNA4 gfx1201")
-    # The three weights fill exactly 1,920 output rows. The raw suffix starts
-    # after two packed chunks and includes a single-row final chunk.
-    rows, chunk = 2177, 128
+    # The three weights fill 1,920 output rows. Keep two packed chunks,
+    # at least one full raw chunk, and a single-row final chunk.
+    rows = 2 * chunk + max(1920, chunk) + 1
     torch.manual_seed(372)
     operands = make_operands(
         rows=rows,

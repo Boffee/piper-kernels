@@ -10,6 +10,18 @@ from piper_kernels._residual.triton import add_residual
 
 
 @triton.jit
+def _weight_offsets(cols, reduction, n, k, pack_k: tl.constexpr):
+    """Address [K / pack, N, pack] panels or ordinary [N, K] weights."""
+    if pack_k:
+        return (
+            (reduction // pack_k)[:, None] * (n * pack_k)
+            + cols[None, :] * pack_k
+            + (reduction % pack_k)[:, None]
+        )
+    return cols[None, :] * k + reduction[:, None]
+
+
+@triton.jit
 def _row_scaled_int8_matmul(
     input_ptr,
     weight_ptr,
@@ -37,15 +49,9 @@ def _row_scaled_int8_matmul(
     offsets_n_i64 = offsets_n.to(tl.int64)
     offsets_k_i64 = offsets_k.to(tl.int64)
     input_pointers = input_ptr + offsets_m_i64[:, None] * k + offsets_k_i64[None, :]
-    if weight_pack_k:
-        weight_pointers = (
-            weight_ptr
-            + (offsets_k_i64 // weight_pack_k)[:, None] * (n * weight_pack_k)
-            + offsets_n_i64[None, :] * weight_pack_k
-            + (offsets_k_i64 % weight_pack_k)[:, None]
-        )
-    else:
-        weight_pointers = weight_ptr + offsets_n_i64[None, :] * k + offsets_k_i64[:, None]
+    weight_pointers = weight_ptr + _weight_offsets(
+        offsets_n_i64, offsets_k_i64, n, k, weight_pack_k
+    )
     accumulator = tl.full((block_m, block_n), accumulator_seed, tl.int32)
 
     for k_offset in range(tl.cdiv(k, block_k)):
