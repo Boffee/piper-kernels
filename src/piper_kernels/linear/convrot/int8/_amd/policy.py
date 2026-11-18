@@ -12,6 +12,10 @@ from ._plan import AmdExecutionPlan
 _SUPPORTED_ARCHITECTURES = ("gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201")
 
 
+# Two output workgroups per WGP on gfx1201.
+_MIN_GFX1201_MATMUL_TILES = 64
+
+
 def supports_target(target: AcceleratorTarget) -> bool:
     """Select HIP architectures covered by the AMD compile tests on Linux and Windows."""
     return (
@@ -50,6 +54,21 @@ def matmul_group_m(plan: LinearExecutionPlan) -> int:
     return 0
 
 
+def matmul_accumulator_seed(target: AcceleratorTarget, in_features: int, output_tiles: int) -> int:
+    """Keep high accumulator bits stable in long signed INT8 reductions on gfx1201."""
+    # Center partial sums away from the signed zero crossing. On a stock RX
+    # 9070 XT this sustains a higher matrix clock. Remove the seed in INT32
+    # before scaling. Each INT8 product contributes at most 128 squared.
+    seed = 0x155555
+    if (
+        target.is_architecture("gfx1201")
+        and output_tiles >= _MIN_GFX1201_MATMUL_TILES
+        and 4096 <= in_features <= (2**31 - 1 - seed) // (128 * 128)
+    ):
+        return seed
+    return 0
+
+
 def select_execution_plan(
     target: AcceleratorTarget,
     *,
@@ -79,7 +98,7 @@ def select_execution_plan(
         and in_features % 8192 == 0
         and rows is not None
         and out_features is not None
-        and ((rows + 127) // 128) * ((out_features + 255) // 256) >= 64
+        and ((rows + 127) // 128) * ((out_features + 255) // 256) >= _MIN_GFX1201_MATMUL_TILES
     )
     block_n, block_k = (256, 64) if rdna4 else (64, 64)
     if wide_k:

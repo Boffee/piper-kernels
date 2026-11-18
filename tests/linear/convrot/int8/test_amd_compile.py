@@ -22,7 +22,9 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"])
 @pytest.mark.parametrize("aligned_nk", [False, True])
 def test_amd_paired_projection_compiles_to_matrix_instructions(architecture, aligned_nk):
-    plan = policy.select_execution_plan(AcceleratorTarget("hip", architecture), in_features=512)
+    target = AcceleratorTarget("hip", architecture)
+    width = 8_192
+    plan = policy.select_execution_plan(target, in_features=width)
     group_m = policy.matmul_group_m(plan)
     source = ASTSource(
         kernels.int8_matmul_kernel,
@@ -53,6 +55,7 @@ def test_amd_paired_projection_compiles_to_matrix_instructions(architecture, ali
             "group_m": group_m,
             "explicit_bias_fma": False,
             "per_tile_tail": bool(group_m),
+            "accumulator_seed": policy.matmul_accumulator_seed(target, width, 64),
         },
     )
     compiled = triton.compile(
@@ -61,7 +64,7 @@ def test_amd_paired_projection_compiles_to_matrix_instructions(architecture, ali
         options={
             "num_warps": plan.matmul_num_warps,
             "num_stages": plan.matmul_num_stages,
-            **amd._amd_matmul_compiler_options(AcceleratorTarget("hip", architecture)),
+            **amd._amd_matmul_compiler_options(target),
         },
     )
     assert ("v_mfma_i32" if architecture == "gfx942" else "v_wmma_i32") in compiled.asm["amdgcn"]
@@ -97,6 +100,9 @@ def _compile_rdna4_projection(architecture, plan, *, aligned_nk, group_m, option
             "group_m": group_m,
             "explicit_bias_fma": False,
             "per_tile_tail": bool(group_m),
+            "accumulator_seed": policy.matmul_accumulator_seed(
+                AcceleratorTarget("hip", architecture), 8192, 64
+            ),
         },
     )
     return triton.compile(

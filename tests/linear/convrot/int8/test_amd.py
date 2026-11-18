@@ -124,6 +124,34 @@ def test_optional_amd_compiler_option_compatibility(monkeypatch):
     assert amd._amd_matmul_compiler_options(target) == {}
 
 
+def test_gfx1201_accumulator_seed_fits_every_int8_partial_sum():
+    target = AcceleratorTarget("hip", "gfx1201")
+    seed = policy.matmul_accumulator_seed(target, 4096, 64)
+    assert seed > 0
+    assert policy.matmul_accumulator_seed(target, 4096, 63) == 0
+    last_safe_width = (2**31 - 1 - seed) // (128 * 128)
+    assert policy.matmul_accumulator_seed(target, last_safe_width, 64) == seed
+    assert policy.matmul_accumulator_seed(target, last_safe_width + 1, 64) == 0
+    assert policy.matmul_accumulator_seed(AcceleratorTarget("hip", "gfx1200"), 4096, 64) == 0
+
+
+@pytest.mark.gpu
+@_gpu
+def test_amd_projection_recovers_integer_sum_before_fp32_rounding():
+    # 2**24 - 1 is exact in FP32, but its seeded sum crosses a binade.
+    width = 4096
+    a = torch.zeros(1024, width, device="cuda", dtype=torch.int8)
+    b = torch.zeros(2048, width, device="cuda", dtype=torch.int8)
+    a[:, :2048] = -128
+    b[:, :2048] = -64
+    a[:, 2048] = 1
+    b[:, 2048] = -1
+    result = amd.linear_prepared(
+        a, torch.ones(1024, device="cuda"), b, torch.ones(2048, device="cuda"), None, torch.float32
+    )
+    assert torch.equal(result, torch.full_like(result, 2**24 - 1))
+
+
 @pytest.mark.gpu
 @_gpu
 @pytest.mark.parametrize(

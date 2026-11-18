@@ -178,6 +178,7 @@ def _compile_int8_matmul(
             "group_m": group_m,
             "explicit_bias_fma": plan.matmul_explicit_bias_fma,
             "per_tile_tail": bool(group_m) or not plan.matmul_specialize_m,
+            "accumulator_seed": 0,
             **flags,
         },
     )

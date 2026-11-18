@@ -549,15 +549,15 @@ def execute_prepared_linear(
     plan = execution_plan
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
     group_m = policy.matmul_group_m(plan)
-    compiler_options = _amd_matmul_compiler_options(
-        AcceleratorTarget.from_device(input_qdata.device)
-    )
+    target = AcceleratorTarget.from_device(input_qdata.device)
+    compiler_options = _amd_matmul_compiler_options(target)
     bias_pointer = bias if bias is not None else output
 
     if not m or not n:
         return result
     row_block_count = triton.cdiv(m, plan.matmul_block_m)
-    grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
+    output_tiles = row_block_count * num_n_tiles
+    grid = (output_tiles,) if group_m else (row_block_count, num_n_tiles)
     with device_context(input_qdata.device):
         int8_matmul_kernel[grid](
             input_qdata_2d,
@@ -584,6 +584,7 @@ def execute_prepared_linear(
             group_m=group_m,
             explicit_bias_fma=False,
             per_tile_tail=bool(group_m),
+            accumulator_seed=policy.matmul_accumulator_seed(target, k, output_tiles),
             **compiler_options,
             num_stages=plan.matmul_num_stages,
             num_warps=plan.matmul_num_warps,
