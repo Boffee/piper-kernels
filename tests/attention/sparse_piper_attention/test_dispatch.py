@@ -48,12 +48,14 @@ def test_attention_preserves_dtype_and_accuracy(device, head_dim, ratio, dtype):
         relative_error = (actual.cpu().float() - expected.float()).norm() / expected.float().norm()
         assert relative_error < 0.03
 
-    # An intermediate store in a narrower dtype would round this value to 1.
-    increment = 2**-10 if dtype is torch.float16 else 2**-20
+    # An intermediate store in a narrower dtype (BF16 for FP16; FP16 or BF16
+    # for FP32) rounds this value to 1, while 2^-12 stays well above RDNA4's
+    # two-term BF16 value_mean WMMA rounding (~1.5e-5) and INT8 V residual step.
+    increment = 2**-10 if dtype is torch.float16 else 2**-12
     constant = torch.full_like(operands[2], 1 + increment)
     zeros = torch.zeros_like(operands[0])
     actual = attention(zeros, zeros, constant, sparse_key_blocks=3)
-    tolerance = 2e-7 if dtype is torch.float32 else 0
+    tolerance = 2e-5 if dtype is torch.float32 else 0
     torch.testing.assert_close(actual, constant, atol=tolerance, rtol=0)
 
 
