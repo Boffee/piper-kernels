@@ -72,7 +72,7 @@ def _softmax_tile(scores, block_max, scale, multiplier):
         )
         packed_fragments += (words,)
         sums += (total,)
-        with gl.amd.warp_pipeline_stage("softmax"):
+        with gl.amd.warp_pipeline_stage("softmax", priority=0):
             pass
     packed = concat_columns(
         concat_columns(packed_fragments[0], packed_fragments[1]),
@@ -148,7 +148,8 @@ def _dense_piper_kernel(  # noqa: PLR0915
     batch = gl.program_id(2).to(gl.int64)
     batch_head = batch * heads + head
     kv_batch_head = batch * (heads // query_heads_per_kv_head) + head // query_heads_per_kv_head
-    query_block = gl.program_id(0)
+    # Launch causal query blocks longest-prefix-first to prevent tail-wave imbalance.
+    query_block = (gl.num_programs(0) - 1 - gl.program_id(0)) if is_causal else gl.program_id(0)
     stored_query_block = query_start // 64 + query_block
     global_query_block = global_query_start // 64 + query_block
     row_layout: gl.constexpr = gl.SliceLayout(2, MMA_LAYOUT)
@@ -254,7 +255,8 @@ def _dense_piper_kernel(  # noqa: PLR0915
             value_mean_ptr + (kv_batch_head * key_chunks + chunk) * head_dim + features[None, :]
         )
         numerator += (chunk_denom * 255.0)[:, :, None] * value_mean[:, None, :]
-    output = numerator / (gl.maximum(denominator, 1e-30)[:, :, None] * 255.0)
+    inverse_denominator = 1.0 / (gl.maximum(denominator, 1e-30) * 255.0)
+    output = numerator * inverse_denominator[:, :, None]
     offsets = batch * stride_ob + head * stride_oh + output_rows[None, :, None] * stride_om
     gl.store(
         output_ptr + offsets + features[None, None, :],

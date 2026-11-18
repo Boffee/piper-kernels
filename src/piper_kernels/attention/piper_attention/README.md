@@ -72,30 +72,33 @@ implementations without changing production dispatch.
 ## RDNA4 behavior
 
 The Gluon implementation uses four wave32 warps and Q64/K64 tiles, with Q32/K64
-scale groups. It supports causal attention and non-causal rectangular attention,
-ragged tails, outer strides, and GQA/MQA. V preparation writes initialized padding directly into packed WMMA
+scale groups. It supports causal attention (traversing longest query prefixes
+first) and non-causal rectangular attention, ragged tails, outer strides, and
+GQA/MQA. V preparation writes initialized padding directly into packed WMMA
 storage, avoiding a full-size transpose/repacking allocation.
 
 Softmax processes 16-column fragments, combining score scaling with FP32 maxima
-and exponential arguments. Probability rounding still uses the logical K64
-tile's maximum and each token's V scale. Interior tiles omit elementwise masks;
-key tails and causal diagonals retain them. AMD uses round-to-nearest-even
-probability packing. FMA/reduction reassociation and backend rounding mean
-cross-backend bitwise equality is not promised.
+and exponential arguments while warp-pipeline stages prioritize QK/PV matrix
+work over softmax. Probability rounding still uses the logical K64 tile's maximum
+and each token's V scale, and the epilogue normalizes by multiplying by the
+per-row reciprocal of `max(denominator, 1e-30) * 255.0`. Interior tiles omit
+elementwise masks; key tails and causal diagonals retain them. AMD uses
+round-to-nearest-even probability packing. FMA/reduction reassociation and
+backend rounding mean cross-backend bitwise equality is not promised.
 
 The kernel launches in WGP mode (`-cumode`) with
 [`amd_compiler_workarounds`](../../_triton/amd_compiler_workarounds.py)
 `LDS_ONLY_FENCE_ATTRS` so workgroup fences synchronize without invalidating shared
-L0/L1 caches across CUs. Two Triton 3.9 compiler changes also cost this kernel
-12–17% on RX 9070 XT. LLVM's SLP vectorizer bundles the per-tile score FMAs into
-vector FMAs, which RDNA4 cannot execute natively, raising D128 register use from
-188 to 208 VGPRs and dropping occupancy from eight waves to seven. Triton 3.9 also
-pins each memory operation inside a warp-pipeline stage, which stops LLVM from
-hoisting and pairing K/V loads. On the affected Triton releases, the kernel
-issues those FMAs as scalar `v_fma_f32` inline assembly, which rounds
-identically, and opts out of the pinned loads. `amd_compiler_workarounds` owns
-these workarounds, the releases they apply to, and how to retire them. With all
-three enabled, Triton 3.9 runs within about 2% (D128) and 4% (D64) of Triton 3.8.
+L0/L1 caches across CUs. Two Triton 3.9 compiler changes also hurt throughput on
+RX 9070 XT: LLVM's SLP vectorizer bundles per-tile score FMAs into vector FMAs
+(adding register pressure without native packed FP32 FMA hardware), and Triton
+3.9 pins each memory operation inside a warp-pipeline stage (blocking K/V load
+hoisting and pairing). On affected Triton releases, the kernel issues those
+score FMAs as scalar `v_fma_f32` inline assembly, which rounds identically, and
+opts out of the pinned loads; `amd_compiler_workarounds` owns these workarounds,
+the releases they apply to, and how to retire them. Inline WMMA accumulator
+seeding and paired 64-bit Q/K/V offset arithmetic further reduce register
+pressure and vector moves.
 
 `gfx1201` has hardware coverage on RX 9070 XT; `gfx1200` has offline compilation
 coverage. This does not establish exhaustive performance tuning. Use the shared

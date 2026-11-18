@@ -110,6 +110,8 @@ def test_fused_amd_compilation(
     assert compiled.asm["ttgir"].count("arith.truncf") == 1  # final BF16 store only
     if rocm_fences_only_lds():
         assert "global_inv" not in compiled.asm["amdgcn"]
+    assert "ds_bpermute" not in compiled.asm["amdgcn"]
+    assert compiled.metadata.shared <= 6208
 
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
