@@ -89,6 +89,10 @@ def test_dense_amd_compilation(architecture, head_dim, causal, dtype, wide):
     assert compiled.asm["ttgir"].count("arith.truncf") == 1  # final output only
     if rocm_fences_only_lds():
         assert "global_inv" not in compiled.asm["amdgcn"]
+    # Non-ROCm builds leave Triton 3.9's warp-pipeline load barriers in place.
+    if torch.version.hip is not None or not amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS:
+        assert "global_load_b64" not in compiled.asm["amdgcn"]
+    assert compiled.asm["amdgcn"].count("v_div_scale_f32") == 2
 
 
 def _compile_llvm_ir_with_scalar_fma(scalar_fma: bool, head_dim: int = 128) -> str:

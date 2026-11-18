@@ -85,18 +85,6 @@ def _recover_scores(biased, scalar: gl.constexpr):
 
 
 @gluon.jit
-def pipeline_boundary(label: gl.constexpr, priority: gl.constexpr = None):
-    """End a warp-pipeline stage, preserving the compiler's default priority."""
-    # Omit the keyword: Gluon cannot unwrap an explicitly passed constexpr(None).
-    if priority is None:
-        with gl.amd.warp_pipeline_stage(label):
-            pass
-    else:
-        with gl.amd.warp_pipeline_stage(label, priority=priority):
-            pass
-
-
-@gluon.jit
 def split_columns(value):
     return gl.split(
         value.reshape([value.shape[0], value.shape[1], 2, value.shape[2] // 2]).permute(
@@ -177,17 +165,12 @@ def query_fragments(
         blocks = blocks.to(gl.int64)
     rows = blocks[:, None] * 64 + (threads // 32 * 16 + lane % 16)[None, :]
     words = query_ptr.to(gl.pointer_type(gl.uint64))
+    row_words = words + rows * (head_dim // 8) + (lane[None, :] // 16) * 2
     fragments = ()
-    for k in gl.static_range(head_dim // 16):
-        fragments += (
-            gl.load(
-                words + rows * (head_dim // 8) + (k // 2) * 4 + (lane[None, :] // 16) * 2 + k % 2
-            ),
-        )
+    for k_pair in gl.static_range(head_dim // 32):
+        pair_words = row_words + k_pair * 4
+        fragments += (gl.load(pair_words), gl.load(pair_words + 1))
     return fragments
-
-
-_INTEGER_SUM_BIAS = gl.constexpr(0x3E22F983)
 
 
 @gluon.jit
@@ -199,7 +182,6 @@ def qk_tiles(
     use_64bit_context_offsets: gl.constexpr,
     head_dim: gl.constexpr,
     two_tiles: gl.constexpr = True,
-    pipeline_priority: gl.constexpr = None,
     scalar_score_recovery: gl.constexpr = False,
 ):
     """Return Q64 scores for one K64 tile or two independently selected K64 tiles.
@@ -208,6 +190,8 @@ def qk_tiles(
     ``tile_1`` and returns K64 scores for dense Piper's per-tile recurrence.
     ``scalar_score_recovery`` uses :func:`scalar_fma`'s form for score recovery,
     which dense Piper needs; sparse Piper keeps plain FMAs, about 1% faster there.
+    Warp-pipeline ``"qk"`` stages run at ``priority=3`` above ``"softmax"``
+    (``priority=0``).
     """
     offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
     lane = gl.arange(0, 128, gl.SliceLayout(0, VECTOR_LAYOUT)) % 32
@@ -219,22 +203,18 @@ def qk_tiles(
             tile = tile_0 if column < 4 else tile_1
             row = tile[:, None] * 64 + (column % 4) * 16 + lane[None, :] % 16
             row = row.to(offset_type)
-            # All D64/D128 INT8 dot products are bounded by 2^21. This integer
-            # bias keeps the result bits in one FP32 binade; the FMA below
-            # recovers the exact integer sum without integer-to-float conversion.
-            bias = gl.full([1, 128], _INTEGER_SUM_BIAS, gl.int32, VECTOR_LAYOUT)
-            acc = (bias, bias, bias, bias, bias, bias, bias, bias)
-            for k in gl.static_range(head_dim // 16):
-                offset = (
-                    row * head_dim + (k // 2) * 32 + (lane[None, :] // 16) * 16 + (k % 2) * 8
-                ).to(offset_type)
-                key = gl.load((key_ptr + offset).to(gl.pointer_type(gl.uint64)))
-                acc = int8_wmma(query[k], key, acc, column % 2)
+            acc = None
+            for k_pair in gl.static_range(head_dim // 32):
+                offset = (row * head_dim + k_pair * 32 + (lane[None, :] // 16) * 16).to(offset_type)
+                pair_words = (key_ptr + offset).to(gl.pointer_type(gl.uint64))
+                acc = int8_wmma(query[2 * k_pair], gl.load(pair_words), acc, column % 2)
+                acc = int8_wmma(query[2 * k_pair + 1], gl.load(pair_words + 1), acc, column % 2)
             result: gl.tensor = _matrix_fragment(acc)
             results += (
                 _recover_scores(result.to(gl.float32, bitcast=True), scalar_score_recovery),
             )
-        pipeline_boundary("qk", pipeline_priority)
+        with gl.amd.warp_pipeline_stage("qk", priority=3):
+            pass
     return _join_matrix(results)
 
 
@@ -267,7 +247,7 @@ def compute_chunk_key_biases(
     column_in_mma = lane % 16
     center_term = column_in_mma % 2
     scale_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT))
-    store_layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 2], [4, 1], [1, 0])
+    store_layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 2], [4, 1], [0, 1])
     row_query_scale = gl.convert_layout(query_scale.reshape([64]), gl.SliceLayout(1, store_layout))[
         :, None
     ]
@@ -276,14 +256,12 @@ def compute_chunk_key_biases(
         tile_slot = half * 8 + column_in_mma // 2
         tile_index = tiles_shared.gather(tile_slot, 0).to(offset_type)[None, :]
         row_offset = (tile_index * (2 * head_dim) + center_term[None, :] * head_dim).to(offset_type)
-        bias = gl.full([1, 128], _INTEGER_SUM_BIAS, gl.int32, VECTOR_LAYOUT)
-        acc = (bias, bias, bias, bias, bias, bias, bias, bias)
-        for k in gl.static_range(head_dim // 16):
-            offset = (row_offset + (k // 2) * 32 + (lane[None, :] // 16) * 16 + (k % 2) * 8).to(
-                offset_type
-            )
-            center = gl.load((key_center_ptr + offset).to(gl.pointer_type(gl.uint64)))
-            acc = int8_wmma(query[k], center, acc, 0)
+        acc = None
+        for k_pair in gl.static_range(head_dim // 32):
+            offset = (row_offset + k_pair * 32 + (lane[None, :] // 16) * 16).to(offset_type)
+            pair_words = (key_center_ptr + offset).to(gl.pointer_type(gl.uint64))
+            acc = int8_wmma(query[2 * k_pair], gl.load(pair_words), acc, 0)
+            acc = int8_wmma(query[2 * k_pair + 1], gl.load(pair_words + 1), acc, 0)
         recovered = _recover_scores(_matrix_fragment(acc).to(gl.float32, bitcast=True), False)
         column = gl.arange(0, 16, scale_layout)
         column_tile_index = tiles_shared.gather(half * 8 + column // 2, 0).to(offset_type)
@@ -317,9 +295,8 @@ def accumulate_chunk_value_means(
     )
     lhs_layout: gl.constexpr = gl.DotOperandLayout(0, mma_2d_layout, k_width=8)
     rhs_layout: gl.constexpr = gl.DotOperandLayout(1, mma_2d_layout, k_width=8)
-    mass_layout: gl.constexpr = gl.BlockedLayout([1, 8], [16, 2], [4, 1], [1, 0])
-    max_layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 2], [4, 1], [1, 0])
-    mean_layout: gl.constexpr = gl.BlockedLayout([8, 1], [2, 16], [1, 4], [0, 1])
+    mass_layout: gl.constexpr = gl.BlockedLayout([1, 8], [16, 2], [4, 1], [0, 1])
+    max_layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 2], [4, 1], [0, 1])
 
     tile_masses = tile_masses_shared.load(mass_layout)
     pair_max = gl.convert_layout(
@@ -341,27 +318,26 @@ def accumulate_chunk_value_means(
     lhs_high = gl.convert_layout(masses_high, lhs_layout)
     lhs_low = gl.convert_layout(masses_low, lhs_layout)
 
-    mean_slots = gl.arange(0, 16, gl.SliceLayout(1, mean_layout))
+    mean_slots = gl.arange(0, 16, gl.SliceLayout(1, rhs_layout))
     tile_indices = gl.where(
         mean_slots < num_valid_tiles,
-        tiles_shared.load(gl.SliceLayout(1, mean_layout)),
+        tiles_shared.load(gl.SliceLayout(1, rhs_layout)),
         0,
     ).to(offset_type)
     numerator_slices = four_fragments(numerator) if head_dim == 64 else eight_fragments(numerator)
     results = ()
     for column_tile in gl.static_range(head_dim // 16):
-        feature_offsets = column_tile * 16 + gl.arange(0, 16, gl.SliceLayout(0, mean_layout)).to(
+        feature_offsets = column_tile * 16 + gl.arange(0, 16, gl.SliceLayout(0, rhs_layout)).to(
             offset_type
         )
         tile_means = gl.load(
             value_mean_ptr + tile_indices[:, None] * head_dim + feature_offsets[None, :]
         )
-        rhs_means = gl.convert_layout(tile_means, rhs_layout)
         acc_slice = gl.convert_layout(
             numerator_slices[column_tile].reshape([64, 16]), mma_2d_layout
         )
-        acc_slice = wmma(lhs_high, rhs_means, acc_slice)
-        acc_slice = wmma(lhs_low, rhs_means, acc_slice)
+        acc_slice = wmma(lhs_high, tile_means, acc_slice)
+        acc_slice = wmma(lhs_low, tile_means, acc_slice)
         results += (gl.convert_layout(acc_slice.reshape([1, 64, 16]), MMA_LAYOUT),)
     return gl.convert_layout(_join_matrix(results), MMA_LAYOUT)
 
@@ -470,7 +446,6 @@ def pv_tiles(
     current_weight,
     use_64bit_context_offsets: gl.constexpr,
     two_tiles: gl.constexpr = True,
-    pipeline_priority: gl.constexpr = None,
 ):
     """Accumulate D16 products into the already-rescaled numerator.
 
@@ -497,14 +472,18 @@ def pv_tiles(
     for group in gl.static_range(head_dim // 32):
         for column_tile in gl.static_range(group * 2, group * 2 + 2):
             column = column_tile * 16 + lane % 16
-            zero = gl.full([1, 128], 0, gl.int32, VECTOR_LAYOUT)
-            acc = (zero, zero, zero, zero, zero, zero, zero, zero)
-            for k in gl.static_range(8 if two_tiles else 4):
-                start = start_0 if k < 4 else start_1
-                token = (k % 4 // 2) * 32 + (lane[None, :] // 16) * 16 + (k % 2) * 8
+            acc = None
+            for k_pair in gl.static_range(4 if two_tiles else 2):
+                start = start_0 if k_pair < 2 else start_1
+                token = (k_pair % 2) * 32 + (lane[None, :] // 16) * 16
                 offset = (start[:, None] * head_dim + column[None, :] * 64 + token).to(offset_type)
-                value = gl.load((value_ptr + offset).to(gl.pointer_type(gl.uint64)))
-                acc = uint8_int8_wmma(fragments[k], value, acc, column_tile % 2)
+                pair_words = (value_ptr + offset).to(gl.pointer_type(gl.uint64))
+                acc = uint8_int8_wmma(
+                    fragments[2 * k_pair], gl.load(pair_words), acc, column_tile % 2
+                )
+                acc = uint8_int8_wmma(
+                    fragments[2 * k_pair + 1], gl.load(pair_words + 1), acc, column_tile % 2
+                )
             result: gl.tensor = _matrix_fragment(acc)
             results += (
                 gl.fma(
@@ -513,5 +492,6 @@ def pv_tiles(
                     gl.convert_layout(numerators[column_tile], MMA_LAYOUT),
                 ),
             )
-        pipeline_boundary("pv", pipeline_priority)
+        with gl.amd.warp_pipeline_stage("pv", priority=3):
+            pass
     return _join_matrix(results)

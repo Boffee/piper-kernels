@@ -20,7 +20,6 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
     accumulate_chunk_value_means,
     compute_chunk_key_biases,
     concat_columns,
-    pipeline_boundary,
     pv_tiles,
     qk_tiles,
     query_fragments,
@@ -67,20 +66,22 @@ def _requires_64bit_context_offsets(
     return storage_sequence_length * head_dim > (1 << 32)
 
 
+_TILE_COLUMN_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 1], [16, 2], [4, 1], [0, 1]))
+
+
 @gluon.jit
 def _load_tile_column(shared, column_index, row_layout: gl.constexpr):
-    column_layout: gl.constexpr = gl.BlockedLayout([1, 1], [16, 2], [4, 1], [1, 0])
-    values = shared.gather(gl.full([64, 1], column_index, gl.int32, column_layout), 1).reshape([64])
+    columns = gl.full([64, 1], column_index, gl.int32, _TILE_COLUMN_LAYOUT)
+    values = shared.gather(columns, 1).reshape([64])
     return gl.convert_layout(values, gl.SliceLayout(0, row_layout))[None, :]
 
 
 @gluon.jit
 def _store_tile_column(shared, values, column_index):
-    column_layout: gl.constexpr = gl.BlockedLayout([1, 1], [16, 2], [4, 1], [1, 0])
-    row_1d_layout: gl.constexpr = gl.SliceLayout(1, column_layout)
+    row_1d_layout: gl.constexpr = gl.SliceLayout(1, _TILE_COLUMN_LAYOUT)
     shared.scatter(
         gl.convert_layout(values.reshape([64]), row_1d_layout)[:, None],
-        gl.full([64, 1], column_index, gl.int32, column_layout),
+        gl.full([64, 1], column_index, gl.int32, _TILE_COLUMN_LAYOUT),
         1,
     )
 
@@ -143,8 +144,6 @@ def _sparse_piper_attention_kernel(
     block_layout: gl.constexpr = gl.SliceLayout(1, row_layout)
     query_blocks = gl.full([1], query_block, gl.int32, block_layout)
     rows = gl.arange(0, 64, gl.SliceLayout(0, row_layout))
-    # The two K64 tiles always produce 128 score columns, independently of D.
-    columns = gl.arange(0, 128, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
     route_head_offset = gl.load(route_head_offsets_ptr + head)
     route_base = (
         routes_ptr
@@ -182,25 +181,21 @@ def _sparse_piper_attention_kernel(
     key_center_head = key_center_ptr + kv_batch_head * sequence_tiles * (2 * head_dim)
     key_center_scale_head = key_center_scale_ptr + kv_batch_head * sequence_tiles * 2
     value_mean_head = value_mean_ptr + kv_batch_head * sequence_tiles * head_dim
-    # D128 benefits from prioritizing matrix work over the intervening softmax.
-    # Keep sequence lengths dynamic so projection windows share this schedule.
-    matrix_priority: gl.constexpr = 3 if head_dim == 128 else None
-    softmax_priority: gl.constexpr = 0 if head_dim == 128 else None
 
     matrix_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        vec=1, per_phase=1, max_phase=1, order=[0, 1]
     )
     vector_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[0]
     )
-    tile_masses_shared = gl.allocate_shared_memory(
+    # compute_chunk_key_biases fills all 16 columns before the pair loop; each
+    # pair reads its two bias columns before writing its two tile-mass columns
+    # within each warp's disjoint 16-row slice, cutting LDS below 7 WGs/WGP.
+    tile_scratch_shared = gl.allocate_shared_memory(
         gl.float32, [64, _TILES_PER_CHUNK], matrix_shared_layout
     )
     pair_max_shared = gl.allocate_shared_memory(
         gl.float32, [64, _PAIRS_PER_CHUNK], matrix_shared_layout
-    )
-    key_bias_shared = gl.allocate_shared_memory(
-        gl.float32, [64, _TILES_PER_CHUNK], matrix_shared_layout
     )
     tiles_shared = gl.allocate_shared_memory(gl.int32, [_TILES_PER_CHUNK], vector_shared_layout)
     tile_load_layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
@@ -231,7 +226,7 @@ def _sparse_piper_attention_kernel(
             key_center_head,
             key_center_scale_head,
             tiles_shared,
-            key_bias_shared,
+            tile_scratch_shared,
             query_scale,
             use_64bit_context_offsets,
             head_dim,
@@ -251,10 +246,9 @@ def _sparse_piper_attention_kernel(
                 tile_1,
                 use_64bit_context_offsets,
                 head_dim,
-                pipeline_priority=matrix_priority,
             )
-            k_bias_0 = _load_tile_column(key_bias_shared, 2 * pair_in_chunk, row_layout)
-            k_bias_1 = _load_tile_column(key_bias_shared, 2 * pair_in_chunk + 1, row_layout)
+            k_bias_0 = _load_tile_column(tile_scratch_shared, 2 * pair_in_chunk, row_layout)
+            k_bias_1 = _load_tile_column(tile_scratch_shared, 2 * pair_in_chunk + 1, row_layout)
             parameters_0 = parameters + tile_0 * PARAMETER_COUNT
             parameters_1 = parameters + tile_1 * PARAMETER_COUNT
             key_scale_0 = gl.load(parameters_0 + KEY_SCALE)
@@ -273,6 +267,8 @@ def _sparse_piper_attention_kernel(
                 & (pair * 2 + 1 < tile_count)
             )
             if not complete:
+                # The two K64 tiles always produce 128 score columns, independently of D.
+                columns = gl.arange(0, 128, gl.SliceLayout(0, gl.SliceLayout(1, MMA_LAYOUT)))
                 column_block_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(1, MMA_LAYOUT))
                 valid_length_0 = gl.convert_layout(
                     length_0, column_block_layout, assert_trivial=True
@@ -336,15 +332,16 @@ def _sparse_piper_attention_kernel(
                 )
                 packed += (words,)
                 sums += (total,)
-                pipeline_boundary("softmax", softmax_priority)
+                with gl.amd.warp_pipeline_stage("softmax", priority=0):
+                    pass
             mass_0 = sums[0] + sums[1]
             mass_1 = sums[2] + sums[3]
             denominator = denominator * old_weight + (mass_0 + mass_1) * current_weight
             probabilities = concat_columns(
                 concat_columns(packed[0], packed[1]), concat_columns(packed[2], packed[3])
             )
-            _store_tile_column(tile_masses_shared, mass_0, 2 * pair_in_chunk)
-            _store_tile_column(tile_masses_shared, mass_1, 2 * pair_in_chunk + 1)
+            _store_tile_column(tile_scratch_shared, mass_0, 2 * pair_in_chunk)
+            _store_tile_column(tile_scratch_shared, mass_1, 2 * pair_in_chunk + 1)
             _store_tile_column(pair_max_shared, block_max, pair_in_chunk)
             numerator = pv_tiles(
                 probabilities,
@@ -354,14 +351,13 @@ def _sparse_piper_attention_kernel(
                 numerator,
                 current_weight,
                 use_64bit_context_offsets,
-                pipeline_priority=matrix_priority,
             )
             running_max = next_max
 
         gl.barrier()
         numerator = accumulate_chunk_value_means(
             numerator,
-            tile_masses_shared,
+            tile_scratch_shared,
             pair_max_shared,
             tiles_shared,
             running_max,
