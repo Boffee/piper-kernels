@@ -137,7 +137,6 @@ def _compute_k_bias_batch(
     mma_layout: gl.constexpr,
     key_layout: gl.constexpr,
     tile_batch_shared=None,
-    use_shared_tiles: gl.constexpr = False,
 ):
     """Compute Q @ rotated_center^T score biases for one batch of 16 routed/dense tiles."""
     elements_d: gl.constexpr = 8 if (mma_warps == 4 and head_dim == 64) else 16
@@ -149,8 +148,9 @@ def _compute_k_bias_batch(
     tile_layout: gl.constexpr = gl.SliceLayout(1, load_layout)
     feature_layout: gl.constexpr = gl.SliceLayout(0, load_layout)
     terms_per_tile: gl.constexpr = key_center_shared.shape[0] // K_BIAS_GROUP_TILES
-    if use_shared_tiles:
-        tiles = tile_batch_shared.gather(  # pyright: ignore[reportOptionalMemberAccess]
+    gl.static_assert(terms_per_tile == 1 or terms_per_tile == 2)  # noqa: PLR1714
+    if tile_batch_shared is not None:
+        tiles = tile_batch_shared.gather(
             gl.arange(0, K_BIAS_GROUP_TILES * terms_per_tile, tile_layout) // terms_per_tile, 0
         )
     else:
@@ -205,10 +205,8 @@ def _compute_k_bias_batch(
         gl.barrier()
         dot_1 = mma_v2(query, key_center_shared.permute([1, 0]).load(key_layout), zero_acc)
 
-    if use_shared_tiles:
-        scale_tiles = tile_batch_shared.load(  # pyright: ignore[reportOptionalMemberAccess]
-            gl.SliceLayout(0, mma_layout)
-        )
+    if tile_batch_shared is not None:
+        scale_tiles = tile_batch_shared.load(gl.SliceLayout(0, mma_layout))
     else:
         scale_tiles = _resolve_batch_tiles(
             batch_tile_start,
@@ -272,16 +270,15 @@ def compute_pair_k_bias(
     key_layout: gl.constexpr,
     row_layout: gl.constexpr,
     tiles_shared=None,
-    use_shared_tiles: gl.constexpr = False,
 ):
     """Refresh the 8-pair K-bias batch on boundaries and return this pair's biases."""
     local_pair = pair_index % _K_BIAS_GROUP_PAIRS  # pyright: ignore[reportOperatorIssue]
     if local_pair == 0:
         batch_tile_start = pair_index * 2
-        if use_shared_tiles:
-            tile_batch_shared = tiles_shared.index(  # pyright: ignore[reportOptionalMemberAccess]
-                (pair_index // _K_BIAS_GROUP_PAIRS) & 1
-            )
+        if tiles_shared is not None:
+            gl.static_assert(mma_warps == 4)
+            gl.static_assert(tiles_shared.shape == [2, K_BIAS_GROUP_TILES])
+            tile_batch_shared = tiles_shared.index((pair_index // _K_BIAS_GROUP_PAIRS) & 1)
             resolved_tiles = _resolve_batch_tiles(
                 batch_tile_start,
                 tile_count,
@@ -298,7 +295,7 @@ def compute_pair_k_bias(
             tile_batch_shared.store(resolved_tiles)
             gl.barrier()
         else:
-            tile_batch_shared = tiles_shared
+            tile_batch_shared = None
         bias_batch = _compute_k_bias_batch(
             query,
             query_scale,
@@ -321,7 +318,6 @@ def compute_pair_k_bias(
             mma_layout,
             key_layout,
             tile_batch_shared,
-            use_shared_tiles,
         )
         bias_cache_0, bias_cache_1 = gl.split(
             gl.reshape(bias_batch, [query.shape[0], _K_BIAS_GROUP_PAIRS, 2])
@@ -693,6 +689,19 @@ def accumulate_chunk_value_means(
     """Accumulate up to 32 buffered per-tile V means via two D64 BF16 MMA strips."""
     head_dim: gl.constexpr = accumulator.shape[1]
     half_dim: gl.constexpr = head_dim // 2
+    gl.static_assert(_VALUE_MEAN_GROUP_PAIRS == 2 * _K_BIAS_GROUP_PAIRS)
+    gl.static_assert(_VALUE_MEAN_GROUP_TILES == 2 * K_BIAS_GROUP_TILES)
+    gl.static_assert(
+        mma_layout.warps_per_cta == [4, 1]  # pyright: ignore[reportAttributeAccessIssue]
+    )
+    gl.static_assert(accumulator.shape == [_GL_BLOCK_N, 128])
+    gl.static_assert(tile_masses_shared.shape == [_GL_BLOCK_N, _VALUE_MEAN_GROUP_TILES])
+    gl.static_assert(pair_max_shared.shape == [_GL_BLOCK_N, _VALUE_MEAN_GROUP_PAIRS])
+    gl.static_assert(tiles_shared.shape == [2, K_BIAS_GROUP_TILES])
+    gl.static_assert(
+        key_center_shared.shape[0] * key_center_shared.shape[1]
+        >= 2 * _VALUE_MEAN_GROUP_TILES * half_dim
+    )
     gl.static_assert(half_dim == 64)
 
     gl.barrier()
@@ -785,10 +794,7 @@ def accumulate_chunk_value_means(
 @gluon.jit
 def accumulate_value_mean_step(
     accumulator,
-    tile_masses_shared,
-    pair_max_shared,
-    tiles_shared,
-    key_center_shared,
+    value_mean_workspace,
     running_max,
     value_mean_ptr,
     mass_0,
@@ -803,10 +809,10 @@ def accumulate_value_mean_step(
     tile_count,
     in_loop: gl.constexpr,
     mma_layout: gl.constexpr,
-    use_chunked_value_mean: gl.constexpr,
 ):
-    """Defer D128 V-mean accumulation to 32-tile BF16 tensor-core chunks; keep D64 scalar."""
-    if use_chunked_value_mean:
+    """Accumulate V-mean restoration in 32-tile BF16 chunks on D128 or scalar pairs on D64."""
+    if value_mean_workspace is not None:
+        tile_masses_shared, pair_max_shared, tiles_shared, key_center_shared = value_mean_workspace
         local_pair = pair_index % _VALUE_MEAN_GROUP_PAIRS  # pyright: ignore[reportOperatorIssue]
         _store_tile_column(tile_masses_shared, mass_0, local_pair * 2)
         _store_tile_column(tile_masses_shared, mass_1, local_pair * 2 + 1)

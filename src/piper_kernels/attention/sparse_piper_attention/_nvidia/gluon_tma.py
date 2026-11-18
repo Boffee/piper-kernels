@@ -183,14 +183,14 @@ def _sparse_piper_attention_kernel(
     gl.static_assert(block_m == 64 or (block_m == 128 and head_dim == 64 and skip_dense_routing))
     gl.static_assert(mma_warps == 4 or (mma_warps == 2 and head_dim == 64 and block_m == 64))
     gl.static_assert(not apply_coarse_residual or block_m == 64)
-    packed_fp32: gl.constexpr = head_dim == 128
+    is_d128: gl.constexpr = head_dim == 128
     head, local_query_block = _schedule_program_coords(
         gl.program_id(1),
         gl.program_id(0) * (block_m // _GL_BLOCK_N),
         heads,
         global_query_block_offset,
         sparse_query_blocks,
-        packed_fp32,
+        is_d128,
         has_dense_query_suffix,
     )
     query_block = query_block_offset + local_query_block
@@ -233,13 +233,13 @@ def _sparse_piper_attention_kernel(
     )
     value_shared_0 = value_shared_pair.index(0)
     value_shared_1 = value_shared_pair.index(1)
-    center_rows: gl.constexpr = (2 if packed_fp32 else 1) * K_BIAS_GROUP_TILES
+    center_rows: gl.constexpr = (2 if is_d128 else 1) * K_BIAS_GROUP_TILES
     key_center_shared = gl.allocate_shared_memory(
         gl.int8,
         [center_rows, head_dim],
         gl.NVMMASharedLayout.get_default_for([center_rows, head_dim], gl.int8),
     )
-    if packed_fp32:
+    if is_d128:
         pair_max_shared = gl.allocate_shared_memory(
             gl.float32,
             [_GL_BLOCK_N, K_BIAS_GROUP_TILES],
@@ -251,8 +251,8 @@ def _sparse_piper_attention_kernel(
             gl.SwizzledSharedLayout(1, 1, 1, [0]),
         )
     else:
-        pair_max_shared = query_shared
-        tiles_shared = query_shared
+        pair_max_shared = None
+        tiles_shared = None
     query_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     key_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     value_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
@@ -313,7 +313,7 @@ def _sparse_piper_attention_kernel(
     )
     mbarrier.wait(query_barrier, phase=0)
     query = query_shared.load(query_layout)
-    if packed_fp32:
+    if is_d128:
         # Ensure all warps finish loading Q before reusing query_shared as FP32 mass scratch.
         gl.barrier()
         tile_masses_shared = query_shared.reinterpret(
@@ -321,8 +321,14 @@ def _sparse_piper_attention_kernel(
             [_GL_BLOCK_N, _VALUE_MEAN_GROUP_TILES],
             gl.SwizzledSharedLayout(1, 1, 1, [0, 1]),
         )
+        value_mean_workspace = (
+            tile_masses_shared,
+            pair_max_shared,
+            tiles_shared,
+            key_center_shared,
+        )
     else:
-        tile_masses_shared = query_shared
+        value_mean_workspace = None
 
     offsets_m = gl.arange(0, block_m, row_layout)
     query_scale_stride = query_storage_sequence_length // _GL_QUERY_SCALE_ROWS
@@ -373,7 +379,6 @@ def _sparse_piper_attention_kernel(
             key_layout,
             row_layout,
             tiles_shared,
-            packed_fp32,
         )
         phase = pair_index & 1
         mbarrier.wait(key_barrier, phase=phase)
@@ -409,7 +414,7 @@ def _sparse_piper_attention_kernel(
             mask_block_lengths,
             False,
             False,
-            packed_fp32,
+            is_d128,
         )
 
         next_n_0, next_n_1 = pair_tile_offsets(
@@ -442,7 +447,7 @@ def _sparse_piper_attention_kernel(
             current_weight,
             mma_layout,
             value_layout,
-            packed_fp32,
+            is_d128,
         )
         gl.barrier()
         _issue_tma_pair(
@@ -455,10 +460,7 @@ def _sparse_piper_attention_kernel(
         )
         accumulator = accumulate_value_mean_step(
             accumulator,
-            tile_masses_shared,
-            pair_max_shared,
-            tiles_shared,
-            key_center_shared,
+            value_mean_workspace,
             running_max,
             value_mean_ptr,
             mass_0,
@@ -473,7 +475,6 @@ def _sparse_piper_attention_kernel(
             tile_count,
             True,
             mma_layout,
-            packed_fp32,
         )
         start_n_0 = next_n_0
         start_n_1 = next_n_1
@@ -504,7 +505,6 @@ def _sparse_piper_attention_kernel(
         key_layout,
         row_layout,
         tiles_shared,
-        packed_fp32,
     )
     final_phase = final_pair & 1
     final_position_0 = final_pair * 2
@@ -542,7 +542,7 @@ def _sparse_piper_attention_kernel(
         mask_block_lengths,
         mask_ragged_tail,
         True,
-        packed_fp32,
+        is_d128,
     )
     mbarrier.wait(value_barrier, phase=final_phase)
     accumulator = piper_pv_pair(
@@ -553,14 +553,11 @@ def _sparse_piper_attention_kernel(
         current_weight,
         mma_layout,
         value_layout,
-        packed_fp32,
+        is_d128,
     )
     accumulator = accumulate_value_mean_step(
         accumulator,
-        tile_masses_shared,
-        pair_max_shared,
-        tiles_shared,
-        key_center_shared,
+        value_mean_workspace,
         running_max,
         value_mean_ptr,
         mass_0,
@@ -575,7 +572,6 @@ def _sparse_piper_attention_kernel(
         tile_count,
         False,
         mma_layout,
-        packed_fp32,
     )
 
     store_attention_output(
