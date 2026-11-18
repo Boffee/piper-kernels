@@ -1,4 +1,9 @@
-"""Paired-K128 Gluon kernel for sparse Piper Attention with NVIDIA TMA loads."""
+"""Paired-K128 Gluon kernel for sparse Piper Attention with NVIDIA TMA loads.
+
+On SM120 D128, V-mean restoration buffers 16 pairs (32 tiles) and flushes via
+D64 BF16 tensor-core strips, reusing query shared memory after the initial load;
+D64 keeps the exact per-pair FP32 scalar restoration path.
+"""
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
 # ruff: noqa: ANN001, ANN202, PLR0913, PLR0915, PLR0917
@@ -24,8 +29,9 @@ from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
 from .._prepared import _PreparedSparsePiperContext, _PreparedSparsePiperQuery
 from . import policy
 from ._recurrence import (
+    _VALUE_MEAN_GROUP_TILES,
     K_BIAS_GROUP_TILES,
-    accumulate_value_mean_pair,
+    accumulate_value_mean_step,
     build_k_bias_cache,
     compute_pair_k_bias,
     piper_probability_pair,
@@ -57,6 +63,70 @@ def _issue_tma_pair(
     mbarrier.expect(barrier, descriptor.block_type.nbytes * 2)
     tma.async_load(descriptor, offsets_0, barrier, shared_0)
     tma.async_load(descriptor, offsets_1, barrier, shared_1)
+
+
+@gluon.jit
+def _schedule_program_coords(
+    head,
+    local_query_block,
+    heads,
+    global_query_block_offset,
+    sparse_query_blocks,
+    group_dense_suffix: gl.constexpr,
+    has_dense_query_suffix: gl.constexpr,
+):
+    """Group dense-suffix CTAs first across heads so sparse waves finish together."""
+    if group_dense_suffix and has_dense_query_suffix:
+        query_blocks = gl.num_programs(0)
+        sparse = gl.minimum(
+            gl.maximum(sparse_query_blocks - global_query_block_offset, 0), query_blocks
+        )
+        dense = query_blocks - sparse
+        linear = head * query_blocks + local_query_block
+        dense_programs = heads * dense
+        sparse_linear = linear - dense_programs
+        in_dense = linear < dense_programs
+        head = gl.where(
+            in_dense,
+            linear // gl.maximum(dense, 1),
+            sparse_linear // gl.maximum(sparse, 1),
+        )
+        local_query_block = gl.where(
+            in_dense,
+            sparse + linear % gl.maximum(dense, 1),
+            sparse_linear % gl.maximum(sparse, 1),
+        )
+    return head, local_query_block
+
+
+@gluon.jit
+def _resolve_sparse_route_counts(
+    head,
+    head_keep_blocks_ptr,
+    global_query_block,
+    sparse_key_blocks,
+    sparse_query_blocks,
+    skip_dense_routing: gl.constexpr,
+    has_dense_query_suffix: gl.constexpr,
+):
+    """Determine selected KV tile count and routing flag for one CTA."""
+    if skip_dense_routing:
+        routed_sparse_tile_count = sparse_key_blocks
+        selected_sparse_tile_count = sparse_key_blocks
+        use_sparse_routes = False
+    else:
+        routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
+        if has_dense_query_suffix:
+            use_sparse_routes = global_query_block < sparse_query_blocks
+            selected_sparse_tile_count = gl.where(
+                use_sparse_routes,
+                routed_sparse_tile_count,
+                sparse_key_blocks,
+            )
+        else:
+            use_sparse_routes = True
+            selected_sparse_tile_count = routed_sparse_tile_count
+    return routed_sparse_tile_count, selected_sparse_tile_count, use_sparse_routes
 
 
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_ARGUMENTS)
@@ -113,10 +183,18 @@ def _sparse_piper_attention_kernel(
     gl.static_assert(block_m == 64 or (block_m == 128 and head_dim == 64 and skip_dense_routing))
     gl.static_assert(mma_warps == 4 or (mma_warps == 2 and head_dim == 64 and block_m == 64))
     gl.static_assert(not apply_coarse_residual or block_m == 64)
-    local_query_block = gl.program_id(0) * (block_m // _GL_BLOCK_N)
+    packed_fp32: gl.constexpr = head_dim == 128
+    head, local_query_block = _schedule_program_coords(
+        gl.program_id(1),
+        gl.program_id(0) * (block_m // _GL_BLOCK_N),
+        heads,
+        global_query_block_offset,
+        sparse_query_blocks,
+        packed_fp32,
+        has_dense_query_suffix,
+    )
     query_block = query_block_offset + local_query_block
     global_query_block = global_query_block_offset + local_query_block
-    head = gl.program_id(1)
     batch = gl.program_id(2)
     batch_head = batch * heads + head
     kv_batch_head = batch * (heads // query_heads_per_kv_head) + head // query_heads_per_kv_head
@@ -155,11 +233,26 @@ def _sparse_piper_attention_kernel(
     )
     value_shared_0 = value_shared_pair.index(0)
     value_shared_1 = value_shared_pair.index(1)
+    center_rows: gl.constexpr = (2 if packed_fp32 else 1) * K_BIAS_GROUP_TILES
     key_center_shared = gl.allocate_shared_memory(
         gl.int8,
-        [K_BIAS_GROUP_TILES, head_dim],
-        gl.NVMMASharedLayout.get_default_for([K_BIAS_GROUP_TILES, head_dim], gl.int8),
+        [center_rows, head_dim],
+        gl.NVMMASharedLayout.get_default_for([center_rows, head_dim], gl.int8),
     )
+    if packed_fp32:
+        pair_max_shared = gl.allocate_shared_memory(
+            gl.float32,
+            [_GL_BLOCK_N, K_BIAS_GROUP_TILES],
+            gl.SwizzledSharedLayout(1, 1, 1, [0, 1]),
+        )
+        tiles_shared = gl.allocate_shared_memory(
+            gl.int32,
+            [2, K_BIAS_GROUP_TILES],
+            gl.SwizzledSharedLayout(1, 1, 1, [0]),
+        )
+    else:
+        pair_max_shared = query_shared
+        tiles_shared = query_shared
     query_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     key_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     value_barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
@@ -168,22 +261,17 @@ def _sparse_piper_attention_kernel(
     mbarrier.init(value_barrier, count=1)
     gl.barrier()
 
-    if skip_dense_routing:
-        routed_sparse_tile_count = sparse_key_blocks
-        selected_sparse_tile_count = sparse_key_blocks
-        use_sparse_routes = False
-    else:
-        routed_sparse_tile_count = gl.load(head_keep_blocks_ptr + head)
-        if has_dense_query_suffix:
-            use_sparse_routes = global_query_block < sparse_query_blocks
-            selected_sparse_tile_count = gl.where(
-                use_sparse_routes,
-                routed_sparse_tile_count,
-                sparse_key_blocks,
-            )
-        else:
-            use_sparse_routes = True
-            selected_sparse_tile_count = routed_sparse_tile_count
+    routed_sparse_tile_count, selected_sparse_tile_count, use_sparse_routes = (
+        _resolve_sparse_route_counts(
+            head,
+            head_keep_blocks_ptr,
+            global_query_block,
+            sparse_key_blocks,
+            sparse_query_blocks,
+            skip_dense_routing,
+            has_dense_query_suffix,
+        )
+    )
     sequence_tiles = storage_sequence_length // _GL_BLOCK_N
     dense_tile_count = sequence_tiles - sparse_key_blocks
     tile_count = selected_sparse_tile_count + dense_tile_count
@@ -225,6 +313,16 @@ def _sparse_piper_attention_kernel(
     )
     mbarrier.wait(query_barrier, phase=0)
     query = query_shared.load(query_layout)
+    if packed_fp32:
+        # Ensure all warps finish loading Q before reusing query_shared as FP32 mass scratch.
+        gl.barrier()
+        tile_masses_shared = query_shared.reinterpret(
+            gl.float32,
+            [_GL_BLOCK_N, _VALUE_MEAN_GROUP_TILES],
+            gl.SwizzledSharedLayout(1, 1, 1, [0, 1]),
+        )
+    else:
+        tile_masses_shared = query_shared
 
     offsets_m = gl.arange(0, block_m, row_layout)
     query_scale_stride = query_storage_sequence_length // _GL_QUERY_SCALE_ROWS
@@ -274,6 +372,8 @@ def _sparse_piper_attention_kernel(
             mma_layout,
             key_layout,
             row_layout,
+            tiles_shared,
+            packed_fp32,
         )
         phase = pair_index & 1
         mbarrier.wait(key_barrier, phase=phase)
@@ -285,6 +385,7 @@ def _sparse_piper_attention_kernel(
             current_weight,
             mass_0,
             mass_1,
+            block_max,
         ) = piper_probability_pair(
             query,
             key_shared_pair,
@@ -308,6 +409,7 @@ def _sparse_piper_attention_kernel(
             mask_block_lengths,
             False,
             False,
+            packed_fp32,
         )
 
         next_n_0, next_n_1 = pair_tile_offsets(
@@ -340,6 +442,7 @@ def _sparse_piper_attention_kernel(
             current_weight,
             mma_layout,
             value_layout,
+            packed_fp32,
         )
         gl.barrier()
         _issue_tma_pair(
@@ -350,17 +453,27 @@ def _sparse_piper_attention_kernel(
             value_shared_1,
             value_barrier,
         )
-        accumulator = accumulate_value_mean_pair(
+        accumulator = accumulate_value_mean_step(
             accumulator,
+            tile_masses_shared,
+            pair_max_shared,
+            tiles_shared,
+            key_center_shared,
+            running_max,
             value_mean_ptr,
             mass_0,
             mass_1,
+            block_max,
             current_weight,
             kv_batch_head,
             start_n_0,
             start_n_1,
             sequence_tiles,
+            pair_index,
+            tile_count,
+            True,
             mma_layout,
+            packed_fp32,
         )
         start_n_0 = next_n_0
         start_n_1 = next_n_1
@@ -390,6 +503,8 @@ def _sparse_piper_attention_kernel(
         mma_layout,
         key_layout,
         row_layout,
+        tiles_shared,
+        packed_fp32,
     )
     final_phase = final_pair & 1
     final_position_0 = final_pair * 2
@@ -403,6 +518,7 @@ def _sparse_piper_attention_kernel(
         current_weight,
         mass_0,
         mass_1,
+        block_max,
     ) = piper_probability_pair(
         query,
         key_shared_pair,
@@ -426,6 +542,7 @@ def _sparse_piper_attention_kernel(
         mask_block_lengths,
         mask_ragged_tail,
         True,
+        packed_fp32,
     )
     mbarrier.wait(value_barrier, phase=final_phase)
     accumulator = piper_pv_pair(
@@ -436,18 +553,29 @@ def _sparse_piper_attention_kernel(
         current_weight,
         mma_layout,
         value_layout,
+        packed_fp32,
     )
-    accumulator = accumulate_value_mean_pair(
+    accumulator = accumulate_value_mean_step(
         accumulator,
+        tile_masses_shared,
+        pair_max_shared,
+        tiles_shared,
+        key_center_shared,
+        running_max,
         value_mean_ptr,
         mass_0,
         mass_1,
+        block_max,
         current_weight,
         kv_batch_head,
         start_n_0,
         start_n_1,
         sequence_tiles,
+        final_pair,
+        tile_count,
+        False,
         mma_layout,
+        packed_fp32,
     )
 
     store_attention_output(
