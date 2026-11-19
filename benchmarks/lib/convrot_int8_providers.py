@@ -72,11 +72,7 @@ def make_convrot_int8_workload(
     backend = select_convrot_int8_backend(target)
     inputs = make_convrot_inputs(shape, config, device=device)
     qdata = inputs[1]
-    production_plan = (
-        backend.default_execution_plan(qdata, target=target, rows=shape.rows)
-        if target.is_nvidia_cuda
-        else backend.default_execution_plan(qdata, target=target)
-    )
+    production_plan = backend.default_execution_plan(qdata, target=target, rows=shape.rows)
     return ConvRotInt8Workload(
         shape=shape,
         config=config,

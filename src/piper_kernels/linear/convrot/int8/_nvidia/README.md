@@ -65,8 +65,11 @@ until a different schedule demonstrates a benefit across representative workload
 
 Plain and residual kernels share projection and store helpers. Their separate
 entry points keep residual arguments out of ordinary GEMM launches. Backend policy
-owns the epilogue choice. FP32 outputs, other NVIDIA targets, and AMD retain the
-materialized projection plus standalone residual kernel, and NVFP4 fusions retain
-their existing path. The same [Triton residual arithmetic](../../../../_residual/triton.py)
-serves native and standalone epilogues; fusion code does not select a GEMM kernel
-or reproduce its arithmetic. The native path has been validated on RTX 5090.
+owns the epilogue choice: SM120 fuses 16-bit projections, RDNA4 `gfx1201` (see the
+[AMD README](../_amd/README.md#residual-epilogues)) fuses aligned 16-bit
+projections, and FP32 outputs, other targets, and unaligned shapes retain the
+materialized projection plus standalone residual kernel (while NVFP4 fusions
+retain their existing path). The same
+[Triton residual arithmetic](../../../../_residual/triton.py) serves native and
+standalone epilogues; fusion code does not select a GEMM kernel or reproduce its
+arithmetic. The native paths have been validated on RTX 5090 and RX 9070 XT.

@@ -1,6 +1,7 @@
 """AMD support boundaries and on-device coverage of the shared INT8 contract."""
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -96,19 +97,156 @@ def test_rdna4_preparation_policy(width, blocks, warps, fused):
     assert plan.matmul_num_stages == 2
 
 
+@pytest.mark.parametrize(
+    ("architecture", "rows", "outputs", "width", "expected_nk"),
+    [
+        ("gfx1201", 4096, 6144, 16384, (128, 128)),
+        ("gfx1201", 4096, 6144, 16448, (256, 64)),
+        ("gfx1201", 2048, 2048, 8192, (128, 128)),
+        ("gfx1201", 4096, 16384, 8192, (128, 128)),
+        ("gfx1201", 4096, 2048, 24576, (128, 128)),
+        ("gfx1201", 1024, 1024, 16384, (256, 64)),
+        ("gfx1200", 4096, 6144, 16384, (256, 64)),
+    ],
+)
+def test_amd_matmul_selects_wide_k_for_aligned_strides(
+    architecture, rows, outputs, width, expected_nk
+):
+    plan = policy.select_execution_plan(
+        AcceleratorTarget("hip", architecture), in_features=width, rows=rows, out_features=outputs
+    )
+    assert (plan.matmul_block_n, plan.matmul_block_k) == expected_nk
+    assert policy.matmul_group_m(plan) == 8
+
+
+@pytest.mark.parametrize(
+    ("architecture", "rows", "outputs", "width", "expected"),
+    [
+        ("gfx1201", 1, 5376, 5376, (32, 128, 64, 4)),
+        ("gfx1201", 32, 14336, 5376, (32, 128, 64, 4)),
+        ("gfx1201", 33, 5376, 5376, (64, 128, 64, 4)),
+        ("gfx1201", 64, 14336, 5376, (64, 128, 64, 4)),
+        ("gfx1201", 65, 5376, 5376, (128, 256, 64, 8)),
+        ("gfx1201", 128, 5376, 5376, (128, 256, 64, 8)),
+        ("gfx1201", 128, 8192, 8192, (128, 256, 64, 8)),
+        ("gfx1201", 128, 16384, 8192, (128, 128, 128, 8)),
+        ("gfx1201", 129, 5376, 5376, (128, 256, 64, 8)),
+        ("gfx1200", 32, 5376, 5376, (128, 256, 64, 8)),
+    ],
+)
+def test_gfx1201_short_batch_matmul_schedules(architecture, rows, outputs, width, expected):
+    plan = policy.select_execution_plan(
+        AcceleratorTarget("hip", architecture), in_features=width, rows=rows, out_features=outputs
+    )
+    assert (
+        plan.matmul_block_m,
+        plan.matmul_block_n,
+        plan.matmul_block_k,
+        plan.matmul_num_warps,
+    ) == expected
+
+
 def test_optional_amd_compiler_option_compatibility(monkeypatch):
     target = AcceleratorTarget("hip", "gfx1201")
     monkeypatch.setattr(amd.importlib, "import_module", Mock(return_value=object()))
     assert amd._amd_matmul_compiler_options(target) == {}
 
 
+def test_gfx1201_accumulator_seed_fits_every_int8_partial_sum():
+    target = AcceleratorTarget("hip", "gfx1201")
+    seed = policy.matmul_accumulator_seed(target, 4096, 64)
+    assert seed > 0
+    assert policy.matmul_accumulator_seed(target, 4096, 63) == 0
+    last_safe_width = (2**31 - 1 - seed) // (128 * 128)
+    assert policy.matmul_accumulator_seed(target, last_safe_width, 64) == seed
+    assert policy.matmul_accumulator_seed(target, last_safe_width + 1, 64) == 0
+    assert policy.matmul_accumulator_seed(AcceleratorTarget("hip", "gfx1200"), 4096, 64) == 0
+
+
+@pytest.mark.parametrize(
+    ("arch", "dtype", "rows", "outputs", "width", "stride", "expected"),
+    [
+        ("gfx1201", torch.bfloat16, 4096, 14336, 5376, 28672, True),
+        ("gfx1201", torch.bfloat16, 2816, 16384, 6144, 32768, True),
+        ("gfx1201", torch.bfloat16, 20480, 8192, 2048, 16384, True),
+        ("gfx1201", torch.bfloat16, 20480, 14336, 5376, 28672, True),
+        ("gfx1201", torch.float32, 20480, 14336, 5376, 28672, False),
+        ("gfx1200", torch.bfloat16, 4096, 14336, 5376, 28672, False),
+        ("gfx1201", torch.bfloat16, 4096, 6144, 8192, 12288, False),
+        ("gfx1201", torch.bfloat16, 4096, 320, 512, 640, False),
+        ("gfx1201", torch.bfloat16, 4096, 512, 224, 1024, False),
+        ("gfx1201", torch.bfloat16, 100000, 14336, 5376, 28672, False),
+    ],
+)
+def test_gfx1201_paired_matmul_selection_boundaries(
+    arch, dtype, rows, outputs, width, stride, expected
+):
+    target = AcceleratorTarget("hip", arch)
+    plan = policy.select_execution_plan(target, in_features=width, rows=rows, out_features=outputs)
+    assert (
+        policy.supports_paired_matmul(
+            target,
+            plan,
+            dtype,
+            rows=rows,
+            in_features=width,
+            out_features=outputs,
+            output_row_stride=stride,
+        )
+        is expected
+    )
+
+
+def test_gfx1201_paired_matmul_respects_custom_plan():
+    target = AcceleratorTarget("hip", "gfx1201")
+    plan = replace(
+        policy.select_execution_plan(target, in_features=5376, rows=4096, out_features=14336),
+        matmul_block_n=128,
+    )
+    assert not policy.supports_paired_matmul(
+        target,
+        plan,
+        torch.bfloat16,
+        rows=4096,
+        in_features=5376,
+        out_features=14336,
+        output_row_stride=28672,
+    )
+
+
 @pytest.mark.gpu
 @_gpu
-@pytest.mark.parametrize("rows", [1023, 1024, 1025, 2049])
+def test_amd_projection_recovers_integer_sum_before_fp32_rounding():
+    # 2**24 - 1 is exact in FP32, but its seeded sum crosses a binade.
+    width = 4096
+    a = torch.zeros(1024, width, device="cuda", dtype=torch.int8)
+    b = torch.zeros(2048, width, device="cuda", dtype=torch.int8)
+    a[:, :2048] = -128
+    b[:, :2048] = -64
+    a[:, 2048] = 1
+    b[:, 2048] = -1
+    result = amd.linear_prepared(
+        a, torch.ones(1024, device="cuda"), b, torch.ones(2048, device="cuda"), None, torch.float32
+    )
+    assert torch.equal(result, torch.full_like(result, 2**24 - 1))
+
+
+@pytest.mark.gpu
+@_gpu
+@pytest.mark.parametrize(
+    ("rows", "width", "columns"),
+    [
+        (1023, 256, 335),
+        (1024, 256, 335),
+        (1025, 256, 335),
+        (2049, 256, 335),
+        (1025, 4096, 1024),
+        (1025, 8192, 2049),
+    ],
+)
 @pytest.mark.parametrize("paired", [False, True])
-def test_amd_projection_crosses_cache_group_and_tail_boundaries(rows, paired):
+def test_amd_projection_crosses_cache_group_and_tail_boundaries(rows, width, columns, paired):
     torch.manual_seed(893)
-    width, columns = 256, 335
     qdata = torch.randint(-127, 128, (rows, width), device="cuda", dtype=torch.int8)
     scale = torch.rand(rows, device="cuda") * 0.01
     weights = [
@@ -267,3 +405,43 @@ def test_amd_compiled_shared_preparation(monkeypatch):
     assert prepare.call_count == 1
     for result, reference_result in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, reference_result, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@_gpu
+@pytest.mark.parametrize("rows", [1, 32, 33, 63, 64, 65, 128])
+@pytest.mark.parametrize("paired", [False, True])
+def test_amd_short_batch_projections_match_reference(rows, paired):
+    torch.manual_seed(913 + rows)
+    width, columns = 512, 320
+    dtype = torch.bfloat16
+    x = torch.randn((rows, width), device="cuda", dtype=dtype)
+    qdata, scale = amd.prepare_input(x, 256)
+    weights = [
+        (
+            torch.randint(-127, 128, (columns, width), device="cuda", dtype=torch.int8),
+            torch.rand(columns, device="cuda") * 0.02,
+            torch.randn(columns, device="cuda", dtype=dtype),
+        )
+        for _ in range(2 if paired else 1)
+    ]
+    actual = amd.linear_prepared(
+        qdata,
+        scale,
+        weights[0][0],
+        weights[0][1],
+        weights[0][2],
+        dtype,
+        second_projection=weights[1] if paired else None,
+    )
+    expected = torch.cat(
+        [reference.linear_prepared(qdata, scale, w, ws, dtype, b) for w, ws, b in weights],
+        dim=-1,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2 * torch.finfo(dtype).eps, atol=1e-5)
+    if not paired:
+        weight = ConvRotInt8Tensor.from_quantized(
+            weights[0][0], weights[0][1][:, None], group_size=256, logical_dtype=dtype
+        )
+        end_to_end = convrot_int8_linear(x, weight, weights[0][2])
+        torch.testing.assert_close(end_to_end, expected, rtol=2 * torch.finfo(dtype).eps, atol=1e-5)

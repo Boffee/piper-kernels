@@ -12,7 +12,7 @@ import triton.language as tl
 from piper_kernels._input_activations import apply_input_activation, input_activation_width
 from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._residual import ResidualAdd
-from piper_kernels._residual.triton import apply_residual_add
+from piper_kernels._residual.triton import add_residual, apply_residual_add
 from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -28,9 +28,6 @@ from piper_kernels.weights.convrot.int8.triton import (
 from .._kernels.triton import int8_matmul_kernel
 from .._plan import LinearExecutionPlan
 from . import policy
-
-# Smaller row groups improve cache reuse at the validated large/wide RDNA4 shapes.
-_LARGE_MATMUL_GROUP_M_TILES = 8
 
 
 @triton.jit
@@ -436,12 +433,15 @@ def default_execution_plan(
     weight_qdata: torch.Tensor,
     *,
     target: AcceleratorTarget | None = None,
+    rows: int | None = None,
 ) -> LinearExecutionPlan:
     """Resolve production policy, accepting an explicit target for offline tuning."""
     target = AcceleratorTarget.from_device(weight_qdata.device) if target is None else target
     return policy.select_execution_plan(
         target,
         in_features=weight_qdata.shape[1],
+        rows=rows,
+        out_features=weight_qdata.shape[0],
     )
 
 
@@ -504,6 +504,76 @@ def prepare_input_with_plan(
     return result
 
 
+@triton.jit(do_not_specialize=["m"])
+def _paired_int8_matmul_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    second_weight_ptr,
+    second_scale_ptr,
+    second_bias_ptr,
+    m,
+    output_row_stride,
+    n: tl.constexpr,
+    k: tl.constexpr,
+    has_bias: tl.constexpr,
+    second_has_bias: tl.constexpr,
+    full_rows: tl.constexpr,
+    accumulator_seed: tl.constexpr,
+):
+    """Project one prepared input into two adjacent 128-column-tiled weights."""
+    # Caller validates that 32-bit element indexing fits inputs, weights, and outputs.
+    pid = tl.program_id(0)
+    row_tiles = tl.cdiv(m, 128)
+    col_tiles: tl.constexpr = n // 128
+    group_n: tl.constexpr = tl.constexpr(4)
+    first_col = pid // (row_tiles * group_n) * group_n
+    cols_in_group = tl.minimum(group_n, col_tiles - first_col)
+    local = pid % (row_tiles * group_n)
+    rows = local // cols_in_group * 128 + tl.arange(0, 128)
+    cols = (first_col + local % cols_in_group) * 128 + tl.arange(0, 128)
+    # Repeat the final valid input row on partial tiles; stores mask out-of-range rows.
+    source_rows = rows if full_rows else tl.minimum(rows, m - 1)
+    offsets_k = tl.arange(0, 64)
+    activation_pointers = input_ptr + source_rows[:, None] * k + offsets_k[None, :]
+    weight_offsets = cols[None, :] * k + offsets_k[:, None]
+    first_weight_pointers = weight_ptr + weight_offsets
+    second_weight_pointers = second_weight_ptr + weight_offsets
+    first_accumulator = tl.full((128, 128), accumulator_seed, tl.int32)
+    second_accumulator = tl.full((128, 128), accumulator_seed, tl.int32)
+    for _ in range(k // 64):
+        activation = tl.load(activation_pointers)
+        first_weight = tl.load(first_weight_pointers)
+        second_weight = tl.load(second_weight_pointers)
+        first_accumulator = tl.dot(activation, first_weight, first_accumulator)
+        second_accumulator = tl.dot(activation, second_weight, second_accumulator)
+        activation_pointers += 64
+        first_weight_pointers += 64
+        second_weight_pointers += 64
+    row_scale = tl.load(input_scale_ptr + source_rows)
+    first_result = (
+        (first_accumulator - accumulator_seed).to(tl.float32)
+        * row_scale[:, None]
+        * tl.load(weight_scale_ptr + cols)[None, :]
+    )
+    if has_bias:
+        first_result += tl.load(bias_ptr + cols).to(tl.float32)[None, :]
+    second_result = (
+        (second_accumulator - accumulator_seed).to(tl.float32)
+        * row_scale[:, None]
+        * tl.load(second_scale_ptr + cols)[None, :]
+    )
+    if second_has_bias:
+        second_result += tl.load(second_bias_ptr + cols).to(tl.float32)[None, :]
+    dest = output_ptr + rows[:, None] * output_row_stride + cols[None, :]
+    valid_rows = True if full_rows else rows[:, None] < m
+    tl.store(dest + n, second_result, mask=valid_rows)
+    tl.store(dest, first_result, mask=valid_rows)
+
+
 def execute_prepared_linear(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -548,21 +618,50 @@ def execute_prepared_linear(
         raise ValueError("prepared INT8 GEMM output must be column-contiguous")
     plan = execution_plan
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
-    # Cache grouping is intrinsic to the large-tile family.
-    group_m = (
-        _LARGE_MATMUL_GROUP_M_TILES
-        if plan.matmul_block_m == 128 and plan.matmul_block_n == 256
-        else 0
-    )
-    compiler_options = _amd_matmul_compiler_options(
-        AcceleratorTarget.from_device(input_qdata.device)
-    )
+    group_m = policy.matmul_group_m(plan)
+    target = AcceleratorTarget.from_device(input_qdata.device)
+    compiler_options = _amd_matmul_compiler_options(target)
     bias_pointer = bias if bias is not None else output
 
     if not m or not n:
         return result
+    if paired and policy.supports_paired_matmul(
+        target,
+        plan,
+        logical_dtype,
+        rows=m,
+        in_features=k,
+        out_features=n,
+        output_row_stride=output.stride(0),
+    ):
+        output_tiles = triton.cdiv(m, 128) * (n // 128)
+        with device_context(input_qdata.device):
+            _paired_int8_matmul_kernel[(output_tiles,)](
+                input_qdata_2d,
+                weight_qdata,
+                output,
+                input_scale_1d,
+                weight_scale,
+                bias_pointer,
+                second_weight,
+                second_scale,
+                second_bias if second_bias is not None else output,
+                m,
+                output.stride(0),
+                n=n,
+                k=k,
+                has_bias=bias is not None,
+                second_has_bias=second_bias is not None,
+                full_rows=m % 128 == 0,
+                accumulator_seed=policy.matmul_accumulator_seed(target, k, output_tiles),
+                **compiler_options,
+                num_stages=2,
+                num_warps=8,
+            )
+        return result
     row_block_count = triton.cdiv(m, plan.matmul_block_m)
-    grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
+    output_tiles = row_block_count * num_n_tiles
+    grid = (output_tiles,) if group_m else (row_block_count, num_n_tiles)
     with device_context(input_qdata.device):
         int8_matmul_kernel[grid](
             input_qdata_2d,
@@ -589,6 +688,7 @@ def execute_prepared_linear(
             group_m=group_m,
             explicit_bias_fma=False,
             per_tile_tail=bool(group_m),
+            accumulator_seed=policy.matmul_accumulator_seed(target, k, output_tiles),
             **compiler_options,
             num_stages=plan.matmul_num_stages,
             num_warps=plan.matmul_num_warps,
@@ -620,7 +720,9 @@ def run_linear(
     plan = (
         execution_plan
         if execution_plan is not None
-        else default_execution_plan(weight_qdata, target=target)
+        else default_execution_plan(
+            weight_qdata, target=target, rows=math.prod(original_shape[:-1])
+        )
     )
     input_qdata, row_scales = prepare_input_with_plan(
         input,
@@ -702,7 +804,7 @@ def linear_prepared(
     second_projection: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """Apply one weight to an input prepared by the matching operator."""
-    plan = default_execution_plan(weight_qdata)
+    plan = default_execution_plan(weight_qdata, rows=math.prod(input_qdata.shape[:-1]))
     return execute_prepared_linear(
         input_qdata,
         input_scale,
@@ -716,6 +818,178 @@ def linear_prepared(
     )
 
 
+@triton.jit
+def _fence_register_value(value):
+    """Keep AMDGPU scheduling from hoisting second-half residual loads across rounding."""
+    return tl.inline_asm_elementwise(
+        ";;", "=v,0", [value], dtype=value.dtype, is_pure=False, pack=1
+    )
+
+
+@triton.jit
+def _store_amd_residual_half(
+    centered_accumulator,
+    cols,
+    barrier_before_residual: tl.constexpr,
+    row_scale,
+    weight_scale_ptr,
+    bias_ptr,
+    base_ptr,
+    output_ptr,
+    gate_ptr,
+    reusable_gate_ptr,
+    indices_ptr,
+    rows,
+    valid_rows,
+    n: tl.constexpr,
+    row_offset,
+    gate_row_stride: tl.constexpr,
+    gate_rows,
+    reusable_gate_row_stride: tl.constexpr,
+    reusable_gate_rows,
+    has_bias: tl.constexpr,
+    has_reusable_update: tl.constexpr,
+    python_indexing: tl.constexpr,
+):
+    """Dequantize, round, add gated residual, and store one 128-column half."""
+    result = (
+        centered_accumulator.to(tl.float32)
+        * row_scale[:, None]
+        * tl.load(weight_scale_ptr + cols)[None, :]
+    )
+    if has_bias:
+        result += tl.load(bias_ptr + cols).to(tl.float32)[None, :]
+    # Round to the logical dtype in registers before FP32 residual math.
+    rounded = _fence_register_value(result.to(output_ptr.dtype.element_ty))
+    if barrier_before_residual:
+        tl.debug_barrier()
+    output = add_residual(
+        rounded.to(tl.float32),
+        base_ptr,
+        output_ptr,
+        gate_ptr,
+        reusable_gate_ptr,
+        indices_ptr,
+        rows[:, None],
+        cols[None, :],
+        valid_rows,
+        valid_rows,
+        n,
+        row_offset,
+        gate_row_stride,
+        gate_rows,
+        reusable_gate_row_stride,
+        reusable_gate_rows,
+        has_reusable_update,
+        python_indexing,
+    )
+    tl.store(
+        output_ptr + rows.to(tl.int64)[:, None] * n + cols[None, :],
+        output,
+        mask=valid_rows,
+    )
+
+
+@triton.jit(do_not_specialize=["m", "row_offset", "gate_rows", "reusable_gate_rows"])
+def _amd_int8_residual_matmul_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    base_ptr,
+    gate_ptr,
+    reusable_gate_ptr,
+    indices_ptr,
+    row_offset,
+    gate_rows,
+    reusable_gate_rows,
+    m,
+    n: tl.constexpr,
+    k: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    has_bias: tl.constexpr,
+    full_rows: tl.constexpr,
+    gate_row_stride: tl.constexpr,
+    reusable_gate_row_stride: tl.constexpr,
+    has_reusable_update: tl.constexpr,
+    python_indexing: tl.constexpr,
+    accumulator_seed: tl.constexpr,
+):
+    """Project and fuse a gated residual update across one or two 128-column halves."""
+    pid = tl.program_id(0)
+    num_pid_n: tl.constexpr = n // block_n
+    row_block_count = tl.num_programs(0) // num_pid_n
+    group_id = pid // (8 * num_pid_n)
+    pid_in_group = pid % (8 * num_pid_n)
+    first_pid_m = group_id * 8
+    actual_group_m = tl.minimum(row_block_count - first_pid_m, 8)
+    pid_m = first_pid_m + pid_in_group % actual_group_m
+    pid_n = pid_in_group // actual_group_m
+
+    rows = pid_m * 128 + tl.arange(0, 128)
+    source_rows = rows if full_rows else tl.minimum(rows, m - 1)
+    first_cols = pid_n * block_n + tl.arange(0, 128)
+    offsets_k = tl.arange(0, block_k)
+    activation_pointers = input_ptr + source_rows[:, None] * k + offsets_k[None, :]
+    first_weight_pointers = weight_ptr + first_cols[None, :] * k + offsets_k[:, None]
+    first_accumulator = tl.full((128, 128), accumulator_seed, tl.int32)
+    split_n: tl.constexpr = tl.constexpr(block_n == 256)
+    second_cols = first_cols + 128
+    second_weight_pointers = weight_ptr + second_cols[None, :] * k + offsets_k[:, None]
+    second_accumulator = tl.full((128, 128), accumulator_seed, tl.int32)
+    for _ in range(k // block_k):
+        activation = tl.load(activation_pointers)
+        first_accumulator = tl.dot(activation, tl.load(first_weight_pointers), first_accumulator)
+        if split_n:
+            second_accumulator = tl.dot(
+                activation, tl.load(second_weight_pointers), second_accumulator
+            )
+            second_weight_pointers += block_k
+        activation_pointers += block_k
+        first_weight_pointers += block_k
+
+    row_scale = tl.load(input_scale_ptr + source_rows)
+    valid_rows = True if full_rows else rows[:, None] < m
+    epilogue_args = (
+        row_scale,
+        weight_scale_ptr,
+        bias_ptr,
+        base_ptr,
+        output_ptr,
+        gate_ptr,
+        reusable_gate_ptr,
+        indices_ptr,
+        rows,
+        valid_rows,
+        n,
+        row_offset,
+        gate_row_stride,
+        gate_rows,
+        reusable_gate_row_stride,
+        reusable_gate_rows,
+        has_bias,
+        has_reusable_update,
+        python_indexing,
+    )
+    _store_amd_residual_half(
+        first_accumulator - accumulator_seed,
+        first_cols,
+        split_n,
+        *epilogue_args,
+    )
+    if split_n:
+        tl.debug_barrier()
+        _store_amd_residual_half(
+            _fence_register_value(second_accumulator - accumulator_seed),
+            second_cols,
+            tl.constexpr(False),
+            *epilogue_args,
+        )
+
+
 def linear_prepared_residual(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -727,14 +1001,69 @@ def linear_prepared_residual(
     row_offset: int = 0,
     projection_scratch: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Project then add a validated residual using the shared standalone kernel."""
-    projection = linear_prepared(
+    """Use a measured native epilogue when supported, or the standalone add."""
+    leading_shape = input_qdata.shape[:-1]
+    m = math.prod(leading_shape)
+    n, k = weight_qdata.shape
+    target = AcceleratorTarget.from_device(input_qdata.device)
+    plan = default_execution_plan(weight_qdata, target=target, rows=m)
+    input_qdata_2d = input_qdata.reshape(m, k)
+    input_scale_1d = input_scale.reshape(m)
+    if policy.supports_residual_epilogue(
+        target,
+        plan,
+        residual_add.base.dtype,
+        rows=m,
+        in_features=k,
+        out_features=n,
+    ):
+        base = residual_add.base.view(-1, n)[row_offset : row_offset + m]
+        output = residual_add.output.view(-1, n)[row_offset : row_offset + m]
+        if m and n:
+            output_tiles = triton.cdiv(m, 128) * (n // plan.matmul_block_n)
+            gate = residual_add.gate
+            reusable = residual_add.reusable
+            reusable_gate = gate if reusable is None else reusable.gate
+            with device_context(input_qdata.device):
+                _amd_int8_residual_matmul_kernel[(output_tiles,)](
+                    input_qdata_2d,
+                    weight_qdata,
+                    output,
+                    input_scale_1d,
+                    weight_scale,
+                    bias if bias is not None else output,
+                    base,
+                    gate,
+                    reusable_gate,
+                    residual_add.gate_indices,
+                    row_offset,
+                    gate.shape[0],
+                    0 if reusable is None else reusable.gate.shape[0],
+                    m,
+                    n=n,
+                    k=k,
+                    block_n=plan.matmul_block_n,
+                    block_k=plan.matmul_block_k,
+                    has_bias=bias is not None,
+                    full_rows=m % 128 == 0,
+                    gate_row_stride=gate.stride(0),
+                    reusable_gate_row_stride=0 if reusable is None else reusable.gate.stride(0),
+                    has_reusable_update=reusable is not None,
+                    python_indexing=residual_add.python_indexing,
+                    accumulator_seed=policy.matmul_accumulator_seed(target, k, output_tiles),
+                    **_amd_matmul_compiler_options(target),
+                    num_stages=2,
+                    num_warps=8,
+                )
+        return output.view(*leading_shape, n)
+    projection = execute_prepared_linear(
         input_qdata,
         input_scale,
         weight_qdata,
         weight_scale,
         bias,
         residual_add.base.dtype,
+        plan,
         out=projection_scratch,
     )
     return apply_residual_add(projection, residual_add, row_offset)

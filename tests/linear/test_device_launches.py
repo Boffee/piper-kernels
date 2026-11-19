@@ -196,6 +196,8 @@ def test_prepared_paired_projection_owns_context_for_all_launches(launches, back
     launches.watch(kernel_backend, "int8_matmul_kernel")
     if backend is nvidia:
         launches.watch(kernel_backend, "dynamic_m_int8_matmul_kernel")
+    else:
+        launches.watch(kernel_backend, "_paired_int8_matmul_kernel")
     with FakeTensorMode():
         value = torch.empty(129, 256, dtype=torch.int8, device="cuda:0")
         scale = torch.empty(129, device=value.device)
@@ -219,6 +221,67 @@ def test_prepared_paired_projection_owns_context_for_all_launches(launches, back
             assert not fail
             assert result is output
     assert launches.calls
+    assert launches.current == 1
+
+
+@pytest.mark.parametrize("backend", [nvidia, amd])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("fail", [False, True])
+def test_prepared_residual_projection_owns_context_for_all_launches(launches, backend, dtype, fail):
+    launches.backend = "hip" if backend is amd else "cuda"
+    launches.fail = fail
+    kernel_backend = nvidia.triton_kernels if backend is nvidia else backend
+    launches.watch(kernel_backend, "int8_matmul_kernel")
+    launches.watch(residual_kernels, "_residual_add_kernel")
+    if backend is nvidia:
+        for name in (
+            "dynamic_m_int8_matmul_kernel",
+            "int8_residual_matmul_kernel",
+            "dynamic_m_int8_residual_matmul_kernel",
+        ):
+            launches.watch(kernel_backend, name)
+    else:
+        launches.watch(kernel_backend, "_amd_int8_residual_matmul_kernel")
+    with FakeTensorMode():
+        value = torch.empty(129, 256, dtype=torch.int8, device="cuda:0")
+        scale = torch.empty(129, device=value.device)
+        weight = torch.empty(256, 256, dtype=torch.int8, device=value.device)
+        weight_scale = torch.empty(256, 1, device=value.device)
+        base = torch.empty(129, 256, dtype=dtype, device=value.device)
+        gate = torch.empty(3, 256, dtype=dtype, device=value.device)
+        indices = torch.empty(129, dtype=torch.int64, device=value.device)
+        reusable = ReusableUpdate(torch.empty_like(base), gate)
+        residual = ResidualAdd(base, gate, indices, True, reusable)
+        error_context = (
+            pytest.raises(RuntimeError, match="simulated kernel failure") if fail else nullcontext()
+        )
+        with error_context:
+            result = backend.linear_prepared_residual(
+                value,
+                scale,
+                weight,
+                weight_scale,
+                None,
+                residual,
+            )
+            assert not fail
+            assert result.shape == (129, 256)
+            assert result.dtype == dtype
+    if backend is amd:
+        if dtype is torch.bfloat16:
+            assert launches.calls == ["_amd_int8_residual_matmul_kernel"]
+        else:
+            expected = ["int8_matmul_kernel"]
+            if not fail:
+                expected.append("_residual_add_kernel")
+            assert launches.calls == expected
+    elif dtype is torch.bfloat16:
+        assert len(launches.calls) == 1
+        assert launches.calls[0].endswith("int8_residual_matmul_kernel")
+    else:
+        assert len(launches.calls) == (1 if fail else 2)
+        if not fail:
+            assert launches.calls[1] == "_residual_add_kernel"
     assert launches.current == 1
 
 

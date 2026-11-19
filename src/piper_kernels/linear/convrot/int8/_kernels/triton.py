@@ -24,6 +24,7 @@ def _row_scaled_int8_matmul(
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     aligned_tiles: tl.constexpr,
+    accumulator_seed: tl.constexpr = 0,
 ):
     """Return the exact INT32 tile product scaled by input rows, and the weight scales."""
     offsets_k = tl.arange(0, block_k)
@@ -32,7 +33,7 @@ def _row_scaled_int8_matmul(
     offsets_k_i64 = offsets_k.to(tl.int64)
     input_pointers = input_ptr + offsets_m_i64[:, None] * k + offsets_k_i64[None, :]
     weight_pointers = weight_ptr + offsets_n_i64[None, :] * k + offsets_k_i64[:, None]
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
+    accumulator = tl.full((block_m, block_n), accumulator_seed, tl.int32)
 
     for k_offset in range(tl.cdiv(k, block_k)):
         if aligned_tiles:
@@ -50,7 +51,10 @@ def _row_scaled_int8_matmul(
                 mask=(offsets_n[None, :] < n) & (offsets_k[:, None] < remaining_k),
                 other=0,
             )
-        accumulator += tl.dot(input_values, weight)
+        if accumulator_seed:
+            accumulator = tl.dot(input_values, weight, accumulator)
+        else:
+            accumulator += tl.dot(input_values, weight)
         input_pointers += block_k
         weight_pointers += block_k
 
@@ -68,7 +72,7 @@ def _row_scaled_int8_matmul(
             mask=offsets_n < n,
             other=0.0,
         )
-    return accumulator.to(tl.float32) * input_scale[:, None], weight_scale
+    return (accumulator - accumulator_seed).to(tl.float32) * input_scale[:, None], weight_scale
 
 
 @triton.jit
@@ -144,6 +148,7 @@ def _int8_matmul_with_bias(
     second_has_bias: tl.constexpr,
     aligned_tiles: tl.constexpr,
     explicit_bias_fma: tl.constexpr,
+    accumulator_seed: tl.constexpr,
 ):
     # Keep scaling and bias together in each branch to preserve FMA rounding.
     row_scaled, weight_scale = _row_scaled_int8_matmul(
@@ -160,6 +165,7 @@ def _int8_matmul_with_bias(
         block_n,
         block_k,
         aligned_tiles,
+        accumulator_seed,
     )
     result = row_scaled * weight_scale[None, :]
     if paired and (has_bias or second_has_bias):
@@ -210,6 +216,7 @@ def _project_tile(
     group_m: tl.constexpr,
     explicit_bias_fma: tl.constexpr,
     per_tile_tail: tl.constexpr,
+    accumulator_seed: tl.constexpr = 0,
 ):
     if group_m:
         pid = tl.program_id(0)
@@ -264,6 +271,7 @@ def _project_tile(
             second_has_bias,
             True,
             explicit_bias_fma,
+            accumulator_seed,
         )
     else:
         result = _int8_matmul_with_bias(
@@ -276,6 +284,7 @@ def _project_tile(
             second_has_bias,
             False,
             explicit_bias_fma,
+            accumulator_seed,
         )
     return result, offsets_m, offsets_n, second, tile_aligned
 
@@ -336,6 +345,7 @@ def int8_matmul_kernel(
     group_m: tl.constexpr,
     explicit_bias_fma: tl.constexpr,
     per_tile_tail: tl.constexpr,
+    accumulator_seed: tl.constexpr = 0,
 ):
     """Project to a logical-dtype tensor without residual launch arguments."""
     result, offsets_m, offsets_n, second, tile_aligned = _project_tile(
@@ -361,6 +371,7 @@ def int8_matmul_kernel(
         group_m,
         explicit_bias_fma,
         per_tile_tail,
+        accumulator_seed,
     )
     _store_tile(
         output_ptr,

@@ -324,8 +324,7 @@ def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
         *prepared, weight, scale, None, torch.float32, out=output, second_projection=second
     )
     assert result is output
-    if backend is nvidia:
-        expected_plan = backend.default_execution_plan(weight, target=target, rows=rows)
+    expected_plan = backend.default_execution_plan(weight, target=target, rows=rows)
     assert project.call_args.args[-1] == expected_plan
     assert project.call_args.kwargs == {"out": output, "second_projection": second}
 

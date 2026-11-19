@@ -1,5 +1,6 @@
 """Offline AMD matrix-instruction coverage; runtime tests live in test_amd."""
 
+import re
 import sys
 from dataclasses import replace
 from functools import partial
@@ -22,12 +23,10 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"])
 @pytest.mark.parametrize("aligned_nk", [False, True])
 def test_amd_paired_projection_compiles_to_matrix_instructions(architecture, aligned_nk):
-    plan = policy.select_execution_plan(AcceleratorTarget("hip", architecture), in_features=512)
-    group_m = (
-        amd._LARGE_MATMUL_GROUP_M_TILES
-        if plan.matmul_block_m == 128 and plan.matmul_block_n == 256
-        else 0
-    )
+    target = AcceleratorTarget("hip", architecture)
+    width = 8_192
+    plan = policy.select_execution_plan(target, in_features=width)
+    group_m = policy.matmul_group_m(plan)
     source = ASTSource(
         kernels.int8_matmul_kernel,
         {
@@ -57,6 +56,7 @@ def test_amd_paired_projection_compiles_to_matrix_instructions(architecture, ali
             "group_m": group_m,
             "explicit_bias_fma": False,
             "per_tile_tail": bool(group_m),
+            "accumulator_seed": policy.matmul_accumulator_seed(target, width, 64),
         },
     )
     compiled = triton.compile(
@@ -65,7 +65,7 @@ def test_amd_paired_projection_compiles_to_matrix_instructions(architecture, ali
         options={
             "num_warps": plan.matmul_num_warps,
             "num_stages": plan.matmul_num_stages,
-            **amd._amd_matmul_compiler_options(AcceleratorTarget("hip", architecture)),
+            **amd._amd_matmul_compiler_options(target),
         },
     )
     assert ("v_mfma_i32" if architecture == "gfx942" else "v_wmma_i32") in compiled.asm["amdgcn"]
@@ -101,6 +101,9 @@ def _compile_rdna4_projection(architecture, plan, *, aligned_nk, group_m, option
             "group_m": group_m,
             "explicit_bias_fma": False,
             "per_tile_tail": bool(group_m),
+            "accumulator_seed": policy.matmul_accumulator_seed(
+                AcceleratorTarget("hip", architecture), 8192, 64
+            ),
         },
     )
     return triton.compile(
@@ -149,7 +152,7 @@ def test_rdna4_projection_barriers_fence_only_lds():
         "gfx1201",
         plan,
         aligned_nk=True,
-        group_m=amd._LARGE_MATMUL_GROUP_M_TILES,
+        group_m=policy.matmul_group_m(plan),
     )
     # The first check fails if Triton stops fencing global memory at its LDS
     # barriers: then retire the workaround as amd_compiler_workarounds describes.
@@ -199,3 +202,108 @@ def test_amd_activated_preparation_compiles(architecture, width, static):
 
     if static:
         assert "tt.reduce" not in compiled.asm["ttir"]
+
+
+@pytest.mark.parametrize("full_rows", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_rdna4_unpacked_paired_matmul_compiles_spill_free(full_rows, has_bias):
+    target = AcceleratorTarget("hip", "gfx1201")
+    source = ASTSource(
+        amd._paired_int8_matmul_kernel,
+        {
+            "input_ptr": "*i8",
+            "weight_ptr": "*i8",
+            "output_ptr": "*bf16",
+            "input_scale_ptr": "*fp32",
+            "weight_scale_ptr": "*fp32",
+            "bias_ptr": "*bf16",
+            "second_weight_ptr": "*i8",
+            "second_scale_ptr": "*fp32",
+            "second_bias_ptr": "*bf16",
+            "m": "i32",
+            "output_row_stride": "i32",
+        },
+        constexprs={
+            "n": 14336,
+            "k": 5376,
+            "has_bias": has_bias,
+            "second_has_bias": has_bias,
+            "full_rows": full_rows,
+            "accumulator_seed": 0x155555,
+        },
+        attrs={
+            **{(index,): [["tt.divisibility", 16], ["tt.pointer_range", 32]] for index in range(9)},
+            (10,): [["tt.divisibility", 16]],
+        },
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("hip", "gfx1201", 32),
+        options={"num_warps": 8, "num_stages": 2, **amd._amd_matmul_compiler_options(target)},
+    )
+    asm = compiled.asm["amdgcn"]
+    assert "v_wmma_i32" in asm
+    assert ".vgpr_spill_count: 0" in asm
+    assert ".private_segment_fixed_size: 0" in asm
+    if rocm_fences_only_lds():
+        assert "global_inv" not in asm
+
+
+@pytest.mark.parametrize(
+    ("block_n", "block_k", "features", "width"),
+    [(128, 128, 6144, 16384), (256, 64, 5376, 14336)],
+)
+@pytest.mark.parametrize("full_rows", [False, True])
+@pytest.mark.parametrize("reusable", [False, True])
+def test_rdna4_residual_matmul_compiles_with_bounded_spills(
+    block_n, block_k, features, width, full_rows, reusable
+):
+    target = AcceleratorTarget("hip", "gfx1201")
+    source = ASTSource(
+        amd._amd_int8_residual_matmul_kernel,
+        {
+            "input_ptr": "*i8",
+            "weight_ptr": "*i8",
+            "output_ptr": "*bf16",
+            "input_scale_ptr": "*fp32",
+            "weight_scale_ptr": "*fp32",
+            "bias_ptr": "*bf16",
+            "base_ptr": "*bf16",
+            "gate_ptr": "*bf16",
+            "reusable_gate_ptr": "*bf16",
+            "indices_ptr": "*i64",
+            "row_offset": "i32",
+            "gate_rows": "i32",
+            "reusable_gate_rows": "i32",
+            "m": "i32",
+        },
+        constexprs={
+            "n": features,
+            "k": width,
+            "block_n": block_n,
+            "block_k": block_k,
+            "has_bias": True,
+            "full_rows": full_rows,
+            "gate_row_stride": features * 2,
+            "reusable_gate_row_stride": features * 2 if reusable else 0,
+            "has_reusable_update": reusable,
+            "python_indexing": True,
+            "accumulator_seed": 0x155555,
+        },
+        attrs={
+            (index,): [["tt.divisibility", 16], ["tt.pointer_range", 32]] for index in range(10)
+        },
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("hip", "gfx1201", 32),
+        options={"num_warps": 8, "num_stages": 2, **amd._amd_matmul_compiler_options(target)},
+    )
+    asm = compiled.asm["amdgcn"]
+    assert "v_wmma_i32" in asm
+    if rocm_fences_only_lds():
+        assert "global_inv" not in asm
+        match = re.search(r"\.vgpr_spill_count:\s*(\d+)", asm)
+        assert match is not None
+        spills = int(match.group(1))
+        assert spills == 0 if (block_n == 128 or not reusable) else spills <= 16

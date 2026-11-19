@@ -49,10 +49,10 @@ def test_sm120_schedule_covers_supported_batch_shapes(
     [
         ((1_797, 2_048, 2_048), (128, 128, 64, 8, 2)),
         ((1_797, 16_384, 2_048), None),
-        ((1_797, 2_048, 8_192), (128, 128, 64, 8, 2)),
+        ((1_797, 2_048, 8_192), None),
         ((3_594, 2_048, 2_048), None),
         ((3_594, 16_384, 2_048), None),
-        ((3_594, 2_048, 8_192), (128, 128, 64, 8, 2)),
+        ((3_594, 2_048, 8_192), None),
         ((7_188, 2_048, 2_048), None),
         ((7_188, 16_384, 2_048), None),
         ((7_188, 2_048, 8_192), None),
@@ -63,6 +63,17 @@ def test_rdna4_schedule_specializes_only_measured_wins(
     expected: tuple[int, int, int, int, int] | None,
 ) -> None:
     assert _schedule_for(shape, target=_GFX1201) == expected
+
+
+@pytest.mark.parametrize("rows", [1_797, 3_594])
+def test_gfx1200_retains_h3_down_projection_schedule(rows: int) -> None:
+    assert _schedule_for((rows, 2048, 8192), target=AcceleratorTarget("hip", "gfx1200")) == (
+        128,
+        128,
+        64,
+        8,
+        2,
+    )
 
 
 def _placeholder(graph: torch.fx.Graph, name: str, value: torch.Tensor) -> torch.fx.Node:
@@ -230,11 +241,11 @@ def test_pass_leaves_exact_h3_shape_unchanged_on_unsupported_target() -> None:
 
 def test_pass_emits_measured_rdna4_schedule() -> None:
     graph = torch.fx.Graph()
-    activation = _placeholder(graph, "activation", torch.empty(1_797, 8_192, device="meta"))
+    activation = _placeholder(graph, "activation", torch.empty(1_797, 2_048, device="meta"))
     qdata = _placeholder(
         graph,
         "qdata",
-        torch.empty(2_048, 8_192, dtype=torch.int8, device="meta"),
+        torch.empty(2_048, 2_048, dtype=torch.int8, device="meta"),
     )
     scale = _placeholder(graph, "scale", torch.empty(2_048, 1, device="meta"))
     output = _linear(graph, activation, qdata, scale)
