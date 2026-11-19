@@ -12,7 +12,7 @@ from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as linear
 
 from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
-from . import gluon_async_copy, policy
+from . import gluon, policy
 
 
 def default_execution_plan(
@@ -32,7 +32,11 @@ def default_execution_plan(
         input_features=input_qdata.shape[2],
         head_dim=head_dim,
         rotary_dim=rotary_dim,
-        operands_aligned=linear_gluon.operands_aligned(input_qdata, weight_qdata),
+        operands_aligned=(
+            linear_gluon.operands_aligned(input_qdata, weight_qdata)
+            and input_qdata.is_contiguous()
+            and weight_qdata.is_contiguous()
+        ),
     )
 
 
@@ -68,8 +72,8 @@ def project_query(  # noqa: PLR0913, PLR0917
         )
     )
     launch = (
-        gluon_async_copy.project_query
-        if plan.kernel == "gluon_async_copy"
+        gluon.project_query
+        if plan.kernel in ("gluon_async_copy", "gluon_tma")
         else projection.project_query
     )
     launch(
@@ -121,8 +125,8 @@ def project_key(  # noqa: PLR0913
         )
     )
     launch = (
-        gluon_async_copy.project_key
-        if plan.kernel == "gluon_async_copy"
+        gluon.project_key
+        if plan.kernel in ("gluon_async_copy", "gluon_tma")
         else projection.project_key
     )
     launch(
@@ -163,8 +167,9 @@ def project_value(
         )
     )
     launch = (
-        gluon_async_copy.project_value
-        if plan.kernel == "gluon_async_copy" and value_format is ValueFormat.TRANSPOSED
+        gluon.project_value
+        if plan.kernel in ("gluon_async_copy", "gluon_tma")
+        and value_format is ValueFormat.TRANSPOSED
         else projection.project_value
     )
     launch(

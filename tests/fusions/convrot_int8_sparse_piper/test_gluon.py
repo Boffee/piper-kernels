@@ -1,13 +1,16 @@
 """NVIDIA projects D128 heads with Gluon kernels and other shapes with the Triton launchers."""
 
 from contextlib import nullcontext
+from dataclasses import replace
 from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _nvidia_resources import PROJECTION_SPILL_STORE_BUDGET_BYTES, compile_with_spill_stores
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
+from triton.experimental.gluon import language as gl
 from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -16,17 +19,15 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
+from piper_kernels.fusions.convrot_int8_projection._nvidia import _tma
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
-from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import (
-    dispatch,
-    gluon_async_copy,
-    policy,
-)
+from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import dispatch, gluon, policy
 
 from ._reference import reconstruct_key_center
 
 _SM89_TARGET = AcceleratorTarget("cuda", "sm89")
+_SM120_TARGET = AcceleratorTarget("cuda", "sm120")
 _NVIDIA_TARGETS = [
     AcceleratorTarget("cuda", architecture) for architecture in ("sm80", "sm86", "sm89", "sm120")
 ]
@@ -112,7 +113,7 @@ def _launch(
     **options,
 ):
     input_qdata, input_scale, weight_qdata, weight_scale, *_ = operands
-    if module in (dispatch, gluon_async_copy) and "execution_plan" not in options:
+    if module in (dispatch, gluon) and "execution_plan" not in options:
         metadata = {
             "operation": operation,
             "head_dim": out[0].shape[2 if operation == "value" else 3],
@@ -176,7 +177,7 @@ def test_every_target_uses_gluon_only_for_supported_projections(
 ):
     monkeypatch.setattr(dispatch.linear_gluon, "operands_aligned", lambda *operands: True)
     gluon_launch, triton_launch = Mock(), Mock()
-    monkeypatch.setattr(gluon_async_copy, f"project_{operation}", gluon_launch)
+    monkeypatch.setattr(gluon, f"project_{operation}", gluon_launch)
     monkeypatch.setattr(projection, f"project_{operation}", triton_launch)
     with FakeTensorMode():
         operands = _operands(
@@ -192,8 +193,12 @@ def test_every_target_uses_gluon_only_for_supported_projections(
     launched.assert_called_once()
     idle.assert_not_called()
     assert launched.call_args.kwargs["out"] is out
-    if not uses_gluon:
-        assert launched.call_args.kwargs["execution_plan"] is policy.select_execution_plan(
+    plan = launched.call_args.kwargs["execution_plan"]
+    if uses_gluon:
+        expected_kernel = "gluon_tma" if target.is_cuda_capability(12, 0) else "gluon_async_copy"
+        assert plan.kernel == expected_kernel
+    else:
+        assert plan is policy.select_execution_plan(
             target,
             operation=operation,
             input_features=272,
@@ -205,11 +210,11 @@ def test_every_target_uses_gluon_only_for_supported_projections(
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
 @pytest.mark.parametrize("with_block_lengths", [False, True])
 def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, with_block_lengths):
-    function = getattr(gluon_async_copy, f"_{operation}_kernel")
+    function = getattr(gluon, f"_{operation}_kernel")
     kernel = MagicMock()
-    monkeypatch.setattr(gluon_async_copy, function.__name__, kernel)
+    monkeypatch.setattr(gluon, function.__name__, kernel)
     guard = Mock(side_effect=lambda device: nullcontext())
-    monkeypatch.setattr(gluon_async_copy, "device_context", guard)
+    monkeypatch.setattr(gluon, "device_context", guard)
     sequence, window = 448, (64, 300)
     rows = window[1] if operation == "query" else sequence
     storage = padded_sequence_length(rows)
@@ -221,9 +226,7 @@ def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, 
             else None
         )
         out = _outputs(operation, "cuda:1", storage=storage)
-        _launch(
-            gluon_async_copy, operation, operands, out, block_lengths=block_lengths, window=window
-        )
+        _launch(gluon, operation, operands, out, block_lengths=block_lengths, window=window)
 
     guard.assert_called_once_with(torch.device("cuda:1"))
     # Heads vary fastest, then 128-row blocks, then the batch.
@@ -241,6 +244,46 @@ def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, 
         if operation == "query":
             assert arguments["chunk_start"] == window[0]
             assert arguments["query_sequence_end"] == sum(window)
+
+
+@pytest.mark.parametrize("operation", ["query", "key", "value"])
+def test_sm120_tma_launches_use_descriptors_and_skip_empty_batches(monkeypatch, operation):
+    function = getattr(gluon, f"_{operation}_kernel")
+    kernel = MagicMock()
+    monkeypatch.setattr(gluon, function.__name__, kernel)
+    monkeypatch.setattr(gluon, "device_context", lambda device: nullcontext())
+    descriptors = [object(), object()]
+    descriptor_builder = Mock(side_effect=descriptors)
+    monkeypatch.setattr(_tma, "build_matrix_descriptor", descriptor_builder)
+    tma_plan = policy.select_execution_plan(
+        _SM120_TARGET,
+        operation=operation,
+        input_features=256,
+        head_dim=128,
+        rotary_dim=96,
+        operands_aligned=True,
+    )
+    assert tma_plan.kernel == "gluon_tma"
+    with FakeTensorMode():
+        operands = _operands("cuda:1", batch=1, sequence=128)
+        out = _outputs(operation, "cuda:1", storage=128, batch=1)
+        _launch(gluon, operation, operands, out, window=(0, 128), execution_plan=tma_plan)
+    assert descriptor_builder.call_count == 2
+    kernel.__getitem__.return_value.assert_called_once()
+    call = kernel.__getitem__.return_value.call_args
+    assert call.args[0] is descriptors[0]
+    assert call.args[2] is descriptors[1]
+
+    descriptor_builder.reset_mock()
+    kernel.reset_mock()
+    with FakeTensorMode():
+        empty_operands = _operands("cuda:1", batch=0, sequence=128)
+        empty_out = _outputs(operation, "cuda:1", storage=128, batch=0)
+        _launch(
+            gluon, operation, empty_operands, empty_out, window=(0, 128), execution_plan=tma_plan
+        )
+    descriptor_builder.assert_not_called()
+    kernel.__getitem__.assert_not_called()
 
 
 # Register allocation depends on the specialized input width, and small widths can
@@ -267,28 +310,26 @@ _POINTER_TYPES = {
 # slices spill SM89's full-tile K mean-routing epilogue after the K loop; K64 slices
 # avoided it but spilled SM120's full tiles, and one slice width serves every target.
 _ACCEPTED_SPILL_STORES = {
-    (80, "query", "bias_without_norm"): 176,
+    (80, "query", "bias_without_norm"): 104,
 }
 
-
-# SM86 and SM87 build the same PTX as SM89; SM80's differs in instruction order.
-@pytest.mark.parametrize("architecture", [80, 89, 120])
-@pytest.mark.parametrize("operation", ["query", "key", "value"])
-@pytest.mark.parametrize(
-    "variant",
-    [
-        "full_tiles",
-        "full_tiles_mean_routing",
-        "masked_tail",
-        "mean_routing",
-        "block_lengths",
-        "bias_without_norm",
-    ],
+_COMPILE_VARIANTS = [
+    "full_tiles",
+    "full_tiles_mean_routing",
+    "masked_tail",
+    "mean_routing",
+    "block_lengths",
+    "bias_without_norm",
+]
+_TMA_DESCRIPTOR_SIGNATURE = (
+    f"tensordesc<i8[128,64],{gl.NVMMASharedLayout.get_default_for([128, 64], gl.int8)!r}>"
 )
-def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, variant):
-    function = getattr(gluon_async_copy, f"_{operation}_kernel")
+
+
+def _compile_sparse_kernel(architecture, operation, variant, *, input_features, use_tma):
+    function = getattr(gluon, f"_{operation}_kernel")
     constants = {
-        "input_features": _INPUT_FEATURES,
+        "input_features": input_features,
         "heads": 3,
         "rotary_dim": 96,
         "norm_epsilon": 1e-5,
@@ -306,6 +347,8 @@ def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, 
         omitted_norm = name == "norm_weight_ptr" and variant == "bias_without_norm"
         if omitted_bias or omitted_norm:
             constants[name], signature[name] = None, "constexpr"
+        elif use_tma and name in ("input_ptr", "weight_ptr"):
+            signature[name] = _TMA_DESCRIPTOR_SIGNATURE
         elif name.endswith("_ptr"):
             signature[name] = _POINTER_TYPES.get(name, "*fp32")
             # Launches specialize PyTorch's 16-byte-aligned allocations; cp.async relies on it.
@@ -320,13 +363,34 @@ def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, 
     assert compiled.asm["cubin"]
     # Two programs share each SM's 99 KiB of shared memory.
     assert compiled.metadata.shared <= 99 * 1024 // 2
-    assert spill_stores <= _ACCEPTED_SPILL_STORES.get(
-        (architecture, operation, variant), PROJECTION_SPILL_STORE_BUDGET_BYTES
-    )
     truncations = [line for line in compiled.asm["ttgir"].splitlines() if "arith.truncf" in line]
     # Only V rounds its per-tile means to BF16.
     assert bool(truncations) is (operation == "value")
     assert all("f32" in line and "bf16" in line for line in truncations)
+    return spill_stores
+
+
+# SM86 and SM87 build the same PTX as SM89; SM80's differs in instruction order.
+@pytest.mark.parametrize("architecture", [80, 89, 120])
+@pytest.mark.parametrize("operation", ["query", "key", "value"])
+@pytest.mark.parametrize("variant", _COMPILE_VARIANTS)
+def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, variant):
+    spill_stores = _compile_sparse_kernel(
+        architecture, operation, variant, input_features=_INPUT_FEATURES, use_tma=False
+    )
+    assert spill_stores <= _ACCEPTED_SPILL_STORES.get(
+        (architecture, operation, variant), PROJECTION_SPILL_STORE_BUDGET_BYTES
+    )
+
+
+@pytest.mark.parametrize("input_features", [_INPUT_FEATURES, 4096])
+@pytest.mark.parametrize("operation", ["query", "key", "value"])
+@pytest.mark.parametrize("variant", _COMPILE_VARIANTS)
+def test_sm120_tma_kernels_compile_for_two_programs_per_sm(input_features, operation, variant):
+    spill_stores = _compile_sparse_kernel(
+        120, operation, variant, input_features=input_features, use_tma=True
+    )
+    assert spill_stores <= PROJECTION_SPILL_STORE_BUDGET_BYTES
 
 
 def _assert_matches(actual, expected, operation):
@@ -436,14 +500,15 @@ def test_gluon_projections_match_the_triton_launchers(operation, case):
         ),
         **options,
     )
-    _launch(gluon_async_copy, operation, operands, actual, **options)
+    _launch(gluon, operation, operands, actual, **options)
 
     _assert_matches(actual, expected, operation)
 
 
+@pytest.mark.parametrize("target", [_SM89_TARGET, _SM120_TARGET], ids=str)
 @pytest.mark.parametrize("operand_index", [0, 2], ids=["input", "weight"])
 @pytest.mark.parametrize("offset", [0, 1, 8, 16])
-def test_execution_plan_checks_both_operand_pointer_alignments(operand_index, offset):
+def test_execution_plan_checks_both_operand_pointer_alignments(target, operand_index, offset):
     operands = list(_operands("cpu", batch=1, heads=1))
     original = operands[operand_index]
     storage = torch.empty(original.numel() + offset, dtype=torch.int8)
@@ -451,12 +516,32 @@ def test_execution_plan_checks_both_operand_pointer_alignments(operand_index, of
     plan = dispatch.default_execution_plan(
         operands[0],
         operands[2],
-        target=_SM89_TARGET,
+        target=target,
         operation="query",
         head_dim=128,
         rotary_dim=96,
     )
-    assert plan.kernel == ("gluon_async_copy" if offset % 16 == 0 else "triton")
+    gluon_kernel = "gluon_tma" if target.is_cuda_capability(12, 0) else "gluon_async_copy"
+    assert plan.kernel == (gluon_kernel if offset % 16 == 0 else "triton")
+
+
+@pytest.mark.parametrize("target", [_SM89_TARGET, _SM120_TARGET], ids=str)
+@pytest.mark.parametrize("operand_index", [0, 2], ids=["input", "weight"])
+def test_execution_plan_requires_contiguous_operands(target, operand_index):
+    operands = list(_operands("cpu", batch=1, sequence=192, heads=2))
+    operands[0] = operands[0][:, ::2, :] if operand_index == 0 else operands[0]
+    operands[2] = operands[2][::2, :] if operand_index == 2 else operands[2]
+    assert dispatch.linear_gluon.operands_aligned(operands[0], operands[2])
+    assert not operands[operand_index].is_contiguous()
+    plan = dispatch.default_execution_plan(
+        operands[0],
+        operands[2],
+        target=target,
+        operation="query",
+        head_dim=128,
+        rotary_dim=96,
+    )
+    assert plan.kernel == "triton"
 
 
 @pytest.mark.gpu
@@ -477,7 +562,7 @@ def test_unaligned_projections_use_the_triton_fallback(
     operands[operand_index] = storage[offset:].view_as(original).copy_(original)
     assert operands[operand_index].is_contiguous()
     guard = Mock(side_effect=AssertionError("unaligned operands reached Gluon"))
-    monkeypatch.setattr(gluon_async_copy, f"project_{operation}", guard)
+    monkeypatch.setattr(gluon, f"project_{operation}", guard)
     expected = _outputs(operation, "cuda", storage=256, batch=1, heads=1)
     actual = _outputs(operation, "cuda", storage=256, batch=1, heads=1)
     plan = policy.select_execution_plan(
@@ -532,3 +617,72 @@ def test_gluon_query_window_intersects_block_lengths(routing_mode, rows, lengths
         torch.testing.assert_close(left, right, rtol=0, atol=0)
     assert torch.count_nonzero(actual[0][:, :, rows:]) == 0
     assert torch.count_nonzero(actual[1][:, :, (rows + 31) // 32 :]) == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("operation", ["query", "key", "value"])
+@pytest.mark.parametrize("input_features", [64, 128, 192, 256, 320, 4096, 5376])
+@pytest.mark.parametrize("mean_routing", [False, True])
+def test_sm120_tma_projections_match_async_copy(operation, input_features, mean_routing):
+    torch.manual_seed(1901 + input_features)
+    batch, sequence, heads = 2, 193, 3
+    operands = _operands(
+        "cuda", batch=batch, sequence=sequence, heads=heads, input_features=input_features
+    )
+    if mean_routing:
+        operands = (*operands[:4], None, *operands[5:])
+    lengths = torch.tensor([55, 64, 31, 1], device="cuda", dtype=torch.int32)
+    bias = torch.randn(heads * 128, device="cuda").bfloat16() if mean_routing else None
+    window = (64, 129)
+    storage = padded_sequence_length(window[1] if operation == "query" else sequence)
+    plan = dispatch.default_execution_plan(
+        operands[0], operands[2], operation=operation, head_dim=128, rotary_dim=96
+    )
+    assert plan.kernel == "gluon_tma"
+    outputs = []
+    for execution_plan in (plan, replace(plan, kernel="gluon_async_copy")):
+        out = _outputs(
+            operation, "cuda", storage=storage, batch=batch, heads=heads, mean_routing=mean_routing
+        )
+        _launch(
+            dispatch,
+            operation,
+            operands,
+            out,
+            block_lengths=lengths,
+            bias=bias,
+            window=window,
+            routing_mode=_MEAN_ROUTING if mean_routing else _MINMAX_ROUTING,
+            execution_plan=execution_plan,
+        )
+        outputs.append(out)
+    for actual, expected in zip(*outputs, strict=True):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("operation", ["query", "key", "value"])
+def test_sm120_tma_graph_capture_and_replay(operation):
+    torch.manual_seed(2026)
+    batch, sequence, heads = 2, 193, 3
+    operands = _operands("cuda", batch=batch, sequence=sequence, heads=heads, input_features=256)
+    storage = padded_sequence_length(sequence)
+    plan = dispatch.default_execution_plan(
+        operands[0], operands[2], operation=operation, head_dim=128, rotary_dim=96
+    )
+    assert plan.kernel == "gluon_tma"
+    actual = _outputs(operation, "cuda", storage=storage, batch=batch, heads=heads)
+    expected = _outputs(operation, "cuda", storage=storage, batch=batch, heads=heads)
+    _launch(dispatch, operation, operands, actual, window=(0, sequence), execution_plan=plan)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _launch(dispatch, operation, operands, actual, window=(0, sequence), execution_plan=plan)
+    operands[0].random_(-127, 128)
+    for tensor in actual:
+        tensor.zero_()
+    graph.replay()
+    _launch(dispatch, operation, operands, expected, window=(0, sequence), execution_plan=plan)
+    for left, right in zip(actual, expected, strict=True):
+        assert torch.equal(left.view(torch.uint8), right.view(torch.uint8))

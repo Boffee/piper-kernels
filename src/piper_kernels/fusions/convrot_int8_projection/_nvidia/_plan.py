@@ -19,4 +19,4 @@ GLUON_NUM_STAGES = 3
 class NvidiaExecutionPlan(ProjectionExecutionPlan):
     """Complete implementation and launch choices for one NVIDIA projection."""
 
-    kernel: Literal["gluon_async_copy", "triton"] = "triton"
+    kernel: Literal["gluon_async_copy", "gluon_tma", "triton"] = "triton"

@@ -67,10 +67,11 @@ Dense V's per-token quantization and `V1024` chunk means remain distinct from
 sparse V's `K64` tile scales and `K64` means.
 Typed backend methods operate on caller-owned buffers; target launch choices
 live in separate NVIDIA/RDNA4 modules. D128 projections run Gluon kernels built
-from the shared [fragments](../convrot_int8_projection/_nvidia/fragments.py): dense
-projections on SM89 and SM120, sparse projections on SM8x and SM120. One shared
-[policy](../convrot_int8_projection/_nvidia/policy.py) decides which operands they
-cover. [_backend.py](_backend.py) provides optional selection for
+from the shared [fragments](../convrot_int8_projection/_nvidia/fragments.py),
+using `cp.async` copies on SM8x and TMA loads on SM120: dense projections on
+SM89 and SM120, sparse projections on SM8x and SM120. One shared
+[policy](../convrot_int8_projection/_nvidia/policy.py) decides which operands and
+memory path they use. [_backend.py](_backend.py) provides optional selection for
 matching and required selection for validated execution.
 
 K/V remain global. Q uses one reusable buffer with global RoPE positions and

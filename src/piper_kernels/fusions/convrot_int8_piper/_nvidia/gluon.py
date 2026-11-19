@@ -1,7 +1,8 @@
 """SM89 and SM120 Gluon kernels for the fused ConvRot INT8 dense-Piper Q/K/V projections.
 
 Each program projects 128 rows onto one D128 head with the shared projection
-fragments. Programs run at the 255-register limit.
+fragments, using ``cp.async`` copies on SM89 and TMA loads on SM120. Programs run
+at the 255-register limit.
 
 Q quantizes its RMSNorm/RoPE tile after the signed Hadamard, with per-thread or
 Q32 scales. Per-thread groups (rows 32b + 8i + t) lie in one thread's registers,
@@ -321,12 +322,15 @@ def project_query(
         return
 
     with device_context(input_qdata.device):
+        input_operand, weight_operand = fragments.resolve_operands(
+            input_qdata, weight_qdata, execution_plan
+        )
 
         def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
             _query_kernel[(heads, row_blocks, batch)](
-                input_qdata,
+                input_operand,
                 input_scale,
-                weight_qdata,
+                weight_operand,
                 weight_scale,
                 bias,
                 norm_weight,
@@ -376,12 +380,15 @@ def project_key(
     stored = input_qdata.new_empty((batch, heads, storage_length, head_dim), dtype=torch.bfloat16)
 
     with device_context(input_qdata.device):
+        input_operand, weight_operand = fragments.resolve_operands(
+            input_qdata, weight_qdata, execution_plan
+        )
 
         def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
             _key_kernel[(heads, row_blocks, batch)](
-                input_qdata,
+                input_operand,
                 input_scale,
-                weight_qdata,
+                weight_operand,
                 weight_scale,
                 bias,
                 norm_weight,
@@ -439,12 +446,15 @@ def project_value(
             block_k=_MEAN_BLOCK_K,
             out=mean,
         )
+        input_operand, weight_operand = fragments.resolve_operands(
+            input_qdata, weight_qdata, execution_plan
+        )
 
         def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
             _value_kernel[(heads, row_blocks, batch)](
-                input_qdata,
+                input_operand,
                 input_scale,
-                weight_qdata,
+                weight_operand,
                 weight_scale,
                 bias,
                 mean,
