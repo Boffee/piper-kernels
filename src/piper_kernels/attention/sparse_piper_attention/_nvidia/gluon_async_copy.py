@@ -329,6 +329,7 @@ def _sparse_piper_attention_kernel(
             current_weight,
             mass_0,
             mass_1,
+            _block_max,
         ) = piper_probability_pair(
             query,
             key_shared_pair,
@@ -442,6 +443,7 @@ def _sparse_piper_attention_kernel(
         current_weight,
         mass_0,
         mass_1,
+        _block_max,
     ) = piper_probability_pair(
         query,
         key_shared_pair,
