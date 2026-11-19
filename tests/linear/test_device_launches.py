@@ -285,6 +285,47 @@ def test_prepared_residual_projection_owns_context_for_all_launches(launches, ba
     assert launches.current == 1
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_sm120_tma_projections_and_residual_own_device_context(launches, monkeypatch, fail):
+    launches.fail = fail
+    descriptor_contexts = []
+
+    def make_descriptor(*args, **kwargs):
+        assert launches.current == 0
+        descriptor_contexts.append(launches.current)
+        return object()
+
+    monkeypatch.setattr(nvidia.gluon_tma, "operands_aligned", lambda *operands: True)
+    monkeypatch.setattr(nvidia.gluon_tma, "TensorDescriptor", make_descriptor)
+    launches.watch(nvidia.gluon_tma, "_int8_tma_matmul_kernel")
+    launches.watch(nvidia.gluon_tma, "_int8_tma_residual_matmul_kernel")
+    with FakeTensorMode():
+        rows, k, n = 2304, 256, 1024
+        value = torch.empty(rows, k, dtype=torch.int8, device="cuda:0")
+        scale = torch.empty(rows, device=value.device)
+        weight = torch.empty(n, k, dtype=torch.int8, device=value.device)
+        weight_scale = torch.empty(n, 1, device=value.device)
+        second = (weight, weight_scale, None)
+        base = torch.empty(rows, n, dtype=torch.bfloat16, device=value.device)
+        gate = torch.empty(3, n, dtype=torch.bfloat16, device=value.device)
+        indices = torch.empty(rows, dtype=torch.int64, device=value.device)
+        residual = ResidualAdd(
+            base, gate, indices, True, ReusableUpdate(torch.empty_like(base), gate)
+        )
+        error_context = (
+            pytest.raises(RuntimeError, match="simulated kernel failure") if fail else nullcontext()
+        )
+        with error_context:
+            nvidia.linear_prepared(
+                value, scale, weight, weight_scale, None, torch.bfloat16, second_projection=second
+            )
+        with error_context:
+            nvidia.linear_prepared_residual(value, scale, weight, weight_scale, None, residual)
+    assert descriptor_contexts == [0, 0, 0, 0, 0]
+    assert launches.calls == ["_int8_tma_matmul_kernel", "_int8_tma_residual_matmul_kernel"]
+    assert launches.current == 1
+
+
 def test_nvfp4_scale_and_gguf_launchers_own_context(launches):
     launches.watch(nvfp4_primitives, "_amax_partial_kernel")
     launches.watch(nvfp4_primitives, "_amax_scale_kernel")

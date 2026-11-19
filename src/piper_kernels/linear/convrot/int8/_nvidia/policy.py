@@ -1,7 +1,8 @@
 """Measured NVIDIA ConvRot INT8 preparation and GEMM schedules.
 
-SM120 and SM8x select GEMM schedules independently of preparation. SM8x thresholds
-are measured on SM89; other supported NVIDIA targets retain the baseline schedule.
+SM120 selects Gluon TMA for large tiles and Triton for small/medium tiles (with
+grouped Triton fallbacks when operands are unaligned); SM8x selects measured
+SM89 GEMM schedules; other supported NVIDIA targets retain the baseline schedule.
 """
 
 from dataclasses import replace
@@ -24,6 +25,17 @@ _SM8X_GLUON_MIN_TILES = 48
 _BASE_MATMUL = MatmulSchedule(128, 256, 128, 8, 3, 16)
 _SM120_SMALL = MatmulSchedule(32, 64, 128, 8, 4, 0)
 _SM120_MEDIUM = MatmulSchedule(64, 64, 128, 4, 3, 0)
+_SM120_GLUON_TMA = MatmulSchedule(
+    128,
+    256,
+    64,
+    8,
+    3,
+    16,
+    "gluon_tma",
+    triton_specialize_m=False,
+    triton_explicit_bias_fma=True,
+)
 _SM8X_SMALL = MatmulSchedule(
     16, 64, 128, 4, 4, 0, triton_specialize_m=False, triton_explicit_bias_fma=True
 )
@@ -71,7 +83,7 @@ def supports_residual_epilogue(
     """
     return (
         target.is_cuda_capability(12, 0)
-        and plan.matmul_kernel == "triton"
+        and plan.matmul_kernel in ("triton", "gluon_tma")
         and logical_dtype in (torch.float16, torch.bfloat16)
     )
 
@@ -100,7 +112,7 @@ def _preparation_schedule(in_features: int, *, sm8x: bool) -> tuple[bool, int]:
 def _sm120_matmul_schedule(rows: int | None, out_features: int | None) -> MatmulSchedule:
     """Select one of three measured tiles using useful work and available parallelism."""
     if not rows or not out_features:
-        return _BASE_MATMUL
+        return _SM120_GLUON_TMA
     small_tiles = ((rows + 31) // 32) * ((out_features + 63) // 64)
     if rows <= 32 or small_tiles <= _SM120_SMALL_MAX_TILES:
         return _SM120_SMALL
@@ -108,7 +120,7 @@ def _sm120_matmul_schedule(rows: int | None, out_features: int | None) -> Matmul
     # A one-row tail is not a full tile; wide tiles cannot reuse a single 64-column tile.
     if out_features <= 64 or rows * large_columns < 128 * _SM120_LARGE_MIN_TILES:
         return _SM120_MEDIUM
-    return _BASE_MATMUL
+    return _SM120_GLUON_TMA
 
 
 def _sm8x_matmul_schedule(rows: int | None, out_features: int | None) -> MatmulSchedule:
@@ -171,7 +183,7 @@ def select_execution_plan(
     sm8x = target.is_cuda_capability(8)
     if sm8x:
         matmul = _sm8x_matmul_schedule(rows, out_features)
-    elif target.is_architecture("sm120"):
+    elif target.is_cuda_capability(12, 0):
         matmul = _sm120_matmul_schedule(rows, out_features)
     else:
         matmul = _BASE_MATMUL

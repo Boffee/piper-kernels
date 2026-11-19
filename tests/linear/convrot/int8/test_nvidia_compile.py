@@ -2,14 +2,16 @@
 
 import pytest
 import triton
+from _nvidia_resources import compile_with_spill_stores
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
+from triton.experimental.gluon import language as gl
 from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._kernels import triton as kernels
 from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as gluon
-from piper_kernels.linear.convrot.int8._nvidia import policy
+from piper_kernels.linear.convrot.int8._nvidia import gluon_tma, policy
 from piper_kernels.linear.convrot.int8._nvidia._plan import NvidiaExecutionPlan
 from piper_kernels.weights.convrot.int8 import triton as kernels_weights
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
@@ -86,6 +88,22 @@ def test_nvidia_paired_projection_compiles_to_matrix_instructions(architecture, 
     assert "mma.sync" in compiled.asm["ptx"]
 
 
+@pytest.mark.parametrize("aligned_nk", [False, True])
+def test_sm120_baseline_triton_paired_projection_compiles_to_matrix_instructions(aligned_nk):
+    plan = policy.baseline_execution_plan(in_features=512)
+    compiled = _compile_int8_matmul(
+        plan,
+        120,
+        output="*fp16",
+        biases=("*fp16", "*fp32"),
+        paired=True,
+        aligned_m=False,
+        aligned_nk=aligned_nk,
+        group_m=16,
+    )
+    assert "mma.sync" in compiled.asm["ptx"]
+
+
 # SM86/SM89 cap one block's dynamic shared memory at 99 KiB; SM80/SM87 allow more.
 _SM8X_SHARED_MEMORY_LIMIT = 99 * 1024
 
@@ -120,10 +138,201 @@ def test_sm8x_schedules_compile_within_consumer_shared_memory(
     assert compiled.metadata.shared <= _SM8X_SHARED_MEMORY_LIMIT
 
 
+_TMA_A_DESCRIPTOR = (
+    f"tensordesc<i8[128,64],{gl.NVMMASharedLayout.get_default_for([128, 64], gl.int8)!r}>"
+)
+_TMA_B_DESCRIPTOR = (
+    f"tensordesc<i8[256,64],{gl.NVMMASharedLayout.get_default_for([256, 64], gl.int8)!r}>"
+)
+_SM120_SHARED_MEMORY_LIMIT = 99 * 1024
+
+
+def _tma_matmul_source(
+    *,
+    output: str,
+    bias: str,
+    paired: bool,
+    stages: int,
+    tail_refills: int,
+    group_m: int,
+    divisible_stride: bool,
+):
+    kernel = gluon_tma._int8_tma_matmul_kernel
+    signature = {
+        "input_descriptor": _TMA_A_DESCRIPTOR,
+        "weight_descriptor": _TMA_B_DESCRIPTOR,
+        "second_weight_descriptor": _TMA_B_DESCRIPTOR,
+        "output_ptr": output,
+        "input_scale_ptr": "*fp32",
+        "weight_scale_ptr": "*fp32",
+        "bias_ptr": bias,
+        "second_scale_ptr": "*fp32",
+        "second_bias_ptr": "*fp32",
+        "m": "i32",
+        "n": "i32",
+        "output_row_stride": "i32",
+        "full_groups": "i32",
+    }
+    aligned = ["output_ptr", "input_scale_ptr", "weight_scale_ptr", "bias_ptr"]
+    aligned += ["second_scale_ptr", "second_bias_ptr"]
+    if divisible_stride:
+        aligned.append("output_row_stride")
+    return GluonASTSource(
+        kernel,
+        signature,
+        attrs={(kernel.arg_names.index(name),): [["tt.divisibility", 16]] for name in aligned},
+        constexprs={
+            "stages": stages,
+            "tail_refills": tail_refills,
+            "group_m": group_m,
+            "has_bias": True,
+            "paired": paired,
+            "second_has_bias": paired,
+        },
+    )
+
+
+def _assert_sm120_tma_zero_spills(source: GluonASTSource) -> None:
+    compiled, spill_stores = compile_with_spill_stores(
+        source,
+        GPUTarget("cuda", 120, 32),
+        {"num_warps": 8},
+    )
+    assert compiled.asm["cubin"]
+    assert "cp.async.bulk.tensor" in compiled.asm["ptx"]
+    assert "mma.sync" in compiled.asm["ptx"]
+    assert compiled.metadata.shared <= _SM120_SHARED_MEMORY_LIMIT
+    assert spill_stores == 0
+
+
+@pytest.mark.parametrize("output", ["*fp16", "*bf16", "*fp32"])
+@pytest.mark.parametrize("paired", [False, True])
+@pytest.mark.parametrize(("stages", "tail_refills"), [(1, 0), (2, 0), (3, 0), (3, 1), (3, 2)])
+def test_sm120_tma_plain_and_paired_kernels_compile_without_spills(
+    output, paired, stages, tail_refills
+):
+    _assert_sm120_tma_zero_spills(
+        _tma_matmul_source(
+            output=output,
+            bias="*fp32",
+            paired=paired,
+            stages=stages,
+            tail_refills=tail_refills,
+            group_m=16,
+            divisible_stride=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("output", ["*fp16", "*bf16", "*fp32"])
+@pytest.mark.parametrize("paired", [False, True])
+def test_sm120_tma_ragged_stride_compiles_without_spills(output, paired):
+    _assert_sm120_tma_zero_spills(
+        _tma_matmul_source(
+            output=output,
+            bias="*fp32",
+            paired=paired,
+            stages=3,
+            tail_refills=1,
+            group_m=16,
+            divisible_stride=False,
+        )
+    )
+
+
+def _tma_residual_source(
+    *,
+    output: str,
+    has_bias: bool,
+    reusable: bool,
+    python_indexing: bool,
+    stages: int,
+    tail_refills: int,
+):
+    kernel = gluon_tma._int8_tma_residual_matmul_kernel
+    signature = {
+        "input_descriptor": _TMA_A_DESCRIPTOR,
+        "weight_descriptor": _TMA_B_DESCRIPTOR,
+        "output_ptr": output,
+        "input_scale_ptr": "*fp32",
+        "weight_scale_ptr": "*fp32",
+        "bias_ptr": "*fp32" if has_bias else output,
+        "m": "i32",
+        "n": "i32",
+        "full_groups": "i32",
+        "residual_base_ptr": output,
+        "residual_gate_ptr": output,
+        "residual_indices_ptr": "*i64",
+        "residual_reusable_gate_ptr": output,
+        "residual_row_offset": "i32",
+        "residual_gate_rows": "i32",
+        "residual_reusable_gate_rows": "i32",
+    }
+    aligned = (
+        "output_ptr",
+        "input_scale_ptr",
+        "weight_scale_ptr",
+        "bias_ptr",
+        "residual_base_ptr",
+        "residual_gate_ptr",
+        "residual_indices_ptr",
+        "residual_reusable_gate_ptr",
+    )
+    return GluonASTSource(
+        kernel,
+        signature,
+        attrs={(kernel.arg_names.index(name),): [["tt.divisibility", 16]] for name in aligned},
+        constexprs={
+            "stages": stages,
+            "tail_refills": tail_refills,
+            "group_m": 16,
+            "has_bias": has_bias,
+            "residual_gate_row_stride": 5376,
+            "residual_reusable_gate_row_stride": 5376 if reusable else 0,
+            "residual_has_reusable_update": reusable,
+            "residual_python_indexing": python_indexing,
+        },
+    )
+
+
+@pytest.mark.parametrize("output", ["*fp16", "*bf16"])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("reusable", [False, True])
+@pytest.mark.parametrize("python_indexing", [False, True])
+def test_sm120_tma_residual_kernel_compiles_without_spills(
+    output, has_bias, reusable, python_indexing
+):
+    _assert_sm120_tma_zero_spills(
+        _tma_residual_source(
+            output=output,
+            has_bias=has_bias,
+            reusable=reusable,
+            python_indexing=python_indexing,
+            stages=3,
+            tail_refills=1,
+        )
+    )
+
+
+@pytest.mark.parametrize("output", ["*fp16", "*bf16"])
+@pytest.mark.parametrize(("stages", "tail_refills"), [(1, 0), (2, 0), (3, 0), (3, 2)])
+def test_sm120_tma_residual_schedules_compile_without_spills(output, stages, tail_refills):
+    _assert_sm120_tma_zero_spills(
+        _tma_residual_source(
+            output=output,
+            has_bias=True,
+            reusable=True,
+            python_indexing=True,
+            stages=stages,
+            tail_refills=tail_refills,
+        )
+    )
+
+
 def _compile_int8_matmul(
     plan, architecture, *, output, biases, paired, aligned_m, aligned_nk, group_m
 ):
-    """Compile the kernel an NVIDIA plan launches: Gluon for SM8x Gluon plans, else Triton.
+    """Compile the kernel an NVIDIA plan launches: Gluon for SM8x/SM120 Gluon plans, else Triton.
 
     ``aligned_m`` and ``group_m`` apply to Triton only; Gluon plans use their own grouping
     and branch on ragged M at run time.
@@ -145,6 +354,23 @@ def _compile_int8_matmul(
     }
     flags = {"has_bias": True, "paired": paired, "second_has_bias": paired}
     target = GPUTarget("cuda", architecture, 32)
+    if plan.matmul_kernel == "gluon_tma":
+        source = _tma_matmul_source(
+            output=output,
+            bias=biases[0],
+            paired=paired,
+            stages=plan.matmul_num_stages,
+            tail_refills=0,
+            group_m=plan.matmul_group_m,
+            divisible_stride=aligned_nk,
+        )
+        # Keep biases[1] for mixed bias dtype coverage on second_bias_ptr.
+        source.signature["second_bias_ptr"] = biases[1]
+        compiled = triton.compile(
+            source, target=target, options={"num_warps": plan.matmul_num_warps}
+        )
+        assert "cp.async.bulk.tensor" in compiled.asm["ptx"]
+        return compiled
     if plan.matmul_kernel == "gluon_async_copy":
         # Runtime specialization marks 16-byte-aligned INT8 operands and K, which the
         # launcher requires before selecting the Gluon GEMM.

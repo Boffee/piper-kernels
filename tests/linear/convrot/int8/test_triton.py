@@ -1,6 +1,7 @@
 """Shared custom-op tests and NVIDIA low-level utility tests."""
 
 from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -14,7 +15,11 @@ from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_i
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8._kernels import triton as int8_kernels
 from piper_kernels.linear.convrot.int8._nvidia import dispatch as int8_nvidia
-from piper_kernels.linear.convrot.int8._nvidia.policy import select_execution_plan
+from piper_kernels.linear.convrot.int8._nvidia.policy import (
+    baseline_execution_plan,
+    grouped_triton_plan,
+    select_execution_plan,
+)
 from piper_kernels.linear.convrot.int8.reference import linear, linear_prepared
 from piper_kernels.weights.convrot import triton as convrot_backend
 from piper_kernels.weights.convrot._rotation import build_hadamard, rotate_groups
@@ -628,11 +633,12 @@ def test_sm120_large_matmul_matches_reference(
 
     plan = int8_nvidia.default_execution_plan(qdata)
     assert (
+        plan.matmul_kernel,
         plan.matmul_block_m,
         plan.matmul_block_n,
         plan.matmul_block_k,
         plan.matmul_num_warps,
-    ) == (128, 256, 128, 8)
+    ) == ("gluon_tma", 128, 256, 64, 8)
 
     actual = int8_nvidia.run_linear(
         activation,
@@ -694,7 +700,7 @@ def test_per_tile_tail_matches_split_with_bias_and_strided_output(rows, k, n, dt
             torch.rand(n, 1, device="cuda") * 0.01,
             torch.randn(n, device="cuda", dtype=torch.float16),
         )
-    plan = int8_nvidia.default_execution_plan(weight)
+    plan = baseline_execution_plan(in_features=k)
     args = (value, row_scale, weight, scale, bias, dtype, plan)
     width = n * (2 if paired else 1)
     expected = torch.empty((1, rows, width), device="cuda", dtype=dtype)
@@ -707,6 +713,226 @@ def test_per_tile_tail_matches_split_with_bias_and_strided_output(rows, k, n, dt
     assert actual is out
     assert torch.equal(actual, expected)
     assert torch.all(storage[..., width:] == 42)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("k", [16, 48, 64, 80, 144, 192, 208, 528])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    ("paired", "bias_dtypes"),
+    [
+        (False, (None, None)),
+        (False, (torch.float32, None)),
+        (True, (None, None)),
+        (True, (torch.float16, torch.float32)),
+        (True, (None, torch.bfloat16)),
+    ],
+)
+def test_sm120_tma_gemm_matches_baseline_across_tails_dtypes_and_paired(
+    k, dtype, paired, bias_dtypes, monkeypatch
+):
+    torch.manual_seed(600 + k)
+    rows, n = 259, 515
+    value = torch.randint(-127, 128, (rows, k), device="cuda", dtype=torch.int8)
+    row_scale = torch.rand(rows, device="cuda") * 0.02
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.03
+    bias_dtype, second_bias_dtype = bias_dtypes
+    bias = None if bias_dtype is None else torch.randn(n, device="cuda", dtype=bias_dtype)
+    second = None
+    if paired:
+        second = (
+            torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8),
+            torch.rand(n, 1, device="cuda") * 0.03,
+            None
+            if second_bias_dtype is None
+            else torch.randn(n, device="cuda", dtype=second_bias_dtype),
+        )
+    reference_plan = grouped_triton_plan(baseline_execution_plan(in_features=k))
+    expected = int8_nvidia.execute_prepared_linear(
+        value, row_scale, weight, scale, bias, dtype, reference_plan, second_projection=second
+    )
+    tma_launch = Mock(wraps=int8_nvidia.gluon_tma.launch_int8_matmul)
+    monkeypatch.setattr(int8_nvidia.gluon_tma, "launch_int8_matmul", tma_launch)
+    tma_plan = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
+    assert tma_plan.matmul_kernel == "gluon_tma"
+    width = n * (2 if paired else 1)
+    group_ms = (0, 8, 16) if k == 208 and paired and bias_dtype is not None else (16,)
+    for group_m in group_ms:
+        plan = replace(tma_plan, matmul_group_m=group_m)
+        storage = torch.full((rows, width + 16), 42, device="cuda", dtype=dtype)
+        out = storage[:, :width]
+        actual = int8_nvidia.execute_prepared_linear(
+            value, row_scale, weight, scale, bias, dtype, plan, out=out, second_projection=second
+        )
+        assert actual is out
+        assert torch.equal(actual, expected)
+        assert torch.all(storage[:, width:] == 42)
+    assert tma_launch.call_count == len(group_ms)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_sm120_tma_gemm_compiles_once_across_row_counts():
+    kernel = int8_nvidia.gluon_tma._int8_tma_matmul_kernel
+    kernel.device_caches.clear()
+    torch.manual_seed(701)
+    k, n = 512, 1024
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.01
+    for rows in (2304, 2305, 4096, 8192, 8193):
+        value = torch.randint(-127, 128, (rows, k), device="cuda", dtype=torch.int8)
+        row_scale = torch.rand(rows, device="cuda") * 0.01
+        plan = int8_nvidia.default_execution_plan(
+            weight, target=AcceleratorTarget("cuda", "sm120"), rows=rows
+        )
+        assert plan.matmul_kernel == "gluon_tma"
+        int8_nvidia.execute_prepared_linear(
+            value, row_scale, weight, scale, None, torch.bfloat16, plan
+        )
+    compiled = sum(len(cache[0]) for cache in kernel.device_caches.values())
+    assert compiled == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("case", ["aligned", "offset", "k_tail", "non_contiguous", "second_weight"])
+def test_sm120_tma_gemm_falls_back_for_unaligned_operands(monkeypatch, case):
+    torch.manual_seed(702)
+    rows, n = 2304, 1024
+    k = 520 if case == "k_tail" else 512
+    input_offset = 8 if case == "offset" else 0
+    in_storage = torch.randint(
+        -127, 128, (rows * k + input_offset,), device="cuda", dtype=torch.int8
+    )
+    value = in_storage[input_offset:].view(rows, k)
+    if case == "non_contiguous":
+        weight_storage = torch.randint(-127, 128, (n, k + 16), device="cuda", dtype=torch.int8)
+        weight = weight_storage[:, :k]
+    else:
+        weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    second = None
+    if case == "second_weight":
+        sec_storage = torch.randint(-127, 128, (n * k + 8,), device="cuda", dtype=torch.int8)
+        second = (
+            sec_storage[8:].view(n, k),
+            torch.rand(n, 1, device="cuda") * 0.02,
+            torch.randn(n, device="cuda", dtype=torch.float16),
+        )
+    row_scale = torch.rand(rows, device="cuda") * 0.02
+    scale = torch.rand(n, 1, device="cuda") * 0.02
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    plan = int8_nvidia.default_execution_plan(
+        weight, target=AcceleratorTarget("cuda", "sm120"), rows=rows
+    )
+    assert plan.matmul_kernel == "gluon_tma"
+    reference_plan = grouped_triton_plan(baseline_execution_plan(in_features=k))
+    expected = int8_nvidia.execute_prepared_linear(
+        value,
+        row_scale,
+        weight,
+        scale,
+        bias,
+        torch.bfloat16,
+        reference_plan,
+        second_projection=second,
+    )
+    launches = []
+    launch = int8_nvidia.gluon_tma.launch_int8_matmul
+    monkeypatch.setattr(
+        int8_nvidia.gluon_tma,
+        "launch_int8_matmul",
+        lambda *a, **kw: launches.append(kw["execution_plan"].matmul_kernel) or launch(*a, **kw),
+    )
+    actual = int8_nvidia.execute_prepared_linear(
+        value,
+        row_scale,
+        weight,
+        scale,
+        bias,
+        torch.bfloat16,
+        plan,
+        second_projection=second,
+    )
+    assert launches == (["gluon_tma"] if case == "aligned" else [])
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_sm120_tma_gemm_supports_cuda_graph_capture_and_replay(monkeypatch):
+    torch.manual_seed(703)
+    rows, k, n = 2304, 512, 1024
+    value = torch.randint(-127, 128, (rows, k), device="cuda", dtype=torch.int8)
+    row_scale = torch.rand(rows, device="cuda") * 0.02
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    scale = torch.rand(n, 1, device="cuda") * 0.02
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    second_weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    second_scale = torch.rand(n, 1, device="cuda") * 0.02
+    second = (second_weight, second_scale, None)
+    plan = int8_nvidia.default_execution_plan(
+        weight, target=AcceleratorTarget("cuda", "sm120"), rows=rows
+    )
+    assert plan.matmul_kernel == "gluon_tma"
+    tma_launch = Mock(wraps=int8_nvidia.gluon_tma.launch_int8_matmul)
+    monkeypatch.setattr(int8_nvidia.gluon_tma, "launch_int8_matmul", tma_launch)
+    out_plain = torch.empty((rows, n), device="cuda", dtype=torch.bfloat16)
+    out_paired = torch.empty((rows, 2 * n), device="cuda", dtype=torch.bfloat16)
+    int8_nvidia.execute_prepared_linear(
+        value, row_scale, weight, scale, bias, torch.bfloat16, plan, out=out_plain
+    )
+    int8_nvidia.execute_prepared_linear(
+        value,
+        row_scale,
+        weight,
+        scale,
+        bias,
+        torch.bfloat16,
+        plan,
+        out=out_paired,
+        second_projection=second,
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        int8_nvidia.execute_prepared_linear(
+            value, row_scale, weight, scale, bias, torch.bfloat16, plan, out=out_plain
+        )
+        int8_nvidia.execute_prepared_linear(
+            value,
+            row_scale,
+            weight,
+            scale,
+            bias,
+            torch.bfloat16,
+            plan,
+            out=out_paired,
+            second_projection=second,
+        )
+    assert tma_launch.call_count == 4
+    out_plain.zero_()
+    out_paired.zero_()
+    value.random_(-127, 128)
+    graph.replay()
+    torch.cuda.synchronize()
+    reference_plan = grouped_triton_plan(baseline_execution_plan(in_features=k))
+    expected_plain = int8_nvidia.execute_prepared_linear(
+        value, row_scale, weight, scale, bias, torch.bfloat16, reference_plan
+    )
+    expected_paired = int8_nvidia.execute_prepared_linear(
+        value,
+        row_scale,
+        weight,
+        scale,
+        bias,
+        torch.bfloat16,
+        reference_plan,
+        second_projection=second,
+    )
+    assert torch.equal(out_plain, expected_plain)
+    assert torch.equal(out_paired, expected_paired)
 
 
 def _mma_v2_available() -> bool:
@@ -760,7 +986,7 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
             if second_bias_dtype is None
             else torch.randn(n, device="cuda", dtype=second_bias_dtype),
         )
-    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
+    base = baseline_execution_plan(in_features=k)
     args = (value, row_scale, weight, scale, bias, dtype)
     expected = int8_nvidia.execute_prepared_linear(*args, base, second_projection=second)
     width = n * (2 if paired else 1)
@@ -831,7 +1057,7 @@ def test_sm8x_gluon_gemm_matches_base_schedule_with_any_grouping(n, group_m):
     scale = torch.rand(n, 1, device="cuda") * 0.01
     bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
     args = (value, row_scale, weight, scale, bias, torch.bfloat16)
-    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
+    base = baseline_execution_plan(in_features=k)
     plan = replace(
         int8_nvidia.default_execution_plan(
             weight, target=AcceleratorTarget("cuda", "sm89"), rows=rows
@@ -858,7 +1084,7 @@ def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset, 
     scale = torch.rand(n, 1, device="cuda") * 0.01
     bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
     args = (value, row_scale, weight, scale, bias, torch.bfloat16)
-    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
+    base = baseline_execution_plan(in_features=k)
     plan = int8_nvidia.default_execution_plan(
         weight, target=AcceleratorTarget("cuda", "sm89"), rows=rows
     )
@@ -901,7 +1127,7 @@ def test_explicit_async_copy_plan_preserves_paired_fma_on_unaligned_operand(unal
         torch.rand(n, 1, device="cuda") * 0.01,
         torch.randn(n, device="cuda", dtype=torch.float16),
     )
-    base = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
+    base = baseline_execution_plan(in_features=k)
     plan = replace(
         base,
         matmul_kernel="gluon_async_copy",

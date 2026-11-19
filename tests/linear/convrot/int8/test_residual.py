@@ -59,6 +59,9 @@ def _clone_residual(residual):
         (129, 192, 97, "gated", torch.float32),
         (129, 192, 97, "two", torch.float16),
         (32, 128, 64, "gated", torch.bfloat16),
+        (1024, 256, 2560, "gated", None),
+        (1024, 256, 2560, "two", torch.float32),
+        (2305, 272, 1025, "two", torch.float16),
     ],
 )
 def test_residual_projection_preserves_math_and_storage(
@@ -68,14 +71,21 @@ def test_residual_projection_preserves_math_and_storage(
     original_base = residual.base.clone()
     original_output = residual.output.clone()
     qdata, scales, weight, weight_scales, bias, _ = args
+    expected_kernel = "gluon_tma" if rows >= 1024 else "triton"
+    assert dispatch.default_execution_plan(weight, rows=rows).matmul_kernel == expected_kernel
     # Double precision supplies an independent oracle for integer accumulation,
     # dequantization, and the residual arithmetic before the final storage cast.
     projection = (qdata.double() @ weight.double().T) * scales.double()[:, None]
     projection *= weight_scales.double().T
     if bias is not None:
         projection += bias.double()
-    projection = projection.to(dtype).double()
     materialized = dispatch.linear_prepared(*args)
+    torch.testing.assert_close(
+        materialized,
+        projection.to(dtype),
+        atol=2e-5,
+        rtol=max(2e-5, 2 * torch.finfo(dtype).eps),
+    )
     reference = _clone_residual(residual)
     expected = reference.output
     residual_kernels.apply_residual_add(materialized, reference, start)
@@ -84,14 +94,19 @@ def test_residual_projection_preserves_math_and_storage(
         previous = original_output.view(-1, features)[start : start + rows].double()
         previous *= residual.reusable.gate[residual.gate_indices[start : start + rows]].double()
         wanted += previous
-    projection *= residual.gate[residual.gate_indices[start : start + rows]].double()
-    wanted = (wanted + projection).to(dtype)
+    wanted = (
+        wanted
+        + materialized.double()
+        * residual.gate[residual.gate_indices[start : start + rows]].double()
+    ).to(dtype)
     standalone = (
         Mock(wraps=residual_kernels.apply_residual_add)
         if dtype is torch.float32
         else Mock(side_effect=AssertionError("residual launched separately"))
     )
+    tma_launch = Mock(wraps=dispatch.gluon_tma.launch_int8_residual_matmul)
     monkeypatch.setattr(dispatch, "apply_residual_add", standalone)
+    monkeypatch.setattr(dispatch.gluon_tma, "launch_int8_residual_matmul", tma_launch)
     actual = dispatch.linear_prepared_residual(*args[:-1], residual, row_offset=start)
     assert actual.data_ptr() == residual.output.view(-1, features)[start:].data_ptr()
     torch.testing.assert_close(actual, wanted, atol=2e-5, rtol=max(2e-5, torch.finfo(dtype).eps))
@@ -105,6 +120,10 @@ def test_residual_projection_preserves_math_and_storage(
     )
     if residual.reusable is not None:
         torch.testing.assert_close(residual.base, original_base, rtol=0, atol=0)
+    if expected_kernel == "gluon_tma" and dtype is not torch.float32:
+        tma_launch.assert_called_once()
+    else:
+        tma_launch.assert_not_called()
     if dtype is torch.float32:
         standalone.assert_called_once()
     else:
@@ -154,3 +173,111 @@ def test_backend_fallback_keeps_residual_semantics(kind, monkeypatch):
     standalone.assert_called_once()
     assert standalone.call_args.args[0].data_ptr() == scratch.data_ptr()
     assert standalone.call_args.args[0].stride() == scratch.stride()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("case", ["offset", "width_tail", "non_contiguous"])
+def test_sm120_tma_residual_falls_back_to_triton_for_unaligned_operands(dtype, case, monkeypatch):
+    rows, features = 1024, 2560
+    width = 264 if case == "width_tail" else 256
+    args, residual, start = _case(dtype, rows, width, features, "two", torch.float32)
+    qdata, scales, weight, weight_scales, bias, _ = args
+    if case == "offset":
+        storage = torch.randint(-127, 128, (rows * width + 8,), device="cuda", dtype=torch.int8)
+        storage[8:].copy_(qdata.reshape(-1))
+        qdata = storage[8:].view(rows, width)
+    elif case == "non_contiguous":
+        weight_storage = torch.randint(
+            -127, 128, (features, width + 16), device="cuda", dtype=torch.int8
+        )
+        weight = weight_storage[:, :width]
+    assert dispatch.default_execution_plan(weight, rows=rows).matmul_kernel == "gluon_tma"
+    original_base = residual.base.clone()
+    reference = _clone_residual(residual)
+    materialized = dispatch.linear_prepared(qdata, scales, weight, weight_scales, bias, dtype)
+    residual_kernels.apply_residual_add(materialized, reference, start)
+    monkeypatch.setattr(
+        dispatch.gluon_tma,
+        "launch_int8_residual_matmul",
+        Mock(side_effect=AssertionError("TMA residual launched on unaligned operands")),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "apply_residual_add",
+        Mock(side_effect=AssertionError("standalone residual launched")),
+    )
+    actual = dispatch.linear_prepared_residual(
+        qdata, scales, weight, weight_scales, bias, residual, row_offset=start
+    )
+    assert actual.data_ptr() == residual.output.view(-1, features)[start:].data_ptr()
+    torch.testing.assert_close(residual.output, reference.output, atol=0, rtol=0)
+    torch.testing.assert_close(residual.base, original_base, atol=0, rtol=0)
+
+
+def test_sm120_tma_residual_compiles_once_across_row_counts_and_offsets():
+    kernel = dispatch.gluon_tma._int8_tma_residual_matmul_kernel
+    kernel.device_caches.clear()
+    width, features = 256, 2560
+    torch.manual_seed(704)
+    weight = torch.randint(-127, 128, (features, width), device="cuda", dtype=torch.int8)
+    weight_scales = torch.rand(features, 1, device="cuda") * 0.03
+    bias = torch.randn(features, device="cuda", dtype=torch.float32)
+    for rows, row_offset in ((1024, 0), (1025, 17), (2048, 1024), (2049, 4096)):
+        total = row_offset + rows + 9
+        qdata = torch.randint(-127, 128, (rows, width), device="cuda", dtype=torch.int8)
+        scales = torch.rand(rows, device="cuda") * 0.02
+        base = torch.randn(total, features, device="cuda", dtype=torch.bfloat16)
+        indices = torch.randint(-3, 3, (total,), device="cuda", dtype=torch.int64)
+        gate = torch.randn(3, 3 * features, device="cuda", dtype=torch.bfloat16)[
+            :, features : 2 * features
+        ]
+        previous_gate = torch.randn(5, 2 * features, device="cuda", dtype=torch.bfloat16)[
+            :, :features
+        ]
+        residual = ResidualAdd(
+            base, gate, indices, True, ReusableUpdate(torch.randn_like(base), previous_gate)
+        )
+        validate_residual_add(base, residual, features)
+        assert dispatch.default_execution_plan(weight, rows=rows).matmul_kernel == "gluon_tma"
+        dispatch.linear_prepared_residual(
+            qdata, scales, weight, weight_scales, bias, residual, row_offset=row_offset
+        )
+    compiled = sum(len(cache[0]) for cache in kernel.device_caches.values())
+    assert compiled == 1
+
+
+def test_sm120_tma_residual_supports_cuda_graph_capture_and_replay(monkeypatch):
+    rows, width, features = 1024, 256, 2560
+    args, residual, start = _case(torch.bfloat16, rows, width, features, "two", torch.float32)
+    qdata, scales, weight, weight_scales, bias, dtype = args
+    assert dispatch.default_execution_plan(weight, rows=rows).matmul_kernel == "gluon_tma"
+    tma_launch = Mock(wraps=dispatch.gluon_tma.launch_int8_residual_matmul)
+    monkeypatch.setattr(dispatch.gluon_tma, "launch_int8_residual_matmul", tma_launch)
+    initial_base = residual.base.clone()
+    initial_update = residual.reusable.update.clone()
+    dispatch.linear_prepared_residual(
+        qdata, scales, weight, weight_scales, bias, residual, row_offset=start
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dispatch.linear_prepared_residual(
+            qdata, scales, weight, weight_scales, bias, residual, row_offset=start
+        )
+    assert tma_launch.call_count == 2
+    qdata.random_(-127, 128)
+    residual.base.copy_(initial_base)
+    residual.reusable.update.copy_(initial_update)
+    reference = _clone_residual(residual)
+    materialized = dispatch.linear_prepared(qdata, scales, weight, weight_scales, bias, dtype)
+    residual_kernels.apply_residual_add(materialized, reference, start)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(residual.output, reference.output, atol=0, rtol=0)
+    actual_rows = residual.output.view(-1, features)
+    initial_rows = initial_update.view(-1, features)
+    torch.testing.assert_close(actual_rows[:start], initial_rows[:start], rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_rows[start + rows :], initial_rows[start + rows :], rtol=0, atol=0
+    )
+    torch.testing.assert_close(residual.base, initial_base, rtol=0, atol=0)

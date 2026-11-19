@@ -3,6 +3,7 @@
 from dataclasses import replace
 
 import pytest
+import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8._nvidia import policy as nvidia_policy
@@ -68,9 +69,9 @@ def test_shared_plan_rejects_invalid_launch_dimensions(value):
 def test_supported_nvidia_targets_keep_the_existing_schedule(architecture, in_features):
     target = AcceleratorTarget("cuda", architecture)
 
-    assert select_execution_plan(target, in_features=in_features) == select_execution_plan(
-        _SM120, in_features=in_features
-    )
+    assert select_execution_plan(
+        target, in_features=in_features
+    ) == nvidia_policy.baseline_execution_plan(in_features=in_features)
 
 
 @pytest.mark.parametrize(
@@ -158,12 +159,23 @@ def test_execution_plan_uses_uniform_mid_size_fused_launch_schedule() -> None:
 
 def test_execution_plan_selects_uniform_matmul_schedule() -> None:
     plan = select_execution_plan(_SM120, in_features=512)
+    baseline = nvidia_policy.baseline_execution_plan(in_features=512)
 
+    assert plan.matmul_kernel == "gluon_tma"
     assert plan.matmul_block_m == 128
     assert plan.matmul_block_n == 256
-    assert plan.matmul_block_k == 128
+    assert plan.matmul_block_k == 64
     assert plan.matmul_num_warps == 8
     assert plan.matmul_num_stages == 3
+    assert plan.matmul_group_m == 16
+    assert plan.matmul_specialize_m is False
+    assert plan.matmul_explicit_bias_fma is True
+    assert baseline.matmul_kernel == "triton"
+    assert baseline.matmul_block_m == 128
+    assert baseline.matmul_block_n == 256
+    assert baseline.matmul_block_k == 128
+    assert baseline.matmul_num_warps == 8
+    assert baseline.matmul_num_stages == 3
 
 
 @pytest.mark.parametrize(
@@ -202,17 +214,12 @@ def test_shape_aware_schedule_preserves_preparation(rows, k, n, block_m):
     previous = select_execution_plan(_SM120, in_features=k)
     actual = select_execution_plan(_SM120, in_features=k, rows=rows, out_features=n)
     assert actual.matmul_block_m == block_m
-    assert (
-        replace(
-            actual,
-            matmul_block_m=previous.matmul_block_m,
-            matmul_block_n=previous.matmul_block_n,
-            matmul_num_warps=previous.matmul_num_warps,
-            matmul_num_stages=previous.matmul_num_stages,
-            matmul_group_m=previous.matmul_group_m,
-        )
-        == previous
-    )
+    assert actual.matmul_kernel == ("gluon_tma" if block_m == 128 else "triton")
+    assert actual.matmul_block_k == (64 if block_m == 128 else 128)
+    preparation = ("fuse_rotation_quantization", "fused_num_warps")
+    preparation += ("rotation_num_warps", "quantization_num_warps")
+    for field in preparation:
+        assert getattr(actual, field) == getattr(previous, field)
 
 
 @pytest.mark.parametrize("out_features", [16, 64, 65, 257, 1024, 3072, 5376, 14336])
@@ -413,6 +420,7 @@ def test_sm8x_plan_rejects_invalid_group_m(group_m):
 
 def test_execution_plan_serializes_flat_tuning_fields() -> None:
     plan = select_execution_plan(_SM120, in_features=512)
+    baseline = nvidia_policy.baseline_execution_plan(in_features=512)
 
     assert plan.as_dict() == {
         "fuse_rotation_quantization": True,
@@ -421,11 +429,17 @@ def test_execution_plan_serializes_flat_tuning_fields() -> None:
         "quantization_num_warps": 8,
         "matmul_block_m": 128,
         "matmul_block_n": 256,
-        "matmul_block_k": 128,
+        "matmul_block_k": 64,
         "matmul_num_warps": 8,
         "matmul_num_stages": 3,
-        "matmul_kernel": "triton",
+        "matmul_kernel": "gluon_tma",
         "matmul_group_m": 16,
+        "matmul_specialize_m": False,
+        "matmul_explicit_bias_fma": True,
+    }
+    assert baseline.as_dict() == plan.as_dict() | {
+        "matmul_block_k": 128,
+        "matmul_kernel": "triton",
         "matmul_specialize_m": True,
         "matmul_explicit_bias_fma": False,
     }
@@ -469,9 +483,9 @@ def test_execution_plan_rejects_invalid_fused_warp_count() -> None:
 
 
 def test_kernel_selection_is_independent_of_tile_replacement() -> None:
-    sm120 = select_execution_plan(_SM120, in_features=512)
+    baseline = nvidia_policy.baseline_execution_plan(in_features=512)
     triton = replace(
-        sm120,
+        baseline,
         matmul_block_m=128,
         matmul_block_n=128,
         matmul_block_k=64,
@@ -484,26 +498,42 @@ def test_kernel_selection_is_independent_of_tile_replacement() -> None:
     with pytest.raises(ValueError, match="async-copy GEMM requires"):
         replace(gluon, matmul_block_n=64)
 
+    tma = select_execution_plan(_SM120, in_features=512)
+    assert replace(tma, matmul_group_m=8).matmul_kernel == "gluon_tma"
+    for invalid in (
+        {"matmul_block_m": 256},
+        {"matmul_block_n": 128},
+        {"matmul_block_k": 128},
+        {"matmul_num_warps": 4},
+        {"matmul_num_stages": 4},
+    ):
+        with pytest.raises(ValueError, match="TMA GEMM requires"):
+            replace(tma, **invalid)
 
+
+@pytest.mark.parametrize("kernel", ["gluon_async_copy", "gluon_tma"])
 @pytest.mark.parametrize("specialize_m", [False, True])
 @pytest.mark.parametrize("explicit_bias_fma", [False, True])
 def test_gluon_reports_effective_behavior_and_preserves_triton_options(
-    specialize_m, explicit_bias_fma
+    kernel, specialize_m, explicit_bias_fma
 ) -> None:
+    tile = (
+        {"matmul_block_n": 128, "matmul_block_k": 64, "matmul_num_warps": 4}
+        if kernel == "gluon_async_copy"
+        else {"matmul_block_k": 64}
+    )
     triton = replace(
-        select_execution_plan(_SM120, in_features=512),
-        matmul_block_n=128,
-        matmul_block_k=64,
-        matmul_num_warps=4,
+        nvidia_policy.baseline_execution_plan(in_features=512),
+        **tile,
         triton_specialize_m=specialize_m,
         triton_explicit_bias_fma=explicit_bias_fma,
     )
-    gluon = replace(triton, matmul_kernel="gluon_async_copy")
+    gluon = replace(triton, matmul_kernel=kernel)
 
     assert gluon.matmul_specialize_m is False
     assert gluon.matmul_explicit_bias_fma is True
     assert gluon.as_dict() == triton.as_dict() | {
-        "matmul_kernel": "gluon_async_copy",
+        "matmul_kernel": kernel,
         "matmul_specialize_m": False,
         "matmul_explicit_bias_fma": True,
     }
@@ -512,6 +542,38 @@ def test_gluon_reports_effective_behavior_and_preserves_triton_options(
     assert fallback.matmul_kernel == "triton"
     assert fallback.matmul_specialize_m is False
     assert fallback.matmul_explicit_bias_fma is True
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("architecture", ["sm89", "sm90", "sm120", "sm121"])
+@pytest.mark.parametrize("kernel", ["triton", "gluon_async_copy", "gluon_tma"])
+def test_supports_residual_epilogue_covers_sm120_triton_and_tma(
+    dtype, architecture, kernel
+) -> None:
+    base = nvidia_policy.baseline_execution_plan(in_features=512)
+    if kernel == "gluon_async_copy":
+        plan = replace(
+            base,
+            matmul_kernel=kernel,
+            matmul_block_n=128,
+            matmul_block_k=64,
+            matmul_num_warps=4,
+        )
+    elif kernel == "gluon_tma":
+        plan = select_execution_plan(_SM120, in_features=512)
+    else:
+        plan = base
+    expected = (
+        architecture == "sm120"
+        and kernel in ("triton", "gluon_tma")
+        and dtype in (torch.float16, torch.bfloat16)
+    )
+    assert (
+        nvidia_policy.supports_residual_epilogue(
+            AcceleratorTarget("cuda", architecture), plan, dtype
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(

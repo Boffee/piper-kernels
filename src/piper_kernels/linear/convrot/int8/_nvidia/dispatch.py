@@ -11,7 +11,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot import triton as convrot_backend
 
 from .._plan import LinearExecutionPlan
-from . import gluon_async_copy, policy
+from . import gluon_async_copy, gluon_tma, policy
 from . import triton as triton_kernels
 from ._plan import NvidiaExecutionPlan
 
@@ -140,12 +140,13 @@ def execute_prepared_linear(
         raise TypeError("NVIDIA ConvRot execution requires a NvidiaExecutionPlan")
     plan = execution_plan
     launcher = triton_kernels.launch_int8_matmul
-    if plan.matmul_kernel == "gluon_async_copy":
-        aligned = gluon_async_copy.operands_aligned(input_qdata_2d, weight_qdata)
+    if plan.matmul_kernel in ("gluon_async_copy", "gluon_tma"):
+        gluon_module = gluon_tma if plan.matmul_kernel == "gluon_tma" else gluon_async_copy
+        aligned = gluon_module.operands_aligned(input_qdata_2d, weight_qdata)
         if paired:
-            aligned = aligned and gluon_async_copy.operands_aligned(second_weight)
+            aligned = aligned and gluon_module.operands_aligned(second_weight)
         if aligned:
-            launcher = gluon_async_copy.launch_int8_matmul
+            launcher = gluon_module.launch_int8_matmul
         else:
             plan = policy.grouped_triton_plan(plan)
     launcher(
@@ -307,8 +308,15 @@ def linear_prepared_residual(
         n, k = weight_qdata.shape
         output = residual_add.output.view(-1, n)[row_offset : row_offset + m]
         if m and n:
-            triton_kernels.launch_int8_residual_matmul(
-                input_qdata.reshape(m, k),
+            input_qdata_2d = input_qdata.reshape(m, k)
+            residual_launcher = triton_kernels.launch_int8_residual_matmul
+            if plan.matmul_kernel == "gluon_tma":
+                if gluon_tma.operands_aligned(input_qdata_2d, weight_qdata):
+                    residual_launcher = gluon_tma.launch_int8_residual_matmul
+                else:
+                    plan = policy.grouped_triton_plan(plan)
+            residual_launcher(
+                input_qdata_2d,
                 weight_qdata,
                 output,
                 input_scale.reshape(m),
