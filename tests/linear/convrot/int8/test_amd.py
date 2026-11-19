@@ -1,6 +1,7 @@
 """AMD support boundaries and on-device coverage of the shared INT8 contract."""
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -135,6 +136,57 @@ def test_gfx1201_accumulator_seed_fits_every_int8_partial_sum():
     assert policy.matmul_accumulator_seed(AcceleratorTarget("hip", "gfx1200"), 4096, 64) == 0
 
 
+@pytest.mark.parametrize(
+    ("arch", "dtype", "rows", "outputs", "width", "stride", "expected"),
+    [
+        ("gfx1201", torch.bfloat16, 4096, 14336, 5376, 28672, True),
+        ("gfx1201", torch.bfloat16, 2816, 16384, 6144, 32768, True),
+        ("gfx1201", torch.bfloat16, 20480, 8192, 2048, 16384, True),
+        ("gfx1201", torch.bfloat16, 20480, 14336, 5376, 28672, True),
+        ("gfx1201", torch.float32, 20480, 14336, 5376, 28672, False),
+        ("gfx1200", torch.bfloat16, 4096, 14336, 5376, 28672, False),
+        ("gfx1201", torch.bfloat16, 4096, 6144, 8192, 12288, False),
+        ("gfx1201", torch.bfloat16, 4096, 320, 512, 640, False),
+        ("gfx1201", torch.bfloat16, 4096, 512, 224, 1024, False),
+        ("gfx1201", torch.bfloat16, 100000, 14336, 5376, 28672, False),
+    ],
+)
+def test_gfx1201_paired_matmul_selection_boundaries(
+    arch, dtype, rows, outputs, width, stride, expected
+):
+    target = AcceleratorTarget("hip", arch)
+    plan = policy.select_execution_plan(target, in_features=width, rows=rows, out_features=outputs)
+    assert (
+        policy.supports_paired_matmul(
+            target,
+            plan,
+            dtype,
+            rows=rows,
+            in_features=width,
+            out_features=outputs,
+            output_row_stride=stride,
+        )
+        is expected
+    )
+
+
+def test_gfx1201_paired_matmul_respects_custom_plan():
+    target = AcceleratorTarget("hip", "gfx1201")
+    plan = replace(
+        policy.select_execution_plan(target, in_features=5376, rows=4096, out_features=14336),
+        matmul_block_n=128,
+    )
+    assert not policy.supports_paired_matmul(
+        target,
+        plan,
+        torch.bfloat16,
+        rows=4096,
+        in_features=5376,
+        out_features=14336,
+        output_row_stride=28672,
+    )
+
+
 @pytest.mark.gpu
 @_gpu
 def test_amd_projection_recovers_integer_sum_before_fp32_rounding():
@@ -156,7 +208,14 @@ def test_amd_projection_recovers_integer_sum_before_fp32_rounding():
 @_gpu
 @pytest.mark.parametrize(
     ("rows", "width", "columns"),
-    [(1023, 256, 335), (1024, 256, 335), (1025, 256, 335), (2049, 256, 335), (1025, 8192, 2049)],
+    [
+        (1023, 256, 335),
+        (1024, 256, 335),
+        (1025, 256, 335),
+        (2049, 256, 335),
+        (1025, 4096, 1024),
+        (1025, 8192, 2049),
+    ],
 )
 @pytest.mark.parametrize("paired", [False, True])
 def test_amd_projection_crosses_cache_group_and_tail_boundaries(rows, width, columns, paired):

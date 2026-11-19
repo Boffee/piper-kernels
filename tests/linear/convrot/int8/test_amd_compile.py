@@ -201,3 +201,48 @@ def test_amd_activated_preparation_compiles(architecture, width, static):
 
     if static:
         assert "tt.reduce" not in compiled.asm["ttir"]
+
+
+@pytest.mark.parametrize("full_rows", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_rdna4_unpacked_paired_matmul_compiles_spill_free(full_rows, has_bias):
+    target = AcceleratorTarget("hip", "gfx1201")
+    source = ASTSource(
+        amd._paired_int8_matmul_kernel,
+        {
+            "input_ptr": "*i8",
+            "weight_ptr": "*i8",
+            "output_ptr": "*bf16",
+            "input_scale_ptr": "*fp32",
+            "weight_scale_ptr": "*fp32",
+            "bias_ptr": "*bf16",
+            "second_weight_ptr": "*i8",
+            "second_scale_ptr": "*fp32",
+            "second_bias_ptr": "*bf16",
+            "m": "i32",
+            "output_row_stride": "i32",
+        },
+        constexprs={
+            "n": 14336,
+            "k": 5376,
+            "has_bias": has_bias,
+            "second_has_bias": has_bias,
+            "full_rows": full_rows,
+            "accumulator_seed": 0x155555,
+        },
+        attrs={
+            **{(index,): [["tt.divisibility", 16], ["tt.pointer_range", 32]] for index in range(9)},
+            (10,): [["tt.divisibility", 16]],
+        },
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("hip", "gfx1201", 32),
+        options={"num_warps": 8, "num_stages": 2, **amd._amd_matmul_compiler_options(target)},
+    )
+    asm = compiled.asm["amdgcn"]
+    assert "v_wmma_i32" in asm
+    assert ".vgpr_spill_count: 0" in asm
+    assert ".private_segment_fixed_size: 0" in asm
+    if rocm_fences_only_lds():
+        assert "global_inv" not in asm

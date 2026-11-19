@@ -504,6 +504,76 @@ def prepare_input_with_plan(
     return result
 
 
+@triton.jit(do_not_specialize=["m"])
+def _paired_int8_matmul_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    second_weight_ptr,
+    second_scale_ptr,
+    second_bias_ptr,
+    m,
+    output_row_stride,
+    n: tl.constexpr,
+    k: tl.constexpr,
+    has_bias: tl.constexpr,
+    second_has_bias: tl.constexpr,
+    full_rows: tl.constexpr,
+    accumulator_seed: tl.constexpr,
+):
+    """Project one prepared input into two adjacent 128-column-tiled weights."""
+    # Caller validates that 32-bit element indexing fits inputs, weights, and outputs.
+    pid = tl.program_id(0)
+    row_tiles = tl.cdiv(m, 128)
+    col_tiles: tl.constexpr = n // 128
+    group_n: tl.constexpr = tl.constexpr(4)
+    first_col = pid // (row_tiles * group_n) * group_n
+    cols_in_group = tl.minimum(group_n, col_tiles - first_col)
+    local = pid % (row_tiles * group_n)
+    rows = local // cols_in_group * 128 + tl.arange(0, 128)
+    cols = (first_col + local % cols_in_group) * 128 + tl.arange(0, 128)
+    # Repeat the final valid input row on partial tiles; stores mask out-of-range rows.
+    source_rows = rows if full_rows else tl.minimum(rows, m - 1)
+    offsets_k = tl.arange(0, 64)
+    activation_pointers = input_ptr + source_rows[:, None] * k + offsets_k[None, :]
+    weight_offsets = cols[None, :] * k + offsets_k[:, None]
+    first_weight_pointers = weight_ptr + weight_offsets
+    second_weight_pointers = second_weight_ptr + weight_offsets
+    first_accumulator = tl.full((128, 128), accumulator_seed, tl.int32)
+    second_accumulator = tl.full((128, 128), accumulator_seed, tl.int32)
+    for _ in range(k // 64):
+        activation = tl.load(activation_pointers)
+        first_weight = tl.load(first_weight_pointers)
+        second_weight = tl.load(second_weight_pointers)
+        first_accumulator = tl.dot(activation, first_weight, first_accumulator)
+        second_accumulator = tl.dot(activation, second_weight, second_accumulator)
+        activation_pointers += 64
+        first_weight_pointers += 64
+        second_weight_pointers += 64
+    row_scale = tl.load(input_scale_ptr + source_rows)
+    first_result = (
+        (first_accumulator - accumulator_seed).to(tl.float32)
+        * row_scale[:, None]
+        * tl.load(weight_scale_ptr + cols)[None, :]
+    )
+    if has_bias:
+        first_result += tl.load(bias_ptr + cols).to(tl.float32)[None, :]
+    second_result = (
+        (second_accumulator - accumulator_seed).to(tl.float32)
+        * row_scale[:, None]
+        * tl.load(second_scale_ptr + cols)[None, :]
+    )
+    if second_has_bias:
+        second_result += tl.load(second_bias_ptr + cols).to(tl.float32)[None, :]
+    dest = output_ptr + rows[:, None] * output_row_stride + cols[None, :]
+    valid_rows = True if full_rows else rows[:, None] < m
+    tl.store(dest + n, second_result, mask=valid_rows)
+    tl.store(dest, first_result, mask=valid_rows)
+
+
 def execute_prepared_linear(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -554,6 +624,40 @@ def execute_prepared_linear(
     bias_pointer = bias if bias is not None else output
 
     if not m or not n:
+        return result
+    if paired and policy.supports_paired_matmul(
+        target,
+        plan,
+        logical_dtype,
+        rows=m,
+        in_features=k,
+        out_features=n,
+        output_row_stride=output.stride(0),
+    ):
+        output_tiles = triton.cdiv(m, 128) * (n // 128)
+        with device_context(input_qdata.device):
+            _paired_int8_matmul_kernel[(output_tiles,)](
+                input_qdata_2d,
+                weight_qdata,
+                output,
+                input_scale_1d,
+                weight_scale,
+                bias_pointer,
+                second_weight,
+                second_scale,
+                second_bias if second_bias is not None else output,
+                m,
+                output.stride(0),
+                n=n,
+                k=k,
+                has_bias=bias is not None,
+                second_has_bias=second_bias is not None,
+                full_rows=m % 128 == 0,
+                accumulator_seed=policy.matmul_accumulator_seed(target, k, output_tiles),
+                **compiler_options,
+                num_stages=2,
+                num_warps=8,
+            )
         return result
     row_block_count = triton.cdiv(m, plan.matmul_block_m)
     output_tiles = row_block_count * num_n_tiles
