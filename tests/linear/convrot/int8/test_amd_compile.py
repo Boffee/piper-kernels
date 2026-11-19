@@ -1,5 +1,6 @@
 """Offline AMD matrix-instruction coverage; runtime tests live in test_amd."""
 
+import re
 import sys
 from dataclasses import replace
 from functools import partial
@@ -246,3 +247,63 @@ def test_rdna4_unpacked_paired_matmul_compiles_spill_free(full_rows, has_bias):
     assert ".private_segment_fixed_size: 0" in asm
     if rocm_fences_only_lds():
         assert "global_inv" not in asm
+
+
+@pytest.mark.parametrize(
+    ("block_n", "block_k", "features", "width"),
+    [(128, 128, 6144, 16384), (256, 64, 5376, 14336)],
+)
+@pytest.mark.parametrize("full_rows", [False, True])
+@pytest.mark.parametrize("reusable", [False, True])
+def test_rdna4_residual_matmul_compiles_with_bounded_spills(
+    block_n, block_k, features, width, full_rows, reusable
+):
+    target = AcceleratorTarget("hip", "gfx1201")
+    source = ASTSource(
+        amd._amd_int8_residual_matmul_kernel,
+        {
+            "input_ptr": "*i8",
+            "weight_ptr": "*i8",
+            "output_ptr": "*bf16",
+            "input_scale_ptr": "*fp32",
+            "weight_scale_ptr": "*fp32",
+            "bias_ptr": "*bf16",
+            "base_ptr": "*bf16",
+            "gate_ptr": "*bf16",
+            "reusable_gate_ptr": "*bf16",
+            "indices_ptr": "*i64",
+            "row_offset": "i32",
+            "gate_rows": "i32",
+            "reusable_gate_rows": "i32",
+            "m": "i32",
+        },
+        constexprs={
+            "n": features,
+            "k": width,
+            "block_n": block_n,
+            "block_k": block_k,
+            "has_bias": True,
+            "full_rows": full_rows,
+            "gate_row_stride": features * 2,
+            "reusable_gate_row_stride": features * 2 if reusable else 0,
+            "has_reusable_update": reusable,
+            "python_indexing": True,
+            "accumulator_seed": 0x155555,
+        },
+        attrs={
+            (index,): [["tt.divisibility", 16], ["tt.pointer_range", 32]] for index in range(10)
+        },
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("hip", "gfx1201", 32),
+        options={"num_warps": 8, "num_stages": 2, **amd._amd_matmul_compiler_options(target)},
+    )
+    asm = compiled.asm["amdgcn"]
+    assert "v_wmma_i32" in asm
+    if rocm_fences_only_lds():
+        assert "global_inv" not in asm
+        match = re.search(r"\.vgpr_spill_count:\s*(\d+)", asm)
+        assert match is not None
+        spills = int(match.group(1))
+        assert spills == 0 if (block_n == 128 or not reusable) else spills <= 16

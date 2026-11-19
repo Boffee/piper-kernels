@@ -121,6 +121,32 @@ def supports_paired_matmul(
     )
 
 
+def supports_residual_epilogue(
+    target: AcceleratorTarget,
+    plan: LinearExecutionPlan,
+    logical_dtype: torch.dtype,
+    *,
+    rows: int,
+    in_features: int,
+    out_features: int,
+) -> bool:
+    """Return whether aligned RDNA4 16-bit GEMMs fuse the residual epilogue."""
+    return (
+        logical_dtype in (torch.float16, torch.bfloat16)
+        and (plan.matmul_block_n, plan.matmul_block_k) in ((128, 128), (256, 64))
+        and out_features % plan.matmul_block_n == 0
+        and in_features % plan.matmul_block_k == 0
+        and _supports_rdna4_128m_fast_path(
+            target,
+            plan,
+            rows=rows,
+            in_features=in_features,
+            out_features=out_features,
+            output_row_bytes=logical_dtype.itemsize * out_features,
+        )
+    )
+
+
 def select_execution_plan(
     target: AcceleratorTarget,
     *,
