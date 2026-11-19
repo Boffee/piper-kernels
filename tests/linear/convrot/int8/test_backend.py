@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, Mock, call
 import pytest
 import torch
 
+from piper_kernels._residual import ResidualAdd, ReusableUpdate
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import _backend, dispatch
@@ -95,10 +96,12 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
     monkeypatch.setattr(kernel_backend, "device_context", lambda device: nullcontext())
     kernel = MagicMock()
     gluon_kernel = MagicMock()
+    tma_kernel = MagicMock()
     monkeypatch.setattr(kernel_backend, "int8_matmul_kernel", kernel)
     if backend is nvidia:
         monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
         monkeypatch.setattr(nvidia.gluon_async_copy, "_int8_matmul_kernel", gluon_kernel)
+        monkeypatch.setattr(nvidia.gluon_tma, "_int8_tma_matmul_kernel", tma_kernel)
     value = torch.empty(m, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
     row_scale = torch.empty(m, device="meta")
@@ -108,9 +111,15 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
         value, row_scale, weight, scale, None, torch.bfloat16, plan
     )
     assert result.shape == (m, n)
-    uses_gluon = getattr(plan, "matmul_kernel", "triton") == "gluon_async_copy"
-    launched, unused = (gluon_kernel, kernel) if uses_gluon else (kernel, gluon_kernel)
-    unused.__getitem__.assert_not_called()
+    plan_kernel = getattr(plan, "matmul_kernel", "triton")
+    if plan_kernel == "gluon_tma":
+        launched, unused = tma_kernel, (kernel, gluon_kernel)
+    elif plan_kernel == "gluon_async_copy":
+        launched, unused = gluon_kernel, (kernel, tma_kernel)
+    else:
+        launched, unused = kernel, (gluon_kernel, tma_kernel)
+    for other in unused:
+        other.__getitem__.assert_not_called()
     if not m or not n:
         launched.__getitem__.assert_not_called()
     else:
@@ -118,7 +127,7 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
         column_tiles = (n + plan.matmul_block_n - 1) // plan.matmul_block_n
         assert launched.__getitem__.call_args_list == [call((row_tiles * column_tiles,))]
         launched.__getitem__.return_value.assert_called_once()
-        if not uses_gluon:
+        if plan_kernel == "triton":
             flags = kernel.__getitem__.return_value.call_args.kwargs
             # SM8x branches per tile instead of specializing on aligned M.
             sm8x = target.is_cuda_capability(8)
@@ -177,7 +186,7 @@ def test_triton_tail_scheduling_is_independent_of_bias_rounding(
     ("architecture", "rows", "n", "tile", "group_m"),
     [
         # Production and explicit schedules both carry grouping in their plan.
-        ("sm120", 4096, 1000, None, 16),
+        ("sm90", 4096, 1000, None, 16),
         ("sm120", 4096, 1000, (128, 128, 128, 4, 2), 0),
         ("sm120", 64, 1000, None, 0),
         ("sm89", 8192, 96, None, 16),
@@ -263,6 +272,81 @@ def test_sm8x_wide_projections_launch_the_gluon_kernel(
     kernel.__getitem__.assert_not_called()
     assert gluon_kernel.__getitem__.call_args_list == [call((tiles,))]
     assert gluon_kernel.__getitem__.return_value.call_args.kwargs["num_warps"] == num_warps
+
+
+@pytest.mark.parametrize("paired", [False, True])
+@pytest.mark.parametrize("k", [1024, 1032])
+def test_sm120_large_projections_launch_tma_or_fall_back_to_grouped_triton(monkeypatch, paired, k):
+    target = AcceleratorTarget("cuda", "sm120")
+    monkeypatch.setattr(nvidia_kernels, "device_context", lambda device: nullcontext())
+    triton_kernel = MagicMock()
+    tma_kernel = MagicMock()
+    monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", triton_kernel)
+    monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", triton_kernel)
+    monkeypatch.setattr(nvidia.gluon_tma, "_int8_tma_matmul_kernel", tma_kernel)
+    rows, n = 4096, 1000
+    value = torch.empty(rows, k, device="meta", dtype=torch.int8)
+    weight = torch.empty(n, k, device="meta", dtype=torch.int8)
+    plan = nvidia.default_execution_plan(weight, target=target, rows=rows)
+    second = (weight, torch.empty(n, 1, device="meta"), None) if paired else None
+    nvidia.execute_prepared_linear(
+        value,
+        torch.empty(rows, device="meta"),
+        weight,
+        torch.empty(n, 1, device="meta"),
+        None,
+        torch.bfloat16,
+        plan,
+        second_projection=second,
+    )
+    assert plan.matmul_kernel == "gluon_tma"
+    if k % 16 == 0:
+        tiles = (rows + 127) // 128 * ((n + 255) // 256) * (2 if paired else 1)
+        triton_kernel.__getitem__.assert_not_called()
+        assert tma_kernel.__getitem__.call_args_list == [call((tiles,))]
+        assert tma_kernel.__getitem__.return_value.call_args.kwargs["num_warps"] == 8
+    else:
+        tma_kernel.__getitem__.assert_not_called()
+        tiles = (rows + 127) // 128 * ((n + 63) // 64) * (2 if paired else 1)
+        assert triton_kernel.__getitem__.call_args_list == [call((tiles,))]
+        assert triton_kernel.__getitem__.return_value.call_args.kwargs["group_m"] == 16
+
+
+@pytest.mark.parametrize("k", [256, 264])
+def test_sm120_large_residual_launches_tma_or_falls_back_when_unaligned(monkeypatch, k):
+    target = AcceleratorTarget("cuda", "sm120")
+    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
+    monkeypatch.setattr(nvidia_kernels, "device_context", lambda device: nullcontext())
+    triton_residual = MagicMock()
+    tma_residual = MagicMock()
+    monkeypatch.setattr(nvidia_kernels, "int8_residual_matmul_kernel", triton_residual)
+    monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_residual_matmul_kernel", triton_residual)
+    monkeypatch.setattr(nvidia.gluon_tma, "_int8_tma_residual_matmul_kernel", tma_residual)
+    rows, n = 1024, 2560
+    value = torch.empty(rows, k, device="meta", dtype=torch.int8)
+    weight = torch.empty(n, k, device="meta", dtype=torch.int8)
+    base = torch.empty(rows, n, device="meta", dtype=torch.bfloat16)
+    gate = torch.empty(2, n, device="meta", dtype=torch.bfloat16)
+    indices = torch.empty(rows, device="meta", dtype=torch.int64)
+    residual = ResidualAdd(base, gate, indices, True, ReusableUpdate(torch.empty_like(base), gate))
+    nvidia.linear_prepared_residual(
+        value,
+        torch.empty(rows, device="meta"),
+        weight,
+        torch.empty(n, 1, device="meta"),
+        None,
+        residual,
+    )
+    if k % 16 == 0:
+        tiles = (rows + 127) // 128 * ((n + 255) // 256)
+        triton_residual.__getitem__.assert_not_called()
+        assert tma_residual.__getitem__.call_args_list == [call((tiles,))]
+        assert tma_residual.__getitem__.return_value.call_args.kwargs["num_warps"] == 8
+    else:
+        tma_residual.__getitem__.assert_not_called()
+        tiles = (rows + 127) // 128 * ((n + 63) // 64)
+        assert triton_residual.__getitem__.call_args_list == [call((tiles,))]
+        assert triton_residual.__getitem__.return_value.call_args.kwargs["group_m"] == 16
 
 
 @pytest.mark.parametrize("architecture", ["sm70", "sm75", "sm120"])

@@ -14,7 +14,7 @@ _MATMUL_BLOCK_K_VALUES = (32, 64, 128)
 _MATMUL_NUM_WARPS_VALUES = (2, 4, 8)
 _MATMUL_NUM_STAGES_VALUES = (1, 2, 3, 4)
 _MATMUL_GROUP_M_VALUES = (0, 8, 16)
-_MATMUL_KERNEL_VALUES = ("triton", "gluon_async_copy")
+_MATMUL_KERNEL_VALUES = ("triton", "gluon_async_copy", "gluon_tma")
 
 
 def _choices(values: tuple[int, ...]) -> str:
@@ -28,11 +28,11 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
 
     The ``triton_*`` options apply only to Triton. The read-only ``matmul_*``
     properties report the selected implementation's effective behavior. Gluon's
-    async-copy implementation always uses dynamic M and explicit bias FMAs,
-    including in its unaligned-operand fallback.
+    async-copy and TMA implementations always use dynamic M and explicit bias FMAs,
+    including in their unaligned-operand fallbacks.
     """
 
-    matmul_kernel: Literal["triton", "gluon_async_copy"] = "triton"
+    matmul_kernel: Literal["triton", "gluon_async_copy", "gluon_tma"] = "triton"
     matmul_group_m: int = 0
     triton_specialize_m: bool = True
     triton_explicit_bias_fma: bool = False
@@ -45,7 +45,9 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
     @property
     def matmul_explicit_bias_fma(self) -> bool:
         """Return whether the selected implementation uses explicit bias FMAs."""
-        return self.matmul_kernel == "gluon_async_copy" or self.triton_explicit_bias_fma
+        return (
+            self.matmul_kernel in ("gluon_async_copy", "gluon_tma") or self.triton_explicit_bias_fma
+        )
 
     def as_dict(self) -> dict[str, int | bool | str]:
         """Report effective execution choices, omitting inactive Triton options."""
@@ -76,13 +78,24 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
     def _validate_matmul(self) -> None:
         """Validate implementation capabilities independently of measured target defaults."""
         if self.matmul_kernel not in _MATMUL_KERNEL_VALUES:
-            raise ValueError("ConvRot matmul kernel must be triton or gluon_async_copy")
+            raise ValueError("ConvRot matmul kernel must be triton, gluon_async_copy, or gluon_tma")
         for name in ("triton_specialize_m", "triton_explicit_bias_fma"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"ConvRot {name} must be boolean")
         group_m = self.matmul_group_m
         if type(group_m) is not int or group_m not in _MATMUL_GROUP_M_VALUES:
             raise ValueError(f"ConvRot matmul group_m must be {_choices(_MATMUL_GROUP_M_VALUES)}")
+        if self.matmul_kernel == "gluon_tma":
+            # Two 64-row warp rows and four 64-column warp columns per CTA.
+            if (
+                self.matmul_block_m != 128
+                or self.matmul_block_n != 256
+                or self.matmul_block_k != 64
+                or self.matmul_num_warps != 8
+                or self.matmul_num_stages != 3
+            ):
+                raise ValueError("ConvRot TMA GEMM requires 128x256x64/8-warps with 3 stages")
+            return
         if self.matmul_kernel == "gluon_async_copy":
             # Two 64-column warp tiles and two/four 64-row warp tiles per CTA.
             if (
@@ -97,7 +110,9 @@ class NvidiaExecutionPlan(LinearExecutionPlan):
                     "256x128x64/8-warps, with 3 or 4 stages"
                 )
             return
+        self._validate_triton_matmul()
 
+    def _validate_triton_matmul(self) -> None:
         if self.matmul_block_m not in _MATMUL_BLOCK_M_VALUES:
             raise ValueError(
                 f"ConvRot Triton matmul block_m must be {_choices(_MATMUL_BLOCK_M_VALUES)}"
@@ -125,6 +140,6 @@ class MatmulSchedule(NamedTuple):
     matmul_num_warps: int
     matmul_num_stages: int
     matmul_group_m: int
-    matmul_kernel: Literal["triton", "gluon_async_copy"] = "triton"
+    matmul_kernel: Literal["triton", "gluon_async_copy", "gluon_tma"] = "triton"
     triton_specialize_m: bool = True
     triton_explicit_bias_fma: bool = False

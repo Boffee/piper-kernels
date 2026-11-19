@@ -105,6 +105,7 @@ def test_amd_tuning_accepts_its_preparation_warp_count_and_preserves_backend_con
     [
         ["--matmul-kernel", "triton"],
         ["--matmul-kernel", "gluon_async_copy"],
+        ["--matmul-kernel", "gluon_tma"],
         ["--matmul-group-m", "16"],
     ],
 )
@@ -157,6 +158,35 @@ def test_tuner_compares_explicit_kernels_and_grouping_on_sm120() -> None:
     assert len({_plan_name(plan) for plan in plans}) == len(plans)
 
 
+def test_tuner_compares_tma_and_triton_kernels_on_sm120(capsys) -> None:
+    args = _parse_args(
+        [
+            "--matmul-kernel",
+            "triton",
+            "gluon_tma",
+            "--matmul-block-m",
+            "128",
+            "--matmul-block-n",
+            "128",
+            "256",
+            "--matmul-block-k",
+            "64",
+            "--matmul-num-warps",
+            "4",
+            "8",
+            "--matmul-group-m",
+            "8",
+            "16",
+        ]
+    )
+    plans = _candidate_plans(args, _production_plan())
+    assert len(plans) == 10
+    assert {plan.matmul_kernel for plan in plans} == {"triton", "gluon_tma"}
+    assert (
+        "Skipped 6 unsupported candidate(s): ConvRot TMA GEMM requires" in capsys.readouterr().err
+    )
+
+
 def test_tuner_rejects_search_with_no_supported_configurations() -> None:
     with pytest.raises(SystemExit, match="no supported execution plans"):
         _candidate_plans(_parse_args(["--matmul-num-stages", "1", "2"]), _sm8x_plan())
@@ -169,6 +199,8 @@ def test_explicit_axes_form_a_deduplicated_cartesian_search() -> None:
             "--fused-num-warps",
             "4",
             "8",
+            "--matmul-kernel",
+            "triton",
             "--matmul-block-m",
             "32",
             "64",

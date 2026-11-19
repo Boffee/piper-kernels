@@ -52,6 +52,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   1.7–2.5× at 110K–221K tokens (up to 5% faster standalone attention and 2.9%
   faster compiled INT8 pipelines at 1/16 keep) with 80–127 MiB lower fused peak
   scratch allocation and exact FP32 score (`<= 2e-5` vs FP64) and top-k parity.
+- On RTX 5090 (SM120), large ConvRot INT8 linear, paired, and fused 16-bit
+  residual projections run 2–8% faster standalone (`3–6%` across end-to-end
+  catalog linears, `3–9%` on GELU/SwiGLU FFNs, and `7–8%` on single- and
+  two-update fused residual projections) with unchanged peak memory and
+  bitwise-identical rounding boundaries.
 
 ### Removed
 
