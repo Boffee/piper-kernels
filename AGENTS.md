@@ -42,7 +42,9 @@ together.
   dispatch, compiler/fake paths, and weight storage wrapping and lifecycle.
   Do not add implicit tensor-content validation or readbacks to these paths.
   Preserve required metadata checks and algorithmic guards for valid inputs;
-  numerical preconditions do not promise runtime rejection.
+  numerical preconditions do not promise runtime rejection. Validate metadata
+  before mutating in-place or caller-owned storage, never retry after a launch
+  may have mutated output, and restore device state on failure.
 - The [execution-plan guide](docs/development.md#execution-plans-and-schedules)
   covers backend conventions, optional imports, and compiler source tracking.
   Read it before changing backend selection or moving kernel definitions.
