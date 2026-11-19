@@ -10,6 +10,7 @@ from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 
 from . import _backend
+from ._block_layout import validate_query_slice
 from ._budget import _resolve_route_layout, _ResolvedRouteLayout
 from ._dtype import validate_output_dtype
 from ._force_tiles import validate_force_tiles
@@ -226,6 +227,7 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
     coarse_key_blocks: int | None = None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
+    global_row_offset: int | None = None,
 ) -> tuple[_PreparedSparsePiperAttention, torch.Tensor | None]:
     """Build validated launch state and optional coarse output for quantized sparse Piper."""
     context = _prepare_quantized_sparse_piper_context(
@@ -254,17 +256,47 @@ def _prepare_quantized_sparse_piper_attention(  # noqa: PLR0913, PLR0917
         query,
         query_scale,
         query_summary,
-        global_block_offset=0,
+        global_block_offset=_global_block_offset(global_row_offset),
     )
+
+
+def _global_block_offset(global_row_offset: int | None) -> int:
+    return 0 if global_row_offset is None else global_row_offset // TILE_ROWS
 
 
 def _quantized_attention_output_sequence_length(
     query: torch.Tensor,
     logical_sequence_length: int,
     block_lengths: torch.Tensor | None,
+    global_row_offset: int | None = None,
 ) -> int:
-    """Resolve compact logical rows or valid-front padded physical rows."""
-    return query.shape[2] if block_lengths is not None else logical_sequence_length
+    """Return the output rows of K64-aligned Q storage, validating where it lies.
+
+    Without ``global_row_offset``, Q storage covers the global sequence, and the output has
+    its padded physical rows or the compact logical rows. With it, Q storage starts at
+    that global row, as in ``SparsePiperAttention.forward``. Compact output rows then
+    end with the storage or the sequence, whichever comes first, so only storage that
+    ends the sequence holds padding rows.
+    """
+    if global_row_offset is None:
+        return query.shape[2] if block_lengths is not None else logical_sequence_length
+    storage_rows = query.shape[2]
+    if block_lengths is not None:
+        global_rows = block_lengths.shape[0] * TILE_ROWS
+        rows = storage_rows
+    else:
+        global_rows = logical_sequence_length
+        rows = min(storage_rows, logical_sequence_length - global_row_offset)
+    validate_query_slice(
+        global_row_offset,
+        rows,
+        sequence_length=global_rows,
+        has_block_lengths=block_lengths is not None,
+        context="quantized sparse Piper",
+    )
+    if storage_rows - rows >= TILE_ROWS:
+        raise ValueError("quantized sparse Piper Q storage must not extend past the sequence")
+    return rows
 
 
 def validate_quantized_attention_output(
@@ -275,20 +307,31 @@ def validate_quantized_attention_output(
     output_dtype: torch.dtype,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
+    global_row_offset: int | None = None,
 ) -> int:
-    """Validate output dtype and forced-route metadata, returning the output rows.
+    """Validate output dtype, Q placement, and forced-route metadata; return the output rows.
 
-    Fake quantized and projected-output boundaries share these metadata checks.
-    Runtime contexts validate forced inputs when preparing global routing state.
+    ``attention_storage`` is Q storage placed at ``global_row_offset`` as
+    ``_quantized_attention_output_sequence_length`` describes. Without
+    ``global_row_offset``, it may be any storage that covers the global sequence, such as
+    K's. Forced tiles cover every global query block. Fake quantized and
+    projected-output boundaries share these metadata checks. Runtime contexts
+    validate forced inputs when preparing global routing state.
     """
     validate_output_dtype(output_dtype)
     sequence_length = _quantized_attention_output_sequence_length(
-        attention_storage, logical_sequence_length, block_lengths
+        attention_storage, logical_sequence_length, block_lengths, global_row_offset
     )
+    if global_row_offset is None:
+        global_query_blocks = (sequence_length + TILE_ROWS - 1) // TILE_ROWS
+    elif block_lengths is not None:
+        global_query_blocks = block_lengths.shape[0]
+    else:
+        global_query_blocks = (logical_sequence_length + TILE_ROWS - 1) // TILE_ROWS
     validate_force_tiles(
         force_tile_ids,
         force_tile_counts,
-        query_blocks=(sequence_length + TILE_ROWS - 1) // TILE_ROWS,
+        query_blocks=global_query_blocks,
         device=attention_storage.device,
     )
     return sequence_length
@@ -354,6 +397,7 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
+    global_row_offset: int | None = None,
 ) -> torch.Tensor:
     """Run quantized sparse Piper with compact or internally padded K64 storage.
 
@@ -364,10 +408,17 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     the full padded query storage; outputs for padded query rows are unspecified
     and must be removed by the caller's layout gather. ``sparse_query_blocks``
     optionally limits route use to the leading query blocks; the suffix is dense.
+    Without ``global_row_offset``, Q storage covers the global sequence. With it, Q storage
+    starts at that global row and the output has its rows, as
+    ``_quantized_attention_output_sequence_length`` describes; every other operand
+    still describes the global sequence.
     """
-    validate_output_dtype(output_dtype)
-    sequence_length = _quantized_attention_output_sequence_length(
-        query, logical_sequence_length, block_lengths
+    sequence_length = validate_quantized_attention_output(
+        query,
+        logical_sequence_length,
+        block_lengths,
+        output_dtype=output_dtype,
+        global_row_offset=global_row_offset,
     )
     output = _new_quantized_attention_output(query, sequence_length, output_dtype=output_dtype)
     prepared, _coarse_output = _prepare_quantized_sparse_piper_attention(
@@ -391,6 +442,7 @@ def _sparse_piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
         sparse_query_blocks,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        global_row_offset=global_row_offset,
     )
     _launch_quantized_sparse_piper_attention(prepared, output.transpose(1, 2))
     return output
@@ -427,11 +479,19 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
     force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
+    global_row_offset: int | None = None,
 ) -> torch.Tensor:
-    """Run quantized sparse attention plus a gated, independently scoped residual."""
-    validate_output_dtype(output_dtype)
-    sequence_length = _quantized_attention_output_sequence_length(
-        query, logical_sequence_length, block_lengths
+    """Run quantized sparse attention plus a gated, independently scoped residual.
+
+    ``global_row_offset`` places Q storage as in ``sparse_piper_attention_from_quantized``,
+    and the coarse gate has the output's rows.
+    """
+    sequence_length = validate_quantized_attention_output(
+        query,
+        logical_sequence_length,
+        block_lengths,
+        output_dtype=output_dtype,
+        global_row_offset=global_row_offset,
     )
     output = _new_quantized_attention_output(query, sequence_length, output_dtype=output_dtype)
     prepared, coarse_output = _prepare_quantized_sparse_piper_attention(
@@ -457,6 +517,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op(  # noqa: PLR
         coarse_key_blocks=coarse_key_blocks,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        global_row_offset=global_row_offset,
     )
     _launch_quantized_sparse_piper_attention(
         prepared,
@@ -491,6 +552,7 @@ def _sparse_piper_attention_from_quantized_op_fake(
     force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
+    global_row_offset: int | None = None,
 ) -> torch.Tensor:
     sequence_length = validate_quantized_attention_output(
         query,
@@ -499,6 +561,7 @@ def _sparse_piper_attention_from_quantized_op_fake(
         output_dtype=output_dtype,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        global_row_offset=global_row_offset,
     )
     return _new_quantized_attention_output(query, sequence_length, output_dtype=output_dtype)
 
@@ -530,6 +593,7 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op_fake(
     force_tile_counts: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
+    global_row_offset: int | None = None,
 ) -> torch.Tensor:
     sequence_length = validate_quantized_attention_output(
         query,
@@ -538,5 +602,6 @@ def _sparse_piper_attention_with_coarse_residual_from_quantized_op_fake(
         output_dtype=output_dtype,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        global_row_offset=global_row_offset,
     )
     return _new_quantized_attention_output(query, sequence_length, output_dtype=output_dtype)

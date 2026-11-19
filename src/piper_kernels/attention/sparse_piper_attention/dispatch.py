@@ -12,7 +12,11 @@ from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BL
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 
 from . import _backend
-from ._block_layout import validate_block_lengths, validate_sparse_query_blocks
+from ._block_layout import (
+    validate_block_lengths,
+    validate_query_slice,
+    validate_sparse_query_blocks,
+)
 from ._budget import (
     _RATIO_SCALE,
     _normalize_head_keep_ratios,
@@ -87,6 +91,7 @@ class SparsePiperAttention(torch.nn.Module):
         block_lengths: torch.Tensor | None = None,
         force_tile_ids: torch.Tensor | None = None,
         force_tile_counts: torch.Tensor | None = None,
+        global_row_offset: int = 0,
     ) -> torch.Tensor:
         """Route leading query blocks over a sparse K64 prefix and dense suffix.
 
@@ -98,6 +103,15 @@ class SparsePiperAttention(torch.nn.Module):
         blocks; all later query blocks attend every key block densely. Query heads
         may be an integer multiple of the shared K/V head count. Keep ratios and
         routes belong to query heads; K/V preparation and storage remain shared.
+
+        With ``global_row_offset``, the call computes only a slice of the query rows
+        against every key, for example one device's share under context parallelism.
+        Q then holds the global rows that start there, while K/V, ``block_lengths``,
+        ``sparse_query_blocks``, and forced tiles still describe the whole sequence.
+        The slice starts at a multiple of 64 and covers whole K64 blocks; only
+        compact rows that end the sequence may end in a partial block, and other
+        placements raise ``ValueError``. Output row ``i`` is global row
+        ``global_row_offset + i`` and equals that row of the whole-sequence call.
 
         Experimental fixed-budget forced routing takes contiguous device INT32
         ``force_tile_ids[query_blocks, capacity]`` and ``force_tile_counts[query_blocks]``.
@@ -119,11 +133,12 @@ class SparsePiperAttention(torch.nn.Module):
             sparse_query_blocks=sparse_query_blocks,
             scale=scale,
             block_lengths=block_lengths,
+            global_row_offset=global_row_offset,
         )
         validate_force_tiles(
             force_tile_ids,
             force_tile_counts,
-            query_blocks=(query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
+            query_blocks=(key.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
             device=query.device,
         )
         return _sparse_piper_attention_op(
@@ -138,6 +153,7 @@ class SparsePiperAttention(torch.nn.Module):
             sparse_query_blocks,
             force_tile_ids,
             force_tile_counts,
+            global_row_offset,
         )
 
 
@@ -174,12 +190,13 @@ def _validate_inputs(
     sparse_query_blocks: int | None,
     scale: float | None,
     block_lengths: torch.Tensor | None,
+    global_row_offset: int,
 ) -> float:
     tensors = (query, key, value)
     if any(tensor.ndim != 4 for tensor in tensors):
         raise ValueError("sparse Piper Q/K/V must use [batch,sequence,heads,features]")
     if (
-        query.shape[:2] != key.shape[:2]
+        query.shape[0] != key.shape[0]
         or query.shape[3] != key.shape[3]
         or key.shape != value.shape
         or query.shape[2] < 1
@@ -187,7 +204,7 @@ def _validate_inputs(
         or query.shape[2] % key.shape[2]
     ):
         raise ValueError(
-            "sparse Piper requires matching batch/sequence/features "
+            "sparse Piper requires matching batch/features, equal K/V shapes, "
             "and query heads divisible by KV heads"
         )
     if query.dtype not in SUPPORTED_DTYPES or any(
@@ -201,13 +218,21 @@ def _validate_inputs(
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
         raise RuntimeError("sparse Piper is inference-only and does not support autograd")
 
-    _batch, sequence, heads, head_dim = query.shape
+    _batch, num_query_rows, heads, head_dim = query.shape
+    sequence = key.shape[1]
     if head_dim not in SUPPORTED_HEAD_DIMS:
         raise ValueError("sparse Piper requires head_dim=64 or 128")
     if sequence < 64:
         raise ValueError("sparse Piper requires at least 64 sequence rows")
     if num_heads != heads:
         raise ValueError("sparse Piper ratio profile must contain one value per head")
+    validate_query_slice(
+        global_row_offset,
+        num_query_rows,
+        sequence_length=sequence,
+        has_block_lengths=block_lengths is not None,
+        context="sparse Piper",
+    )
     if block_lengths is not None:
         validate_block_lengths(
             block_lengths,
@@ -245,19 +270,30 @@ def _run_sparse_piper_attention(  # noqa: PLR0913
     block_lengths: torch.Tensor | None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
+    global_row_offset: int = 0,
 ) -> torch.Tensor:
-    """Execute validated sparse routing outside Dynamo tracing."""
+    """Execute validated sparse routing outside Dynamo tracing.
+
+    Q holds the global rows from ``global_row_offset``; every other operand is global.
+    Routing and attention locate Q's blocks by ``global_block_offset``.
+    """
     backend = _backend.select_attention_backend(query)
     sparse_key_rows = sparse_key_blocks * _BLOCK_ROWS
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     sparse_key = key_head_major[:, :, :sparse_key_rows]
     validate_routing_mode(routing_mode)
+    global_block_offset = global_row_offset // _BLOCK_ROWS
+    query_blocks = (query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     force_tile_mask = None
     if force_tile_ids is not None and not layout.keeps_all_blocks(sparse_key_blocks):
         assert force_tile_counts is not None
+        # Forced rows are indexed by global query block; route only this call's rows.
+        end_block = global_block_offset + query_blocks
         force_tile_mask = _backend.build_force_tile_bitmask(
-            force_tile_ids, force_tile_counts, sparse_key_blocks
+            force_tile_ids[global_block_offset:end_block],
+            force_tile_counts[global_block_offset:end_block],
+            sparse_key_blocks,
         )
     # Take min/max routing summaries from the Q/K quantization pass
     # unless this call keeps every block, which needs no summaries at all.
@@ -273,6 +309,7 @@ def _run_sparse_piper_attention(  # noqa: PLR0913
             layout,
             routing_mode,
             block_lengths,
+            global_block_offset=global_block_offset,
             skip_dense_routing=backend is not None and backend.skip_dense_routing,
             force_tile_mask=force_tile_mask,
         )
@@ -286,6 +323,7 @@ def _run_sparse_piper_attention(  # noqa: PLR0913
                 scale=scale,
                 block_lengths=block_lengths,
                 sparse_query_blocks=sparse_query_blocks,
+                global_row_offset=global_row_offset,
             )
         value_head_major = value.transpose(1, 2)
         output = torch.empty_like(query, memory_format=torch.contiguous_format)
@@ -297,6 +335,7 @@ def _run_sparse_piper_attention(  # noqa: PLR0913
             combined_value=value_head_major,
             block_lengths=block_lengths,
             sparse_query_blocks=sparse_query_blocks,
+            global_block_offset=global_block_offset,
         ).with_routes(
             routes.indices,
             routes.head_keep_blocks,
@@ -313,6 +352,7 @@ def _run_sparse_piper_attention(  # noqa: PLR0913
             combined_value=value.transpose(1, 2),
             block_lengths=block_lengths,
             sparse_query_blocks=sparse_query_blocks,
+            global_block_offset=global_block_offset,
             emit_summaries=True,
         )
         assert operands.query_summary is not None
@@ -358,6 +398,7 @@ def _sparse_piper_attention_op(  # noqa: PLR0913, PLR0917
     sparse_query_blocks: int | None = None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
+    global_row_offset: int = 0,
 ) -> torch.Tensor:
     layout = _resolve_route_layout(
         ratio_profile.units,
@@ -376,6 +417,7 @@ def _sparse_piper_attention_op(  # noqa: PLR0913, PLR0917
         block_lengths=block_lengths,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+        global_row_offset=global_row_offset,
     )
 
 
@@ -392,5 +434,6 @@ def _sparse_piper_attention_op_fake(
     _sparse_query_blocks: int | None = None,
     _force_tile_ids: torch.Tensor | None = None,
     _force_tile_counts: torch.Tensor | None = None,
+    _global_row_offset: int = 0,
 ) -> torch.Tensor:
     return torch.empty_like(query, memory_format=torch.contiguous_format)

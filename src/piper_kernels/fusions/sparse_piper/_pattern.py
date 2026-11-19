@@ -59,15 +59,19 @@ def _normalized_rope_pattern(
     output_users: int = 1,
     activation_dtype: torch.dtype = torch.bfloat16,
     affine: bool = True,
+    rows_prefix: str = "sparse",
 ) -> CallFunction:
-    """Bind the shared transform grammar to sparse-attention captures."""
+    """Bind the shared transform grammar to sparse-attention captures.
+
+    ``rows_prefix`` names the row-dependent captures: the attention shape and RoPE tables.
+    """
     return projected_qk_pattern.normalized_rope_pattern(
         projection,
-        shape_name="sparse_attention_shape",
+        shape_name=f"{rows_prefix}_attention_shape",
         norm_weight_name=f"{prefix}_norm_weight",
         norm_epsilon_name=f"{prefix}_norm_epsilon",
-        cos_name="sparse_cos",
-        sin_name="sparse_sin",
+        cos_name=f"{rows_prefix}_cos",
+        sin_name=f"{rows_prefix}_sin",
         rotary_dim_name="sparse_rotary_dim",
         half_rotary_dim_name="sparse_half_rotary_dim",
         output_users=output_users,
@@ -86,8 +90,15 @@ def sparse_piper_projection_pattern(
     activation_dtype: torch.dtype = torch.bfloat16,
     q_affine: bool = True,
     k_affine: bool = True,
+    query_slices: bool = False,
 ) -> CallFunction:
-    """Match projected sparse attention with optional padding, coarse, and Q scopes."""
+    """Match projected sparse attention with optional padding, coarse, and Q scopes.
+
+    With ``query_slices``, Q's attention shape and RoPE tables are captured as
+    ``sparse_q_attention_shape``, ``sparse_q_cos`` and ``sparse_q_sin``, and the fine
+    attention's ``global_row_offset`` as ``sparse_global_row_offset``, so Q may hold a
+    slice of K/V's rows. Unsliced calls bind the same nodes to both names.
+    """
     operand_users = 2 if with_coarse else 1
     query = _normalized_rope_pattern(
         projection("sparse_q"),
@@ -95,6 +106,7 @@ def sparse_piper_projection_pattern(
         affine=q_affine,
         output_users=operand_users,
         activation_dtype=activation_dtype,
+        rows_prefix="sparse_q" if query_slices else "sparse",
     )
     key = _normalized_rope_pattern(
         projection("sparse_k"),
@@ -129,7 +141,9 @@ def sparse_piper_projection_pattern(
         KeywordArg("sparse_routing_mode"),
         *optional_arguments,
     )
-    fine_output = CallFunction(*arguments, _users=1) if with_coarse else CallFunction(*arguments)
+    # Declared keywords match their defaults too, so this does not double the patterns.
+    offset = {"global_row_offset": KeywordArg("sparse_global_row_offset")} if query_slices else {}
+    fine_output = CallFunction(*arguments, _users=1, **offset)
     if not with_coarse:
         return fine_output
     coarse_arguments = (
@@ -157,7 +171,12 @@ def reshaped_quantized_attention_pattern(
     """Match one materialized quantized attention result before projection."""
     # PyTorch 2.15+ rejects nodes with undeclared non-default keywords, such as
     # FP16 outputs; output fusions validate this dtype against the attention result.
-    output_dtype = KeywordArg("output_attention_dtype")
+    # Earlier versions ignore them, so a query offset must be declared to survive.
+    # Declared keywords match their defaults too, so neither doubles the patterns.
+    keywords = {
+        "output_dtype": KeywordArg("output_attention_dtype"),
+        "global_row_offset": KeywordArg("output_global_row_offset"),
+    }
     operands = tuple(KeywordArg(name) for name in _QUANTIZED_ATTENTION_OPERAND_NAMES)
     policy = tuple(KeywordArg(name) for name in _QUANTIZED_ATTENTION_POLICY_NAMES)
     force_arguments = (
@@ -181,7 +200,7 @@ def reshaped_quantized_attention_pattern(
             ),
             *force_arguments,
             _users=1,
-            output_dtype=output_dtype,
+            **keywords,
         )
     else:
         block_lengths = KeywordArg("output_block_lengths") if with_block_lengths else None
@@ -199,7 +218,7 @@ def reshaped_quantized_attention_pattern(
             *policy,
             *optional_arguments,
             _users=1,
-            output_dtype=output_dtype,
+            **keywords,
         )
     return CallFunction(
         torch.ops.aten.reshape.default,
@@ -217,6 +236,16 @@ def build_forced_attention_keywords(match: Match) -> dict[str, Argument]:
         "force_tile_ids": cast(Argument, match.kwargs["output_force_tile_ids"]),
         "force_tile_counts": cast(Argument, match.kwargs["output_force_tile_counts"]),
     }
+
+
+def build_query_slice_keywords(match: Match) -> dict[str, Argument]:
+    """Preserve where a quantized attention's Q rows start across output fusion."""
+    global_row_offset = match.kwargs["output_global_row_offset"]
+    return (
+        {}
+        if global_row_offset is None
+        else {"global_row_offset": cast(Argument, global_row_offset)}
+    )
 
 
 def quantized_attention_arguments(match: Match) -> tuple[Argument, ...]:
@@ -244,6 +273,7 @@ def bounded_attention_arguments(match: Match) -> tuple[Argument, ...]:
 __all__ = [
     "bounded_attention_arguments",
     "build_forced_attention_keywords",
+    "build_query_slice_keywords",
     "optional_attention_layout_arguments",
     "quantized_attention_arguments",
     "reshaped_quantized_attention_pattern",

@@ -168,6 +168,9 @@ def _prepared_query_projection(
 
 
 def _valid_attention_output(match: Match) -> bool:  # noqa: PLR0911
+    # NVFP4 output fusions compute every query row; leave Q-row slices unfused.
+    if match.kwargs["output_global_row_offset"] is not None:
+        return False
     required_names = (
         "output_query",
         "output_weight_qdata",

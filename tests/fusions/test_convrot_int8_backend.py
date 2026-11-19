@@ -238,7 +238,7 @@ def test_sparse_gate_uses_selected_projection_operation(operations):
     qdata, scale = reference.prepare_input(value, 16)
     weight, weight_scale, bias = _weight(128, 16)
     gate = sparse_output._prepare_gate_projection(
-        storage, 5, None, qdata, scale, weight, weight_scale, bias
+        storage, 5, qdata, scale, weight, weight_scale, bias
     )
     output = torch.full((2, 3, 1, 128), -999, dtype=torch.bfloat16)
     gate.project(output, 2, 2)
@@ -284,7 +284,7 @@ def test_sparse_gate_prepares_only_requested_rows(operations, static):
     input_scale = torch.tensor(0.02) if static else None
     weight, weight_scale, bias = _weight(128, 16)
     gate = sparse_output._prepare_gate_projection(
-        storage, 5, None, value, input_scale, weight, weight_scale, bias, 16
+        storage, 5, value, input_scale, weight, weight_scale, bias, 16
     )
     output = torch.full((2, 3, 1, 128), -999, dtype=torch.bfloat16)
     gate.project(output, 2, 2)

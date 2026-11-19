@@ -10,6 +10,7 @@ import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
+from piper_kernels.attention.sparse_piper_attention._block_layout import validate_query_slice
 from piper_kernels.attention.sparse_piper_attention._dtype import validate_output_dtype
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.attention import _output as output_pipeline
@@ -43,11 +44,15 @@ class _PreparedAttentionOutput:
 
 @dataclass(frozen=True, slots=True)
 class _PreparedAttentionContext:
-    """Global launch state for query chunks that have not been projected yet."""
+    """Global launch state for query chunks that have not been projected yet.
+
+    Output row 0 is the first row of global K64 block ``global_block_offset``.
+    """
 
     quantized_context: _quantized_dispatch._PreparedQuantizedSparsePiperContext
     sequence_length: int
     coarse_gate: torch.Tensor | None
+    global_block_offset: int = 0
 
 
 def new_projected_output(
@@ -62,6 +67,35 @@ def new_projected_output(
         (attention_storage.shape[0], sequence_length, output_features),
         dtype=output_dtype,
     )
+
+
+def projected_query_output_rows(
+    key: torch.Tensor,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None,
+    *,
+    global_row_offset: int | None = None,
+    num_query_rows: int | None = None,
+) -> int:
+    """Return the output rows of Q projected inside the fused operation.
+
+    Without ``global_row_offset``, Q covers the global sequence that K's storage describes,
+    and the boundary checks Q's input against those rows. With it, Q's input holds
+    ``num_query_rows`` global rows from there, validated as in
+    ``SparsePiperAttention.forward``.
+    """
+    global_rows = output_sequence_length(key, logical_sequence_length, block_lengths)
+    if global_row_offset is None:
+        return global_rows
+    assert num_query_rows is not None, "global_row_offset requires Q's input rows"
+    validate_query_slice(
+        global_row_offset,
+        num_query_rows,
+        sequence_length=global_rows,
+        has_block_lengths=block_lengths is not None,
+        context="fused sparse Piper",
+    )
+    return num_query_rows
 
 
 def validate_attention_output(
@@ -112,10 +146,14 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
     force_tile_counts: torch.Tensor | None = None,
     start_head: int = 0,
     end_head: int | None = None,
+    global_row_offset: int | None = None,
+    num_query_rows: int | None = None,
 ) -> _PreparedAttentionContext:
     """Prepare global K/V state for bounded, independently projected Q chunks.
 
     The operands hold ``ratio_profile``'s query heads ``[start_head, end_head)``.
+    Q covers the global sequence, or with ``global_row_offset`` its ``num_query_rows``
+    global rows from there, as ``projected_query_output_rows`` describes.
     """
     if coarse_gate is not None and has_projected_coarse_gate:
         raise ValueError("coarse gate cannot be both materialized and projected")
@@ -149,12 +187,15 @@ def prepare_attention_context(  # noqa: PLR0913, PLR0917
     )
     return _PreparedAttentionContext(
         quantized_context=quantized_context,
-        sequence_length=output_sequence_length(
+        sequence_length=projected_query_output_rows(
             key,
             logical_sequence_length,
             block_lengths,
+            global_row_offset=global_row_offset,
+            num_query_rows=num_query_rows,
         ),
         coarse_gate=coarse_gate,
+        global_block_offset=_quantized_dispatch._global_block_offset(global_row_offset),
     )
 
 
@@ -184,8 +225,13 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     has_projected_coarse_gate: bool = False,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
+    global_row_offset: int | None = None,
 ) -> _PreparedAttentionOutput:
-    """Prepare fine routing and, when requested, one shared coarse result."""
+    """Prepare fine routing and, when requested, one shared coarse result.
+
+    Q storage covers the global sequence, or starts at global row ``global_row_offset``
+    as in ``sparse_piper_attention_from_quantized``.
+    """
     context = prepare_attention_context(
         key,
         key_scale,
@@ -214,11 +260,17 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
         query,
         query_scale,
         query_summary,
-        global_block_offset=0,
+        global_block_offset=_quantized_dispatch._global_block_offset(global_row_offset),
     )
     return _PreparedAttentionOutput(
         attention=prepared,
-        sequence_length=context.sequence_length,
+        sequence_length=(
+            context.sequence_length
+            if global_row_offset is None
+            else output_sequence_length(
+                query, logical_sequence_length, block_lengths, global_row_offset
+            )
+        ),
         coarse_output=coarse_output,
         coarse_gate=coarse_gate,
     )
@@ -348,7 +400,7 @@ def run_chunked_projected_query_attention_output(  # noqa: PLR0913
             query,
             query_scale,
             query_summary,
-            global_block_offset=start // TILE_ROWS,
+            global_block_offset=prepared.global_block_offset + start // TILE_ROWS,
         )
         _quantized_dispatch._launch_quantized_sparse_piper_attention(
             local_attention,
@@ -381,6 +433,7 @@ __all__ = [
     "output_sequence_length",
     "prepare_attention",
     "prepare_attention_context",
+    "projected_query_output_rows",
     "run_chunked_attention_output",
     "run_chunked_projected_query_attention_output",
     "validate_attention_output",

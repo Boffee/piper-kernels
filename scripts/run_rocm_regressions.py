@@ -30,6 +30,8 @@ _SUITE = (
     "tests/attention/test_gqa.py::test_gqa_minmax_score_kernel_preserves_query_heads",
     "tests/attention/sparse_piper_attention/test_dispatch.py",
     "tests/attention/sparse_piper_attention/test_amd_attention.py",
+    "tests/attention/sparse_piper_attention/test_query_slice.py",
+    "tests/fusions/convrot_int8_sparse_piper/test_query_slice.py",
     "tests/fusions/convrot_int8_sparse_piper/test_compile.py"
     "::test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph",
     "tests/fusions/convrot_int8_sparse_piper/test_compile.py"

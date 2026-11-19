@@ -22,6 +22,7 @@ def sparse_piper_coarse_residual(
     coarse_key_blocks: int | None = None,
     coarse_scale: float,
     block_lengths: torch.Tensor | None = None,
+    global_row_offset: int = 0,
 ) -> torch.Tensor:
     """Return a gated coarse branch using the selected block-summary policy.
 
@@ -29,6 +30,11 @@ def sparse_piper_coarse_residual(
     may end in one partial block. With ``block_lengths``, storage instead holds
     complete physical K64 blocks whose valid rows occupy each block's prefix.
     ``coarse_key_blocks`` defaults to every available K64 block.
+
+    With ``global_row_offset``, the call computes only the slice of query rows that
+    starts at that global row, placed as in ``SparsePiperAttention.forward``: Q and
+    the gate hold the slice's rows, K/V and ``block_lengths`` describe the whole
+    sequence, and the result has Q's rows.
     """
     return _coarse_residual_from_mode(
         query,
@@ -39,6 +45,7 @@ def sparse_piper_coarse_residual(
         coarse_scale=coarse_scale,
         routing_mode=routing_mode_from_name(routing),
         block_lengths=block_lengths,
+        global_row_offset=global_row_offset,
     )
 
 

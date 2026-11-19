@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from itertools import product
 
 import torch
@@ -52,9 +53,10 @@ type _SemanticGateProjection = tuple[
 
 
 def _linear_pattern(prefix: str) -> CallFunction:
+    # Q's input may be a row slice of K/V's; _match_query_slice checks which.
     return CallFunction(
         torch.ops.piper_kernels.convrot_int8_linear.default,
-        KeywordArg("sparse_input"),
+        KeywordArg("sparse_q_input" if prefix == "sparse_q" else "sparse_input"),
         KeywordArg(f"{prefix}_weight_qdata"),
         KeywordArg(f"{prefix}_weight_scale"),
         KeywordArg(f"{prefix}_bias"),
@@ -110,6 +112,111 @@ def _semantic_gate_projection(
         return None
     assert input_scale is None or isinstance(input_scale, torch.fx.Node)
     return linear, weight_qdata, weight_scale, bias, input_scale
+
+
+type _QuerySlice = tuple[int, int]
+
+
+def _match_query_slice(
+    match: Match, sequence_length: int | torch.SymInt
+) -> tuple[bool, _QuerySlice | None]:
+    """Return whether Q's input is supported and, for a row slice of K/V's input, its rows.
+
+    Preparation quantizes each row independently, so a slice of the shared prepared input
+    equals preparing the slice. A slice starts on a K64 block and covers whole blocks,
+    except one that ends the sequence, as ``global_row_offset`` requires.
+    """
+    query_input = match.kwargs.get("sparse_q_input", match.kwargs["sparse_input"])
+    if query_input is match.kwargs["sparse_input"]:
+        return True, None
+    if (
+        not isinstance(query_input, torch.fx.Node)
+        or query_input.target is not torch.ops.aten.slice.Tensor
+        or query_input.kwargs
+        or not isinstance(sequence_length, int)
+    ):
+        return False, None
+    # Defaults of aten.slice.Tensor's self, dim, start, end and step.
+    defaults = (None, 0, None, None, 1)
+    if len(query_input.args) > len(defaults):
+        return False, None
+    source, dim, start, stop, step = (*query_input.args, *defaults[len(query_input.args) :])
+    start = 0 if start is None else start
+    stop = sequence_length if stop is None else stop
+    if (
+        source is not match.kwargs["sparse_input"]
+        or dim not in (1, -2)
+        or step != 1
+        or not isinstance(start, int)
+        or not isinstance(stop, int)
+    ):
+        return False, None
+    stop = min(stop, sequence_length)
+    if (
+        not 0 <= start < stop
+        or start % _TILE_ROWS
+        or ((stop - start) % _TILE_ROWS and stop != sequence_length)
+    ):
+        return False, None
+    return True, (start, stop)
+
+
+@dataclass(frozen=True, slots=True)
+class _QueryRows:
+    """Q's prepared input rows, RoPE tables, and storage within K/V's sequence."""
+
+    input_qdata: torch.fx.Node
+    input_scale: torch.fx.Node
+    storage_length: int
+    cos: Argument
+    sin: Argument
+    global_row_offset: int | None
+
+
+def _query_rows(
+    graph: torch.fx.Graph,
+    match: Match,
+    prepared: _compile_fx.PreparedInputNodes,
+    sequence_length: int,
+) -> _QueryRows:
+    """Select Q's rows of the shared prepared input for a validated match."""
+    input_qdata, input_scale, _ = prepared
+    _, query_slice = _match_query_slice(match, sequence_length)
+    rows = sequence_length
+    # A declared keyword matches its default too, so an unsliced call's offset reads as 0;
+    # its fused call keeps Q covering the global sequence.
+    global_row_offset = None
+    if query_slice is not None:
+        input_qdata = _slice_rows(graph, input_qdata, query_slice)
+        input_scale = _slice_rows(graph, input_scale, query_slice)
+        rows = query_slice[1] - query_slice[0]
+        # Q storage covers only the slice; an absent offset places it at row 0.
+        global_row_offset = match.kwargs.get("sparse_global_row_offset") or 0
+    assert global_row_offset is None or isinstance(global_row_offset, int)
+    return _QueryRows(
+        input_qdata,
+        input_scale,
+        _layout.padded_sequence_length(rows),
+        match.kwargs.get("sparse_q_cos", match.kwargs["sparse_cos"]),
+        match.kwargs.get("sparse_q_sin", match.kwargs["sparse_sin"]),
+        global_row_offset,
+    )
+
+
+def _slice_rows(graph: torch.fx.Graph, node: torch.fx.Node, rows: _QuerySlice) -> torch.fx.Node:
+    """Slice prepared rows, copying only when the slice is not contiguous (batch > 1)."""
+    value = node.meta["val"]
+    sliced = graph.call_function(torch.ops.aten.slice.Tensor, args=(node, 1, *rows))
+    sliced.meta["val"] = value[:, rows[0] : rows[1]]
+    if sliced.meta["val"].is_contiguous():
+        return sliced
+    copied = graph.call_function(
+        torch.ops.aten.clone.default,
+        args=(sliced,),
+        kwargs={"memory_format": torch.contiguous_format},
+    )
+    copied.meta["val"] = sliced.meta["val"].contiguous()
+    return copied
 
 
 def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0912
@@ -168,6 +275,18 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
         isinstance(sequence_length, int) and sequence_length < _TILE_ROWS
     ):
         return False
+    supported_query, query_slice = _match_query_slice(match, sequence_length)
+    global_row_offset = match.kwargs.get("sparse_global_row_offset")
+    if (
+        not supported_query
+        or (global_row_offset is not None and not isinstance(global_row_offset, int))
+        # Q covering every row starts at row 0.
+        or (query_slice is None and global_row_offset not in (None, 0))
+        # A slice's padding masks would need its own K64 lengths.
+        or (query_slice is not None and match.kwargs.get("sparse_block_lengths") is not None)
+    ):
+        return False
+    query_rows = sequence_length if query_slice is None else query_slice[1] - query_slice[0]
     if (
         _backend.select_projection_backend(input_value, head_dim=head_dim) is None
         or linear_backend.select_linear_backend(input_value) is None
@@ -216,14 +335,20 @@ def _valid_sparse_piper_projection(match: Match) -> bool:  # noqa: PLR0911, PLR0
         device=input_value.device,
         head_dim=head_dim,
         tile_rows=_TILE_ROWS,
+        query_rows=query_rows,
     )
 
 
 def _valid_sparse_piper_coarse_residual_projection(
     match: Match,
 ) -> bool:
-    """Validate the extra operands and routing policy of a coarse residual."""
-    if not _valid_sparse_piper_projection(match):
+    """Validate the extra operands and routing policy of a coarse residual.
+
+    The fused coarse call computes every query row, so query slices stay unfused.
+    """
+    if match.kwargs.get("sparse_q_input", match.kwargs["sparse_input"]) is not match.kwargs[
+        "sparse_input"
+    ] or not _valid_sparse_piper_projection(match):
         return False
     return sparse_piper_compile.valid_sparse_piper_coarse_residual(match)
 
@@ -327,32 +452,32 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
                     args=(prepared_gate_linear, coarse_gate.args[1]),
                 )
                 prepared_coarse_gate.meta = coarse_gate.meta.copy()
+        query_rows = _query_rows(graph, match, prepare(sparse_q_input_scale), sequence_length)
         query_values = (
             input_value.new_empty(
-                (batch, heads, storage_sequence_length, head_dim),
+                (batch, heads, query_rows.storage_length, head_dim),
                 dtype=torch.int8,
             ),
             input_value.new_empty(
-                (batch, heads, storage_sequence_length // _QUERY_SCALE_ROWS),
+                (batch, heads, query_rows.storage_length // _QUERY_SCALE_ROWS),
                 dtype=torch.float32,
             ),
             input_value.new_empty(
-                (batch, heads, storage_sequence_length // _TILE_ROWS, head_dim),
+                (batch, heads, query_rows.storage_length // _TILE_ROWS, head_dim),
                 dtype=torch.float32,
             ),
         )
-        q_input, q_scales, _ = prepare(sparse_q_input_scale)
         query, query_scale, query_summary = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.convrot_int8_sparse_piper_project_query.default,
             (
-                q_input,
-                q_scales,
+                query_rows.input_qdata,
+                query_rows.input_scale,
                 sparse_q_weight_qdata,
                 sparse_q_weight_scale,
                 sparse_q_norm_weight,
-                sparse_cos,
-                sparse_sin,
+                query_rows.cos,
+                query_rows.sin,
                 sparse_q_norm_epsilon,
                 sparse_softmax_scale,
                 sparse_routing_mode,
@@ -470,6 +595,7 @@ def _replace_sparse_piper_projection(  # noqa: PLR0913, PLR0917
             coarse_scale=coarse_scale,
             coarse_key_blocks=coarse_key_blocks,
             output_dtype=original.meta["val"].dtype,
+            global_row_offset=query_rows.global_row_offset,
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
@@ -497,6 +623,7 @@ for _activation_dtype in SUPPORTED_DTYPES:
                 with_coarse=_with_coarse,
                 with_sparse_query_blocks=_with_sparse_query_blocks,
                 with_force_tiles=_with_force_tiles,
+                query_slices=True,
             ),
             extra_check=(
                 _valid_sparse_piper_coarse_residual_projection
@@ -509,7 +636,10 @@ for _activation_dtype in SUPPORTED_DTYPES:
 
 def _fold_sparse_piper_projection(graph: torch.fx.Graph) -> bool:
     """Replace one compatible materialized sparse-attention projection region."""
-    with _compile_fx.canonical_linear_calls(graph):
+    with (
+        sparse_piper_compile.canonical_query_offsets(graph),
+        _compile_fx.canonical_linear_calls(graph),
+    ):
         changed = _patterns.apply(graph) > 0
     if changed:
         graph.eliminate_dead_code()

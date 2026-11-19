@@ -76,11 +76,12 @@ class _PreparedSparsePiperAttention:
 
 @dataclass(frozen=True, slots=True)
 class _PreparedSparsePiperOperands:
-    """Quantized Q/K/V operands before routes are known.
+    """Quantized sequence-global K/V and local Q before routes are known.
 
+    Q starts at global block ``global_block_offset``.
     ``query_summary``/``key_summary``/``key_aux`` are the min/max routing
     summaries, present only when preparation was asked to emit them.
-    Key summaries cover only the sparse prefix; query summaries cover all blocks.
+    Key summaries cover only the sparse prefix; query summaries cover every Q block.
     """
 
     key: torch.Tensor
@@ -100,6 +101,7 @@ class _PreparedSparsePiperOperands:
     query_summary: torch.Tensor | None = None
     key_summary: torch.Tensor | None = None
     key_aux: torch.Tensor | None = None
+    global_block_offset: int = 0
 
     def with_routes(
         self,
@@ -128,7 +130,11 @@ class _PreparedSparsePiperOperands:
             logical_sequence_length=self.logical_sequence_length,
         )
         query = _prepare_sparse_piper_query_from_quantized(
-            self.query, self.query_scale, routes, context
+            self.query,
+            self.query_scale,
+            routes,
+            context,
+            global_block_offset=self.global_block_offset,
         )
         return _PreparedSparsePiperAttention(launch=bind(context), query=query)
 

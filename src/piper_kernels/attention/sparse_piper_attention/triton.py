@@ -18,7 +18,11 @@ from piper_kernels.attention.kernels.sparse_piper import (
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, ValueFormat
 
-from ._block_layout import valid_block_rows, validate_sparse_query_blocks
+from ._block_layout import (
+    slice_query_block_lengths,
+    valid_block_rows,
+    validate_sparse_query_blocks,
+)
 from ._prepared import _PreparedSparsePiperOperands
 
 _BLOCK_N = 64
@@ -323,7 +327,8 @@ def _prepare_query_key_with_summaries(
     *,
     storage_sequence_length: int,
     sparse_key_blocks: int,
-    block_lengths: torch.Tensor | None,
+    query_block_lengths: torch.Tensor | None,
+    key_block_lengths: torch.Tensor | None,
 ) -> tuple[
     qk_quantization.PreparedInt8QueryKey,
     torch.Tensor,
@@ -332,15 +337,21 @@ def _prepare_query_key_with_summaries(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Quantize Q/K (K64 tile-centered) and emit min/max K64 summaries in one pass."""
-    batch, heads, sequence_length, head_dim = query.shape
-    kv_heads = key.shape[1]
+    """Quantize Q/K (K64 tile-centered) and emit min/max K64 summaries in one pass.
+
+    Each length vector, when present, holds one value per K64 block of its operand;
+    ``storage_sequence_length`` is K's.
+    """
+    batch, heads, query_length, head_dim = query.shape
+    kv_heads, key_length = key.shape[1:3]
     blocks = storage_sequence_length // _BLOCK_N
+    query_blocks = triton.cdiv(query_length, _BLOCK_N)
+    query_storage_length = query_blocks * _BLOCK_N
     query_int8 = torch.empty(
-        (batch, heads, storage_sequence_length, head_dim), device=query.device, dtype=torch.int8
+        (batch, heads, query_storage_length, head_dim), device=query.device, dtype=torch.int8
     )
     query_scale = torch.empty(
-        (batch, heads, storage_sequence_length // QUERY_SCALE_ROWS),
+        (batch, heads, query_storage_length // QUERY_SCALE_ROWS),
         device=query.device,
         dtype=torch.float32,
     )
@@ -355,28 +366,27 @@ def _prepare_query_key_with_summaries(
         (batch, kv_heads, blocks, 2), device=key.device, dtype=torch.float32
     )
     query_summary = torch.empty(
-        (batch, heads, blocks, head_dim), device=query.device, dtype=torch.float32
+        (batch, heads, query_blocks, head_dim), device=query.device, dtype=torch.float32
     )
     key_primary = torch.empty(
         (batch, kv_heads, sparse_key_blocks, head_dim), device=key.device, dtype=torch.float32
     )
     key_aux = torch.empty_like(key_primary)
-    lengths_or_placeholder = block_lengths if block_lengths is not None else key_scale
     with device_context(query.device):
-        _quantize_query_with_summary_kernel[(blocks, heads, batch)](
+        _quantize_query_with_summary_kernel[(query_blocks, heads, batch)](
             query,
             query_int8,
             query_scale,
             query_summary,
-            lengths_or_placeholder,
-            sequence_length,
-            storage_sequence_length,
+            query_block_lengths if query_block_lengths is not None else key_scale,
+            query_length,
+            query_storage_length,
             query.stride(0),
             query.stride(1),
             query.stride(2),
             heads,
             scale,
-            mask_block_lengths=block_lengths is not None,
+            mask_block_lengths=query_block_lengths is not None,
             head_dim=head_dim,
             block_m=_BLOCK_N,
             scale_rows=QUERY_SCALE_ROWS,
@@ -390,15 +400,15 @@ def _prepare_query_key_with_summaries(
             key_center_scale,
             key_primary,
             key_aux,
-            lengths_or_placeholder,
-            sequence_length,
+            key_block_lengths if key_block_lengths is not None else key_scale,
+            key_length,
             storage_sequence_length,
             sparse_key_blocks,
             key.stride(0),
             key.stride(1),
             key.stride(2),
             kv_heads,
-            mask_block_lengths=block_lengths is not None,
+            mask_block_lengths=key_block_lengths is not None,
             head_dim=head_dim,
             block_n=_BLOCK_N,
             num_warps=_FUSED_QK_WARPS[head_dim],
@@ -421,37 +431,51 @@ def _prepare_sparse_piper_operands(
     combined_value: torch.Tensor,
     block_lengths: torch.Tensor | None = None,
     sparse_query_blocks: int | None = None,
+    global_block_offset: int = 0,
     emit_summaries: bool = False,
     value_format: ValueFormat = ValueFormat.TRANSPOSED,
 ) -> _PreparedSparsePiperOperands:
     """Quantize Q/K/V, optionally emitting min/max summaries from the Q/K pass.
 
+    Q holds the global rows from block ``global_block_offset``.
     Mask padded rows in the mean and V kernels. The fused Q/K pass also masks
     padding, while the separate Q/K quantizer still needs zeroed copies.
     """
+    batch, kv_heads, logical_sequence_length, head_dim = combined_key.shape
+    query_length = query.shape[2]
     if (
         combined_key.shape[0] != query.shape[0]
-        or combined_key.shape[2:] != query.shape[2:]
+        or combined_key.shape[3] != query.shape[3]
         or combined_key.shape[1] < 1
         or query.shape[1] % combined_key.shape[1]
         or combined_value.shape != combined_key.shape
-        or not 1 <= sparse_key_blocks <= query.shape[2] // _BLOCK_N
+        or not 1 <= sparse_key_blocks <= logical_sequence_length // _BLOCK_N
+        or query_length < 1
+        or global_block_offset < 0
+        or global_block_offset * _BLOCK_N + query_length > logical_sequence_length
     ):
         raise ValueError("combined Q/K/V and the sparse-prefix K64 count must agree")
     if combined_key.stride(-1) != 1 or combined_value.stride(-1) != 1:
         raise ValueError("combined K/V feature dimensions must be contiguous")
 
-    batch, kv_heads, logical_sequence_length, head_dim = combined_key.shape
     if block_lengths is not None and (
         logical_sequence_length % _BLOCK_N
+        or query_length % _BLOCK_N
         or block_lengths.shape != (logical_sequence_length // _BLOCK_N,)
         or block_lengths.dtype is not torch.int32
         or block_lengths.device != query.device
         or not block_lengths.is_contiguous()
     ):
-        raise ValueError("padded sparse Piper requires one contiguous device INT32 length per K64")
+        raise ValueError(
+            "padded sparse Piper requires whole Q blocks and one contiguous device INT32 "
+            "length per K64"
+        )
+    query_block_lengths = slice_query_block_lengths(
+        block_lengths, global_block_offset, query_length
+    )
     if block_lengths is not None and not emit_summaries:
-        valid_rows = valid_block_rows(block_lengths).reshape(-1)
+        assert query_block_lengths is not None
+        valid_rows = valid_block_rows(query_block_lengths).reshape(-1)
         valid_rows = valid_rows[None, None, :, None]
         query = torch.where(valid_rows, query, 0)
     tile_count = (logical_sequence_length + _BLOCK_N - 1) // _BLOCK_N
@@ -477,7 +501,8 @@ def _prepare_sparse_piper_operands(
             scale,
             storage_sequence_length=storage_sequence_length,
             sparse_key_blocks=sparse_key_blocks,
-            block_lengths=block_lengths,
+            query_block_lengths=query_block_lengths,
+            key_block_lengths=block_lengths,
         )
         query_int8, query_scale = prepared_qk.query, prepared_qk.query_scale
         key_int8, key_scale = prepared_qk.key, prepared_qk.key_scale
@@ -486,7 +511,7 @@ def _prepare_sparse_piper_operands(
             query,
             scale,
             grouped=True,
-            storage_query_length=storage_sequence_length,
+            storage_query_length=(query_length + _BLOCK_N - 1) // _BLOCK_N * _BLOCK_N,
         )
         key_int8, key_scale, key_center, key_center_scale = (
             qk_quantization.prepare_tile_centered_key(
@@ -547,4 +572,5 @@ def _prepare_sparse_piper_operands(
         query_summary=query_summary,
         key_summary=key_summary,
         key_aux=key_aux,
+        global_block_offset=global_block_offset,
     )

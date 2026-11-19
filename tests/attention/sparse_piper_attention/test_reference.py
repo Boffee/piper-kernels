@@ -108,3 +108,38 @@ def test_quantized_reference_restores_large_constant_value() -> None:
             scale=64**-0.5,
         )
         torch.testing.assert_close(actual, value, atol=0, rtol=0)
+
+
+def test_query_offset_reproduces_the_whole_sequence_reference_rows() -> None:
+    generator = torch.Generator().manual_seed(56)
+    query, key, value = (
+        torch.randn((1, 5 * 64, 2, 128), dtype=torch.bfloat16, generator=generator)
+        for _ in range(3)
+    )
+    block_lengths = torch.tensor([64, 17, 64, 40, 64], dtype=torch.int32)
+    layout = _resolve_route_layout(
+        _normalize_head_keep_ratios((0.5, 1.0)),
+        4,
+        torch.device("cpu"),
+    )
+    options = {"sparse_key_blocks": 4, "scale": 128**-0.5, "block_lengths": block_lengths}
+
+    def run(start: int, end: int) -> torch.Tensor:
+        rows = query[:, start:end]
+        routes = packed_routes_from_sequences(
+            rows.transpose(1, 2),
+            key[:, :256].transpose(1, 2),
+            layout,
+            _MINMAX_ROUTING,
+            block_lengths,
+            global_block_offset=start // 64,
+        )
+        # The routed scope ends inside the second slice.
+        return reference_sparse_piper_attention(
+            rows, key, value, routes, sparse_query_blocks=3, global_row_offset=start, **options
+        )
+
+    expected = run(0, 320)
+    actual = torch.cat((run(0, 128), run(128, 320)), dim=1)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
