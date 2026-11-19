@@ -1,8 +1,11 @@
 """Paired-K128 Gluon kernel for sparse Piper Attention with NVIDIA TMA loads.
 
-On SM120 D128, V-mean restoration buffers 16 pairs (32 tiles) and flushes via
-D64 BF16 tensor-core strips, reusing query shared memory after the initial load;
-D64 keeps the exact per-pair FP32 scalar restoration path.
+On SM120 D128, query/key dot products stream in four D32 slices, 16-tile
+K-bias batches reuse ``key_center_shared`` as an FP32 cache, PV accumulation
+splits across D64 halves using ``rescale_packed``, and V-mean restoration
+buffers 16 pairs (32 tiles) via BF16 tensor-core strips reusing query shared
+memory after the initial load. D64 keeps the single-accumulator recurrence and
+exact per-pair FP32 scalar V-mean restoration path.
 """
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
@@ -29,14 +32,22 @@ from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
 from .._prepared import _PreparedSparsePiperContext, _PreparedSparsePiperQuery
 from . import policy
 from ._recurrence import (
-    _VALUE_MEAN_GROUP_TILES,
     K_BIAS_GROUP_TILES,
-    accumulate_value_mean_step,
+    SCRATCH_SHARED_LAYOUT,
+    VALUE_MEAN_GROUP_PAIRS,
+    VALUE_MEAN_GROUP_TILES,
+    accumulate_value_mean_pair,
+    accumulate_value_mean_step_d128,
     build_k_bias_cache,
     compute_pair_k_bias,
+    compute_pair_k_bias_d128,
     piper_probability_pair,
+    piper_probability_pair_d128,
     piper_pv_pair,
+    piper_pv_pair_d128,
+    qk_pair_d128,
     store_attention_output,
+    store_attention_output_d128,
 )
 
 _BLOCK_N = TILE_ROWS
@@ -129,6 +140,366 @@ def _resolve_sparse_route_counts(
     return routed_sparse_tile_count, selected_sparse_tile_count, use_sparse_routes
 
 
+@gluon.jit
+def _run_d128_recurrence(
+    query_shared,
+    key_desc,
+    value_desc,
+    key_shared_0,
+    key_shared_1,
+    value_shared_0,
+    value_shared_1,
+    key_center_shared,
+    pair_max_shared,
+    tiles_shared,
+    key_barrier,
+    value_barrier,
+    query_scale,
+    key_scale_ptr,
+    key_center_ptr,
+    key_center_scale_ptr,
+    value_scale_multiplier_ptr,
+    value_mean_ptr,
+    coarse_output_ptr,
+    coarse_gate_ptr,
+    block_lengths_ptr,
+    route_base,
+    output_ptr,
+    batch,
+    head,
+    query_block,
+    global_query_block,
+    kv_batch_head,
+    output_start_m,
+    offsets_m,
+    storage_sequence_length,
+    logical_sequence_length,
+    sequence_tiles,
+    tile_count,
+    pair_count,
+    routed_sparse_tile_count,
+    selected_sparse_tile_count,
+    sparse_key_blocks,
+    use_sparse_routes,
+    start_n_0,
+    start_n_1,
+    stride_rr,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_cb,
+    stride_ch,
+    stride_cq,
+    stride_gb,
+    stride_gh,
+    stride_gn,
+    mma_layout: gl.constexpr,
+    query_layout: gl.constexpr,
+    key_layout: gl.constexpr,
+    probability_layout: gl.constexpr,
+    value_layout: gl.constexpr,
+    row_layout: gl.constexpr,
+    mask_block_lengths: gl.constexpr,
+    mask_ragged_tail: gl.constexpr,
+    apply_coarse_residual: gl.constexpr,
+    skip_dense_routing: gl.constexpr,
+    mask_output_tail: gl.constexpr,
+):
+    """Run the split-D64 SM120 recurrence reusing query and key-center SMEM."""
+    query_0 = query_shared.slice(0, 32, dim=1).load(query_layout)
+    query_1 = query_shared.slice(32, 32, dim=1).load(query_layout)
+    query_2 = query_shared.slice(64, 32, dim=1).load(query_layout)
+    query_3 = query_shared.slice(96, 32, dim=1).load(query_layout)
+    # Wait for every warp to finish loading Q before reusing query_shared for tile masses.
+    gl.barrier()
+    tile_masses_shared = query_shared.reinterpret(
+        gl.float32,
+        [_GL_BLOCK_N, VALUE_MEAN_GROUP_TILES],
+        SCRATCH_SHARED_LAYOUT,
+    )
+    bias_shared = key_center_shared.reinterpret(
+        gl.float32,
+        [_GL_BLOCK_N, K_BIAS_GROUP_TILES],
+        SCRATCH_SHARED_LAYOUT,
+    )
+
+    accumulator_0 = gl.zeros([_GL_BLOCK_N, 64], gl.float32, mma_layout)
+    accumulator_1 = gl.zeros([_GL_BLOCK_N, 64], gl.float32, mma_layout)
+    denominator = gl.zeros([_GL_BLOCK_N], gl.float32, row_layout)
+    running_max = gl.full([_GL_BLOCK_N], -float("inf"), gl.float32, row_layout)
+
+    for pair_index in range(pair_count - 1):
+        k_bias_0, k_bias_1 = compute_pair_k_bias_d128(
+            pair_index,
+            query_0,
+            query_1,
+            query_2,
+            query_3,
+            query_scale,
+            key_center_ptr,
+            key_center_scale_ptr,
+            key_center_shared,
+            bias_shared,
+            tiles_shared,
+            route_base,
+            tile_count,
+            routed_sparse_tile_count,
+            selected_sparse_tile_count,
+            sparse_key_blocks,
+            stride_rr,
+            use_sparse_routes,
+            skip_dense_routing,
+            kv_batch_head,
+            sequence_tiles,
+            mma_layout,
+            key_layout,
+            row_layout,
+        )
+        next_n_0, next_n_1 = pair_tile_offsets(
+            route_base,
+            pair_index + 1,
+            tile_count,
+            routed_sparse_tile_count,
+            selected_sparse_tile_count,
+            sparse_key_blocks,
+            stride_rr,
+            use_sparse_routes,
+            skip_dense_routing,
+            _GL_BLOCK_N,
+        )
+        phase = pair_index & 1
+        mbarrier.wait(key_barrier, phase=phase)
+        integer_scores_0, integer_scores_1 = qk_pair_d128(
+            query_0,
+            query_1,
+            query_2,
+            query_3,
+            key_shared_0,
+            key_shared_1,
+            mma_layout,
+            key_layout,
+        )
+        gl.barrier()
+        _issue_tma_pair(
+            key_desc,
+            [kv_batch_head * storage_sequence_length + next_n_0, 0],
+            [kv_batch_head * storage_sequence_length + next_n_1, 0],
+            key_shared_0,
+            key_shared_1,
+            key_barrier,
+        )
+        (
+            probability_uint8_0,
+            probability_uint8_1,
+            denominator,
+            running_max,
+            old_weight,
+            current_weight,
+            mass_0,
+            mass_1,
+            block_max,
+        ) = piper_probability_pair_d128(
+            integer_scores_0,
+            integer_scores_1,
+            query_scale,
+            key_scale_ptr,
+            value_scale_multiplier_ptr,
+            block_lengths_ptr,
+            k_bias_0,
+            k_bias_1,
+            denominator,
+            running_max,
+            kv_batch_head,
+            start_n_0,
+            start_n_1,
+            True,
+            sequence_tiles,
+            logical_sequence_length,
+            mma_layout,
+            probability_layout,
+            mask_block_lengths,
+            False,
+            False,
+        )
+        mbarrier.wait(value_barrier, phase=phase)
+        accumulator_0, accumulator_1 = piper_pv_pair_d128(
+            probability_uint8_0,
+            probability_uint8_1,
+            value_shared_0,
+            value_shared_1,
+            accumulator_0,
+            accumulator_1,
+            old_weight,
+            current_weight,
+            mma_layout,
+            value_layout,
+        )
+        gl.barrier()
+        _issue_tma_pair(
+            value_desc,
+            [kv_batch_head * 128, next_n_0],
+            [kv_batch_head * 128, next_n_1],
+            value_shared_0,
+            value_shared_1,
+            value_barrier,
+        )
+        accumulator_0, accumulator_1 = accumulate_value_mean_step_d128(
+            accumulator_0,
+            accumulator_1,
+            tile_masses_shared,
+            pair_max_shared,
+            tiles_shared,
+            key_center_shared,
+            running_max,
+            value_mean_ptr,
+            mass_0,
+            mass_1,
+            block_max,
+            pair_index,
+            tile_count,
+            kv_batch_head,
+            sequence_tiles,
+            False,
+            mma_layout,
+        )
+        start_n_0 = next_n_0
+        start_n_1 = next_n_1
+
+    final_pair = pair_count - 1
+    k_bias_0, k_bias_1 = compute_pair_k_bias_d128(
+        final_pair,
+        query_0,
+        query_1,
+        query_2,
+        query_3,
+        query_scale,
+        key_center_ptr,
+        key_center_scale_ptr,
+        key_center_shared,
+        bias_shared,
+        tiles_shared,
+        route_base,
+        tile_count,
+        routed_sparse_tile_count,
+        selected_sparse_tile_count,
+        sparse_key_blocks,
+        stride_rr,
+        use_sparse_routes,
+        skip_dense_routing,
+        kv_batch_head,
+        sequence_tiles,
+        mma_layout,
+        key_layout,
+        row_layout,
+    )
+    final_phase = final_pair & 1
+    has_second = final_pair * 2 + 1 < tile_count
+    mbarrier.wait(key_barrier, phase=final_phase)
+    integer_scores_0, integer_scores_1 = qk_pair_d128(
+        query_0,
+        query_1,
+        query_2,
+        query_3,
+        key_shared_0,
+        key_shared_1,
+        mma_layout,
+        key_layout,
+    )
+    (
+        probability_uint8_0,
+        probability_uint8_1,
+        denominator,
+        running_max,
+        old_weight,
+        current_weight,
+        mass_0,
+        mass_1,
+        block_max,
+    ) = piper_probability_pair_d128(
+        integer_scores_0,
+        integer_scores_1,
+        query_scale,
+        key_scale_ptr,
+        value_scale_multiplier_ptr,
+        block_lengths_ptr,
+        k_bias_0,
+        k_bias_1,
+        denominator,
+        running_max,
+        kv_batch_head,
+        start_n_0,
+        start_n_1,
+        has_second,
+        sequence_tiles,
+        logical_sequence_length,
+        mma_layout,
+        probability_layout,
+        mask_block_lengths,
+        mask_ragged_tail,
+        True,
+    )
+    mbarrier.wait(value_barrier, phase=final_phase)
+    accumulator_0, accumulator_1 = piper_pv_pair_d128(
+        probability_uint8_0,
+        probability_uint8_1,
+        value_shared_0,
+        value_shared_1,
+        accumulator_0,
+        accumulator_1,
+        old_weight,
+        current_weight,
+        mma_layout,
+        value_layout,
+    )
+    accumulator_0, accumulator_1 = accumulate_value_mean_step_d128(
+        accumulator_0,
+        accumulator_1,
+        tile_masses_shared,
+        pair_max_shared,
+        tiles_shared,
+        key_center_shared,
+        running_max,
+        value_mean_ptr,
+        mass_0,
+        mass_1,
+        block_max,
+        final_pair,
+        tile_count,
+        kv_batch_head,
+        sequence_tiles,
+        True,
+        mma_layout,
+    )
+    store_attention_output_d128(
+        accumulator_0,
+        accumulator_1,
+        denominator,
+        coarse_output_ptr,
+        coarse_gate_ptr,
+        output_ptr,
+        batch,
+        head,
+        query_block,
+        global_query_block,
+        output_start_m,
+        offsets_m,
+        logical_sequence_length,
+        stride_ob,
+        stride_oh,
+        stride_on,
+        stride_cb,
+        stride_ch,
+        stride_cq,
+        stride_gb,
+        stride_gh,
+        stride_gn,
+        mma_layout,
+        mask_ragged_tail,
+        apply_coarse_residual,
+        mask_output_tail,
+    )
+
+
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_ARGUMENTS)
 def _sparse_piper_attention_kernel(
     query_desc,
@@ -184,6 +555,7 @@ def _sparse_piper_attention_kernel(
     gl.static_assert(mma_warps == 4 or (mma_warps == 2 and head_dim == 64 and block_m == 64))
     gl.static_assert(not apply_coarse_residual or block_m == 64)
     is_d128: gl.constexpr = head_dim == 128
+    gl.static_assert(not (is_d128 and skip_dense_routing))
     head, local_query_block = _schedule_program_coords(
         gl.program_id(1),
         gl.program_id(0) * (block_m // _GL_BLOCK_N),
@@ -242,8 +614,8 @@ def _sparse_piper_attention_kernel(
     if is_d128:
         pair_max_shared = gl.allocate_shared_memory(
             gl.float32,
-            [_GL_BLOCK_N, K_BIAS_GROUP_TILES],
-            gl.SwizzledSharedLayout(1, 1, 1, [0, 1]),
+            [_GL_BLOCK_N, VALUE_MEAN_GROUP_PAIRS],
+            SCRATCH_SHARED_LAYOUT,
         )
         tiles_shared = gl.allocate_shared_memory(
             gl.int32,
@@ -312,24 +684,6 @@ def _sparse_piper_attention_kernel(
         value_barrier,
     )
     mbarrier.wait(query_barrier, phase=0)
-    query = query_shared.load(query_layout)
-    if is_d128:
-        # Ensure all warps finish loading Q before reusing query_shared as FP32 mass scratch.
-        gl.barrier()
-        tile_masses_shared = query_shared.reinterpret(
-            gl.float32,
-            [_GL_BLOCK_N, _VALUE_MEAN_GROUP_TILES],
-            gl.SwizzledSharedLayout(1, 1, 1, [0, 1]),
-        )
-        value_mean_workspace = (
-            tile_masses_shared,
-            pair_max_shared,
-            tiles_shared,
-            key_center_shared,
-        )
-    else:
-        value_mean_workspace = None
-
     offsets_m = gl.arange(0, block_m, row_layout)
     query_scale_stride = query_storage_sequence_length // _GL_QUERY_SCALE_ROWS
     if block_m == 128:
@@ -346,16 +700,201 @@ def _sparse_piper_attention_kernel(
             + batch_head * query_scale_stride
             + (start_m + offsets_m) // _GL_QUERY_SCALE_ROWS
         )
-    accumulator = gl.zeros([block_m, head_dim], gl.float32, mma_layout)
-    denominator = gl.zeros([block_m], gl.float32, row_layout)
-    running_max = gl.full([block_m], -float("inf"), gl.float32, row_layout)
-    bias_cache_0, bias_cache_1 = build_k_bias_cache(block_m, mma_layout)
-    start_n_0 = initial_n_0
-    start_n_1 = initial_n_1
 
-    for pair_index in range(pair_count - 1):
-        k_bias_0, k_bias_1, bias_cache_0, bias_cache_1 = compute_pair_k_bias(
-            pair_index,
+    if is_d128:
+        _run_d128_recurrence(
+            query_shared,
+            key_desc,
+            value_desc,
+            key_shared_0,
+            key_shared_1,
+            value_shared_0,
+            value_shared_1,
+            key_center_shared,
+            pair_max_shared,
+            tiles_shared,
+            key_barrier,
+            value_barrier,
+            query_scale,
+            key_scale_ptr,
+            key_center_ptr,
+            key_center_scale_ptr,
+            value_scale_multiplier_ptr,
+            value_mean_ptr,
+            coarse_output_ptr,
+            coarse_gate_ptr,
+            block_lengths_ptr,
+            route_base,
+            output_ptr,
+            batch,
+            head,
+            query_block,
+            global_query_block,
+            kv_batch_head,
+            output_start_m,
+            offsets_m,
+            storage_sequence_length,
+            logical_sequence_length,
+            sequence_tiles,
+            tile_count,
+            pair_count,
+            routed_sparse_tile_count,
+            selected_sparse_tile_count,
+            sparse_key_blocks,
+            use_sparse_routes,
+            initial_n_0,
+            initial_n_1,
+            stride_rr,
+            stride_ob,
+            stride_oh,
+            stride_on,
+            stride_cb,
+            stride_ch,
+            stride_cq,
+            stride_gb,
+            stride_gh,
+            stride_gn,
+            mma_layout,
+            query_layout,
+            key_layout,
+            probability_layout,
+            value_layout,
+            row_layout,
+            mask_block_lengths,
+            mask_ragged_tail,
+            apply_coarse_residual,
+            skip_dense_routing,
+            mask_output_tail,
+        )
+    else:
+        query = query_shared.load(query_layout)
+        accumulator = gl.zeros([block_m, head_dim], gl.float32, mma_layout)
+        denominator = gl.zeros([block_m], gl.float32, row_layout)
+        running_max = gl.full([block_m], -float("inf"), gl.float32, row_layout)
+        bias_cache_0, bias_cache_1 = build_k_bias_cache(block_m, mma_layout)
+        start_n_0 = initial_n_0
+        start_n_1 = initial_n_1
+
+        for pair_index in range(pair_count - 1):
+            k_bias_0, k_bias_1, bias_cache_0, bias_cache_1 = compute_pair_k_bias(
+                pair_index,
+                bias_cache_0,
+                bias_cache_1,
+                query,
+                query_scale,
+                key_center_ptr,
+                key_center_scale_ptr,
+                key_center_shared,
+                route_base,
+                tile_count,
+                routed_sparse_tile_count,
+                selected_sparse_tile_count,
+                sparse_key_blocks,
+                stride_rr,
+                use_sparse_routes,
+                skip_dense_routing,
+                kv_batch_head,
+                sequence_tiles,
+                head_dim,
+                mma_warps,
+                mma_layout,
+                key_layout,
+                row_layout,
+            )
+            phase = pair_index & 1
+            mbarrier.wait(key_barrier, phase=phase)
+            (
+                probability,
+                denominator,
+                running_max,
+                old_weight,
+                current_weight,
+                mass_0,
+                mass_1,
+                _block_max,
+            ) = piper_probability_pair(
+                query,
+                key_shared_pair,
+                query_scale,
+                key_scale_ptr,
+                value_scale_multiplier_ptr,
+                block_lengths_ptr,
+                k_bias_0,
+                k_bias_1,
+                denominator,
+                running_max,
+                kv_batch_head,
+                start_n_0,
+                start_n_1,
+                True,
+                sequence_tiles,
+                logical_sequence_length,
+                mma_layout,
+                key_layout,
+                probability_layout,
+                mask_block_lengths,
+                False,
+                False,
+            )
+
+            next_n_0, next_n_1 = pair_tile_offsets(
+                route_base,
+                pair_index + 1,
+                tile_count,
+                routed_sparse_tile_count,
+                selected_sparse_tile_count,
+                sparse_key_blocks,
+                stride_rr,
+                use_sparse_routes,
+                skip_dense_routing,
+                _GL_BLOCK_N,
+            )
+            gl.barrier()
+            _issue_tma_pair(
+                key_desc,
+                [kv_batch_head * storage_sequence_length + next_n_0, 0],
+                [kv_batch_head * storage_sequence_length + next_n_1, 0],
+                key_shared_0,
+                key_shared_1,
+                key_barrier,
+            )
+            mbarrier.wait(value_barrier, phase=phase)
+            accumulator = piper_pv_pair(
+                probability,
+                value_shared_pair,
+                accumulator,
+                old_weight,
+                current_weight,
+                mma_layout,
+                value_layout,
+            )
+            gl.barrier()
+            _issue_tma_pair(
+                value_desc,
+                [kv_batch_head * head_dim, next_n_0],
+                [kv_batch_head * head_dim, next_n_1],
+                value_shared_0,
+                value_shared_1,
+                value_barrier,
+            )
+            accumulator = accumulate_value_mean_pair(
+                accumulator,
+                value_mean_ptr,
+                mass_0,
+                mass_1,
+                current_weight,
+                kv_batch_head,
+                start_n_0,
+                start_n_1,
+                sequence_tiles,
+                mma_layout,
+            )
+            start_n_0 = next_n_0
+            start_n_1 = next_n_1
+
+        final_pair = pair_count - 1
+        k_bias_0, k_bias_1, _bias_cache_0, _bias_cache_1 = compute_pair_k_bias(
+            final_pair,
             bias_cache_0,
             bias_cache_1,
             query,
@@ -378,10 +917,11 @@ def _sparse_piper_attention_kernel(
             mma_layout,
             key_layout,
             row_layout,
-            tiles_shared,
         )
-        phase = pair_index & 1
-        mbarrier.wait(key_barrier, phase=phase)
+        final_phase = final_pair & 1
+        final_position_0 = final_pair * 2
+        has_second = final_position_0 + 1 < tile_count
+        mbarrier.wait(key_barrier, phase=final_phase)
         (
             probability,
             denominator,
@@ -390,7 +930,7 @@ def _sparse_piper_attention_kernel(
             current_weight,
             mass_0,
             mass_1,
-            block_max,
+            _block_max,
         ) = piper_probability_pair(
             query,
             key_shared_pair,
@@ -405,40 +945,17 @@ def _sparse_piper_attention_kernel(
             kv_batch_head,
             start_n_0,
             start_n_1,
-            True,
+            has_second,
             sequence_tiles,
             logical_sequence_length,
             mma_layout,
             key_layout,
             probability_layout,
             mask_block_lengths,
-            False,
-            False,
-            is_d128,
+            mask_ragged_tail,
+            True,
         )
-
-        next_n_0, next_n_1 = pair_tile_offsets(
-            route_base,
-            pair_index + 1,
-            tile_count,
-            routed_sparse_tile_count,
-            selected_sparse_tile_count,
-            sparse_key_blocks,
-            stride_rr,
-            use_sparse_routes,
-            skip_dense_routing,
-            _GL_BLOCK_N,
-        )
-        gl.barrier()
-        _issue_tma_pair(
-            key_desc,
-            [kv_batch_head * storage_sequence_length + next_n_0, 0],
-            [kv_batch_head * storage_sequence_length + next_n_1, 0],
-            key_shared_0,
-            key_shared_1,
-            key_barrier,
-        )
-        mbarrier.wait(value_barrier, phase=phase)
+        mbarrier.wait(value_barrier, phase=final_phase)
         accumulator = piper_pv_pair(
             probability,
             value_shared_pair,
@@ -447,161 +964,48 @@ def _sparse_piper_attention_kernel(
             current_weight,
             mma_layout,
             value_layout,
-            is_d128,
         )
-        gl.barrier()
-        _issue_tma_pair(
-            value_desc,
-            [kv_batch_head * head_dim, next_n_0],
-            [kv_batch_head * head_dim, next_n_1],
-            value_shared_0,
-            value_shared_1,
-            value_barrier,
-        )
-        accumulator = accumulate_value_mean_step(
+        accumulator = accumulate_value_mean_pair(
             accumulator,
-            value_mean_workspace,
-            running_max,
             value_mean_ptr,
             mass_0,
             mass_1,
-            block_max,
             current_weight,
             kv_batch_head,
             start_n_0,
             start_n_1,
             sequence_tiles,
-            pair_index,
-            tile_count,
-            True,
             mma_layout,
         )
-        start_n_0 = next_n_0
-        start_n_1 = next_n_1
 
-    final_pair = pair_count - 1
-    k_bias_0, k_bias_1, _bias_cache_0, _bias_cache_1 = compute_pair_k_bias(
-        final_pair,
-        bias_cache_0,
-        bias_cache_1,
-        query,
-        query_scale,
-        key_center_ptr,
-        key_center_scale_ptr,
-        key_center_shared,
-        route_base,
-        tile_count,
-        routed_sparse_tile_count,
-        selected_sparse_tile_count,
-        sparse_key_blocks,
-        stride_rr,
-        use_sparse_routes,
-        skip_dense_routing,
-        kv_batch_head,
-        sequence_tiles,
-        head_dim,
-        mma_warps,
-        mma_layout,
-        key_layout,
-        row_layout,
-        tiles_shared,
-    )
-    final_phase = final_pair & 1
-    final_position_0 = final_pair * 2
-    has_second = final_position_0 + 1 < tile_count
-    mbarrier.wait(key_barrier, phase=final_phase)
-    (
-        probability,
-        denominator,
-        running_max,
-        old_weight,
-        current_weight,
-        mass_0,
-        mass_1,
-        block_max,
-    ) = piper_probability_pair(
-        query,
-        key_shared_pair,
-        query_scale,
-        key_scale_ptr,
-        value_scale_multiplier_ptr,
-        block_lengths_ptr,
-        k_bias_0,
-        k_bias_1,
-        denominator,
-        running_max,
-        kv_batch_head,
-        start_n_0,
-        start_n_1,
-        has_second,
-        sequence_tiles,
-        logical_sequence_length,
-        mma_layout,
-        key_layout,
-        probability_layout,
-        mask_block_lengths,
-        mask_ragged_tail,
-        True,
-        is_d128,
-    )
-    mbarrier.wait(value_barrier, phase=final_phase)
-    accumulator = piper_pv_pair(
-        probability,
-        value_shared_pair,
-        accumulator,
-        old_weight,
-        current_weight,
-        mma_layout,
-        value_layout,
-        is_d128,
-    )
-    accumulator = accumulate_value_mean_step(
-        accumulator,
-        value_mean_workspace,
-        running_max,
-        value_mean_ptr,
-        mass_0,
-        mass_1,
-        block_max,
-        current_weight,
-        kv_batch_head,
-        start_n_0,
-        start_n_1,
-        sequence_tiles,
-        final_pair,
-        tile_count,
-        False,
-        mma_layout,
-    )
-
-    store_attention_output(
-        accumulator,
-        denominator,
-        coarse_output_ptr,
-        coarse_gate_ptr,
-        output_ptr,
-        batch,
-        head,
-        query_block,
-        global_query_block,
-        output_start_m,
-        offsets_m,
-        logical_sequence_length,
-        output_sequence_length,
-        stride_ob,
-        stride_oh,
-        stride_on,
-        stride_cb,
-        stride_ch,
-        stride_cq,
-        stride_gb,
-        stride_gh,
-        stride_gn,
-        mma_layout,
-        mask_ragged_tail,
-        apply_coarse_residual,
-        mask_output_tail,
-    )
+        store_attention_output(
+            accumulator,
+            denominator,
+            coarse_output_ptr,
+            coarse_gate_ptr,
+            output_ptr,
+            batch,
+            head,
+            query_block,
+            global_query_block,
+            output_start_m,
+            offsets_m,
+            logical_sequence_length,
+            output_sequence_length,
+            stride_ob,
+            stride_oh,
+            stride_on,
+            stride_cb,
+            stride_ch,
+            stride_cq,
+            stride_gb,
+            stride_gh,
+            stride_gn,
+            mma_layout,
+            mask_ragged_tail,
+            apply_coarse_residual,
+            mask_output_tail,
+        )
 
     # Every warp must finish its final waits before any warp invalidates the
     # shared barriers.
