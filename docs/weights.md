@@ -361,10 +361,19 @@ plan = ColwiseParallel() if dim == 0 else RowwiseParallel()
 distributed_layer = parallelize_module(distributed_layer, mesh, plan)
 ```
 
-Use `Shard(0)` bias for `dim=0` and `Replicate()` for `dim=1`. Compare sharded
-results against local quantized execution; for fused sharded blocks, keep full
-heads or FFN intermediate shards local, unwrap activations around fusions, keep
-collectives outside, and compare against the local **fused** output.
+Use `Shard(0)` bias for `dim=0` and `Replicate()` for `dim=1`. Sequence-sharded
+(`Shard(1)`) `PrepareModuleInput` boundaries whose shared activation feeds two
+or more sibling ConvRot INT8 linears fold into quantized INT8 all-gathers under
+`convrot_int8_compile_options`; adding `convrot_int8_sparse_piper_compile_options`
+also folds sparse Piper attention `Shard(1)` `PrepareModuleInput` and
+`RowwiseParallel(output_layouts=Shard(1))` boundaries into overlapped K/V
+gathers and bounded peer-exchange reduce-scatters (and into in-place residual
+adds when `residual_updates_compile_options` is enabled, rounding peer and local
+rank contributions into `base` in two steps when `sequence_length` divides
+evenly across ranks and each rank's local sequence is a multiple of 64 tokens).
+For other fused sharded blocks, keep full heads or FFN intermediate shards local,
+unwrap activations around fusions, keep collectives outside, and compare against
+the local **fused** output.
 
 ## Storage and checkpoint compatibility
 

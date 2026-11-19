@@ -17,7 +17,7 @@ from . import _backend
 from ._layout import TILE_ROWS, padded_sequence_length, validate_block_lengths
 
 
-def _validate_inputs(
+def validate_key_inputs(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -30,6 +30,7 @@ def _validate_inputs(
     head_dim: int | None = None,
     bias: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
+    """Validate fused ConvRot INT8 K projection tensors and return ``(batch, seq, heads)``."""
     result = validate_qk_projection_inputs(
         input_qdata,
         input_scale,
@@ -46,6 +47,39 @@ def _validate_inputs(
     if result[1] < TILE_ROWS:
         raise ValueError(f"K projection requires at least {TILE_ROWS} sequence rows")
     return result
+
+
+_validate_inputs = validate_key_inputs
+
+
+def allocate_key_output(
+    template: torch.Tensor,
+    batch: int,
+    heads: int,
+    storage_sequence_length: int,
+    head_dim: int,
+    routing_mode: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate contiguous sparse-Piper key storage and per-tile metadata."""
+    storage_tiles = storage_sequence_length // TILE_ROWS
+    key = template.new_empty(
+        (batch, heads, storage_sequence_length, head_dim),
+        dtype=torch.int8,
+    )
+    key_scale = template.new_empty((batch, heads, storage_tiles), dtype=torch.float32)
+    key_center = template.new_empty(
+        (batch, heads, storage_tiles, 2, head_dim),
+        dtype=torch.int8,
+    )
+    key_center_scale = template.new_empty((batch, heads, storage_tiles, 2), dtype=torch.float32)
+    summary_shape = (batch, heads, storage_tiles, head_dim)
+    key_summary = template.new_empty(summary_shape, dtype=torch.float32)
+    key_aux = (
+        template.new_empty((batch, heads, 0, head_dim), dtype=torch.float32)
+        if routing_mode == _MEAN_ROUTING
+        else template.new_empty(summary_shape, dtype=torch.float32)
+    )
+    return key, key_scale, key_center, key_center_scale, key_summary, key_aux
 
 
 def _launch_key_projection(  # noqa: PLR0913
@@ -78,40 +112,15 @@ def _launch_key_projection(  # noqa: PLR0913
     )
     head_dim = resolve_head_dim(norm_weight, head_dim)
     storage_sequence_length = padded_sequence_length(sequence_length)
-    storage_tiles = storage_sequence_length // TILE_ROWS
     validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
-    key = torch.empty(
-        (batch, heads, storage_sequence_length, head_dim),
-        device=input_qdata.device,
-        dtype=torch.int8,
-    )
-    key_scale = torch.empty(
-        (batch, heads, storage_tiles),
-        device=input_qdata.device,
-        dtype=torch.float32,
-    )
-    key_center = torch.empty(
-        (batch, heads, storage_tiles, 2, head_dim),
-        device=input_qdata.device,
-        dtype=torch.int8,
-    )
-    key_center_scale = torch.empty(
-        (batch, heads, storage_tiles, 2),
-        device=input_qdata.device,
-        dtype=torch.float32,
-    )
-    summary_shape = (batch, heads, storage_tiles, head_dim)
-    key_summary = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
-    mean_pool_summary = routing_mode == _MEAN_ROUTING
-    key_aux = (
-        torch.empty(
-            (batch, heads, 0, head_dim),
-            device=input_qdata.device,
-            dtype=torch.float32,
-        )
-        if mean_pool_summary
-        else torch.empty_like(key_summary)
+    key, key_scale, key_center, key_center_scale, key_summary, key_aux = allocate_key_output(
+        input_qdata,
+        batch,
+        heads,
+        storage_sequence_length,
+        head_dim,
+        routing_mode,
     )
     backend.project_key(
         input_qdata,
@@ -184,25 +193,12 @@ def _project_key_op_fake(
     batch, sequence_length, _input_features = input_qdata.shape
     head_dim = resolve_head_dim(norm_weight, head_dim)
     storage_sequence_length = padded_sequence_length(sequence_length)
-    storage_tiles = storage_sequence_length // TILE_ROWS
     heads = weight_qdata.shape[0] // head_dim
-    key = input_qdata.new_empty((batch, heads, storage_sequence_length, head_dim))
-    key_scale = input_qdata.new_empty(
-        (batch, heads, storage_tiles),
-        dtype=torch.float32,
+    return allocate_key_output(
+        input_qdata,
+        batch,
+        heads,
+        storage_sequence_length,
+        head_dim,
+        routing_mode,
     )
-    key_center = input_qdata.new_empty((batch, heads, storage_tiles, 2, head_dim))
-    key_center_scale = input_qdata.new_empty(
-        (batch, heads, storage_tiles, 2),
-        dtype=torch.float32,
-    )
-    summary = input_qdata.new_empty(
-        (batch, heads, storage_tiles, head_dim),
-        dtype=torch.float32,
-    )
-    key_aux = (
-        summary.new_empty((batch, heads, 0, head_dim))
-        if routing_mode == _MEAN_ROUTING
-        else summary.new_empty(summary.shape)
-    )
-    return key, key_scale, key_center, key_center_scale, summary, key_aux

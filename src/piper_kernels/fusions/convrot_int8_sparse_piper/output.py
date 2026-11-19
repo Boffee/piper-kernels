@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -9,6 +10,7 @@ import torch
 from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
+from piper_kernels.fusions.convrot_int8_projection._validation import validate_qk_transform_inputs
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
@@ -20,9 +22,11 @@ from piper_kernels.weights.convrot.int8._quantization import (
 
 from . import _backend as fusion_backend
 from . import query as query_projection
+from ._interfaces import ProjectionBackend
 from ._layout import TILE_ROWS
 
-_DEFAULT_QUERY_CHUNK_ROWS = output_common.DEFAULT_QUERY_CHUNK_ROWS
+DEFAULT_QUERY_CHUNK_ROWS = output_common.DEFAULT_QUERY_CHUNK_ROWS
+_DEFAULT_QUERY_CHUNK_ROWS = DEFAULT_QUERY_CHUNK_ROWS
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,6 +355,152 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     )
 
 
+def validate_projected_query_input(  # noqa: PLR0913
+    query_input: torch.Tensor,
+    query_input_scale: torch.Tensor | None,
+    query_weight_qdata: torch.Tensor,
+    query_weight_scale: torch.Tensor,
+    key: torch.Tensor,
+    sequence_length: int,
+    *,
+    query_norm_weight: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    query_norm_epsilon: float,
+    softmax_scale: float,
+    input_group_size: int | None = None,
+    query_bias: torch.Tensor | None = None,
+) -> None:
+    """Validate full Q projection metadata before launching bounded chunk pipelines."""
+    if key.ndim != 4:
+        raise ValueError("fused sparse Piper output requires four-dimensional quantized storage")
+    batch, heads, _storage_sequence_length, head_dim = key.shape
+    if (
+        query_input.ndim != 3
+        or query_input.shape[:2] != (batch, sequence_length)
+        or query_input.shape[-1] != query_weight_qdata.shape[-1]
+        or query_input.device != key.device
+        or query_input.layout is not torch.strided
+    ):
+        raise ValueError(
+            "fused ConvRot INT8 Q input must match the global attention rows and width"
+        )
+    if input_group_size is None:
+        if query_input_scale is None:
+            raise ValueError("fused ConvRot INT8 prepared Q input requires row scales")
+        _, _, query_heads = query_projection._validate_inputs(
+            query_input,
+            query_input_scale,
+            query_weight_qdata,
+            query_weight_scale,
+            query_norm_weight,
+            cos,
+            sin,
+            norm_epsilon=query_norm_epsilon,
+            softmax_scale=softmax_scale,
+            head_dim=head_dim,
+            bias=query_bias,
+        )
+        if query_heads != heads:
+            raise ValueError("fused ConvRot INT8 Q heads must match sparse attention key heads")
+        return
+
+    validate_storage(query_weight_qdata, query_weight_scale, input_group_size, query_input.dtype)
+    validate_activation_scale(query_input_scale, query_input.device)
+    output_features = heads * head_dim
+    if query_weight_qdata.device != key.device or query_weight_qdata.shape[0] != output_features:
+        raise ValueError("fused ConvRot INT8 Q heads must match sparse attention key heads")
+    if query_bias is not None:
+        _bias.validate_dtype(query_bias, "Q projection")
+        if (
+            query_bias.shape != (output_features,)
+            or query_bias.device != key.device
+            or query_bias.layout is not torch.strided
+            or not query_bias.is_contiguous()
+        ):
+            raise ValueError(
+                "Q projection bias must be contiguous with one value per output feature"
+            )
+    validate_qk_transform_inputs(
+        query_norm_weight,
+        cos,
+        sin,
+        sequence_length=sequence_length,
+        head_dim=head_dim,
+        device=key.device,
+        norm_epsilon=query_norm_epsilon,
+        name="Q",
+    )
+    if not math.isfinite(softmax_scale) or softmax_scale <= 0:
+        raise ValueError("Q projection softmax scale must be finite and positive")
+
+
+def build_query_chunk_projector(  # noqa: PLR0913, PLR0917
+    query_input: torch.Tensor,
+    query_input_scale: torch.Tensor | None,
+    query_weight_qdata: torch.Tensor,
+    query_weight_scale: torch.Tensor,
+    query_norm_weight: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    query_norm_epsilon: float,
+    softmax_scale: float,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None,
+    *,
+    backend: LinearBackend,
+    projection_backend: ProjectionBackend,
+    head_dim: int,
+    input_group_size: int | None = None,
+    query_bias: torch.Tensor | None = None,
+) -> output_common.QueryChunkProjector:
+    """Build a bounded chunk query projector over prepared or raw query inputs."""
+
+    def project_query_chunk(
+        start: int,
+        rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if input_group_size is None:
+            assert query_input_scale is not None
+            chunk_input, chunk_scale = query_input, query_input_scale
+            chunk_cos, chunk_sin = cos, sin
+            chunk_lengths = block_lengths
+            chunk_start = start
+        else:
+            chunk_input, chunk_scale = backend.prepare_input(
+                query_input[:, start : start + rows].contiguous(),
+                input_group_size,
+                input_scale=query_input_scale,
+            )
+            chunk_cos, chunk_sin = cos[start : start + rows], sin[start : start + rows]
+            chunk_lengths = (
+                None
+                if block_lengths is None
+                else block_lengths[start // TILE_ROWS : (start + rows + TILE_ROWS - 1) // TILE_ROWS]
+            )
+            chunk_start = 0
+        return query_projection._launch_query_projection_range(
+            chunk_input,
+            chunk_scale,
+            query_weight_qdata,
+            query_weight_scale,
+            query_norm_weight,
+            chunk_cos,
+            chunk_sin,
+            query_norm_epsilon,
+            softmax_scale,
+            routing_mode,
+            chunk_lengths,
+            chunk_start=chunk_start,
+            chunk_rows=rows,
+            backend=projection_backend,
+            head_dim=head_dim,
+            bias=query_bias,
+        )
+
+    return project_query_chunk
+
+
 def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     query_input: torch.Tensor,
     query_input_scale: torch.Tensor | None,
@@ -436,22 +586,21 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         start_head=start_head,
         end_head=end_head,
     )
-    if (
-        query_input.ndim != 3
-        or query_input.shape[:2] != (key.shape[0], prepared.sequence_length)
-        or query_input.shape[-1] != query_weight_qdata.shape[-1]
-        or query_input.device != key.device
-    ):
-        raise ValueError(
-            "fused ConvRot INT8 Q input must match the global attention rows and width"
-        )
-    if input_group_size is not None:
-        validate_storage(
-            query_weight_qdata, query_weight_scale, input_group_size, query_input.dtype
-        )
-        validate_activation_scale(query_input_scale, query_input.device)
-    elif query_input_scale is None:
-        raise ValueError("fused ConvRot INT8 prepared Q input requires row scales")
+    validate_projected_query_input(
+        query_input,
+        query_input_scale,
+        query_weight_qdata,
+        query_weight_scale,
+        key,
+        prepared.sequence_length,
+        query_norm_weight=query_norm_weight,
+        cos=cos,
+        sin=sin,
+        query_norm_epsilon=query_norm_epsilon,
+        softmax_scale=softmax_scale,
+        input_group_size=input_group_size,
+        query_bias=query_bias,
+    )
     output_features, project_chunk, projector_tensors = _prepare_output_chunk_projector(
         key,
         prepared.sequence_length,
@@ -466,48 +615,24 @@ def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         output_input_scale=output_input_scale,
         residual_add=residual_add,
     )
-
-    def project_query_chunk(
-        start: int,
-        rows: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if input_group_size is None:
-            assert query_input_scale is not None
-            chunk_input, chunk_scale = query_input, query_input_scale
-            chunk_cos, chunk_sin = cos, sin
-            chunk_lengths = block_lengths
-            chunk_start = start
-        else:
-            chunk_input, chunk_scale = backend.prepare_input(
-                query_input[:, start : start + rows],
-                input_group_size,
-                input_scale=query_input_scale,
-            )
-            chunk_cos, chunk_sin = cos[start : start + rows], sin[start : start + rows]
-            chunk_lengths = (
-                None
-                if block_lengths is None
-                else block_lengths[start // TILE_ROWS : (start + rows + TILE_ROWS - 1) // TILE_ROWS]
-            )
-            chunk_start = 0
-        return query_projection._launch_query_projection_range(
-            chunk_input,
-            chunk_scale,
-            query_weight_qdata,
-            query_weight_scale,
-            query_norm_weight,
-            chunk_cos,
-            chunk_sin,
-            query_norm_epsilon,
-            softmax_scale,
-            routing_mode,
-            chunk_lengths,
-            chunk_start=chunk_start,
-            chunk_rows=rows,
-            backend=projection_backend,
-            head_dim=key.shape[-1],
-            bias=query_bias,
-        )
+    project_query_chunk = build_query_chunk_projector(
+        query_input,
+        query_input_scale,
+        query_weight_qdata,
+        query_weight_scale,
+        query_norm_weight,
+        cos,
+        sin,
+        query_norm_epsilon,
+        softmax_scale,
+        routing_mode,
+        block_lengths,
+        backend=backend,
+        projection_backend=projection_backend,
+        head_dim=key.shape[-1],
+        input_group_size=input_group_size,
+        query_bias=query_bias,
+    )
 
     return output_common.run_chunked_projected_query_attention_output(
         prepared,
@@ -891,6 +1016,8 @@ def _validate_residual_add(
     )
     if base.ndim != 3 or base.shape[:2] != (key.shape[0], sequence_length):
         raise ValueError("sparse Piper residual base must have one row per output row")
+    if base.device != key.device:
+        raise ValueError("sparse Piper residual base must share the attention storage device")
     residual_add = ResidualAdd(
         base=base,
         gate=gate,
@@ -1270,5 +1397,11 @@ def _attention_output_op_fake(
         query, sequence_length, weight_qdata.shape[0], output_dtype=output_dtype
     )
 
+
+GateProjection = _GateProjection
+prepare_optional_gate_projection = _prepare_optional_gate_projection
+resolve_projected_gate_input = _resolve_projected_gate_input
+validate_output_projection = _validate_output_projection
+run_projected_query_attention_output = _run_projected_query_attention_output
 
 __all__: list[str] = []

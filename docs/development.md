@@ -20,7 +20,7 @@ All package paths below are under [`src/piper_kernels`](../src/piper_kernels).
 | `linear/`, `conv3d/` | Operators consuming weight formats, references, and backend dispatch |
 | `fusions/` | Composed operations and compiler rewrites sharing preparation or intermediates |
 | `specializations/` | Explicitly enabled model integrations built from reusable kernels |
-| `_residual/`, `_input_activations/`, `_inductor_options.py` | Private contracts and compiler options shared across areas |
+| `_distributed/`, `_residual/`, `_input_activations/`, `_inductor_options.py` | Private contracts and compiler options shared across areas |
 | `_triton/`, `attention/kernels/` | Triton runtime/target facts, compiler workarounds, and shared GPU primitives |
 | `gguf/`, `trellis/`, `stochastic_quantization/` | Packed GGUF decoding, trellis encoding/decoding, and rounding arithmetic |
 

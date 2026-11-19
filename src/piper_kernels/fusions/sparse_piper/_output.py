@@ -224,6 +224,27 @@ def prepare_attention(  # noqa: PLR0913, PLR0917
     )
 
 
+def validate_coarse_gate(
+    coarse_gate: torch.Tensor,
+    *,
+    batch: int,
+    sequence_length: int,
+    heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """Validate optional materialized coarse gate storage before launching chunks."""
+    if (
+        coarse_gate.shape != (batch, sequence_length, heads, head_dim)
+        or coarse_gate.dtype is not dtype
+        or coarse_gate.device != device
+        or coarse_gate.layout is not torch.strided
+        or coarse_gate.stride(-1) != 1
+    ):
+        raise ValueError("sparse Piper coarse gate must match the attention output")
+
+
 def _run_chunked_attention_pipeline(  # noqa: PLR0913
     attention_storage: torch.Tensor,
     sequence_length: int,
@@ -249,14 +270,20 @@ def _run_chunked_attention_pipeline(  # noqa: PLR0913
         coarse_gate is not None or project_coarse_gate_chunk is not None
     ):
         raise ValueError("coarse gate source requires coarse attention")
+    batch, heads, _storage_sequence_length, head_dim = attention_storage.shape
+    if coarse_gate is not None:
+        validate_coarse_gate(
+            coarse_gate,
+            batch=batch,
+            sequence_length=sequence_length,
+            heads=heads,
+            head_dim=head_dim,
+            dtype=output_dtype,
+            device=attention_storage.device,
+        )
 
     return output_pipeline.run_chunked_attention_output(
-        (
-            attention_storage.shape[0],
-            sequence_length,
-            attention_storage.shape[1],
-            attention_storage.shape[3],
-        ),
+        (batch, sequence_length, heads, head_dim),
         attention_storage.device,
         output_features,
         query_chunk_rows,
@@ -333,8 +360,13 @@ def run_chunked_projected_query_attention_output(  # noqa: PLR0913
     project_attention: AttentionProjector | None = None,
     reuse_output_for_attention: bool = False,
     out: torch.Tensor | None = None,
+    global_row_offset: int = 0,
+    sequence_length: int | None = None,
 ) -> torch.Tensor:
     """Project, route, attend, and consume one bounded Q window at a time."""
+    target_sequence_length = (
+        prepared.sequence_length if sequence_length is None else sequence_length
+    )
 
     def launch_chunk(
         attention_chunk: torch.Tensor,
@@ -342,13 +374,14 @@ def run_chunked_projected_query_attention_output(  # noqa: PLR0913
         rows: int,
         gate_chunk: torch.Tensor | None,
     ) -> None:
-        query, query_scale, query_summary = project_query_chunk(start, rows)
+        global_start = global_row_offset + start
+        query, query_scale, query_summary = project_query_chunk(global_start, rows)
         local_attention, coarse_output = _quantized_dispatch._prepare_quantized_sparse_piper_query(
             prepared.quantized_context,
             query,
             query_scale,
             query_summary,
-            global_block_offset=start // TILE_ROWS,
+            global_block_offset=global_start // TILE_ROWS,
         )
         _quantized_dispatch._launch_quantized_sparse_piper_attention(
             local_attention,
@@ -357,11 +390,17 @@ def run_chunked_projected_query_attention_output(  # noqa: PLR0913
             coarse_gate=gate_chunk,
         )
 
+    coarse_gate = (
+        prepared.coarse_gate
+        if prepared.coarse_gate is None
+        or (global_row_offset == 0 and target_sequence_length == prepared.sequence_length)
+        else prepared.coarse_gate[:, global_row_offset : global_row_offset + target_sequence_length]
+    )
     return _run_chunked_attention_pipeline(
         prepared.quantized_context.kernel_context.key,
-        prepared.sequence_length,
+        target_sequence_length,
         prepared.quantized_context.pooled_value is not None,
-        prepared.coarse_gate,
+        coarse_gate,
         output_features,
         query_chunk_rows,
         launch_chunk,
@@ -384,5 +423,6 @@ __all__ = [
     "run_chunked_attention_output",
     "run_chunked_projected_query_attention_output",
     "validate_attention_output",
+    "validate_coarse_gate",
     "validate_output_metadata",
 ]

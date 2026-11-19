@@ -105,6 +105,9 @@ def _launch_full_and_tail_blocks(
     heads: int,
     execution_plan: ProjectionExecutionPlan,
     launch: Callable[[tuple[int, int, int], int, bool, bool], None],
+    *,
+    start_row_block: int = 0,
+    num_row_blocks: int | None = None,
 ) -> None:
     batch, sequence_length, input_features = input_qdata.shape
     head_blocks = triton.cdiv(heads, execution_plan.heads_per_program)
@@ -112,6 +115,23 @@ def _launch_full_and_tail_blocks(
         input_features % execution_plan.block_k == 0
         and heads % execution_plan.heads_per_program == 0
     )
+    if start_row_block != 0 or num_row_blocks is not None:
+        if start_row_block < 0:
+            raise ValueError("start_row_block must be non-negative")
+        full_row_blocks = sequence_length // execution_plan.block_m
+        if num_row_blocks is None:
+            if sequence_length % execution_plan.block_m != 0:
+                raise ValueError("partial row-block launches require full block_m alignment")
+            block_count = full_row_blocks - start_row_block
+        else:
+            block_count = num_row_blocks
+        if block_count < 0 or start_row_block + block_count > full_row_blocks:
+            raise ValueError(
+                "partial row-block range must stay within full block_m blocks of sequence_length"
+            )
+        if block_count > 0:
+            launch((block_count, head_blocks, batch), start_row_block, True, aligned_shape)
+        return
     full_row_blocks = sequence_length // execution_plan.block_m
     if full_row_blocks:
         launch((full_row_blocks, head_blocks, batch), 0, True, aligned_shape)
@@ -134,6 +154,8 @@ def project_key(
     execution_plan: ProjectionExecutionPlan,
     out: KeyOutput,
     bias: torch.Tensor | None = None,
+    start_row_block: int = 0,
+    num_row_blocks: int | None = None,
 ) -> None:
     """Prepare K64-centered INT8 keys, scales, centers, and FP32 routing summaries."""
     key, key_scale, key_center, key_center_scale, key_summary, key_aux = out
@@ -192,7 +214,14 @@ def project_key(
                 **lds_only_fence_options(execution_plan.lds_only_fences),
             )
 
-        _launch_full_and_tail_blocks(input_qdata, heads, execution_plan, launch)
+        _launch_full_and_tail_blocks(
+            input_qdata,
+            heads,
+            execution_plan,
+            launch,
+            start_row_block=start_row_block,
+            num_row_blocks=num_row_blocks,
+        )
 
 
 def project_value(
@@ -206,6 +235,8 @@ def project_value(
     value_format: ValueFormat,
     out: ValueOutput,
     bias: torch.Tensor | None = None,
+    start_row_block: int = 0,
+    num_row_blocks: int | None = None,
 ) -> None:
     """Launch K64 tile-centered INT8 values, multipliers, and BF16 per-tile means."""
     value, value_scale_multiplier, value_mean = out
@@ -254,4 +285,11 @@ def project_value(
                 **lds_only_fence_options(execution_plan.lds_only_fences),
             )
 
-        _launch_full_and_tail_blocks(input_qdata, heads, execution_plan, launch)
+        _launch_full_and_tail_blocks(
+            input_qdata,
+            heads,
+            execution_plan,
+            launch,
+            start_row_block=start_row_block,
+            num_row_blocks=num_row_blocks,
+        )

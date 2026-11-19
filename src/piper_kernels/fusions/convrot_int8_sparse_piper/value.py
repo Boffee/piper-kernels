@@ -16,7 +16,7 @@ from . import _backend
 from ._layout import SUPPORTED_HEAD_DIMS, TILE_ROWS, padded_sequence_length, validate_block_lengths
 
 
-def _validate_inputs(
+def validate_value_inputs(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -25,6 +25,7 @@ def _validate_inputs(
     *,
     bias: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
+    """Validate fused ConvRot INT8 V projection tensors and return ``(batch, seq, heads)``."""
     if head_dim not in SUPPORTED_HEAD_DIMS:
         raise ValueError("V projection requires head_dim=64 or 128")
     batch, sequence_length, heads = validate_projection_inputs(
@@ -33,6 +34,34 @@ def _validate_inputs(
     if sequence_length < TILE_ROWS:
         raise ValueError(f"V projection requires at least {TILE_ROWS} sequence rows")
     return batch, sequence_length, heads
+
+
+_validate_inputs = validate_value_inputs
+
+
+def allocate_value_output(
+    template: torch.Tensor,
+    batch: int,
+    heads: int,
+    storage_sequence_length: int,
+    head_dim: int,
+    storage_format: ValueFormat,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate contiguous sparse-Piper value storage and per-tile metadata."""
+    storage_tiles = storage_sequence_length // TILE_ROWS
+    value = template.new_empty(
+        storage_format.shape(batch, heads, storage_sequence_length, head_dim),
+        dtype=torch.int8,
+    )
+    value_scale_multiplier = template.new_empty(
+        (batch, heads, storage_tiles, 1),
+        dtype=torch.float32,
+    )
+    value_mean = template.new_empty(
+        (batch, heads, storage_tiles, head_dim),
+        dtype=torch.bfloat16,
+    )
+    return value, value_scale_multiplier, value_mean
 
 
 def _launch_value_projection(
@@ -56,23 +85,15 @@ def _launch_value_projection(
     )
     validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
     storage_sequence_length = padded_sequence_length(sequence_length)
-    storage_tiles = storage_sequence_length // TILE_ROWS
     storage_format = ValueFormat(value_format)
     backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
-    value = torch.empty(
-        storage_format.shape(batch, heads, storage_sequence_length, head_dim),
-        device=input_qdata.device,
-        dtype=torch.int8,
-    )
-    value_scale_multiplier = torch.empty(
-        (batch, heads, storage_tiles, 1),
-        device=input_qdata.device,
-        dtype=torch.float32,
-    )
-    value_mean = torch.empty(
-        (batch, heads, storage_tiles, head_dim),
-        device=input_qdata.device,
-        dtype=torch.bfloat16,
+    value, value_scale_multiplier, value_mean = allocate_value_output(
+        input_qdata,
+        batch,
+        heads,
+        storage_sequence_length,
+        head_dim,
+        storage_format,
     )
     backend.project_value(
         input_qdata,
@@ -126,15 +147,12 @@ def _project_value_op_fake(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
     storage_sequence_length = padded_sequence_length(sequence_length)
-    storage_tiles = storage_sequence_length // TILE_ROWS
     heads = weight_qdata.shape[0] // head_dim
-    return (
-        input_qdata.new_empty(
-            ValueFormat(value_format).shape(batch, heads, storage_sequence_length, head_dim)
-        ),
-        input_qdata.new_empty(
-            (batch, heads, storage_tiles, 1),
-            dtype=torch.float32,
-        ),
-        input_qdata.new_empty((batch, heads, storage_tiles, head_dim), dtype=torch.bfloat16),
+    return allocate_value_output(
+        input_qdata,
+        batch,
+        heads,
+        storage_sequence_length,
+        head_dim,
+        ValueFormat(value_format),
     )

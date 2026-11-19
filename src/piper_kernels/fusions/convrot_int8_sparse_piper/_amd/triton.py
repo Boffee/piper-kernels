@@ -1,5 +1,7 @@
 """Bind shared projection launchers to RDNA4 policy."""
 
+from typing import Literal
+
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
@@ -55,6 +57,19 @@ def project_query(
     )
 
 
+def partial_row_block_size(
+    input_qdata: torch.Tensor,  # noqa: ARG001 - protocol symmetry
+    weight_qdata: torch.Tensor,  # noqa: ARG001 - protocol symmetry
+    *,
+    operation: Literal["key", "value"],
+    head_dim: int,
+    rotary_dim: int = 0,  # noqa: ARG001 - protocol symmetry
+    value_format: ValueFormat = ValueFormat.TRANSPOSED,  # noqa: ARG001 - protocol symmetry
+) -> int:
+    """Return RDNA4's Triton row block height for partial K/V launches."""
+    return policy.select_execution_plan(operation, head_dim=head_dim).block_m
+
+
 def project_key(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -70,6 +85,8 @@ def project_key(
     out: KeyOutput,
     bias: torch.Tensor | None = None,
     execution_plan: ProjectionExecutionPlan | None = None,
+    start_row_block: int = 0,
+    num_row_blocks: int | None = None,
 ) -> None:
     """Project keys using the RDNA4 K execution plan."""
     plan = (
@@ -91,6 +108,8 @@ def project_key(
         execution_plan=plan,
         out=out,
         bias=bias,
+        start_row_block=start_row_block,
+        num_row_blocks=num_row_blocks,
     )
 
 
@@ -105,6 +124,8 @@ def project_value(
     out: ValueOutput,
     bias: torch.Tensor | None = None,
     execution_plan: ProjectionExecutionPlan | None = None,
+    start_row_block: int = 0,
+    num_row_blocks: int | None = None,
 ) -> None:
     """Select the RDNA4 V projection plan from head width unless overridden."""
     plan = (
@@ -122,4 +143,6 @@ def project_value(
         value_format=value_format,
         out=out,
         bias=bias,
+        start_row_block=start_row_block,
+        num_row_blocks=num_row_blocks,
     )
