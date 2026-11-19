@@ -41,9 +41,11 @@ def select_execution_plan(
     """
     if not supports_target(target):
         raise ValueError(f"Dense projections have no NVIDIA policy for {target}")
-    # On an RTX 5090 at 1K-32K tokens with 56 heads, Gluon projects Q 1.25-1.41x, K
-    # 1.16-1.28x, and V 1.18-1.34x faster than SM120's two-head Triton plan.
+    # On an RTX 5090 at 1K-32K tokens, Gluon projects Q 1.25-1.41x, K 1.16-1.28x, and V
+    # 1.18-1.34x faster than SM120's two-head Triton plan with cp.async, and TMA adds a
+    # further 2-11% across Q/K/V.
     return projection_policy.select_execution_plan(
+        target,
         operation=operation,
         input_features=input_features,
         head_dim=head_dim,

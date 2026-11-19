@@ -45,9 +45,9 @@ def select_execution_plan(
     """
     if not supports_target(target):
         raise ValueError(f"Sparse projections have no NVIDIA policy for {target}")
-    # On an RTX 5090 at 1K-32K rows and 8-56 heads, Gluon projects Q 1.3-1.4x and V
-    # 1.0-1.3x faster than SM120's Triton plans. K ranges from 5% slower, for 12 heads
-    # at 2.8K rows, to 1.2x faster.
+    # On an RTX 5090 across 193-110K tokens, 8-56 heads, and K64-aligned widths up to
+    # 6144, TMA operand loads project Q/K/V up to 17% faster than cp.async (7-10%
+    # faster at 110K x 56 x 5376), while Gluon beats SM120's Triton schedules cleanly.
     if target.is_cuda_capability(12, 0):
         triton_execution_plan = (
             _SM120_QUERY_EXECUTION_PLAN if operation == "query" else _SM120_CONTEXT_EXECUTION_PLAN
@@ -55,6 +55,7 @@ def select_execution_plan(
     else:
         triton_execution_plan = projection_policy.SM8X_TRITON_EXECUTION_PLAN
     return projection_policy.select_execution_plan(
+        target,
         operation=operation,
         input_features=input_features,
         head_dim=head_dim,

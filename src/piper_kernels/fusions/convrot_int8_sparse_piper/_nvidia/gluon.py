@@ -1,12 +1,12 @@
 """SM8x and SM120 Gluon kernels for the fused ConvRot INT8 sparse-Piper Q/K/V projections.
 
 Each program projects 128 rows onto one D128 head with the shared projection
-fragments. Q and K permute the weight rows so RoPE and the signed Hadamard stay
-in registers: Q emits Q32 INT8 rows with routing summaries, and K emits
-K64-centered INT8 rows, scales, 2-term INT8 centers, and routing summaries in a
-single pass. Q/K programs run at the 255-register limit. V projects its tiles
-through the shared value-tile fragment, centers each K64 tile around its BF16
-mean, and emits scaled transposed INT8 values and means in a single pass.
+fragments, using ``cp.async`` copies on SM8x and TMA loads on SM120. Q emits
+Q32 INT8 rows with routing summaries, and K emits K64-centered INT8 rows, scales,
+2-term INT8 centers, and routing summaries in a single pass. Q/K programs run at
+the 255-register limit. V projects its tiles through the shared value-tile fragment,
+centers each K64 tile around its BF16 mean, and emits scaled transposed INT8 values
+and means in a single pass.
 
 The policy module selects shared Triton launchers for other shapes or unaligned operands.
 """
@@ -225,7 +225,18 @@ def _query_kernel(
     if not mean_pool_summary:
         summary += minimum
 
+    batch_head = batch * heads + head
     blocks: gl.constexpr = _GL_BLOCK_M // _GL_TILE_ROWS
+    # Store routing summaries before the Hadamard transform so they do not stay live
+    # alongside smoothed Q rows in the 255-register tail epilogue.
+    fragments.store_summaries(
+        query_summary_ptr + batch_head * storage_tiles * _GL_HEAD_DIM,
+        summary,
+        row_block * blocks,
+        storage_tiles,
+        mask_rows,
+    )
+
     groups: gl.constexpr = _GL_BLOCK_M // _GL_QUERY_SCALE_ROWS
     smoothed = gl.reshape(
         fragments.signed_hadamard(values, features), [groups, _GL_QUERY_SCALE_ROWS, _GL_HEAD_DIM]
@@ -247,7 +258,6 @@ def _query_kernel(
         stored_scale = raw_scale * (softmax_scale * _GL_LOG2_E)
     quantized = fragments.round_to_int8(smoothed / raw_scale[:, None, None])
 
-    batch_head = batch * heads + head
     storage_rows = storage_tiles * _GL_TILE_ROWS
     storage_groups = storage_rows // _GL_QUERY_SCALE_ROWS
     fragments.store_rows(
@@ -262,13 +272,6 @@ def _query_kernel(
         stored_scale,
         row_block * groups,
         storage_groups,
-        mask_rows,
-    )
-    fragments.store_summaries(
-        query_summary_ptr + batch_head * storage_tiles * _GL_HEAD_DIM,
-        summary,
-        row_block * blocks,
-        storage_tiles,
         mask_rows,
     )
 
@@ -590,15 +593,20 @@ def project_query(
     """Fill Q32 INT8 queries, scales, and Q64 summaries for a supported query window."""
     query, query_scale, query_summary = out
     batch, heads, storage_sequence_length, _head_dim = query.shape
+    if batch == 0:
+        return
     mask_block_lengths = block_lengths is not None
 
     with device_context(input_qdata.device):
+        input_operand, weight_operand = fragments.resolve_operands(
+            input_qdata, weight_qdata, execution_plan
+        )
 
         def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
             _query_kernel[(heads, row_blocks, batch)](
-                input_qdata,
+                input_operand,
                 input_scale,
-                weight_qdata,
+                weight_operand,
                 weight_scale,
                 bias,
                 norm_weight,
@@ -652,12 +660,15 @@ def project_key(
     mask_block_lengths = block_lengths is not None
 
     with device_context(input_qdata.device):
+        input_operand, weight_operand = fragments.resolve_operands(
+            input_qdata, weight_qdata, execution_plan
+        )
 
         def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
             _key_kernel[(heads, row_blocks, batch)](
-                input_qdata,
+                input_operand,
                 input_scale,
-                weight_qdata,
+                weight_operand,
                 weight_scale,
                 bias,
                 norm_weight,
@@ -703,15 +714,20 @@ def project_value(
         raise ValueError("NVIDIA Gluon V projection requires transposed storage")
     value, value_scale_multiplier, value_mean = out
     batch, heads, _head_dim, storage_sequence_length = value.shape
+    if batch == 0:
+        return
     mask_block_lengths = block_lengths is not None
 
     with device_context(input_qdata.device):
+        input_operand, weight_operand = fragments.resolve_operands(
+            input_qdata, weight_qdata, execution_plan
+        )
 
         def launch(row_blocks: int, row_block_offset: int, *, mask_rows: bool) -> None:
             _value_kernel[(heads, row_blocks, batch)](
-                input_qdata,
+                input_operand,
                 input_scale,
-                weight_qdata,
+                weight_operand,
                 weight_scale,
                 bias,
                 value,

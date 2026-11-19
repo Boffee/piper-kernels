@@ -1,15 +1,15 @@
 """Gluon fragments shared by the fused ConvRot INT8 dense and sparse Piper projections.
 
-Each program projects 128 rows onto one D128 head through the SM8x ConvRot INT8
-GEMM's pipeline: ``cp.async`` copies stage K64 slices of the INT8 operands in shared
-memory, and ``mma_v2`` accumulates exact INT32 products from K32 operand slices.
+Each program projects 128 rows onto one D128 head through an up-to-three-stage K64
+ring feeding K32 ``mma_v2`` slices: ``cp.async`` copies on SM8x, and 2D TMA loads on
+SM120 when operands are passed as ``tma.tensor_descriptor`` arguments.
 
-Q and K split warps only across rows and permute the weight rows, so each thread
-holds 4 consecutive features of every row it owns, with the other feature bits in
-registers or its lane quad. Loads of cos/sin are then 16 bytes wide, and RoPE
-pairs stay in registers. The signed Hadamard runs five of its seven stages in
-registers and the other two as butterfly shuffles. K stores rotated BF16 rows
-for sparse (K64) or dense (K1024) key quantization.
+Q and K split warps only across rows and permute weight rows in ``cp.async`` (or read
+feature-ordered SMEM tiles directly under TMA), so each thread holds 4 consecutive
+features of every row it owns, with the other feature bits in registers or its lane quad.
+Loads of cos/sin are then 16 bytes wide, and RoPE pairs stay in registers. The signed
+Hadamard runs five of its seven stages in registers and the other two as butterfly
+shuffles. K stores rotated BF16 rows for sparse (K64) or dense (K1024) key quantization.
 
 V keeps a 2x2 warp grid; ``project_value_tiles`` owns its epilogue layout, and
 ``store_value_codes`` its transposed ``[D128, S]`` code storage.
@@ -26,6 +26,7 @@ from collections.abc import Callable
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.nvidia.hopper import tma
 from triton.language.extra import libdevice
 
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
@@ -35,7 +36,10 @@ from piper_kernels.linear.convrot.int8._nvidia.gluon_async_copy import (
     _accumulate as _accumulate_tiles,
 )
 
+from . import _tma_projection
 from ._plan import GLUON_BLOCK_K, GLUON_BLOCK_M, GLUON_NUM_STAGES, GLUON_NUM_WARPS
+
+resolve_operands = _tma_projection.resolve_operands
 
 HEAD_DIM = 128
 BLOCK_M = GLUON_BLOCK_M
@@ -272,25 +276,43 @@ def project_rmsnorm_rope(
     Returns the tile, its sequence positions, and its features. With ``mask_rows``,
     rows past the sequence end repeat its last row; callers mask their outputs.
     """
-    positions = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, FEATURE_LAYOUT))
-    copy_positions = first_row + gl.arange(0, _GL_BLOCK_M, COPY_ROWS)
-    if mask_rows:
-        positions = gl.minimum(positions, logical_sequence_length - 1)
-        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
     input_row_start = batch * logical_sequence_length
     mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[2, 0], warps_per_cta=[_GL_NUM_WARPS, 1], instr_shape=[16, 8]
     )
-    columns = gl.arange(0, _GL_HEAD_DIM, COPY_ROWS)
-    accumulator = project_int8(
-        input_ptr,
-        weight_ptr,
-        input_row_start + copy_positions,
-        head * _GL_HEAD_DIM + _column_features(columns),
-        gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
-        input_features,
-    )
-    accumulator = _by_feature(accumulator)
+    if isinstance(input_ptr, tma.tensor_descriptor):
+        gl.static_assert(isinstance(weight_ptr, tma.tensor_descriptor))
+        accumulator = _tma_projection.project_int8(
+            input_ptr,
+            weight_ptr,
+            input_row_start + first_row,
+            head,
+            input_features,
+            mma_layout,
+        )
+        accumulator = gl.convert_layout(accumulator, FEATURE_LAYOUT)
+        # Defer epilogue row-index materialization until after the TMA GEMM so the
+        # loop stays within the 255-register budget without tail-path spills.
+        positions = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, FEATURE_LAYOUT))
+        if mask_rows:
+            positions = gl.minimum(positions, logical_sequence_length - 1)
+    else:
+        gl.static_assert(not isinstance(weight_ptr, tma.tensor_descriptor))
+        positions = first_row + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, FEATURE_LAYOUT))
+        copy_positions = first_row + gl.arange(0, _GL_BLOCK_M, COPY_ROWS)
+        if mask_rows:
+            positions = gl.minimum(positions, logical_sequence_length - 1)
+            copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
+        columns = gl.arange(0, _GL_HEAD_DIM, COPY_ROWS)
+        accumulator = project_int8(
+            input_ptr,
+            weight_ptr,
+            input_row_start + copy_positions,
+            head * _GL_HEAD_DIM + _column_features(columns),
+            gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
+            input_features,
+        )
+        accumulator = _by_feature(accumulator)
 
     features = gl.arange(0, _GL_HEAD_DIM, gl.SliceLayout(0, FEATURE_LAYOUT))
     input_scale = gl.load(input_scale_ptr + input_row_start + positions)
@@ -384,20 +406,32 @@ def project_value_tiles(
         [1, 8, 1], [1, 8, 4], [tiles, 1, _GL_NUM_WARPS // tiles], [1, 2, 0]
     )
     input_row_start = batch * logical_sequence_length
-    copy_positions = row_block * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, COPY_ROWS)
-    if mask_rows:
-        copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
     mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[2, 0], warps_per_cta=[2, 2], instr_shape=[16, 8]
     )
-    accumulator = project_int8(
-        input_ptr,
-        weight_ptr,
-        input_row_start + copy_positions,
-        head * _GL_HEAD_DIM + gl.arange(0, _GL_HEAD_DIM, COPY_ROWS),
-        gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
-        input_features,
-    )
+    if isinstance(input_ptr, tma.tensor_descriptor):
+        gl.static_assert(isinstance(weight_ptr, tma.tensor_descriptor))
+        accumulator = _tma_projection.project_int8(
+            input_ptr,
+            weight_ptr,
+            input_row_start + row_block * _GL_BLOCK_M,
+            head,
+            input_features,
+            mma_layout,
+        )
+    else:
+        gl.static_assert(not isinstance(weight_ptr, tma.tensor_descriptor))
+        copy_positions = row_block * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, COPY_ROWS)
+        if mask_rows:
+            copy_positions = gl.minimum(copy_positions, logical_sequence_length - 1)
+        accumulator = project_int8(
+            input_ptr,
+            weight_ptr,
+            input_row_start + copy_positions,
+            head * _GL_HEAD_DIM + gl.arange(0, _GL_HEAD_DIM, COPY_ROWS),
+            gl.zeros([_GL_BLOCK_M, _GL_HEAD_DIM], gl.int32, mma_layout),
+            input_features,
+        )
 
     tile_rows_layout: gl.constexpr = gl.SliceLayout(2, layout)
     tile_offsets = row_block * tiles + gl.arange(0, tiles, gl.SliceLayout(1, tile_rows_layout))

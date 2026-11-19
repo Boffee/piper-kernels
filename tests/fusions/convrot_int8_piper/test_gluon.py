@@ -1,21 +1,26 @@
 """SM89 and SM120 project dense D128 heads with Gluon kernels, and other shapes with Triton."""
 
 from contextlib import nullcontext
+from dataclasses import replace
 from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from _nvidia_resources import PROJECTION_SPILL_STORE_BUDGET_BYTES, compile_with_spill_stores
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
+from triton.experimental.gluon import language as gl
 from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.convrot_int8_piper import key, query, value
 from piper_kernels.fusions.convrot_int8_piper import triton as projection
-from piper_kernels.fusions.convrot_int8_piper._nvidia import dispatch, gluon_async_copy, policy
+from piper_kernels.fusions.convrot_int8_piper._nvidia import dispatch, gluon, policy
+from piper_kernels.fusions.convrot_int8_projection._nvidia import _tma_projection
 
 _SM89_TARGET = AcceleratorTarget("cuda", "sm89")
+_SM120_TARGET = AcceleratorTarget("cuda", "sm120")
 _NVIDIA_TARGETS = [AcceleratorTarget("cuda", architecture) for architecture in ("sm89", "sm120")]
 # Only Q and K produce Q/K scales, so V runs once.
 _OPERATION_GRANULARITIES = [
@@ -84,7 +89,7 @@ def _launch(
     **options,
 ):
     input_qdata, input_scale, weight_qdata, weight_scale, *_ = operands
-    if module in (dispatch, gluon_async_copy) and "execution_plan" not in options:
+    if module in (dispatch, gluon) and "execution_plan" not in options:
         metadata = {
             "operation": operation,
             "head_dim": out[0].shape[2 if operation == "value" else 3],
@@ -143,7 +148,7 @@ def test_every_target_uses_gluon_only_for_supported_projections(
 ):
     monkeypatch.setattr(dispatch.linear_gluon, "operands_aligned", lambda *operands: True)
     gluon_launch, triton_launch = Mock(), Mock()
-    monkeypatch.setattr(gluon_async_copy, f"project_{operation}", gluon_launch)
+    monkeypatch.setattr(gluon, f"project_{operation}", gluon_launch)
     monkeypatch.setattr(projection, f"project_{operation}", triton_launch)
     with FakeTensorMode():
         operands = _operands(
@@ -160,7 +165,12 @@ def test_every_target_uses_gluon_only_for_supported_projections(
     idle.assert_not_called()
     assert launched.call_args.kwargs["out"] is out
     plan = launched.call_args.kwargs["execution_plan"]
-    assert plan.kernel == ("gluon_async_copy" if uses_gluon else "triton")
+    expected_kernel = (
+        ("gluon_tma" if target.is_cuda_capability(12, 0) else "gluon_async_copy")
+        if uses_gluon
+        else "triton"
+    )
+    assert plan.kernel == expected_kernel
     if not uses_gluon:
         assert plan is policy.select_execution_plan(
             target,
@@ -169,6 +179,25 @@ def test_every_target_uses_gluon_only_for_supported_projections(
             head_dim=128,
             operands_aligned=True,
         )
+
+
+@pytest.mark.parametrize("target", _NVIDIA_TARGETS, ids=str)
+@pytest.mark.parametrize("operand_index", [0, 2], ids=["input", "weight"])
+def test_execution_plan_requires_contiguous_operands(target, operand_index):
+    operands = list(_operands("cpu", batch=1, sequence=192, heads=2))
+    operands[0] = operands[0][:, ::2, :] if operand_index == 0 else operands[0]
+    operands[2] = operands[2][::2, :] if operand_index == 2 else operands[2]
+    assert dispatch.linear_gluon.operands_aligned(operands[0], operands[2])
+    assert not operands[operand_index].is_contiguous()
+    plan = dispatch.default_execution_plan(
+        operands[0],
+        operands[2],
+        target=target,
+        operation="query",
+        head_dim=128,
+        rotary_dim=96,
+    )
+    assert plan.kernel == "triton"
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
@@ -211,28 +240,26 @@ def test_other_nvidia_targets_have_no_dense_projection_policy(architecture):
     _OPERATION_GRANULARITIES,
 )
 def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, granularity):
-    function = getattr(gluon_async_copy, f"_{operation}_kernel")
+    function = getattr(gluon, f"_{operation}_kernel")
     kernel = MagicMock()
-    monkeypatch.setattr(gluon_async_copy, function.__name__, kernel)
+    monkeypatch.setattr(gluon, function.__name__, kernel)
     project_value_chunk_means = Mock()
     monkeypatch.setattr(
-        gluon_async_copy.shared_projection,
+        gluon.shared_projection,
         "project_value_chunk_means",
         project_value_chunk_means,
     )
     guard = Mock(side_effect=lambda device: nullcontext())
-    monkeypatch.setattr(gluon_async_copy, "device_context", guard)
+    monkeypatch.setattr(gluon, "device_context", guard)
     encode_key = Mock()
-    monkeypatch.setattr(
-        gluon_async_copy.piper_quantization, "prepare_chunk_centered_key", encode_key
-    )
+    monkeypatch.setattr(gluon.piper_quantization, "prepare_chunk_centered_key", encode_key)
     sequence, window = 448, (128, 300)
     rows = window[1] if operation == "query" else sequence
     storage = (rows + 63) // 64 * 64
     with FakeTensorMode():
         operands = _operands("cuda:1", sequence=sequence)
         out = _outputs(operation, "cuda:1", rows=rows, granularity=granularity)
-        _launch(gluon_async_copy, operation, operands, out, window=window, causal=False)
+        _launch(gluon, operation, operands, out, window=window, causal=False)
 
     guard.assert_called_once_with(torch.device("cuda:1"))
     # Heads vary fastest, then 128-row blocks, then the batch.
@@ -280,6 +307,48 @@ def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, 
         encode_key.assert_not_called()
 
 
+@pytest.mark.parametrize("operation", ["query", "key", "value"])
+def test_sm120_tma_launches_use_descriptors_and_skip_empty_batches(monkeypatch, operation):
+    function = getattr(gluon, f"_{operation}_kernel")
+    kernel = MagicMock()
+    monkeypatch.setattr(gluon, function.__name__, kernel)
+    monkeypatch.setattr(gluon, "device_context", lambda device: nullcontext())
+    monkeypatch.setattr(gluon.shared_projection, "project_value_chunk_means", Mock())
+    monkeypatch.setattr(gluon.piper_quantization, "prepare_chunk_centered_key", Mock())
+    descriptors = [object(), object()]
+    descriptor_builder = Mock(side_effect=descriptors)
+    monkeypatch.setattr(_tma_projection, "build_matrix_descriptor", descriptor_builder)
+    tma_plan = policy.select_execution_plan(
+        _SM120_TARGET,
+        operation=operation,
+        input_features=256,
+        head_dim=128,
+        rotary_dim=96,
+        operands_aligned=True,
+    )
+    assert tma_plan.kernel == "gluon_tma"
+    with FakeTensorMode():
+        operands = _operands("cuda:1", batch=1, sequence=128)
+        out = _outputs(operation, "cuda:1", rows=128, batch=1)
+        _launch(gluon, operation, operands, out, window=(0, 128), execution_plan=tma_plan)
+    assert descriptor_builder.call_count == 2
+    kernel.__getitem__.return_value.assert_called_once()
+    call = kernel.__getitem__.return_value.call_args
+    assert call.args[0] is descriptors[0]
+    assert call.args[2] is descriptors[1]
+
+    descriptor_builder.reset_mock()
+    kernel.reset_mock()
+    with FakeTensorMode():
+        empty_operands = _operands("cuda:1", batch=0, sequence=128)
+        empty_out = _outputs(operation, "cuda:1", rows=128, batch=0)
+        _launch(
+            gluon, operation, empty_operands, empty_out, window=(0, 128), execution_plan=tma_plan
+        )
+    descriptor_builder.assert_not_called()
+    kernel.__getitem__.assert_not_called()
+
+
 # Register allocation depends on the specialized input width, and small widths can
 # hide spills that production widths show, so kernels compile at H3's 5376 features.
 _INPUT_FEATURES = 5376
@@ -293,14 +362,15 @@ _POINTER_TYPES = {
     "norm_weight_ptr": "*bf16",
     "bias_ptr": "*bf16",
 }
+_TMA_DESCRIPTOR_SIGNATURE = (
+    f"tensordesc<i8[128,64],{gl.NVMMASharedLayout.get_default_for([128, 64], gl.int8)!r}>"
+)
 
 
-@pytest.mark.parametrize("architecture", [89, 120])
-@pytest.mark.parametrize(("operation", "variant"), _COMPILE_VARIANTS)
-def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, variant):
-    function = getattr(gluon_async_copy, f"_{operation}_kernel")
+def _compile_dense_kernel(architecture, operation, variant, *, input_features, use_tma):
+    function = getattr(gluon, f"_{operation}_kernel")
     constants = {
-        "input_features": _INPUT_FEATURES,
+        "input_features": input_features,
         "heads": 3,
         "rotary_dim": 96,
         "norm_epsilon": 1e-5,
@@ -318,6 +388,8 @@ def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, 
         omitted_norm = name == "norm_weight_ptr" and variant == "bias_without_norm"
         if omitted_bias or omitted_norm:
             constants[name], signature[name] = None, "constexpr"
+        elif use_tma and name in ("input_ptr", "weight_ptr"):
+            signature[name] = _TMA_DESCRIPTOR_SIGNATURE
         elif name.endswith("_ptr"):
             signature[name] = _POINTER_TYPES.get(name, "*fp32")
             # Launches specialize PyTorch's 16-byte-aligned allocations; cp.async relies on it.
@@ -338,6 +410,20 @@ def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, 
     assert bool(truncations) is (operation != "query")
     if operation == "key":
         assert all("f32" in line and "bf16" in line for line in truncations)
+
+
+@pytest.mark.parametrize("architecture", [89, 120])
+@pytest.mark.parametrize(("operation", "variant"), _COMPILE_VARIANTS)
+def test_gluon_kernels_compile_for_two_programs_per_sm(architecture, operation, variant):
+    _compile_dense_kernel(
+        architecture, operation, variant, input_features=_INPUT_FEATURES, use_tma=False
+    )
+
+
+@pytest.mark.parametrize("input_features", [_INPUT_FEATURES, 4096])
+@pytest.mark.parametrize(("operation", "variant"), _COMPILE_VARIANTS)
+def test_sm120_tma_kernels_compile_for_two_programs_per_sm(input_features, operation, variant):
+    _compile_dense_kernel(120, operation, variant, input_features=input_features, use_tma=True)
 
 
 def _assert_matches(operation, actual, expected):
@@ -410,6 +496,43 @@ def test_gluon_projections_match_the_triton_launchers(operation, granularity, ca
         **options,
         **triton_options,
     )
-    _launch(gluon_async_copy, operation, operands, actual, **options)
+    _launch(gluon, operation, operands, actual, **options)
 
     _assert_matches(operation, actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize(("operation", "granularity"), _OPERATION_GRANULARITIES)
+@pytest.mark.parametrize("input_features", [64, 128, 192, 320, 4096, 5376])
+def test_sm120_tma_projections_match_async_copy(operation, granularity, input_features):
+    torch.manual_seed(1913 + input_features)
+    batch, sequence, heads = 2, 193, 3
+    operands = _operands(
+        "cuda", batch=batch, sequence=sequence, heads=heads, input_features=input_features
+    )
+    window = (64, 129)
+    rows = window[1] if operation == "query" else sequence
+    allocation = {"rows": rows, "batch": batch, "heads": heads, "granularity": granularity}
+    plan = dispatch.default_execution_plan(
+        operands[0], operands[2], operation=operation, head_dim=128, rotary_dim=96
+    )
+    assert plan.kernel == "gluon_tma"
+    actual = _outputs(operation, "cuda", **allocation)
+    expected = _outputs(operation, "cuda", **allocation)
+    _launch(dispatch, operation, operands, actual, window=window, execution_plan=plan)
+    _launch(
+        dispatch,
+        operation,
+        operands,
+        expected,
+        window=window,
+        execution_plan=replace(plan, kernel="gluon_async_copy"),
+    )
+    if operation == "query":
+        assert torch.equal(actual[0].view(torch.uint8), expected[0].view(torch.uint8))
+        # Triton's default FP fusion can shift an epilogue FMA by 1 ULP at small K.
+        assert int((actual[1].view(torch.int32) - expected[1].view(torch.int32)).abs().max()) <= 1
+    else:
+        for left, right in zip(actual, expected, strict=True):
+            assert torch.equal(left.view(torch.uint8), right.view(torch.uint8))

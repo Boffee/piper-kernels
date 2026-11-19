@@ -34,6 +34,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   BF16 tensor-core `value_mean` accumulation and packed FP32 recurrence FMAs slightly
   change `D=128` rounding within INT8 tolerances, while `D=64` and SM8x outputs are
   unchanged.
+- On RTX 5090 (SM120), `D=128` `convrot_int8_sparse_piper` and `convrot_int8_piper`
+  Q/K/V projections use TMA operand loads across all `K64`-aligned input widths,
+  running 7–10% faster on standalone 110K-token sparse Q/K/V phases and up to 1.3%
+  faster end-to-end in compiled dense and sparse pipelines with unchanged peak memory.
+  Sparse Q/K/V and dense K/V outputs are bitwise-identical, while dense Q scales stay
+  within 1 ULP under Triton's default FP fusion with identical INT8 codes.
 
 ### Removed
 

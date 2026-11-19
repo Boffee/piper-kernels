@@ -1,8 +1,13 @@
 """Projection choices shared by the fused ConvRot INT8 dense and sparse Piper fusions.
 
-The Gluon kernels run the SM8x ConvRot INT8 GEMM's ``cp.async`` pipeline. SM8x plans
-follow measurements on SM89, which represents the family; SM120 runs the same kernels.
+The Gluon kernels run the SM8x ``cp.async`` pipeline and use SM120 TMA operand
+loads when targeting exact SM120. SM8x plans follow measurements on SM89, which
+represents the family.
 """
+
+from dataclasses import replace
+
+from piper_kernels._triton.targets import AcceleratorTarget
 
 from ._plan import (
     GLUON_BLOCK_K,
@@ -27,7 +32,7 @@ SM8X_TRITON_EXECUTION_PLAN = NvidiaExecutionPlan(
     # The compact mean projection needs more CTAs than the full matrix projection.
     value_mean_block_n=32,
 )
-_GLUON_EXECUTION_PLAN = NvidiaExecutionPlan(
+_GLUON_ASYNC_COPY_EXECUTION_PLAN = NvidiaExecutionPlan(
     block_m=GLUON_BLOCK_M,
     block_k=GLUON_BLOCK_K,
     heads_per_program=1,
@@ -37,9 +42,11 @@ _GLUON_EXECUTION_PLAN = NvidiaExecutionPlan(
     value_mean_block_n=32,
     kernel="gluon_async_copy",
 )
+_GLUON_TMA_EXECUTION_PLAN = replace(_GLUON_ASYNC_COPY_EXECUTION_PLAN, kernel="gluon_tma")
 
 
 def select_execution_plan(
+    target: AcceleratorTarget,
     *,
     operation: ProjectionOperation,
     input_features: int,
@@ -48,11 +55,11 @@ def select_execution_plan(
     operands_aligned: bool,
     triton_execution_plan: NvidiaExecutionPlan,
 ) -> NvidiaExecutionPlan:
-    """Select the Gluon kernels when they cover the operands, else the target's Triton plan.
+    """Select SM120 TMA or SM8x async-copy Gluon kernels when supported, else Triton.
 
     Gluon's Q/K epilogue pairs RoPE features within registers, so Q/K need rotary widths
-    in multiples of 32; V has no RoPE. Whole K64 slices and 16-byte-aligned operands keep
-    its ``cp.async`` copies valid.
+    in multiples of 32; V has no RoPE. Whole K64 slices and 16-byte-aligned contiguous
+    operands keep ``cp.async`` and TMA loads valid.
     """
     if (
         head_dim == 128
@@ -60,5 +67,9 @@ def select_execution_plan(
         and (operation == "value" or rotary_dim % 32 == 0)
         and operands_aligned
     ):
-        return _GLUON_EXECUTION_PLAN
+        return (
+            _GLUON_TMA_EXECUTION_PLAN
+            if target.is_cuda_capability(12, 0)
+            else _GLUON_ASYNC_COPY_EXECUTION_PLAN
+        )
     return triton_execution_plan
