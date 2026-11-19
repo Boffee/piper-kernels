@@ -120,6 +120,10 @@ Applies across inference, dispatch, compiler/fake paths, and weight wrapping
   quantizers/converters (such as `from_hp(..., compute_per_tensor_scale=True)`)
   may validate derived scales as documented. Algorithmic guards for valid inputs
   (such as all-zero dynamic scaling) are still required.
+- Validate metadata before mutating in-place or caller-owned storage (`out=`,
+  in-place weight updates, fused residual targets). Never catch and retry a
+  failure after a kernel launch may have partially mutated output storage, and
+  always restore active device state on exceptions.
 
 ## Execution plans and schedules
 
@@ -168,17 +172,29 @@ compiler caches, and [ROCm regressions](environments.md#rocm-regressions).
 Build only what the test exercises, beside the subsystem it covers, using local
 `conftest.py` fixtures, temporary directories for filesystem state, and lazy
 backend imports. Test shared validation at its owning layer plus representative
-caller integration cases.
+caller integration cases, and verify storage ownership and untouched guard
+regions for in-place and caller-owned outputs.
 
-Always select backends through `AcceleratorTarget` (ROCm RX 9070 XT reports CUDA
-capability `(12, 0)`); use `exact_sm120_available()` from [`tests/_accelerators.py`](../tests/_accelerators.py)
+Keep expected results independent of the implementation under test, and assert
+the intended capability or path (selected kernel, fusion, instruction emission,
+or absence of fallback) so silently losing an optimization fails a test. Guard
+against compilation, dispatch, and resource regressions with deterministic
+counts and compiler invariants (compile/launch counts, spill/stack budgets,
+shared-memory limits) rather than wall-clock timings, which belong in
+`benchmarks/`.
+
+Keep helpers narrow and important inputs/assertions visible; split helpers that
+accumulate flags, format branches, or conditional expectations. Always select
+backends through `AcceleratorTarget` (ROCm RX 9070 XT reports CUDA capability
+`(12, 0)`); use `exact_sm120_available()` from [`tests/_accelerators.py`](../tests/_accelerators.py)
 when targeting NVIDIA SM120 specifically.
 
-Parametrize meaningful format/layout/device boundaries without duplicating
-identical paths. Preserve oracles, failure checks, and cold-import isolation in
-subprocess import checks. When trimming a matrix, state which retained tests cover
-the dropped cases, and compare performance using `--durations=20` across matched
-runs.
+Parametrize meaningful format/layout/tail/device boundaries without
+multiplying unrelated dimensions. Preserve distinct scenarios, failure checks,
+and cold-import isolation when consolidating — matching line or branch coverage
+alone does not prove test equivalence. When trimming a matrix, state which
+retained tests cover the dropped cases and compare `--durations=20` across
+repeated runs with matching hardware, dependency versions, and cache state.
 
 ## Commits and pull requests
 
@@ -195,14 +211,17 @@ the next commit, and verify full repo checks at the stack tip.
 
 Lead PR descriptions with the problem, then cover **Change** (design and what is
 removed), **Compatibility** (API, metadata, rounding/accumulation, storage changes),
-and **Validation** (commands, hardware/workloads, portable/compile vs on-device
-coverage). Link related issues and PRs.
+and **Validation** (commands, results, hardware/workloads, portable/compile vs
+on-device coverage, and what remains unvalidated such as untested GPU targets or
+OS paths; follow [benchmarks](../benchmarks/README.md) for performance claims).
+Link related issues and PRs.
 
 Add a **`CHANGELOG.md`** entry under `## [Unreleased]` (`Added`/`Changed`/`Fixed`,
 with `Breaking:` prefix when breaking) whenever callers can observe API, behavior,
 numerical, performance, mutation, or storage changes. Keep entries to 1–2 short
-sentences on caller impact and hardware/measurement scope; leave kernel
-mechanics and benchmark sweeps in PRs or READMEs.
+sentences on caller impact and hardware/measurement scope; update an existing
+unreleased entry in place when that feature changes again rather than stacking
+another bullet, and leave kernel mechanics and benchmark sweeps in PRs or READMEs.
 
 ## Releases
 
