@@ -36,10 +36,10 @@ from piper_kernels.linear.convrot.int8._nvidia.gluon_async_copy import (
     _accumulate as _accumulate_tiles,
 )
 
-from . import _tma_projection
+from . import _tma
 from ._plan import GLUON_BLOCK_K, GLUON_BLOCK_M, GLUON_NUM_STAGES, GLUON_NUM_WARPS
 
-resolve_operands = _tma_projection.resolve_operands
+resolve_operands = _tma.resolve_operands
 
 HEAD_DIM = 128
 BLOCK_M = GLUON_BLOCK_M
@@ -282,7 +282,7 @@ def project_rmsnorm_rope(
     )
     if isinstance(input_ptr, tma.tensor_descriptor):
         gl.static_assert(isinstance(weight_ptr, tma.tensor_descriptor))
-        accumulator = _tma_projection.project_int8(
+        accumulator = _tma.project_int8(
             input_ptr,
             weight_ptr,
             input_row_start + first_row,
@@ -411,7 +411,7 @@ def project_value_tiles(
     )
     if isinstance(input_ptr, tma.tensor_descriptor):
         gl.static_assert(isinstance(weight_ptr, tma.tensor_descriptor))
-        accumulator = _tma_projection.project_int8(
+        accumulator = _tma.project_int8(
             input_ptr,
             weight_ptr,
             input_row_start + row_block * _GL_BLOCK_M,
