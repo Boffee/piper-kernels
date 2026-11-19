@@ -10,8 +10,8 @@ from torch.fx.node import Argument
 
 from piper_kernels._distributed import _fx as distributed_fx
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+from piper_kernels.fusions.attention import _distributed_fold as distributed_fold
 from piper_kernels.fusions.residual_updates import _graph as residual_graph
-from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 from . import (
     distributed_output as distributed_output_operators,  # noqa: F401 - registers distributed output ops
@@ -32,103 +32,14 @@ _PROJECTED_QUERY_RS = (
 )
 
 
-def _match_exclusive_projected_output(
-    reduce_scatter_match: distributed_fx.SequenceReduceScatterMatch,
-) -> torch.fx.Node | None:
-    producer = reduce_scatter_match.input_node
-    if producer.op != "call_function" or producer.target is not _PROJECTED_QUERY_OUTPUT:
-        return None
-    consumer = (
-        reduce_scatter_match.split_node
-        if reduce_scatter_match.split_node is not None
-        else reduce_scatter_match.repack_node
-    )
-    if set(producer.users) != {consumer}:
-        return None
-    return producer
-
-
-def _fold_attention_reduce_scatter_residual(
-    graph: torch.fx.Graph,
-    call: torch.fx.Node,
-) -> bool:
-    residual_match = distributed_fx.match_distributed_residual_add(
-        call, residual_graph.RESIDUAL_ADD
-    )
-    if residual_match is None:
-        return False
-    base, reduce_scatter_match = residual_match
-    producer = _match_exclusive_projected_output(reduce_scatter_match)
-    base_val = preparation_sharing.tensor_metadata(base)
-    if producer is None or base_val is None:
-        return False
-    operands = residual_graph.bind_arguments(producer)
-    if operands.get("output_dtype", torch.bfloat16) is not base_val.dtype:
-        return False
-
-    values: dict[str, Argument] = {
-        "base": base,
-        "gate": cast(Argument, call.kwargs["gate"]),
-        "gate_indices": cast(Argument, call.kwargs["gate_indices"]),
-        "python_indexing": cast(Argument, call.kwargs["python_indexing"]),
-        "comm_group_size": reduce_scatter_match.group_size,
-        "comm_group_name": reduce_scatter_match.group_name,
-        **{name: value for name, value in operands.items() if name != "output_dtype"},
-    }
-    with graph.inserting_before(call):
-        result = residual_graph.call_functional(graph, _PROJECTED_QUERY_RS_RESIDUAL_ADD, values)
-    for user in list(call.users):
-        user.replace_all_uses_with(result)
-        graph.erase_node(user)
-    graph.erase_node(call)
-    distributed_fx.erase_sequence_reduce_scatter(graph, reduce_scatter_match)
-    if not producer.users:
-        graph.erase_node(producer)
-    return True
-
-
-def _fold_attention_reduce_scatter_standalone(
-    graph: torch.fx.Graph,
-    wait_node: torch.fx.Node,
-) -> bool:
-    reduce_scatter_match = distributed_fx.match_sequence_reduce_scatter(wait_node)
-    if reduce_scatter_match is None:
-        return False
-    producer = _match_exclusive_projected_output(reduce_scatter_match)
-    if producer is None:
-        return False
-    operands = residual_graph.bind_arguments(producer)
-    values = {
-        "comm_group_size": reduce_scatter_match.group_size,
-        "comm_group_name": reduce_scatter_match.group_name,
-        **operands,
-    }
-    with graph.inserting_before(wait_node):
-        replacement = distributed_fx.call_in_schema_order(graph, _PROJECTED_QUERY_RS, values)
-    replacement.meta = wait_node.meta.copy()
-    replacement.meta.pop("eager_input_vals", None)
-    wait_node.replace_all_uses_with(replacement)
-    distributed_fx.erase_sequence_reduce_scatter(graph, reduce_scatter_match)
-    if not producer.users:
-        graph.erase_node(producer)
-    return True
-
-
 def fold_distributed_attention_output(graph: torch.fx.Graph) -> bool:
     """Fold ``projected_query_attention_output -> reduce_scatter -> (optional) residual_add_``."""
-    if not distributed_fx.has_c10d_collectives(graph):
-        return False
-
-    changed = False
-    for node in list(graph.nodes):
-        changed = _fold_attention_reduce_scatter_residual(graph, node) or changed
-    for node in list(graph.nodes):
-        changed = _fold_attention_reduce_scatter_standalone(graph, node) or changed
-
-    if changed:
-        graph.eliminate_dead_code()
-        graph.lint()
-    return changed
+    return distributed_fold.fold_distributed_projected_output(
+        graph,
+        output_op=_PROJECTED_QUERY_OUTPUT,
+        reduce_scatter_op=_PROJECTED_QUERY_RS,
+        reduce_scatter_residual_op=_PROJECTED_QUERY_RS_RESIDUAL_ADD,
+    )
 
 
 def _find_exclusive_kv_pair(

@@ -122,6 +122,10 @@ def _run_projected_query_attention(  # noqa: PLR0913, PLR0917
     build_projector: Callable[[int], tuple[pipeline.ChunkProjector, tuple[torch.Tensor, ...]]],
     *,
     out: torch.Tensor | None = None,
+    global_row_offset: int = 0,
+    sequence_length: int | None = None,
+    context: attention.QuantizedContext | None = None,
+    query_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Run validated Q windows through attention and a chunk projector.
 
@@ -130,34 +134,38 @@ def _run_projected_query_attention(  # noqa: PLR0913, PLR0917
     attention then uses separate bounded buffers.
     """
     batch, heads, sequence, head_dim = query_shape
+    target_sequence = sequence if sequence_length is None else sequence_length
     query_chunk_rows = _schedule.select_query_chunk_rows(
-        query_shape,
+        (batch, heads, target_sequence, head_dim),
         input_qdata.device,
         query_chunk_rows,
         is_causal=is_causal,
     )
     backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
-    context = attention.prepare_quantized_context(
-        *context_operands,
-        query_length=sequence,
-        key_length=key_length,
-        is_causal=is_causal,
-    )
-    capacity = (min(query_chunk_rows, sequence) + 63) // 64 * 64
-    # Q scales follow the granularity of the validated K scales.
-    key, key_scale = context_operands[:2]
-    granularity = resolve_qk_quantization(key_scale, key.shape[2])
-    query_buffers = (
-        input_qdata.new_empty((batch, heads, capacity, head_dim)),
-        input_qdata.new_empty(
-            (batch, heads, count_query_scales(capacity, granularity)), dtype=torch.float32
-        ),
-    )
+    if context is None:
+        context = attention.prepare_quantized_context(
+            *context_operands,
+            query_length=sequence,
+            key_length=key_length,
+            is_causal=is_causal,
+        )
+    if query_buffers is None:
+        capacity = (min(query_chunk_rows, target_sequence) + 63) // 64 * 64
+        # Q scales follow the granularity of the validated K scales.
+        key, key_scale = context_operands[:2]
+        granularity = resolve_qk_quantization(key_scale, key.shape[2])
+        query_buffers = (
+            input_qdata.new_empty((batch, heads, capacity, head_dim)),
+            input_qdata.new_empty(
+                (batch, heads, count_query_scales(capacity, granularity)), dtype=torch.float32
+            ),
+        )
     project_chunk, retained = build_projector(query_chunk_rows)
 
     def launch_chunk(
         output: torch.Tensor, start: int, rows: int, _auxiliary: torch.Tensor | None
     ) -> None:
+        global_start = global_row_offset + start
         backend.project_query(
             input_qdata,
             input_scale,
@@ -169,16 +177,16 @@ def _run_projected_query_attention(  # noqa: PLR0913, PLR0917
             norm_epsilon,
             softmax_scale,
             query_bias,
-            chunk_start=start,
+            chunk_start=global_start,
             chunk_rows=rows,
             out=query_buffers,
         )
         attention.launch_quantized_attention_into(
-            context, *query_buffers, output.transpose(1, 2), global_row_offset=start
+            context, *query_buffers, output.transpose(1, 2), global_row_offset=global_start
         )
 
     return pipeline.run_chunked_attention_output(
-        (batch, sequence, heads, head_dim),
+        (batch, target_sequence, heads, head_dim),
         input_qdata.device,
         output_features,
         query_chunk_rows,
@@ -424,6 +432,8 @@ def _validate_residual_add_inputs(  # noqa: PLR0913, PLR0917
     batch, _, sequence, _ = shape
     if base.ndim != 3 or base.shape[:2] != (batch, sequence):
         raise ValueError("dense Piper residual base must have one row per query token")
+    if base.device != input_qdata.device:
+        raise ValueError("dense Piper residual base must share the input storage device")
     residual_add = ResidualAdd(
         base=base,
         gate=gate,
@@ -618,3 +628,9 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
         head_dim=head_dim,
         query_chunk_rows=query_chunk_rows,
     )
+
+
+validate_output_inputs = _validate_inputs
+run_projected_query_attention = _run_projected_query_attention
+
+__all__: list[str] = []

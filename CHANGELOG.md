@@ -7,15 +7,17 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
-- Sequence-sharded (`Shard(1)`) ConvRot INT8 and fused sparse Piper attention
-  blocks compiled with `convrot_int8_compile_options` and
-  `convrot_int8_sparse_piper_compile_options` now fold PyTorch TP+SP collective
-  boundaries automatically (rounding peer and local rank residual updates into
-  `base` in two steps on 64-token rank-aligned sequences when paired with
-  `residual_updates_compile_options`). On 2x RX 9070 XT over `piper_relay`,
-  compiled 8-block MiniMax-H3 hybrid TP+SP runs 1.90x faster than single-GPU
-  streaming at 16K tokens (41.07 vs 77.93 ms/block, 7-iteration median) with
-  lower peak memory (1587 vs 1644 MiB).
+- Sequence-sharded (`Shard(1)`) ConvRot INT8 linears and fused dense
+  (`convrot_int8_piper_compile_options(..., fuse_output=True)`) or sparse Piper
+  attention blocks fold PyTorch TP+SP collective boundaries automatically
+  (rounding peer and local rank residual updates into `base` in two steps on
+  128-token dense or 64-token sparse rank-aligned sequences when paired with
+  `residual_updates_compile_options`). On 2x RX 9070 XT over `piper_relay` at
+  16K tokens, compiled 8-block MiniMax-H3 hybrid TP+SP runs 1.90x faster than
+  single-GPU streaming for sparse attention (41.07 vs 77.93 ms/block,
+  7-iteration median; peak 1587 vs 1644 MiB) and 1.78x faster non-causal /
+  1.74x causal for dense attention (67.52 vs 120.44 ms/block and 53.98 vs
+  93.81 ms/block, 5-iteration median; peak 1500 vs 1616 MiB).
 
 ### Changed
 

@@ -30,12 +30,22 @@ from torch.distributed.tensor.parallel import (
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import SparsePiperAttention, sparse_piper_coarse_residual
+from piper_kernels import SparsePiperAttention, piper_attention, sparse_piper_coarse_residual
 from piper_kernels._distributed import _comm as distributed_comm
 from piper_kernels._distributed import _fx as distributed_fx
+from piper_kernels._distributed import _peer_exchange as peer_exchange
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
+    count_key_scales,
+)
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+from piper_kernels.attention.piper_attention import _quantized_dispatch as dense_quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
+from piper_kernels.fusions.convrot_int8_piper import _backend as dense_fusion_backend
+from piper_kernels.fusions.convrot_int8_piper import _distributed_compile as dense_dist_compile
+from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
+from piper_kernels.fusions.convrot_int8_piper import distributed_output as dense_distributed_output
 from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import NvidiaExecutionPlan
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend as fusion_backend,
@@ -677,15 +687,15 @@ def _make_distributed_output_meta_args(
 
 
 def test_distributed_output_validation_and_fake() -> None:
-    assert distributed_output._validate_distributed_sequence(128, 2, "tp_0") == 64
+    assert peer_exchange.validate_distributed_sequence(128, 2, "tp_0") == 64
     with pytest.raises(ValueError, match="comm_group_size >= 2"):
-        distributed_output._validate_distributed_sequence(128, 1, "tp_0")
+        peer_exchange.validate_distributed_sequence(128, 1, "tp_0")
     with pytest.raises(ValueError, match="comm_group_size >= 2"):
-        distributed_output._validate_distributed_sequence(128, True, "tp_0")
+        peer_exchange.validate_distributed_sequence(128, True, "tp_0")
     with pytest.raises(TypeError, match="string comm_group_name"):
-        distributed_output._validate_distributed_sequence(128, 2, 123)  # type: ignore[arg-type]
+        peer_exchange.validate_distributed_sequence(128, 2, 123)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="divide evenly"):
-        distributed_output._validate_distributed_sequence(131, 2, "tp_0")
+        peer_exchange.validate_distributed_sequence(131, 2, "tp_0")
 
     with FakeTensorMode():
         valid_args, valid_base = _make_distributed_output_meta_args()
@@ -1391,6 +1401,378 @@ def test_fold_distributed_attention_output_fx_shared_negative(fake_triton_device
         assert not sparse_dist_compile.fold_distributed_attention_output(graph)
 
 
+def _make_dense_distributed_output_meta_args(
+    *,
+    key_device: str | torch.device = "meta",
+    base_device: str | torch.device = "meta",
+    batch: int = 1,
+    seq: int = 256,
+    local_seq: int = 128,
+    softmax_scale: float = 0.125,
+    query_chunk_rows: int = 128,
+    output_dtype: torch.dtype = torch.bfloat16,
+    fill_tensors: bool = False,
+) -> tuple[tuple[Any, ...], dict[str, Any], torch.Tensor]:
+    make = torch.zeros if fill_tensors else torch.empty
+    heads, head_dim, hidden = 2, 64, 128
+    storage = (seq + 63) // 64 * 64
+    chunks = (seq + 1023) // 1024
+    num_key_scales = count_key_scales(storage, "per_warp")
+    base = make((batch, local_seq, hidden), device=base_device, dtype=output_dtype)
+    gate = make((4, hidden), device=base_device, dtype=output_dtype)
+    gate_indices = torch.zeros(batch * local_seq, device=base_device, dtype=torch.int64)
+    input_qdata = make((batch, seq, hidden), device=key_device, dtype=torch.int8)
+    input_scale = (
+        torch.ones((batch, seq), device=key_device, dtype=torch.float32)
+        if fill_tensors
+        else torch.empty((batch, seq), device=key_device, dtype=torch.float32)
+    )
+    key = make((batch, heads, storage, head_dim), device=key_device, dtype=torch.int8)
+    args = (
+        base,
+        gate,
+        gate_indices,
+        False,
+        2,
+        "tp_0",
+        input_qdata,
+        input_scale,
+        make((hidden, hidden), device=key_device, dtype=torch.int8),
+        make((hidden, 1), device=key_device, dtype=torch.float32),
+        make((head_dim,), device=key_device, dtype=output_dtype),
+        make((seq, 32), device=key_device, dtype=torch.float32),
+        make((seq, 32), device=key_device, dtype=torch.float32),
+        1e-5,
+        softmax_scale,
+        None,
+        key,
+        make((batch, heads, num_key_scales), device=key_device, dtype=torch.float32),
+        make((batch, heads, chunks, head_dim), device=key_device, dtype=torch.float32),
+        make((batch, heads, head_dim, storage), device=key_device, dtype=torch.int8),
+        make((batch, heads, storage), device=key_device, dtype=torch.float32),
+        make((batch, heads, storage), device=key_device, dtype=torch.float32),
+        make((batch, heads, chunks, head_dim), device=key_device, dtype=torch.float32),
+        seq,
+        False,
+        make((hidden, heads * head_dim), device=key_device, dtype=torch.int8),
+        make((hidden, 1), device=key_device, dtype=torch.float32),
+        None,
+        64,
+        None,
+    )
+    kwargs = {"head_dim": head_dim, "query_chunk_rows": query_chunk_rows}
+    return args, kwargs, base
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("residual", [True, False])
+def test_fold_dense_distributed_attention_output_fx(
+    fake_triton_device: None,
+    batch: int,
+    residual: bool,
+) -> None:
+    with FakeTensorMode():
+        graph = torch.fx.Graph()
+        names = (
+            "iq",
+            "isc",
+            "qw",
+            "qs",
+            "cos",
+            "sin",
+            "k0",
+            "k1",
+            "k2",
+            "v0",
+            "v1",
+            "v2",
+            "v3",
+            "ow",
+            "os",
+        )
+        p = {name: graph.placeholder(name) for name in names}
+        full_val = torch.empty((batch, 256, 128), device=_DEVICE, dtype=torch.bfloat16)
+        attn_out = graph.call_function(
+            _ops.convrot_int8_piper_projected_query_attention_output.default,
+            args=(
+                p["iq"],
+                p["isc"],
+                p["qw"],
+                p["qs"],
+                None,
+                p["cos"],
+                p["sin"],
+                1e-5,
+                0.088,
+                None,
+                p["k0"],
+                p["k1"],
+                p["k2"],
+                p["v0"],
+                p["v1"],
+                p["v2"],
+                p["v3"],
+                256,
+                False,
+                torch.bfloat16,
+                p["ow"],
+                p["os"],
+                None,
+                64,
+                None,
+            ),
+            kwargs={"head_dim": 64},
+        )
+        attn_out.meta["val"] = full_val
+        wait_node = _add_sequence_reduce_scatter(
+            graph, attn_out, batch=batch, local_seq=128, hidden=128
+        )
+        if residual:
+            base = graph.placeholder("base")
+            gate = graph.placeholder("gate")
+            idx = graph.placeholder("idx")
+            base_val = torch.empty((batch, 128, 128), device=_DEVICE, dtype=torch.bfloat16)
+            base.meta["val"] = base_val
+            call = graph.call_function(
+                _AUTO_FUNCTIONALIZED,
+                args=(_RESIDUAL_ADD,),
+                kwargs={
+                    "base": base,
+                    "update": wait_node,
+                    "gate": gate,
+                    "gate_indices": idx,
+                    "python_indexing": False,
+                },
+            )
+            call.meta["val"] = (None, base_val)
+            out_node = graph.call_function(operator.getitem, args=(call, 1))
+            out_node.meta["val"] = base_val
+        else:
+            out_node = wait_node
+        graph.output(out_node)
+
+        assert dense_dist_compile.fold_distributed_attention_output(graph)
+        graph.lint()
+        assert not distributed_fx.has_c10d_collectives(graph)
+        targets = [n.target for n in graph.nodes if n.op == "call_function"]
+        assert _ops.convrot_int8_piper_projected_query_attention_output.default not in targets
+        if residual:
+            expected_res_op = dense_dist_compile._PROJECTED_QUERY_RS_RESIDUAL_ADD
+            assert any(
+                n.target is _AUTO_FUNCTIONALIZED and n.args and n.args[0] is expected_res_op
+                for n in graph.nodes
+            )
+        else:
+            assert (
+                _ops.convrot_int8_piper_projected_query_attention_reduce_scatter.default in targets
+            )
+
+
+def test_fold_dense_distributed_attention_output_fx_negative(fake_triton_device: None) -> None:
+    with FakeTensorMode():
+        # Non-exclusive producer rejects folding.
+        g_shared = torch.fx.Graph()
+        p = g_shared.placeholder("p")
+        attn_out = g_shared.call_function(
+            _ops.convrot_int8_piper_projected_query_attention_output.default,
+            args=tuple([p] * 25),
+            kwargs={"head_dim": 64},
+        )
+        attn_out.meta["val"] = torch.empty((1, 256, 128), device=_DEVICE, dtype=torch.bfloat16)
+        wait_node = _add_sequence_reduce_scatter(
+            g_shared, attn_out, batch=1, local_seq=128, hidden=128
+        )
+        extra = g_shared.call_function(_aten.neg.default, args=(attn_out,))
+        g_shared.output((wait_node, extra))
+        assert not dense_dist_compile.fold_distributed_attention_output(g_shared)
+
+        # Residual dtype mismatch rejects folding into residual_add_.
+        g_dtype = torch.fx.Graph()
+        arg_nodes = [g_dtype.placeholder(f"p{idx}") for idx in range(25)]
+        arg_nodes[19] = torch.bfloat16  # type: ignore[assignment]
+        mismatch_out = g_dtype.call_function(
+            _ops.convrot_int8_piper_projected_query_attention_output.default,
+            args=tuple(arg_nodes),
+            kwargs={"head_dim": 64},
+        )
+        mismatch_out.meta["val"] = torch.empty((1, 256, 128), device=_DEVICE, dtype=torch.bfloat16)
+        wait_mismatch = _add_sequence_reduce_scatter(
+            g_dtype, mismatch_out, batch=1, local_seq=128, hidden=128
+        )
+        base = g_dtype.placeholder("base")
+        base.meta["val"] = torch.empty((1, 128, 128), device=_DEVICE, dtype=torch.float16)
+        call = g_dtype.call_function(
+            _AUTO_FUNCTIONALIZED,
+            args=(_RESIDUAL_ADD,),
+            kwargs={
+                "base": base,
+                "update": wait_mismatch,
+                "gate": arg_nodes[0],
+                "gate_indices": arg_nodes[1],
+                "python_indexing": False,
+            },
+        )
+        out = g_dtype.call_function(operator.getitem, args=(call, 1))
+        g_dtype.output(out)
+        # Residual fold skips on dtype mismatch, then standalone fold rewrites the reduce-scatter.
+        assert dense_dist_compile.fold_distributed_attention_output(g_dtype)
+        targets = [n.target for n in g_dtype.nodes if n.op == "call_function"]
+        assert dense_dist_compile._PROJECTED_QUERY_RS in targets
+        assert not any(
+            n.target is _AUTO_FUNCTIONALIZED
+            and n.args
+            and n.args[0] is dense_dist_compile._PROJECTED_QUERY_RS_RESIDUAL_ADD
+            for n in g_dtype.nodes
+        )
+
+
+def test_dense_distributed_output_validation_and_fake() -> None:
+    with FakeTensorMode():
+        args, kwargs, valid_base = _make_dense_distributed_output_meta_args()
+        assert (
+            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
+                *args, **kwargs
+            )
+            is None
+        )
+        rs_args = (*args[4:25], torch.bfloat16, *args[25:])
+        standalone = dense_distributed_output._projected_query_attention_reduce_scatter_op_fake(
+            *rs_args, **kwargs
+        )
+        assert standalone.shape == (1, 128, 128)
+        assert standalone.dtype is torch.bfloat16
+
+        # Batch == 0 validates metadata cleanly.
+        empty_args, empty_kw, _ = _make_dense_distributed_output_meta_args(batch=0)
+        assert (
+            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
+                *empty_args, **empty_kw
+            )
+            is None
+        )
+        empty_rs = (*empty_args[4:25], torch.bfloat16, *empty_args[25:])
+        assert dense_distributed_output._projected_query_attention_reduce_scatter_op_fake(
+            *empty_rs, **empty_kw
+        ).shape == (0, 128, 128)
+
+        wrong_rows_args, wrong_kw, _ = _make_dense_distributed_output_meta_args(local_seq=256)
+        with pytest.raises(ValueError, match="local rank share"):
+            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
+                *wrong_rows_args, **wrong_kw
+            )
+
+        wrong_dev_args, dev_kw, _ = _make_dense_distributed_output_meta_args(
+            key_device="meta", base_device="cpu"
+        )
+        with pytest.raises(ValueError, match="storage device"):
+            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
+                *wrong_dev_args, **dev_kw
+            )
+
+        bad_chunk_args, bad_chunk_kw, _ = _make_dense_distributed_output_meta_args(
+            query_chunk_rows=64
+        )
+        with pytest.raises(ValueError, match="multiples of 128"):
+            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
+                *bad_chunk_args, **bad_chunk_kw
+            )
+
+        bad_rs_args = (1, "tp_0", *rs_args[2:])
+        with pytest.raises(ValueError, match="comm_group_size >= 2"):
+            dense_distributed_output._projected_query_attention_reduce_scatter_op_fake(
+                *bad_rs_args, **kwargs
+            )
+        odd_args, odd_kw, _ = _make_dense_distributed_output_meta_args(seq=257, local_seq=128)
+        with pytest.raises(ValueError, match="divide evenly"):
+            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
+                *odd_args, **odd_kw
+            )
+        assert valid_base.shape == (1, 128, 128)
+
+
+def test_dense_distributed_output_pre_mutation_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeGroup:
+        def rank(self) -> int:
+            return 0
+
+        def size(self) -> int:
+            return 2
+
+    comm_calls = 0
+
+    def fail_comm(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal comm_calls
+        comm_calls += 1
+        raise AssertionError("collective launched despite invalid metadata or empty batch")
+
+    monkeypatch.setattr(distributed_comm, "resolve_process_group", lambda _name: _FakeGroup())
+    monkeypatch.setattr(dist, "all_gather", fail_comm)
+    monkeypatch.setattr(dist, "reduce_scatter", fail_comm)
+    monkeypatch.setattr(dist, "reduce_scatter_tensor", fail_comm)
+    monkeypatch.setattr(
+        convrot_linear_backend, "require_linear_backend", lambda *_a, **_kw: object()
+    )
+    monkeypatch.setattr(
+        dense_fusion_backend, "require_projection_backend", lambda *_a, **_kw: object()
+    )
+
+    cases = [
+        ("softmax scale", {"softmax_scale": 0.0}),
+        ("multiples of 128", {"query_chunk_rows": 64}),
+        ("storage device", {"key_device": "meta", "base_device": "cpu"}),
+        ("local rank share", {"local_seq": 64}),
+    ]
+    for pattern, overrides in cases:
+        make_kwargs: dict[str, Any] = {
+            "key_device": "cpu",
+            "base_device": "cpu",
+            "fill_tensors": True,
+            **overrides,
+        }
+        args, kwargs, base = _make_dense_distributed_output_meta_args(**make_kwargs)
+        if base.device.type == "cpu":
+            torch.manual_seed(17)
+            base.copy_(torch.randn_like(base))
+        before = base.clone()
+        with pytest.raises(ValueError, match=pattern):
+            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op(
+                *args, **kwargs
+            )
+        assert comm_calls == 0
+        assert torch.equal(base, before)
+
+    mismatch_args, mismatch_kw, mismatch_base = _make_dense_distributed_output_meta_args(
+        key_device="cpu", base_device="cpu", seq=256, local_seq=64, fill_tensors=True
+    )
+    torch.manual_seed(19)
+    mismatch_base.copy_(torch.randn_like(mismatch_base))
+    before_mismatch = mismatch_base.clone()
+    with pytest.raises(ValueError, match="must match resolved group"):
+        dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op(
+            *mismatch_args[:4], 4, *mismatch_args[5:], **mismatch_kw
+        )
+    assert comm_calls == 0
+    assert torch.equal(mismatch_base, before_mismatch)
+
+    # Batch == 0 returns cleanly without launching collectives.
+    empty_args, empty_kw, empty_base = _make_dense_distributed_output_meta_args(
+        key_device="cpu", base_device="cpu", batch=0, fill_tensors=True
+    )
+    assert (
+        dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op(
+            *empty_args, **empty_kw
+        )
+        is None
+    )
+    empty_rs_args = (*empty_args[4:25], torch.bfloat16, *empty_args[25:])
+    empty_out = dense_distributed_output._projected_query_attention_reduce_scatter_op(
+        *empty_rs_args, **empty_kw
+    )
+    assert empty_out.shape == (0, 128, 128)
+    assert empty_base.shape == (0, 128, 128)
+    assert comm_calls == 0
+
+
 # --- Live 2-GPU end-to-end tests ---
 
 _LIVE_HIDDEN = 512
@@ -1616,8 +1998,8 @@ def _parallelize_attention_module(
 @contextmanager
 def _count_distributed_paths() -> Iterator[dict[str, int]]:
     counts = {"peer_exchange": 0, "fallback": 0}
-    orig_peer = distributed_output._run_peer_attention_exchange
-    orig_fallback = distributed_output._run_distributed_fallback
+    orig_peer = peer_exchange.run_peer_chunk_exchange
+    orig_fallback = peer_exchange.run_distributed_fallback
 
     def wrapped_peer(*args: Any, **kwargs: Any) -> Any:
         counts["peer_exchange"] += 1
@@ -1627,13 +2009,13 @@ def _count_distributed_paths() -> Iterator[dict[str, int]]:
         counts["fallback"] += 1
         return orig_fallback(*args, **kwargs)
 
-    distributed_output._run_peer_attention_exchange = wrapped_peer  # type: ignore[assignment]
-    distributed_output._run_distributed_fallback = wrapped_fallback  # type: ignore[assignment]
+    peer_exchange.run_peer_chunk_exchange = wrapped_peer  # type: ignore[assignment]
+    peer_exchange.run_distributed_fallback = wrapped_fallback  # type: ignore[assignment]
     try:
         yield counts
     finally:
-        distributed_output._run_peer_attention_exchange = orig_peer  # type: ignore[assignment]
-        distributed_output._run_distributed_fallback = orig_fallback  # type: ignore[assignment]
+        peer_exchange.run_peer_chunk_exchange = orig_peer  # type: ignore[assignment]
+        peer_exchange.run_distributed_fallback = orig_fallback  # type: ignore[assignment]
 
 
 _KV_GATHER_OP = "piper_kernels.convrot_int8_sparse_piper_prepare_gather_project_kv.default"
@@ -2400,6 +2782,787 @@ def _check_direct_multichunk_and_inplace_ownership(
     assert torch.equal(local_base, before_fail)
 
 
+_DENSE_KEY_OP = "piper_kernels.convrot_int8_piper_project_key.default"
+_DENSE_VALUE_OP = "piper_kernels.convrot_int8_piper_project_value.default"
+_DENSE_ATTN_RS_OP = (
+    "piper_kernels.convrot_int8_piper_projected_query_attention_reduce_scatter.default"
+)
+_DENSE_ATTN_RS_RESIDUAL_OP = (
+    "piper_kernels."
+    "convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default"
+)
+
+
+class _DenseRotaryAttn(nn.Module):
+    def __init__(
+        self,
+        heads: int,
+        *,
+        is_causal: bool = False,
+        bias: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        self.heads = heads
+        self.head_dim = _LIVE_HEAD_DIM
+        self.rotary_dim = _LIVE_ROTARY_DIM
+        self.is_causal = is_causal
+        self.to_q = nn.Linear(_LIVE_HIDDEN, heads * self.head_dim, bias=bias, dtype=dtype)
+        self.to_k = nn.Linear(_LIVE_HIDDEN, heads * self.head_dim, bias=bias, dtype=dtype)
+        self.to_v = nn.Linear(_LIVE_HIDDEN, heads * self.head_dim, bias=bias, dtype=dtype)
+        self.norm_q = _RMSNorm(self.head_dim, dtype=dtype)
+        self.norm_k = _RMSNorm(self.head_dim, dtype=dtype)
+        self.to_out = nn.ModuleList(
+            [nn.Linear(heads * self.head_dim, _LIVE_HIDDEN, bias=bias, dtype=dtype)]
+        )
+
+    def _norm_rope(
+        self, proj: torch.Tensor, norm: _RMSNorm, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        batch, seq, _ = proj.shape
+        x = norm(proj.view(batch, seq, self.heads, self.head_dim))
+        rotary = x[..., : self.rotary_dim]
+        half1, half2 = rotary.chunk(2, dim=-1)
+        rot_cat = torch.cat((-half2, half1), dim=-1)
+        c_slice = cos.to(proj.dtype)[None, :, None, :]
+        s_slice = sin.to(proj.dtype)[None, :, None, :]
+        rotary = rotary * c_slice + rot_cat * s_slice
+        return torch.cat((rotary, x[..., self.rotary_dim :]), dim=-1).contiguous()
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, seq, _ = hidden.shape
+        cos_seq = cos[:seq]
+        sin_seq = sin[:seq]
+        q = self._norm_rope(self.to_q(hidden), self.norm_q, cos_seq, sin_seq)
+        k = self._norm_rope(self.to_k(hidden), self.norm_k, cos_seq, sin_seq)
+        v = self.to_v(hidden).view(batch, seq, self.heads, self.head_dim)
+        attn = piper_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            is_causal=self.is_causal,
+        ).transpose(1, 2)
+        return self.to_out[0](attn.reshape(batch, seq, self.heads * self.head_dim))
+
+
+class _LiveDenseBlock(nn.Module):
+    def __init__(self, heads: int, *, is_causal: bool = False) -> None:
+        super().__init__()
+        self.attn = _DenseRotaryAttn(heads, is_causal=is_causal)
+        self.ff = _SwiGLUFFN()
+        self.attn_gates = nn.Parameter(
+            torch.full((4, _LIVE_HIDDEN), 0.5, dtype=torch.bfloat16), requires_grad=False
+        )
+        self.ffn_gates = nn.Parameter(
+            torch.full((4, _LIVE_HIDDEN), 0.5, dtype=torch.bfloat16), requires_grad=False
+        )
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        gate_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = hidden + self.attn_gates[gate_indices] * self.attn(hidden, cos, sin)
+        hidden = hidden + self.ffn_gates[gate_indices] * self.ff(hidden)
+        return hidden
+
+
+def _parallelize_dense_attention_module(module: nn.Module, mesh: DeviceMesh) -> None:
+    plan: dict[str, Any] = {
+        "attn": PrepareModuleInput(
+            input_layouts=(Shard(1), None, None),
+            desired_input_layouts=(Replicate(), None, None),
+            use_local_output=True,
+        ),
+        "attn.to_q": ColwiseParallel(),
+        "attn.to_k": ColwiseParallel(),
+        "attn.to_v": ColwiseParallel(),
+        "attn.to_out.0": RowwiseParallel(output_layouts=Shard(1), use_local_output=True),
+    }
+    parallelize_module(module, mesh, plan, src_data_rank=None)
+
+
+def _build_dense_compile_options(capture: FunctionalTargetCapturePass | None) -> dict[str, Any]:
+    opts: dict[str, Any] = {}
+    opts = residual_updates_compile_options(opts)
+    opts = convrot_int8_piper_compile_options(opts, fuse_output=True)
+    opts = convrot_int8_swiglu_ffn_compile_options(opts)
+    opts = convrot_int8_compile_options(opts)
+    return opts if capture is None else capture.wrap_options(opts)
+
+
+def _compile_dense_block(
+    mesh: DeviceMesh,
+    rank: int,
+    world: int,
+    device: torch.device,
+    weights: dict[str, torch.Tensor],
+    norms: dict[str, torch.Tensor],
+    *,
+    is_causal: bool = False,
+    dynamic: bool = False,
+) -> tuple[Any, FunctionalTargetCapturePass]:
+    block = _LiveDenseBlock(_LIVE_HEADS // world, is_causal=is_causal).to(device).eval()
+    _quantize_module_linears(
+        block,
+        weights,
+        norms,
+        mesh=mesh,
+        rank=rank,
+        world=world,
+        device=device,
+        colwise_names=_ATTN_COLWISE,
+        rowwise_names=_ATTN_ROWWISE,
+    )
+    _parallelize_dense_attention_module(block, mesh)
+    capture = FunctionalTargetCapturePass()
+    compiled = torch.compile(
+        lambda h, c, s, gi: h.copy_(block(h, c, s, gi)),
+        dynamic=dynamic,
+        options=_build_dense_compile_options(capture),
+    )
+    return compiled, capture
+
+
+def _check_dense_dynamic_tpsp_blocks(
+    mesh: DeviceMesh,
+    pg: dist.ProcessGroup,
+    rank: int,
+    world: int,
+    device: torch.device,
+    weights: dict[str, torch.Tensor],
+    norms: dict[str, torch.Tensor],
+    cos_all: torch.Tensor,
+    sin_all: torch.Tensor,
+) -> None:
+    compiled_dist, capture = _compile_dense_block(
+        mesh, rank, world, device, weights, norms, is_causal=False, dynamic=True
+    )
+    ref_fn = None
+    if rank == 0:
+        ref_block = _LiveDenseBlock(_LIVE_HEADS, is_causal=False).to(device).eval()
+        _quantize_module_linears(ref_block, weights, norms, device=device)
+        ref_fn = torch.compile(
+            lambda h, c, s, gi: h.copy_(ref_block(h, c, s, gi)),
+            dynamic=True,
+            options=_build_dense_compile_options(None),
+        )
+
+    for seq in (256, 512):
+        local_seq = seq // world
+        mine = slice(rank * local_seq, (rank + 1) * local_seq)
+        torch.manual_seed(1100 + seq)
+        full_h = torch.randn(1, seq, _LIVE_HIDDEN, dtype=torch.bfloat16)
+        full_gi = torch.arange(seq, dtype=torch.int64) % 4
+        local_h = full_h[:, mine].clone(memory_format=torch.contiguous_format).to(device)
+        local_gi = full_gi[mine].contiguous().to(device)
+        with _count_distributed_paths() as path_counts:
+            compiled_dist(local_h, cos_all, sin_all, local_gi)
+        gathered = _gather_seq(local_h, world, pg)
+        if rank == 0:
+            assert ref_fn is not None
+            ref_h = full_h.clone().to(device)
+            ref_fn(ref_h, cos_all, sin_all, full_gi.clone().to(device))
+            assert _rel_l2(gathered, ref_h) < 0.005
+        assert path_counts == {"peer_exchange": 1, "fallback": 0}
+
+    assert capture.calls == 1
+    assert "_c10d_functional.all_gather_into_tensor_coalesced.default" in capture.target_names
+    assert "_c10d_functional.all_gather_into_tensor.default" not in capture.target_names
+    assert "_c10d_functional.reduce_scatter_tensor.default" not in capture.target_names
+    assert _DENSE_KEY_OP in capture.target_names
+    assert _DENSE_VALUE_OP in capture.target_names
+    assert _DENSE_ATTN_RS_RESIDUAL_OP in capture.target_names
+    assert "piper_kernels.convrot_int8_swiglu_ffn_residual_add_.default" in capture.target_names
+
+
+def _check_dense_causal_and_unaligned(
+    mesh: DeviceMesh,
+    pg: dist.ProcessGroup,
+    rank: int,
+    world: int,
+    device: torch.device,
+    weights: dict[str, torch.Tensor],
+    norms: dict[str, torch.Tensor],
+    cos_all: torch.Tensor,
+    sin_all: torch.Tensor,
+) -> None:
+    compiled_causal, cap_causal = _compile_dense_block(
+        mesh, rank, world, device, weights, norms, is_causal=True
+    )
+    compiled_unaligned, cap_unaligned = _compile_dense_block(
+        mesh, rank, world, device, weights, norms, is_causal=False
+    )
+    ref_causal = None
+    ref_noncausal = None
+    if rank == 0:
+        rc_block = _LiveDenseBlock(_LIVE_HEADS, is_causal=True).to(device).eval()
+        _quantize_module_linears(rc_block, weights, norms, device=device)
+        ref_causal = torch.compile(
+            lambda h, c, s, gi: h.copy_(rc_block(h, c, s, gi)),
+            options=_build_dense_compile_options(None),
+        )
+        rn_block = _LiveDenseBlock(_LIVE_HEADS, is_causal=False).to(device).eval()
+        _quantize_module_linears(rn_block, weights, norms, device=device)
+        ref_noncausal = torch.compile(
+            lambda h, c, s, gi: h.copy_(rn_block(h, c, s, gi)),
+            options=_build_dense_compile_options(None),
+        )
+
+    for seq, expected_paths, is_causal, fn, cap, ref_fn in (
+        (512, {"peer_exchange": 1, "fallback": 0}, True, compiled_causal, cap_causal, ref_causal),
+        (
+            192,
+            {"peer_exchange": 0, "fallback": 1},
+            False,
+            compiled_unaligned,
+            cap_unaligned,
+            ref_noncausal,
+        ),
+    ):
+        local_seq = seq // world
+        mine = slice(rank * local_seq, (rank + 1) * local_seq)
+        torch.manual_seed(1200 + seq + int(is_causal))
+        full_h = torch.randn(1, seq, _LIVE_HIDDEN, dtype=torch.bfloat16)
+        full_gi = torch.arange(seq, dtype=torch.int64) % 4
+        local_h = full_h[:, mine].clone(memory_format=torch.contiguous_format).to(device)
+        local_gi = full_gi[mine].contiguous().to(device)
+        with _count_distributed_paths() as path_counts:
+            fn(local_h, cos_all, sin_all, local_gi)
+        gathered = _gather_seq(local_h, world, pg)
+        if rank == 0:
+            assert ref_fn is not None
+            ref_h = full_h.clone().to(device)
+            ref_fn(ref_h, cos_all, sin_all, full_gi.clone().to(device))
+            assert _rel_l2(gathered, ref_h) < 0.005
+        assert path_counts == expected_paths
+        assert cap.calls == 1
+        assert _DENSE_ATTN_RS_RESIDUAL_OP in cap.target_names
+        assert "_c10d_functional.reduce_scatter_tensor.default" not in cap.target_names
+
+
+def _check_dense_batched_and_standalone(
+    mesh: DeviceMesh,
+    pg: dist.ProcessGroup,
+    rank: int,
+    world: int,
+    device: torch.device,
+    weights: dict[str, torch.Tensor],
+    norms: dict[str, torch.Tensor],
+    cos_all: torch.Tensor,
+    sin_all: torch.Tensor,
+) -> None:
+    compiled_b2, cap_b2 = _compile_dense_block(mesh, rank, world, device, weights, norms)
+    seq = 512
+    local_seq = seq // world
+    mine = slice(rank * local_seq, (rank + 1) * local_seq)
+    torch.manual_seed(1303)
+    full_h_b2 = torch.randn(2, seq, _LIVE_HIDDEN, dtype=torch.bfloat16)
+    full_gi_b2 = torch.arange(seq, dtype=torch.int64) % 4
+    lh_b2 = full_h_b2[:, mine].clone(memory_format=torch.contiguous_format).to(device)
+    lgi_b2 = full_gi_b2[mine].contiguous().to(device)
+    with _count_distributed_paths() as b2_counts:
+        compiled_b2(lh_b2, cos_all, sin_all, lgi_b2)
+    gathered_b2 = _gather_seq(lh_b2, world, pg)
+    if rank == 0:
+        ref_b2 = _LiveDenseBlock(_LIVE_HEADS).to(device).eval()
+        _quantize_module_linears(ref_b2, weights, norms, device=device)
+        ref_b2_fn = torch.compile(
+            lambda h, c, s, gi: h.copy_(ref_b2(h, c, s, gi)),
+            options=_build_dense_compile_options(None),
+        )
+        rh_b2 = full_h_b2.clone().to(device)
+        ref_b2_fn(rh_b2, cos_all, sin_all, full_gi_b2.clone().to(device))
+        assert _rel_l2(gathered_b2, rh_b2) < 0.005
+    assert b2_counts == {"peer_exchange": 1, "fallback": 0}
+    assert cap_b2.calls == 1
+    assert _DENSE_ATTN_RS_OP in cap_b2.target_names
+
+    class _WrapDenseStandalone(nn.Module):
+        def __init__(self, heads: int) -> None:
+            super().__init__()
+            self.attn = _DenseRotaryAttn(heads)
+            self.ff = _SwiGLUFFN()
+
+        def forward(self, h: torch.Tensor, c: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            a = self.attn(h, c, s)
+            return a + self.ff(a)
+
+    sa_mod = _WrapDenseStandalone(_LIVE_HEADS // world).to(device).eval()
+    _quantize_module_linears(
+        sa_mod,
+        weights,
+        norms,
+        mesh=mesh,
+        rank=rank,
+        world=world,
+        device=device,
+        colwise_names=_ATTN_COLWISE,
+        rowwise_names=_ATTN_ROWWISE,
+    )
+    _parallelize_dense_attention_module(sa_mod, mesh)
+    cap_sa = FunctionalTargetCapturePass()
+    sa_opts = convrot_int8_compile_options(
+        convrot_int8_swiglu_ffn_compile_options(
+            convrot_int8_piper_compile_options({}, fuse_output=True)
+        )
+    )
+    compiled_sa = torch.compile(sa_mod, options=cap_sa.wrap_options(sa_opts))
+    torch.manual_seed(1404)
+    sa_h = torch.randn(1, seq, _LIVE_HIDDEN, dtype=torch.bfloat16)
+    with _count_distributed_paths() as sa_counts:
+        sa_out = compiled_sa(
+            sa_h[:, mine].clone(memory_format=torch.contiguous_format).to(device), cos_all, sin_all
+        )
+    gathered_sa = _gather_seq(sa_out, world, pg)
+    if rank == 0:
+        sa_ref = _WrapDenseStandalone(_LIVE_HEADS).to(device).eval()
+        _quantize_module_linears(sa_ref, weights, norms, device=device)
+        ref_sa_out = torch.compile(sa_ref, options=sa_opts)(sa_h.to(device), cos_all, sin_all)
+        assert _rel_l2(gathered_sa, ref_sa_out) < 0.02
+    assert sa_counts == {"peer_exchange": 1, "fallback": 0}
+    assert cap_sa.calls == 1
+    assert _DENSE_ATTN_RS_OP in cap_sa.target_names
+    assert "_c10d_functional.reduce_scatter_tensor.default" not in cap_sa.target_names
+
+
+def _check_dense_direct_multichunk_and_ownership(
+    pg: dist.ProcessGroup,
+    rank: int,
+    world: int,
+    device: torch.device,
+    weights: dict[str, torch.Tensor],
+    norms: dict[str, torch.Tensor],
+    cos_all: torch.Tensor,
+    sin_all: torch.Tensor,
+) -> None:
+    batch, seq = 2, 512
+    local_seq = seq // world
+    mine = slice(rank * local_seq, (rank + 1) * local_seq)
+    (q_full, k_full, v_full, o_full), (q_local, k_local, v_local, o_local) = (
+        _prepare_sharded_attn_weights(rank, world, device, weights)
+    )
+    q_norm, k_norm = norms["attn.norm_q"].to(device), norms["attn.norm_k"].to(device)
+    cos_seq, sin_seq = cos_all[:seq].contiguous(), sin_all[:seq].contiguous()
+    scale = _LIVE_HEAD_DIM**-0.5
+
+    torch.manual_seed(1505)
+    full_h = torch.randn(batch, seq, _LIVE_HIDDEN, dtype=torch.bfloat16, device=device)
+    full_base = torch.randn(batch, seq, _LIVE_HIDDEN, dtype=torch.bfloat16, device=device)
+    gate = torch.randn(4, _LIVE_HIDDEN, dtype=torch.bfloat16, device=device)
+    full_gi_2d = (torch.arange(batch * seq, device=device, dtype=torch.int64) % 4).view(batch, seq)
+
+    qdata_2d, scale_1d = convrot_int8_ops.prepare_input(full_h.view(batch * seq, _LIVE_HIDDEN), 64)
+    full_qdata, full_scale = qdata_2d.view(batch, seq, _LIVE_HIDDEN), scale_1d.view(batch, seq)
+    qk_granularity = dense_quantized_dispatch.select_qk_quantization(
+        AcceleratorTarget.from_device(device)
+    )
+    k_out = _ops.convrot_int8_piper_project_key.default(
+        full_qdata,
+        full_scale,
+        k_local.qdata,
+        k_local.scale,
+        k_norm,
+        cos_seq,
+        sin_seq,
+        1e-5,
+        qk_quantization=qk_granularity,
+    )
+    v_out = _ops.convrot_int8_piper_project_value.default(
+        full_qdata,
+        full_scale,
+        v_local.qdata,
+        v_local.scale,
+        head_dim=_LIVE_HEAD_DIM,
+        is_causal=False,
+    )
+
+    local_base = full_base[:, mine].clone(memory_format=torch.contiguous_format)
+    local_gi = full_gi_2d[:, mine].reshape(-1).contiguous()
+    base_ptr = local_base.data_ptr()
+    common_args = (
+        full_qdata,
+        full_scale,
+        q_local.qdata,
+        q_local.scale,
+        q_norm,
+        cos_seq,
+        sin_seq,
+        1e-5,
+        scale,
+        None,
+        *k_out,
+        *v_out,
+        seq,
+        False,
+        o_local.qdata,
+        o_local.scale,
+        None,
+        64,
+        None,
+    )
+
+    exchange_calls = 0
+    orig_start = distributed_comm.start_peer_exchange
+
+    def counted_exchange(*args: Any, **kwargs: Any) -> Any:
+        nonlocal exchange_calls
+        exchange_calls += 1
+        return orig_start(*args, **kwargs)
+
+    distributed_comm.start_peer_exchange = counted_exchange
+    try:
+        with _count_distributed_paths() as path_counts:
+            _ops.convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default(
+                local_base,
+                gate,
+                local_gi,
+                False,
+                world,
+                pg.group_name,
+                *common_args,
+                head_dim=_LIVE_HEAD_DIM,
+                query_chunk_rows=128,
+            )
+    finally:
+        distributed_comm.start_peer_exchange = orig_start
+
+    assert local_base.data_ptr() == base_ptr
+    assert path_counts == {"peer_exchange": 1, "fallback": 0}
+    assert exchange_calls == 2
+    gathered_base = _gather_seq(local_base, world, pg)
+    if rank == 0:
+        ref_k = _ops.convrot_int8_piper_project_key.default(
+            full_qdata,
+            full_scale,
+            k_full.qdata,
+            k_full.scale,
+            k_norm,
+            cos_seq,
+            sin_seq,
+            1e-5,
+            qk_quantization=qk_granularity,
+        )
+        ref_v = _ops.convrot_int8_piper_project_value.default(
+            full_qdata,
+            full_scale,
+            v_full.qdata,
+            v_full.scale,
+            head_dim=_LIVE_HEAD_DIM,
+            is_causal=False,
+        )
+        ref_base = full_base.clone()
+        _ops.convrot_int8_piper_projected_query_attention_residual_add_.default(
+            ref_base,
+            gate,
+            full_gi_2d.reshape(-1).contiguous(),
+            False,
+            full_qdata,
+            full_scale,
+            q_full.qdata,
+            q_full.scale,
+            q_norm,
+            cos_seq,
+            sin_seq,
+            1e-5,
+            scale,
+            None,
+            *ref_k,
+            *ref_v,
+            seq,
+            False,
+            o_full.qdata,
+            o_full.scale,
+            None,
+            64,
+            None,
+            head_dim=_LIVE_HEAD_DIM,
+            query_chunk_rows=128,
+        )
+        assert _rel_l2(gathered_base, ref_base) < 0.005
+
+    before_fail = local_base.clone()
+    with pytest.raises(ValueError, match="softmax scale"):
+        _ops.convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default(
+            local_base,
+            gate,
+            local_gi,
+            False,
+            world,
+            pg.group_name,
+            *common_args[:8],
+            0.0,
+            *common_args[9:],
+            head_dim=_LIVE_HEAD_DIM,
+            query_chunk_rows=128,
+        )
+    assert local_base.data_ptr() == base_ptr
+    assert torch.equal(local_base, before_fail)
+
+
+def _check_dense_fp16_bias(
+    mesh: DeviceMesh,
+    pg: dist.ProcessGroup,
+    rank: int,
+    world: int,
+    device: torch.device,
+    cos_all: torch.Tensor,
+    sin_all: torch.Tensor,
+) -> None:
+    class _WrapDenseAttnBias(nn.Module):
+        def __init__(self, heads: int) -> None:
+            super().__init__()
+            self.attn = _DenseRotaryAttn(heads, bias=True, dtype=torch.float16)
+
+        def forward(
+            self,
+            h: torch.Tensor,
+            c: torch.Tensor,
+            s: torch.Tensor,
+        ) -> torch.Tensor:
+            return self.attn(h, c, s)
+
+    torch.manual_seed(1601)
+    scale = 0.02
+    fp16_weights = {
+        "attn.to_q": torch.randn(_LIVE_HIDDEN, _LIVE_HIDDEN, dtype=torch.float16) * scale,
+        "attn.to_k": torch.randn(_LIVE_HIDDEN, _LIVE_HIDDEN, dtype=torch.float16) * scale,
+        "attn.to_v": torch.randn(_LIVE_HIDDEN, _LIVE_HIDDEN, dtype=torch.float16) * scale,
+        "attn.to_out.0": torch.randn(_LIVE_HIDDEN, _LIVE_HIDDEN, dtype=torch.float16) * scale,
+    }
+    fp16_biases = {
+        name: torch.randn(_LIVE_HIDDEN, dtype=torch.float16) * 0.05 for name in fp16_weights
+    }
+    fp16_norms = {
+        "attn.norm_q": torch.rand(_LIVE_HEAD_DIM, dtype=torch.float16).add_(0.5),
+        "attn.norm_k": torch.rand(_LIVE_HEAD_DIM, dtype=torch.float16).add_(0.5),
+    }
+
+    dist_mod = _WrapDenseAttnBias(_LIVE_HEADS // world).to(device).eval()
+    _quantize_module_linears(
+        dist_mod,
+        fp16_weights,
+        fp16_norms,
+        biases=fp16_biases,
+        mesh=mesh,
+        rank=rank,
+        world=world,
+        device=device,
+        colwise_names=_ATTN_COLWISE,
+        rowwise_names=_ATTN_ROWWISE,
+    )
+    _parallelize_dense_attention_module(dist_mod, mesh)
+    capture = FunctionalTargetCapturePass()
+    fp16_opts = convrot_int8_compile_options(
+        convrot_int8_piper_compile_options({}, fuse_output=True)
+    )
+    compiled_dist = torch.compile(dist_mod, options=capture.wrap_options(fp16_opts))
+
+    ref_fn = None
+    if rank == 0:
+        ref_mod = _WrapDenseAttnBias(_LIVE_HEADS).to(device).eval()
+        _quantize_module_linears(
+            ref_mod, fp16_weights, fp16_norms, biases=fp16_biases, device=device
+        )
+        ref_fn = torch.compile(ref_mod, options=fp16_opts)
+
+    seq = 512
+    local_seq = seq // world
+    mine = slice(rank * local_seq, (rank + 1) * local_seq)
+    torch.manual_seed(1602)
+    full_h = torch.randn(1, seq, _LIVE_HIDDEN, dtype=torch.float16)
+    with _count_distributed_paths() as path_counts:
+        dist_out = compiled_dist(
+            full_h[:, mine].clone(memory_format=torch.contiguous_format).to(device),
+            cos_all,
+            sin_all,
+        )
+    gathered = _gather_seq(dist_out, world, pg)
+    if rank == 0:
+        assert ref_fn is not None
+        ref_out = ref_fn(full_h.to(device), cos_all, sin_all)
+        rel = _rel_l2(gathered, ref_out)
+        assert rel < 0.02, f"dense fp16+bias rel_l2={rel}"
+    assert path_counts == {"peer_exchange": 1, "fallback": 0}
+    assert capture.calls == 1
+    assert "_c10d_functional.all_gather_into_tensor_coalesced.default" in capture.target_names
+    assert "_c10d_functional.all_gather_into_tensor.default" not in capture.target_names
+    assert "_c10d_functional.reduce_scatter_tensor.default" not in capture.target_names
+    assert _DENSE_KEY_OP in capture.target_names
+    assert _DENSE_VALUE_OP in capture.target_names
+    assert _DENSE_ATTN_RS_OP in capture.target_names
+
+
+def _check_dense_narrow_output(
+    pg: dist.ProcessGroup,
+    rank: int,
+    world: int,
+    device: torch.device,
+    weights: dict[str, torch.Tensor],
+    norms: dict[str, torch.Tensor],
+    cos_all: torch.Tensor,
+    sin_all: torch.Tensor,
+) -> None:
+    batch, seq = 2, 512
+    local_seq = seq // world
+    narrow_features = 128
+    torch.manual_seed(1603)
+    o_narrow_raw = torch.randn(narrow_features, _LIVE_HIDDEN, dtype=torch.bfloat16) * 0.02
+    o_narrow_full = ConvRotInt8Tensor.from_hp(o_narrow_raw.to(device), group_size=64)
+    head_len = (_LIVE_HEADS // world) * _LIVE_HEAD_DIM
+    o_narrow_local = shard_quantized_weight(
+        o_narrow_full, dim=1, start=rank * head_len, length=head_len
+    )
+
+    (q_full, k_full, v_full, _o_full), (q_local, k_local, v_local, _o_local) = (
+        _prepare_sharded_attn_weights(rank, world, device, weights)
+    )
+    q_norm, k_norm = norms["attn.norm_q"].to(device), norms["attn.norm_k"].to(device)
+    cos_seq, sin_seq = cos_all[:seq].contiguous(), sin_all[:seq].contiguous()
+    attn_scale = _LIVE_HEAD_DIM**-0.5
+
+    torch.manual_seed(1604)
+    full_h_narrow = torch.randn(batch, seq, _LIVE_HIDDEN, dtype=torch.bfloat16, device=device)
+    qdata_2d, scale_1d = convrot_int8_ops.prepare_input(
+        full_h_narrow.view(batch * seq, _LIVE_HIDDEN), 64
+    )
+    full_qdata, full_scale = qdata_2d.view(batch, seq, _LIVE_HIDDEN), scale_1d.view(batch, seq)
+    qk_granularity = dense_quantized_dispatch.select_qk_quantization(
+        AcceleratorTarget.from_device(device)
+    )
+    k_out = _ops.convrot_int8_piper_project_key.default(
+        full_qdata,
+        full_scale,
+        k_local.qdata,
+        k_local.scale,
+        k_norm,
+        cos_seq,
+        sin_seq,
+        1e-5,
+        qk_quantization=qk_granularity,
+    )
+    v_out = _ops.convrot_int8_piper_project_value.default(
+        full_qdata,
+        full_scale,
+        v_local.qdata,
+        v_local.scale,
+        head_dim=_LIVE_HEAD_DIM,
+        is_causal=False,
+    )
+
+    exchange_calls = 0
+    orig_start = distributed_comm.start_peer_exchange
+
+    def counted_exchange(*args: Any, **kwargs: Any) -> Any:
+        nonlocal exchange_calls
+        exchange_calls += 1
+        return orig_start(*args, **kwargs)
+
+    distributed_comm.start_peer_exchange = counted_exchange
+    try:
+        with _count_distributed_paths() as narrow_counts:
+            narrow_out = _ops.convrot_int8_piper_projected_query_attention_reduce_scatter.default(
+                world,
+                pg.group_name,
+                full_qdata,
+                full_scale,
+                q_local.qdata,
+                q_local.scale,
+                q_norm,
+                cos_seq,
+                sin_seq,
+                1e-5,
+                attn_scale,
+                None,
+                *k_out,
+                *v_out,
+                seq,
+                False,
+                torch.bfloat16,
+                o_narrow_local.qdata,
+                o_narrow_local.scale,
+                None,
+                64,
+                None,
+                head_dim=_LIVE_HEAD_DIM,
+                query_chunk_rows=128,
+            )
+    finally:
+        distributed_comm.start_peer_exchange = orig_start
+
+    assert narrow_counts == {"peer_exchange": 1, "fallback": 0}
+    assert exchange_calls == 2
+    assert narrow_out.shape == (batch, local_seq, narrow_features)
+    gathered_narrow = _gather_seq(narrow_out, world, pg)
+    if rank == 0:
+        ref_k = _ops.convrot_int8_piper_project_key.default(
+            full_qdata,
+            full_scale,
+            k_full.qdata,
+            k_full.scale,
+            k_norm,
+            cos_seq,
+            sin_seq,
+            1e-5,
+            qk_quantization=qk_granularity,
+        )
+        ref_v = _ops.convrot_int8_piper_project_value.default(
+            full_qdata,
+            full_scale,
+            v_full.qdata,
+            v_full.scale,
+            head_dim=_LIVE_HEAD_DIM,
+            is_causal=False,
+        )
+        ref_narrow = _ops.convrot_int8_piper_projected_query_attention_output.default(
+            full_qdata,
+            full_scale,
+            q_full.qdata,
+            q_full.scale,
+            q_norm,
+            cos_seq,
+            sin_seq,
+            1e-5,
+            attn_scale,
+            None,
+            *ref_k,
+            *ref_v,
+            seq,
+            False,
+            torch.bfloat16,
+            o_narrow_full.qdata,
+            o_narrow_full.scale,
+            None,
+            64,
+            None,
+            head_dim=_LIVE_HEAD_DIM,
+            query_chunk_rows=128,
+        )
+        assert _rel_l2(gathered_narrow, ref_narrow) < 0.02
+
+
+def _check_dense_fp16_bias_and_narrow_output(
+    mesh: DeviceMesh,
+    pg: dist.ProcessGroup,
+    rank: int,
+    world: int,
+    device: torch.device,
+    weights: dict[str, torch.Tensor],
+    norms: dict[str, torch.Tensor],
+    cos_all: torch.Tensor,
+    sin_all: torch.Tensor,
+) -> None:
+    _check_dense_fp16_bias(mesh, pg, rank, world, device, cos_all, sin_all)
+    _check_dense_narrow_output(pg, rank, world, device, weights, norms, cos_all, sin_all)
+
+
 def _2gpu_block_worker(rank: int, world: int, store_path: str, backend: str) -> None:
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -2479,6 +3642,21 @@ def _2gpu_block_worker(rank: int, world: int, store_path: str, backend: str) -> 
             _check_bias_fp16_and_projected_gate(mesh, pg, rank, world, device, cos_all, sin_all)
             _check_direct_multichunk_and_inplace_ownership(
                 pg, rank, world, device, weights, norms, cos_all, sin_all
+            )
+            _check_dense_dynamic_tpsp_blocks(
+                mesh, pg, rank, world, device, weights, norms, cos_all, sin_all
+            )
+            _check_dense_causal_and_unaligned(
+                mesh, pg, rank, world, device, weights, norms, cos_all, sin_all
+            )
+            _check_dense_batched_and_standalone(
+                mesh, pg, rank, world, device, weights, norms, cos_all, sin_all
+            )
+            _check_dense_direct_multichunk_and_ownership(
+                pg, rank, world, device, weights, norms, cos_all, sin_all
+            )
+            _check_dense_fp16_bias_and_narrow_output(
+                mesh, pg, rank, world, device, weights, norms, cos_all, sin_all
             )
 
             if backend == "piper_relay":

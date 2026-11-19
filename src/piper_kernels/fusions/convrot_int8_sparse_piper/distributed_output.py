@@ -15,8 +15,8 @@ import torch
 import torch.distributed as dist
 
 from piper_kernels._distributed import _comm as distributed_comm
+from piper_kernels._distributed import _peer_exchange as peer_exchange
 from piper_kernels._residual import ResidualAdd, validate_residual_add
-from piper_kernels._residual.triton import apply_residual_add
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
@@ -28,108 +28,6 @@ from . import output as output_ops
 from ._layout import TILE_ROWS
 
 _DEFAULT_QUERY_CHUNK_ROWS = output_ops.DEFAULT_QUERY_CHUNK_ROWS
-
-
-def _contiguous_chunk_view(
-    buffer: torch.Tensor,
-    batch: int,
-    rows: int,
-    features: int,
-) -> torch.Tensor:
-    return buffer.view(-1)[: batch * rows * features].view(batch, rows, features)
-
-
-def _choose_distributed_chunk_rows(local_sequence_length: int, query_chunk_rows: int) -> int:
-    if local_sequence_length < TILE_ROWS:
-        return local_sequence_length
-    target = min(local_sequence_length, query_chunk_rows, 4096)
-    return max(TILE_ROWS, (target // TILE_ROWS) * TILE_ROWS)
-
-
-def _validate_distributed_sequence(
-    sequence_length: int,
-    comm_group_size: int,
-    comm_group_name: str,
-) -> int:
-    if (
-        isinstance(comm_group_size, bool)
-        or not isinstance(comm_group_size, int)
-        or comm_group_size < 2
-    ):
-        raise ValueError("distributed sparse Piper attention requires comm_group_size >= 2")
-    if not isinstance(comm_group_name, str):
-        raise TypeError("distributed sparse Piper attention requires string comm_group_name")
-    if not isinstance(sequence_length, torch.SymInt) and sequence_length % comm_group_size:
-        raise ValueError("distributed sparse Piper sequence length must divide evenly across ranks")
-    return sequence_length // comm_group_size
-
-
-def _run_distributed_fallback(
-    process_group: dist.ProcessGroup,
-    comm_group_size: int,
-    local_sequence_length: int,
-    output_features: int,
-    output_dtype: torch.dtype,
-    full_output: torch.Tensor,
-    residual_add: ResidualAdd | None,
-) -> torch.Tensor:
-    batch = full_output.shape[0]
-    reduced = torch.empty(
-        (batch, local_sequence_length, output_features),
-        device=full_output.device,
-        dtype=output_dtype,
-    )
-    reduce_scatter_input = (
-        full_output.view(comm_group_size, 1, local_sequence_length, output_features)
-        if batch == 1
-        else torch.cat(list(full_output.split(local_sequence_length, dim=1)), dim=0).contiguous()
-    )
-    work = dist.reduce_scatter_tensor(
-        reduced,
-        reduce_scatter_input,
-        op=dist.ReduceOp.SUM,
-        group=process_group,
-        async_op=False,
-    )
-    if work is not None:
-        work.wait()
-    if residual_add is not None:
-        apply_residual_add(reduced, residual_add, row_offset=0)
-        return residual_add.base
-    return reduced
-
-
-def _allocate_peer_comm_slots(
-    world_size: int,
-    peer_ranks: tuple[int, ...],
-    batch: int,
-    capacity: int,
-    output_features: int,
-    *,
-    slots: int,
-    device: torch.device,
-    output_dtype: torch.dtype,
-    reuse_direct_receive: bool,
-) -> tuple[list[list[torch.Tensor]], list[torch.Tensor | None], torch.Tensor | None]:
-    send_slots: list[list[torch.Tensor]] = [
-        [
-            torch.empty((batch, capacity, output_features), device=device, dtype=output_dtype)
-            for _ in peer_ranks
-        ]
-        for _ in range(slots)
-    ]
-    receive_slots: list[torch.Tensor | None] = [
-        None
-        if reuse_direct_receive
-        else torch.empty((batch, capacity, output_features), device=device, dtype=output_dtype)
-        for _ in range(slots)
-    ]
-    zero_local_buffer = (
-        None
-        if world_size == 2
-        else torch.zeros((batch, capacity, output_features), device=device, dtype=output_dtype)
-    )
-    return send_slots, receive_slots, zero_local_buffer
 
 
 def _run_peer_attention_exchange(
@@ -145,16 +43,9 @@ def _run_peer_attention_exchange(
     *,
     reuse_direct_receive: bool,
 ) -> tuple[dist.Work, int, int, torch.Tensor, tuple[torch.Tensor, ...]]:
-    world_size = process_group.size()
     batch, local_sequence_length, output_features = output.shape
     heads, head_dim = key_dims[1], key_dims[2]
     capacity = min(local_sequence_length, comm_chunk_rows)
-    sub_ranges = [
-        (offset, min(comm_chunk_rows, local_sequence_length - offset))
-        for offset in range(0, local_sequence_length, comm_chunk_rows)
-    ]
-    slots = min(2, len(sub_ranges))
-    peer_ranks = tuple(peer for peer in range(world_size) if peer != process_group.rank())
     attention_scratch: torch.Tensor | None = (
         None
         if output_features >= heads * head_dim
@@ -201,62 +92,14 @@ def _run_peer_attention_exchange(
         )
         peer_projector(attention_chunk, output_buffer, 0, rows)
 
-    send_slots, receive_slots, zero_local_buffer = _allocate_peer_comm_slots(
-        world_size,
-        peer_ranks,
-        batch,
-        capacity,
-        output_features,
-        slots=slots,
-        device=output.device,
-        output_dtype=output.dtype,
+    return peer_exchange.run_peer_chunk_exchange(
+        process_group,
+        output,
+        comm_chunk_rows,
+        run_peer_window,
+        apply_received,
         reuse_direct_receive=reuse_direct_receive,
     )
-
-    pending: tuple[dist.Work, int, int, int, torch.Tensor] | None = None
-    try:
-        for chunk_index, (local_offset, rows) in enumerate(sub_ranges):
-            slot = chunk_index % slots
-            send_views = [
-                _contiguous_chunk_view(send_slots[slot][peer_index], batch, rows, output_features)
-                for peer_index in range(len(peer_ranks))
-            ]
-            for peer_rank, send_view in zip(peer_ranks, send_views, strict=True):
-                run_peer_window(peer_rank * local_sequence_length + local_offset, rows, send_view)
-
-            if pending is not None:
-                prev_work, _prev_slot, prev_offset, prev_rows, prev_receive = pending
-                prev_work.wait()
-                apply_received(prev_receive, prev_offset, prev_rows)
-                pending = None
-
-            if reuse_direct_receive:
-                receive_view = output[:, local_offset : local_offset + rows]
-            else:
-                receive_slot = receive_slots[slot]
-                assert receive_slot is not None
-                receive_view = _contiguous_chunk_view(receive_slot, batch, rows, output_features)
-            zero_view = (
-                None
-                if zero_local_buffer is None
-                else _contiguous_chunk_view(zero_local_buffer, batch, rows, output_features)
-            )
-            work = distributed_comm.start_peer_exchange(
-                process_group, send_views, receive_view, zero_view
-            )
-            pending = (work, slot, local_offset, rows, receive_view)
-    except BaseException:
-        if pending is not None:
-            pending[0].wait()
-        raise
-
-    assert pending is not None
-    last_work, last_slot, last_offset, last_rows, last_receive = pending
-    keepalive: tuple[torch.Tensor, ...] = (
-        *send_slots[last_slot],
-        *(() if zero_local_buffer is None else (zero_local_buffer,)),
-    )
-    return last_work, last_offset, last_rows, last_receive, keepalive
 
 
 def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
@@ -333,8 +176,11 @@ def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         force_tile_counts=force_tile_counts,
     )
     sequence_length = prepared.sequence_length
-    local_sequence_length = _validate_distributed_sequence(
-        sequence_length, comm_group_size, comm_group_name
+    local_sequence_length = peer_exchange.validate_distributed_sequence(
+        sequence_length,
+        comm_group_size,
+        comm_group_name,
+        name="distributed sparse Piper",
     )
     process_group = distributed_comm.resolve_process_group(comm_group_name)
     rank = process_group.rank()
@@ -421,7 +267,7 @@ def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
             force_tile_ids=force_tile_ids,
             force_tile_counts=force_tile_counts,
         )
-        return _run_distributed_fallback(
+        return peer_exchange.run_distributed_fallback(
             process_group,
             comm_group_size,
             local_sequence_length,
@@ -450,7 +296,11 @@ def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         query_bias=query_bias,
     )
 
-    comm_chunk_rows = _choose_distributed_chunk_rows(local_sequence_length, query_chunk_rows)
+    comm_chunk_rows = peer_exchange.choose_distributed_chunk_rows(
+        local_sequence_length,
+        query_chunk_rows,
+        tile_rows=TILE_ROWS,
+    )
     batch, heads, _storage_seq, head_dim = key.shape
     peer_projector, _peer_retained = projection_output.prepare_chunk_projector(
         local_sequence_length,
@@ -473,40 +323,38 @@ def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     reuse_direct_receive = residual_add is None and batch == 1
 
     def apply_received(receive_tensor: torch.Tensor, local_offset: int, rows: int) -> None:
-        if residual_add is not None:
-            for batch_index in range(batch):
-                apply_residual_add(
-                    receive_tensor[batch_index],
-                    residual_add,
-                    row_offset=batch_index * local_sequence_length + local_offset,
-                )
-        elif not reuse_direct_receive:
-            output[:, local_offset : local_offset + rows].copy_(receive_tensor)
-
-    last_work, last_offset, last_rows, last_receive, last_comm_keepalive = (
-        _run_peer_attention_exchange(
-            process_group,
-            prepared,
-            (batch, heads, head_dim),
+        peer_exchange.apply_received_chunk(
+            receive_tensor,
             output,
-            comm_chunk_rows,
-            project_query_chunk,
-            gate_projection,
-            apply_received,
-            peer_projector,
+            local_offset,
+            rows,
+            residual_add=residual_add,
             reuse_direct_receive=reuse_direct_receive,
         )
+
+    last_exchange = _run_peer_attention_exchange(
+        process_group,
+        prepared,
+        (batch, heads, head_dim),
+        output,
+        comm_chunk_rows,
+        project_query_chunk,
+        gate_projection,
+        apply_received,
+        peer_projector,
+        reuse_direct_receive=reuse_direct_receive,
     )
     del peer_projector, _peer_retained
 
-    own_partial: torch.Tensor | None = None
-    try:
+    def run_own() -> torch.Tensor | None:
         own_base = rank * local_sequence_length
-        own_gate_project = (
-            None
-            if gate_projection is None
-            else (lambda buf, start, rows: gate_projection.project(buf, own_base + start, rows))
-        )
+        if gate_projection is None:
+            own_gate_project = None
+        else:
+            active_gate = gate_projection
+            own_gate_project = lambda buf, start, rows: active_gate.project(  # noqa: E731
+                buf, own_base + start, rows
+            )
         own_projector, own_retained = projection_output.prepare_chunk_projector(
             local_sequence_length,
             comm_chunk_rows,
@@ -533,32 +381,31 @@ def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
                 global_row_offset=own_base,
                 sequence_length=local_sequence_length,
             )
-        else:
-            own_partial = output_common.run_chunked_projected_query_attention_output(
-                prepared,
-                output_features,
-                comm_chunk_rows,
-                project_query_chunk,
-                own_projector,
-                own_retained,
-                project_coarse_gate_chunk=own_gate_project,
-                output_dtype=output_dtype,
-                reuse_output_for_attention=True,
-                global_row_offset=own_base,
-                sequence_length=local_sequence_length,
-            )
-    except BaseException:
-        last_work.wait()
-        del last_comm_keepalive, last_receive
-        raise
-    last_work.wait()
-    del last_comm_keepalive
-    apply_received(last_receive, last_offset, last_rows)
-    if residual_add is not None:
-        return residual_add.base
-    assert own_partial is not None
-    output.add_(own_partial)
-    return output
+            return None
+        return output_common.run_chunked_projected_query_attention_output(
+            prepared,
+            output_features,
+            comm_chunk_rows,
+            project_query_chunk,
+            own_projector,
+            own_retained,
+            project_coarse_gate_chunk=own_gate_project,
+            output_dtype=output_dtype,
+            reuse_output_for_attention=True,
+            global_row_offset=own_base,
+            sequence_length=local_sequence_length,
+        )
+
+    try:
+        return peer_exchange.finish_overlapped_exchange(
+            last_exchange,
+            run_own=run_own,
+            apply_received=apply_received,
+            output=output,
+            residual_add=residual_add,
+        )
+    finally:
+        del last_exchange
 
 
 def _validate_distributed_residual_add(
@@ -582,8 +429,11 @@ def _validate_distributed_residual_add(
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
     )
-    local_sequence_length = _validate_distributed_sequence(
-        sequence_length, comm_group_size, comm_group_name
+    local_sequence_length = peer_exchange.validate_distributed_sequence(
+        sequence_length,
+        comm_group_size,
+        comm_group_name,
+        name="distributed sparse Piper",
     )
     if base.ndim != 3 or base.shape[:2] != (key.shape[0], local_sequence_length):
         raise ValueError(
@@ -979,8 +829,11 @@ def _projected_query_attention_reduce_scatter_op_fake(
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
     )
-    local_sequence_length = _validate_distributed_sequence(
-        sequence_length, comm_group_size, comm_group_name
+    local_sequence_length = peer_exchange.validate_distributed_sequence(
+        sequence_length,
+        comm_group_size,
+        comm_group_name,
+        name="distributed sparse Piper",
     )
     return output_common.new_projected_output(
         key, local_sequence_length, weight_qdata.shape[0], output_dtype=output_dtype
