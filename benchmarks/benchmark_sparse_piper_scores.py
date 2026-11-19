@@ -160,7 +160,9 @@ def _benchmark(
                 "query_stride": query.stride(),
                 "key_stride": primary.stride(),
                 "implementation": (
-                    selected.__module__ if name == "selected" and selected is not None else "torch"
+                    getattr(selected, "func", selected).__module__
+                    if name == "selected" and selected is not None
+                    else "torch"
                 ),
                 "input_source": "synthetic_fp32_summaries",
                 "scope": "summary scoring only; allocation and maximum epilogue included",

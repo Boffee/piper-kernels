@@ -9,9 +9,9 @@ import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
 
-_BLOCK_M = 32
-_BLOCK_N = 64
-_BLOCK_K = 16
+from ._plan import MinmaxScoreSchedule
+
+_DEFAULT_SCORE_SCHEDULE = MinmaxScoreSchedule(32, 64, 16)
 
 
 @triton.jit
@@ -98,14 +98,16 @@ def minmax_scores(
     key_aux: torch.Tensor,
     *,
     score_scale: float | None = None,
+    schedule: MinmaxScoreSchedule = _DEFAULT_SCORE_SCHEDULE,
 ) -> torch.Tensor:
     """Contract validated D128 summaries into one contiguous FP32 score tensor."""
     batch, heads, query_blocks, _ = query_summary.shape
     key_blocks = key_primary.shape[2]
+    block_m, block_n, block_k = schedule
     output = query_summary.new_empty((batch, heads, query_blocks, key_blocks))
     with device_context(query_summary.device):
         _minmax_scores_kernel[
-            (triton.cdiv(query_blocks, _BLOCK_M), triton.cdiv(key_blocks, _BLOCK_N), batch * heads)
+            (triton.cdiv(query_blocks, block_m), triton.cdiv(key_blocks, block_n), batch * heads)
         ](
             query_summary,
             key_primary,
@@ -120,9 +122,9 @@ def minmax_scores(
             *key_aux.stride()[:3],
             1.0 if score_scale is None else score_scale,
             has_score_scale=score_scale is not None,
-            block_m=_BLOCK_M,
-            block_n=_BLOCK_N,
-            block_k=_BLOCK_K,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
             num_warps=4,
             num_stages=1,
         )

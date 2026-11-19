@@ -7,7 +7,7 @@ SM8x launches follow choices measured on SM89, which represents the family.
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-from .._plan import AttentionSchedule
+from .._plan import AttentionSchedule, MinmaxScoreSchedule
 
 
 def uses_tensor_descriptors(target: AcceleratorTarget) -> bool:
@@ -23,6 +23,28 @@ def uses_async_copies(target: AcceleratorTarget) -> bool:
 def supports_target(target: AcceleratorTarget) -> bool:
     """Enable NVIDIA SM8x and exact SM120 sparse attention and its routing kernels."""
     return uses_tensor_descriptors(target) or uses_async_copies(target)
+
+
+_SM120_MINMAX_SMALL_QUERY_SCHEDULE = MinmaxScoreSchedule(64, 64, 16)
+_SM120_MINMAX_LARGE_QUERY_SCHEDULE = MinmaxScoreSchedule(128, 32, 16)
+_SM120_MINMAX_LARGE_QUERY_THRESHOLD = 65
+
+
+def supports_minmax_scores(target: AcceleratorTarget) -> bool:
+    """Select fused IEEE FP32 min/max routing scores on exact NVIDIA SM120."""
+    return uses_tensor_descriptors(target)
+
+
+def select_sm120_minmax_score_schedule(query_blocks: int) -> MinmaxScoreSchedule:
+    """Select measured SM120 FP32 min/max score tiles without spilling.
+
+    Paired primary and auxiliary keys double the effective dot N tile, so
+    128x32x16 wins on multi-tile query chunks (128 and 384 blocks) while
+    64x64x16 avoids idle query rows on short requests and chunk tails.
+    """
+    if query_blocks >= _SM120_MINMAX_LARGE_QUERY_THRESHOLD:
+        return _SM120_MINMAX_LARGE_QUERY_SCHEDULE
+    return _SM120_MINMAX_SMALL_QUERY_SCHEDULE
 
 
 def skip_dense_routing(head_dim: int) -> bool:

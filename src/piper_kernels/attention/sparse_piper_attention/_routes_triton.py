@@ -146,8 +146,12 @@ def _tiled_radix_select_pass(  # noqa: ANN202
         tl.where(bins < descending_bin, descending_counts, 0),
         axis=0,
     )
+    bin_count = tl.sum(
+        tl.where(bins == descending_bin, descending_counts, 0),
+        axis=0,
+    )
     chosen_digit = (_RADIX_BINS - 1 - descending_bin).to(tl.uint32)  # pyright: ignore[reportAttributeAccessIssue]
-    return (prefix << 8) | chosen_digit, rank - preceding
+    return (prefix << 8) | chosen_digit, rank - preceding, bin_count
 
 
 @triton.jit(
@@ -194,12 +198,12 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         + (query_block_offset + query_block) * route_query_stride
         + route_head_offset * route_route_stride
     )
-    head_keep_block_count = tl.load(head_keep_blocks_ptr + head)
+    rank = tl.load(head_keep_blocks_ptr + head)
     force_row = force_mask_ptr + (query_block_offset + query_block) * force_mask_stride
 
-    prefix = 0
-    rank = head_keep_block_count
-    prefix, rank = _tiled_radix_select_pass(
+    prefix = tl.full((), 0, tl.uint32)
+    resolved_shift = tl.full((), 24, tl.uint32)
+    prefix, rank, bin_count = _tiled_radix_select_pass(
         scores_ptr,
         score_base,
         sparse_key_blocks,
@@ -210,39 +214,47 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         force_row,
         has_force,
     )
-    prefix, rank = _tiled_radix_select_pass(
-        scores_ptr,
-        score_base,
-        sparse_key_blocks,
-        prefix,
-        rank,
-        tl.constexpr(16),
-        selector_tile,
-        force_row,
-        has_force,
-    )
-    prefix, rank = _tiled_radix_select_pass(
-        scores_ptr,
-        score_base,
-        sparse_key_blocks,
-        prefix,
-        rank,
-        tl.constexpr(8),
-        selector_tile,
-        force_row,
-        has_force,
-    )
-    threshold_bits, equal_keep = _tiled_radix_select_pass(
-        scores_ptr,
-        score_base,
-        sparse_key_blocks,
-        prefix,
-        rank,
-        tl.constexpr(0),
-        selector_tile,
-        force_row,
-        has_force,
-    )
+    # When the threshold digit's bucket count equals the remaining rank, all of
+    # its items belong in top-k so lower bytes cannot affect the selected set.
+    if bin_count != rank:
+        prefix, rank, bin_count = _tiled_radix_select_pass(
+            scores_ptr,
+            score_base,
+            sparse_key_blocks,
+            prefix,
+            rank,
+            tl.constexpr(16),
+            selector_tile,
+            force_row,
+            has_force,
+        )
+        resolved_shift = tl.full((), 16, tl.uint32)
+        if bin_count != rank:
+            prefix, rank, bin_count = _tiled_radix_select_pass(
+                scores_ptr,
+                score_base,
+                sparse_key_blocks,
+                prefix,
+                rank,
+                tl.constexpr(8),
+                selector_tile,
+                force_row,
+                has_force,
+            )
+            resolved_shift = tl.full((), 8, tl.uint32)
+            if bin_count != rank:
+                prefix, rank, bin_count = _tiled_radix_select_pass(
+                    scores_ptr,
+                    score_base,
+                    sparse_key_blocks,
+                    prefix,
+                    rank,
+                    tl.constexpr(0),
+                    selector_tile,
+                    force_row,
+                    has_force,
+                )
+                resolved_shift = tl.full((), 0, tl.uint32)
 
     output_offset = 0
     equal_offset = 0
@@ -251,9 +263,14 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         valid = key_offsets < sparse_key_blocks
         scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
         ordered_bits = _route_priority_bits(scores, key_offsets, valid, force_row, has_force)
-        equal = valid & (ordered_bits == threshold_bits)
-        equal_rank = equal_offset + tl.cumsum(equal.to(tl.int32), axis=0)
-        selected = valid & ((ordered_bits > threshold_bits) | (equal & (equal_rank <= equal_keep)))
+        shifted = ordered_bits >> resolved_shift
+        if resolved_shift == 0:
+            equal = valid & (shifted == prefix)
+            equal_rank = equal_offset + tl.cumsum(equal.to(tl.int32), axis=0)
+            selected = valid & ((shifted > prefix) | (equal & (equal_rank <= rank)))
+            equal_offset += tl.sum(equal.to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
+        else:
+            selected = valid & (shifted >= prefix)
         local_output_rank = tl.cumsum(selected.to(tl.int32), axis=0) - 1
         tl.store(
             routes_ptr + output_base + (output_offset + local_output_rank) * route_route_stride,
@@ -261,7 +278,6 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
             mask=selected,
         )
         output_offset += tl.sum(selected.to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
-        equal_offset += tl.sum(equal.to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
 
 
 def tiled_radix_select_packed_routes(

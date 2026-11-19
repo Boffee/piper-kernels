@@ -606,7 +606,13 @@ def test_cuda_compile_lifetime_chunks_a_convrot_nvfp4_gate(
         )
 
     assert actual.dtype is dtype
-    assert_fusion_output_close(actual[:, valid_rows], expected[:, valid_rows])
+    # 1-ULP FP32 differences across chunked coarse_attention (M=3 vs M=1) can flip one
+    # 4-bit NVFP4 block over 132 valid rows; static outputs retain the 1e-3 bound.
+    assert_fusion_output_close(
+        actual[:, valid_rows],
+        expected[:, valid_rows],
+        relative_l2=5e-3 if output_dynamic else 1e-3,
+    )
     assert (
         capture.targets.count(torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default)
         == preparation_count

@@ -1,4 +1,4 @@
-"""RDNA4 minmax scoring stays FP32 and shares the routing-score contract."""
+"""RDNA4 and SM120 minmax scoring stay FP32 and share the routing-score contract."""
 
 from unittest.mock import Mock
 
@@ -7,10 +7,12 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend
+from piper_kernels.attention.sparse_piper_attention._amd import policy as amd_policy
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
+from piper_kernels.attention.sparse_piper_attention._nvidia import policy as nvidia_policy
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_from_summaries,
     routing_scores,
@@ -23,10 +25,10 @@ pytestmark = pytest.mark.gpu
 @pytest.fixture
 def generator():
     if not torch.cuda.is_available():
-        pytest.skip("requires RDNA4 scoring")
+        pytest.skip("requires RDNA4 or SM120 scoring")
     target = AcceleratorTarget.from_device(torch.device("cuda"))
-    if not (target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201")):
-        pytest.skip("requires RDNA4 scoring")
+    if not (amd_policy.supports_target(target) or nvidia_policy.supports_minmax_scores(target)):
+        pytest.skip("requires RDNA4 or SM120 scoring")
     return torch.Generator(device="cuda").manual_seed(671)
 
 
@@ -124,9 +126,9 @@ def test_large_query_routes_preserve_exact_ties_across_chunks(summaries, monkeyp
         ],
         dim=-1,
     )
-    score = _backend.select_minmax_scores(query, primary, auxiliary)
-    assert score is not None
-    score_calls = Mock(wraps=score)
+    assert _backend.select_minmax_scores(query, primary, auxiliary) is not None
+    assert _backend._score_backend is not None
+    score_calls = Mock(wraps=_backend._score_backend.minmax_scores)
     monkeypatch.setattr(_backend._score_backend, "minmax_scores", score_calls)
     actual = packed_routes_from_summaries(query, primary, auxiliary, layout, _MINMAX_ROUTING)
 
