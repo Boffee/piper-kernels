@@ -119,6 +119,33 @@ def test_amd_matmul_selects_wide_k_for_aligned_strides(
     assert policy.matmul_group_m(plan) == 8
 
 
+@pytest.mark.parametrize(
+    ("architecture", "rows", "outputs", "width", "expected"),
+    [
+        ("gfx1201", 1, 5376, 5376, (32, 128, 64, 4)),
+        ("gfx1201", 32, 14336, 5376, (32, 128, 64, 4)),
+        ("gfx1201", 33, 5376, 5376, (64, 128, 64, 4)),
+        ("gfx1201", 64, 14336, 5376, (64, 128, 64, 4)),
+        ("gfx1201", 65, 5376, 5376, (128, 256, 64, 8)),
+        ("gfx1201", 128, 5376, 5376, (128, 256, 64, 8)),
+        ("gfx1201", 128, 8192, 8192, (128, 256, 64, 8)),
+        ("gfx1201", 128, 16384, 8192, (128, 128, 128, 8)),
+        ("gfx1201", 129, 5376, 5376, (128, 256, 64, 8)),
+        ("gfx1200", 32, 5376, 5376, (128, 256, 64, 8)),
+    ],
+)
+def test_gfx1201_short_batch_matmul_schedules(architecture, rows, outputs, width, expected):
+    plan = policy.select_execution_plan(
+        AcceleratorTarget("hip", architecture), in_features=width, rows=rows, out_features=outputs
+    )
+    assert (
+        plan.matmul_block_m,
+        plan.matmul_block_n,
+        plan.matmul_block_k,
+        plan.matmul_num_warps,
+    ) == expected
+
+
 def test_optional_amd_compiler_option_compatibility(monkeypatch):
     target = AcceleratorTarget("hip", "gfx1201")
     monkeypatch.setattr(amd.importlib, "import_module", Mock(return_value=object()))
@@ -378,3 +405,43 @@ def test_amd_compiled_shared_preparation(monkeypatch):
     assert prepare.call_count == 1
     for result, reference_result in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, reference_result, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@_gpu
+@pytest.mark.parametrize("rows", [1, 32, 33, 63, 64, 65, 128])
+@pytest.mark.parametrize("paired", [False, True])
+def test_amd_short_batch_projections_match_reference(rows, paired):
+    torch.manual_seed(913 + rows)
+    width, columns = 512, 320
+    dtype = torch.bfloat16
+    x = torch.randn((rows, width), device="cuda", dtype=dtype)
+    qdata, scale = amd.prepare_input(x, 256)
+    weights = [
+        (
+            torch.randint(-127, 128, (columns, width), device="cuda", dtype=torch.int8),
+            torch.rand(columns, device="cuda") * 0.02,
+            torch.randn(columns, device="cuda", dtype=dtype),
+        )
+        for _ in range(2 if paired else 1)
+    ]
+    actual = amd.linear_prepared(
+        qdata,
+        scale,
+        weights[0][0],
+        weights[0][1],
+        weights[0][2],
+        dtype,
+        second_projection=weights[1] if paired else None,
+    )
+    expected = torch.cat(
+        [reference.linear_prepared(qdata, scale, w, ws, dtype, b) for w, ws, b in weights],
+        dim=-1,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2 * torch.finfo(dtype).eps, atol=1e-5)
+    if not paired:
+        weight = ConvRotInt8Tensor.from_quantized(
+            weights[0][0], weights[0][1][:, None], group_size=256, logical_dtype=dtype
+        )
+        end_to_end = convrot_int8_linear(x, weight, weights[0][2])
+        torch.testing.assert_close(end_to_end, expected, rtol=2 * torch.finfo(dtype).eps, atol=1e-5)

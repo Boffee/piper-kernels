@@ -178,17 +178,28 @@ def select_execution_plan(
         and out_features is not None
         and ((rows + 127) // 128) * ((out_features + 255) // 256) >= _MIN_GFX1201_MATMUL_TILES
     )
+    block_m = 128 if rdna4 else 64
     block_n, block_k = (256, 64) if rdna4 else (64, 64)
+    matmul_warps = 8 if rdna4 else 4
     if wide_k:
         block_n, block_k = 128, 128
+    # Keep short batches (rows <= 64) on a single M tile with 128-column blocks
+    # so weights exceeding the 64 MiB Infinity Cache stream once while doubling
+    # N parallelism across the 32 WGPs. Above 64 rows, keep 128-row plans so
+    # paired and fused-residual fast paths apply uniformly.
+    if target.is_architecture("gfx1201") and rows is not None and out_features is not None:
+        if 1 <= rows <= 32:
+            block_m, block_n, block_k, matmul_warps = 32, 128, 64, 4
+        elif 33 <= rows <= 64:
+            block_m, block_n, block_k, matmul_warps = 64, 128, 64, 4
     return AmdExecutionPlan(
         fuse_rotation_quantization=block_size <= 16384,
         fused_num_warps=fused_num_warps,
         rotation_num_warps=4,
         quantization_num_warps=4,
-        matmul_block_m=128 if rdna4 else 64,
+        matmul_block_m=block_m,
         matmul_block_n=block_n,
         matmul_block_k=block_k,
-        matmul_num_warps=8 if rdna4 else 4,
+        matmul_num_warps=matmul_warps,
         matmul_num_stages=2 if rdna4 else 1,
     )

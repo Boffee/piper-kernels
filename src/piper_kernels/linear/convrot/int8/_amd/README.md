@@ -23,14 +23,18 @@ Preparation chooses up to three group-aligned power-of-two segments, fusing
 rotation and quantization through 16,384 input features before falling back to a
 split path.
 
-On `gfx1201`, baseline GEMMs use `(128, 256, 64)` tiles (8 warps, 2 stages,
-`group_m = 8`), switching to `(128, 128, 128)` when `in_features` is a multiple
-of 8,192 and the launch fills at least two workgroups per WGP (`64` tiles). For
-reductions of 4,096+ features with at least 64 output tiles, the GEMM seeds INT32
-accumulators with `0x155555` to avoid signed zero-crossing clock drops and
-subtracts the seed before FP32 scaling. Matrix launches also pass LLVM attributes
-from [the AMD compiler workarounds](../../../../_triton/amd_compiler_workarounds.py)
-so LDS barriers omit redundant `global_inv` fences.
+On `gfx1201`, short batches with known `out_features` use single-row-tile
+schedules (`(32, 128, 64)` with 4 warps for `1 <= rows <= 32`, and
+`(64, 128, 64)` with 4 warps for `33 <= rows <= 64`) so uncached weights
+stream once while doubling N parallelism. Above 64 rows, GEMMs use
+`(128, 256, 64)` tiles (8 warps, 2 stages, `group_m = 8`), switching to
+`(128, 128, 128)` when `in_features` is a multiple of 8,192 and the launch fills
+at least two workgroups per WGP (`64` tiles). For reductions of 4,096+ features
+with at least 64 output tiles, the GEMM seeds INT32 accumulators with `0x155555`
+to avoid signed zero-crossing clock drops and subtracts the seed before FP32
+scaling. Matrix launches also pass LLVM attributes from
+[the AMD compiler workarounds](../../../../_triton/amd_compiler_workarounds.py) so
+LDS barriers omit redundant `global_inv` fences.
 
 ## Paired projections
 
