@@ -25,11 +25,14 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 from piper_kernels.fusions.residual_updates import residual_updates_compile_options
-from piper_kernels.linear.convrot import convrot_int8_compile_options
 
 from ._helpers import output_available, projection_available
 from .test_attention import _HEAD_DIM, _HEADS, _INPUT_FEATURES, _Operands, _operands
-from .test_compile import _make_output_projection, _SparseProjectionAttention
+from .test_compile import (
+    _make_output_projection,
+    _SparseProjectionAttention,
+    _SparseProjectionAttentionOutput,
+)
 
 _ops = torch.ops.piper_kernels
 _FEATURES = _HEADS * _HEAD_DIM
@@ -681,8 +684,8 @@ def test_residual_fold_keeps_the_global_row_offset_in_each_head_slice() -> None:
     assert torch.equal(sliced, whole)
 
 
-class _QuerySliceAttention(_SparseProjectionAttention):
-    """Project Q from one slice of the hidden rows and K/V from all of them."""
+class _QuerySliceAttention(_SparseProjectionAttentionOutput):
+    """One device's share of a head split: Q from a slice of the rows, K/V from all rows."""
 
     def _rope_rows(self, projected: torch.Tensor, norm: torch.Tensor, rows: slice) -> torch.Tensor:
         normalized = F.rms_norm(
@@ -695,8 +698,7 @@ class _QuerySliceAttention(_SparseProjectionAttention):
         rotary = rotary * cos + torch.cat((-second, first), dim=-1) * sin
         return torch.cat((rotary, normalized[..., self.rotary_dim :]), dim=-1).contiguous()
 
-    def forward(self, hidden_states: torch.Tensor, global_row_offset: int) -> torch.Tensor:  # type: ignore[override]
-        rows = slice(global_row_offset, global_row_offset + 128)
+    def attend(self, hidden_states: torch.Tensor, rows: slice) -> torch.Tensor:
         query = self._rope_rows(self.query(hidden_states[:, rows]), self.query_norm, rows)
         everything = slice(None)
         key = self._rope_rows(self.key(hidden_states), self.key_norm, everything)
@@ -706,19 +708,44 @@ class _QuerySliceAttention(_SparseProjectionAttention):
             key,
             value,
             sparse_key_blocks=self.sparse_key_blocks,
-            global_row_offset=global_row_offset,
+            global_row_offset=rows.start,
         )
 
+    def forward(self, hidden_states: torch.Tensor, global_row_offset: int) -> torch.Tensor:  # type: ignore[override]
+        return self.attend(hidden_states, slice(global_row_offset, global_row_offset + 128))
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
-@pytest.mark.parametrize("global_row_offset", [0, 64])
-def test_projection_fold_leaves_query_slices_unfused(global_row_offset: int) -> None:
+    def gated_update(
+        self,
+        hidden_states: torch.Tensor,
+        gate: torch.Tensor,
+        row_gate_indices: torch.Tensor,
+        rows: slice,
+    ) -> torch.Tensor:
+        """Gate the slice's projected output; ``row_gate_indices`` holds the slice's rows."""
+        attention = self.attend(hidden_states, rows)
+        projected = self.output(attention.flatten(2))
+        return gate[row_gate_indices] * projected
+
+    def whole_gated_update(
+        self, hidden_states: torch.Tensor, gate: torch.Tensor, gate_indices: torch.Tensor
+    ) -> torch.Tensor:
+        return gate[gate_indices] * _SparseProjectionAttentionOutput.forward(self, hidden_states)
+
+
+def _query_slice_model() -> tuple[_QuerySliceAttention, torch.Tensor]:
     torch.manual_seed(1606)
     model = _QuerySliceAttention().eval()
     hidden = torch.randn(
         (1, model.sequence_length, model.input_features), device="cuda", dtype=torch.bfloat16
     )
+    return model, hidden
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
+@pytest.mark.parametrize("global_row_offset", [0, 64])
+def test_projection_fold_fuses_query_slices(global_row_offset: int) -> None:
+    model, hidden = _query_slice_model()
     capture = TargetCapturePass()
     options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
 
@@ -726,10 +753,84 @@ def test_projection_fold_leaves_query_slices_unfused(global_row_offset: int) -> 
         torch._dynamo.reset()
         actual = torch.compile(model, fullgraph=True, options=options)(hidden, global_row_offset)
         torch._dynamo.reset()
-        unfused = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())
-        expected = unfused(hidden, global_row_offset)
+        whole = torch.compile(
+            lambda hidden: _SparseProjectionAttention.forward(model, hidden),
+            fullgraph=True,
+            options=convrot_int8_sparse_piper_compile_options(),
+        )(hidden)
 
-    # The projection fusion needs Q and K/V projected from the same rows.
-    assert capture.targets.count(_ops.sparse_piper_attention.default) == 1
-    assert _ops.sparse_piper_attention_from_quantized.default not in capture.targets
-    assert torch.equal(actual, expected)
+    # Q projects the slice's rows of the input prepared once for K and V.
+    assert capture.targets.count(_ops.convrot_int8_sparse_piper_project_query.default) == 1
+    assert capture.targets.count(_ops.sparse_piper_attention_from_quantized.default) == 1
+    assert _ops.sparse_piper_attention.default not in capture.targets
+    assert torch.equal(actual, whole[:, global_row_offset : global_row_offset + 128])
+
+
+@pytest.mark.gpu
+@requires_output
+@pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
+@pytest.mark.parametrize("own_rows", [True, False])
+def test_head_split_rows_fuse_through_the_gated_output(own_rows: bool) -> None:
+    """A device's own rows add into its hidden rows; the peer's rows return the update."""
+    model, hidden = _query_slice_model()
+    gate = torch.randn((3, model.output_features), device="cuda", dtype=torch.bfloat16)
+    gate_indices = torch.randint(0, 3, (model.sequence_length,), device="cuda")
+    base = torch.randn(
+        (1, model.sequence_length, model.output_features), device="cuda", dtype=torch.bfloat16
+    )
+    options = residual_updates_compile_options(convrot_int8_sparse_piper_compile_options())
+
+    def own(hidden_states, base_rows, row_gate_indices, rows):
+        update = model.gated_update(hidden_states, gate, row_gate_indices, rows)
+        return base_rows.copy_(base_rows + update)
+
+    def whole_own(hidden_states, base_rows):
+        return base_rows.copy_(
+            base_rows + model.whole_gated_update(hidden_states, gate, gate_indices)
+        )
+
+    with torch.no_grad():
+        torch._dynamo.reset()
+        whole_options = residual_updates_compile_options(
+            convrot_int8_sparse_piper_compile_options()
+        )
+        if own_rows:
+            whole = base.clone()
+            torch.compile(whole_own, fullgraph=True, options=whole_options)(hidden, whole)
+        else:
+            whole = torch.compile(
+                lambda hidden_states: model.whole_gated_update(hidden_states, gate, gate_indices),
+                fullgraph=True,
+                options=whole_options,
+            )(hidden)
+        parts, targets = [], []
+        for rows in (slice(0, 128), slice(128, model.sequence_length)):
+            capture = FunctionalTargetCapturePass()
+            torch._dynamo.reset()
+            if own_rows:
+                # The add writes into its base only when that base has standard strides.
+                part = base[:, rows].clone(memory_format=torch.contiguous_format)
+                compiled = torch.compile(own, fullgraph=True, options=capture.wrap_options(options))
+                compiled(hidden, part, gate_indices[rows], rows)
+            else:
+                compiled = torch.compile(
+                    lambda hidden_states, row_gate_indices, rows: model.gated_update(
+                        hidden_states, gate, row_gate_indices, rows
+                    ),
+                    fullgraph=True,
+                    options=capture.wrap_options(options),
+                )
+                part = compiled(hidden, gate_indices[rows], rows)
+            parts.append(part)
+            targets.append(capture.targets)
+
+    fused = (
+        _ops.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default
+        if own_rows
+        else _ops.convrot_int8_sparse_piper_projected_query_attention_output.default
+    )
+    for captured in targets:
+        assert fused in captured
+        assert _ops.sparse_piper_attention.default not in captured
+        assert _ops.sparse_piper_attention_from_quantized.default not in captured
+    assert torch.equal(torch.cat(parts, dim=1), whole)

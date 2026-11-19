@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import torch
 from torch._inductor.pattern_matcher import Match
 from torch._library.fake_class_registry import FakeScriptObject
@@ -90,14 +93,20 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
     output_dtype: torch.dtype = torch.bfloat16,
     force_tile_ids: Argument | None = None,
     force_tile_counts: Argument | None = None,
+    global_row_offset: Argument | None = None,
 ) -> torch.fx.Node:
-    """Emit the shared fine or coarse quantized sparse-attention call."""
+    """Emit the shared fine or coarse quantized sparse-attention call.
+
+    ``global_row_offset`` places the fine call's Q rows; coarse calls take no offset.
+    """
     force_arguments = (force_tile_ids, force_tile_counts) if force_tile_ids is not None else ()
     coarse_arguments = coarse_gate, coarse_scale, coarse_key_blocks
     with_coarse = any(argument is not None for argument in coarse_arguments)
     if with_coarse:
         if any(argument is None for argument in coarse_arguments):
             raise ValueError("coarse sparse attention requires every coarse operand")
+        if global_row_offset is not None:
+            raise ValueError("fused coarse sparse attention does not take a query offset")
         return graph.call_function(
             torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
             args=(
@@ -129,8 +138,45 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
                 *force_arguments,
             ),
         ),
-        kwargs={"output_dtype": output_dtype},
+        kwargs={
+            "output_dtype": output_dtype,
+            **({} if global_row_offset is None else {"global_row_offset": global_row_offset}),
+        },
     )
+
+
+@contextmanager
+def canonical_query_offsets(graph: torch.fx.Graph) -> Iterator[None]:
+    """Pass sparse attention's ``global_row_offset`` as the keyword patterns declare.
+
+    Tracing passes it positionally, after explicit defaults for the optional layout
+    operands, which no positional pattern spells. Matching sees the defaults dropped and
+    the offset named; calls that survive get their traced arguments back for lowering.
+    """
+    target = torch.ops.piper_kernels.sparse_piper_attention.default
+    schema = target._schema.arguments
+    offset_index = next(
+        i for i, argument in enumerate(schema) if argument.name == "global_row_offset"
+    )
+    first_optional = next(i for i, argument in enumerate(schema) if argument.has_default_value())
+    traced: dict[torch.fx.Node, tuple[tuple[Argument, ...], dict[str, Argument]]] = {}
+    for node in graph.find_nodes(op="call_function", target=target):
+        if len(node.args) != offset_index + 1:
+            continue
+        traced[node] = (node.args, dict(node.kwargs))
+        arguments = list(node.args[:offset_index])
+        while len(arguments) > first_optional and arguments[-1] is None:
+            arguments.pop()
+        offset = node.args[offset_index]
+        node.args = tuple(arguments)
+        node.kwargs = {**node.kwargs, "global_row_offset": offset}
+    try:
+        yield
+    finally:
+        live_nodes = set(graph.nodes)
+        for node, (arguments, keywords) in traced.items():
+            if node in live_nodes:
+                node.args, node.kwargs = arguments, keywords
 
 
 def attention_head_dim(match: Match) -> int | None:
@@ -151,39 +197,39 @@ def valid_sparse_piper_attention(  # noqa: PLR0911
     device: torch.device,
     head_dim: int,
     tile_rows: int,
+    query_rows: int | torch.SymInt | None = None,
 ) -> bool:
-    """Validate the projection-independent portion of a sparse Piper match."""
-    shape = match.kwargs["sparse_attention_shape"]
+    """Validate the projection-independent portion of a sparse Piper match.
+
+    ``query_rows`` is Q's row count when Q holds a slice of the ``sequence_length`` K/V
+    rows. Its attention shape and RoPE tables are then the ``sparse_q_*`` captures.
+    """
+    query_rows = sequence_length if query_rows is None else query_rows
     output = preparation_sharing.tensor_metadata(match.output_node())
     if (
         output is None
         or output.ndim != 4
-        or not isinstance(shape, (list, tuple))
-        or len(shape) != 4
-    ):
-        return False
-    shape_batch = integer_scalar_metadata(shape[0])
-    shape_sequence_length = integer_scalar_metadata(shape[1])
-    if (
-        shape_batch is None
-        or shape_sequence_length is None
-        or preparation_sharing.dimension_key(shape_batch)
-        != preparation_sharing.dimension_key(batch)
-        or preparation_sharing.dimension_key(shape_sequence_length)
-        != preparation_sharing.dimension_key(sequence_length)
-        or static_int(shape[2]) != heads
-        or static_int(shape[3]) != head_dim
         or output.dtype not in _dtype.SUPPORTED_DTYPES
         or output.device != device
         or preparation_sharing.dimension_key(output.shape[0])
         != preparation_sharing.dimension_key(batch)
         or preparation_sharing.dimension_key(output.shape[1])
-        != preparation_sharing.dimension_key(sequence_length)
+        != preparation_sharing.dimension_key(query_rows)
         or tuple(output.shape[2:]) != (heads, head_dim)
         or (isinstance(sequence_length, int) and sequence_length < tile_rows)
     ):
         return False
 
+    if not _valid_row_operands(
+        match,
+        batch=batch,
+        sequence_length=sequence_length,
+        query_rows=query_rows,
+        heads=heads,
+        head_dim=head_dim,
+        device=device,
+    ):
+        return False
     if (
         any(
             not projected_qk_compile.valid_rmsnorm(
@@ -196,16 +242,6 @@ def valid_sparse_piper_attention(  # noqa: PLR0911
             for prefix in ("sparse_q", "sparse_k")
         )
         or projected_qk_compile.positive_float(match.kwargs["sparse_softmax_scale"]) is None
-    ):
-        return False
-    if not projected_qk_compile.valid_rope_tables(
-        match.kwargs["sparse_cos"],
-        match.kwargs["sparse_sin"],
-        match.kwargs["sparse_rotary_dim"],
-        match.kwargs["sparse_half_rotary_dim"],
-        sequence_length=sequence_length,
-        head_dim=head_dim,
-        device=device,
     ):
         return False
 
@@ -252,6 +288,58 @@ def valid_sparse_piper_attention(  # noqa: PLR0911
         ):
             return False
     return _valid_ratio_profile(match.kwargs["sparse_ratio_profile"], heads)
+
+
+def _valid_row_operands(
+    match: Match,
+    *,
+    batch: int | torch.SymInt,
+    sequence_length: int | torch.SymInt,
+    query_rows: int | torch.SymInt,
+    heads: int,
+    head_dim: int,
+    device: torch.device,
+) -> bool:
+    """Check K/V's and Q's attention shapes and RoPE tables against their row counts."""
+    shape = match.kwargs["sparse_attention_shape"]
+    for rows, rows_shape in (
+        (sequence_length, shape),
+        (query_rows, match.kwargs.get("sparse_q_attention_shape", shape)),
+    ):
+        if not isinstance(rows_shape, (list, tuple)) or len(rows_shape) != 4:
+            return False
+        shape_batch = integer_scalar_metadata(rows_shape[0])
+        shape_rows = integer_scalar_metadata(rows_shape[1])
+        if (
+            shape_batch is None
+            or shape_rows is None
+            or preparation_sharing.dimension_key(shape_batch)
+            != preparation_sharing.dimension_key(batch)
+            or preparation_sharing.dimension_key(shape_rows)
+            != preparation_sharing.dimension_key(rows)
+            or static_int(rows_shape[2]) != heads
+            or static_int(rows_shape[3]) != head_dim
+        ):
+            return False
+    for rows, cos, sin in (
+        (sequence_length, match.kwargs["sparse_cos"], match.kwargs["sparse_sin"]),
+        (
+            query_rows,
+            match.kwargs.get("sparse_q_cos", match.kwargs["sparse_cos"]),
+            match.kwargs.get("sparse_q_sin", match.kwargs["sparse_sin"]),
+        ),
+    ):
+        if not projected_qk_compile.valid_rope_tables(
+            cos,
+            sin,
+            match.kwargs["sparse_rotary_dim"],
+            match.kwargs["sparse_half_rotary_dim"],
+            sequence_length=rows,
+            head_dim=head_dim,
+            device=device,
+        ):
+            return False
+    return True
 
 
 def _valid_ratio_profile(profile_node: object, heads: int) -> bool:

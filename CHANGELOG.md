@@ -16,8 +16,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   blocks, except a compact slice that ends the sequence, and misplaced slices raise
   `ValueError`. Each output row equals that row of the whole-sequence call; this was
   verified bit for bit on RDNA4 and the portable path, not yet on NVIDIA GPUs. The
-  default, 0, leaves whole-sequence calls unchanged. Sliced calls compile without
-  the projection fusions, which need Q and K/V projected from the same rows.
+  default, 0, leaves whole-sequence calls unchanged. Under
+  `convrot_int8_sparse_piper_compile_options`, a sliced call whose Q is projected
+  from a row slice of K/V's input fuses through the projections, attention, output
+  projection, and gated residual add, preparing the input once, when its K/V feed
+  no other attention call. Sliced calls with `block_lengths` or a coarse residual,
+  and NVFP4 projection fusions, stay unfused.
 
 ### Changed
 

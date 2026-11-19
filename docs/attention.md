@@ -147,8 +147,21 @@ raise `ValueError`. Everything else still describes the whole sequence:
 slice's call receives the same tensors. The output holds the slice's rows, each
 equal to that row of the whole-sequence call, so concatenating the slices' outputs
 reproduces it. The operators see only local tensors; gathering K/V and outputs
-across devices belongs to the caller. The projection fusions need Q and K/V
-projected from the same rows, so a sliced call compiles without them.
+across devices belongs to the caller.
+
+Under `convrot_int8_sparse_piper_compile_options`, a sliced call still fuses when Q
+is projected from a unit-step slice of the rows that K and V are projected from,
+with static bounds: `query(hidden[:, start:end])` with RoPE tables `cos[start:end]`,
+and `key(hidden)`. The input is prepared once, and Q projects the slice's rows of
+it. The output projection and a gated residual add then fold as for whole
+sequences, such as for one device's query rows over a gathered input. The fusion
+requires K and V to feed only that one attention call, so two sliced calls that
+share one K/V projection compile unfused. When a residual base is a row slice of a
+larger tensor, such as `hidden[:, start:end].clone()`, clone it with
+`memory_format=torch.contiguous_format`: an in-place residual add writes only into a
+base with standard strides. Sliced calls with `block_lengths` or a coarse residual,
+and every sliced call under the NVFP4 fusions, compile without the projection
+fusion.
 
 ### Caller-forced tiles (experimental)
 
