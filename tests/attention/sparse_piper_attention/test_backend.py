@@ -5,6 +5,7 @@ import subprocess
 import sys
 from contextlib import nullcontext
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -145,17 +146,21 @@ def test_missing_score_implementation_does_not_probe_device(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("target", "supported"),
+    ("target", "expected_schedule"),
     [
-        (AcceleratorTarget("hip", "gfx1200"), True),
-        (AcceleratorTarget("hip", "gfx1201"), True),
-        (AcceleratorTarget("hip", "gfx1100"), False),
-        (AcceleratorTarget("hip", "gfx942"), False),
-        (AcceleratorTarget("cuda", "sm120"), False),
-        (AcceleratorTarget("cpu"), False),
+        (AcceleratorTarget("hip", "gfx1200"), (32, 64, 16)),
+        (AcceleratorTarget("hip", "gfx1201"), (32, 64, 16)),
+        (AcceleratorTarget("hip", "gfx1100"), None),
+        (AcceleratorTarget("hip", "gfx942"), None),
+        (AcceleratorTarget("cuda", "sm120"), (64, 64, 16)),
+        (AcceleratorTarget("cuda", "sm89"), None),
+        (AcceleratorTarget("cuda", "sm80"), None),
+        (AcceleratorTarget("cpu"), None),
     ],
 )
-def test_score_selection_is_independent_and_uses_operand_target(monkeypatch, target, supported):
+def test_score_selection_is_independent_and_uses_operand_target(
+    monkeypatch, target, expected_schedule
+):
     score = Mock()
     probe = Mock(return_value=target)
     monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
@@ -172,23 +177,36 @@ def test_score_selection_is_independent_and_uses_operand_target(monkeypatch, tar
         requires_grad=False,
     )
     selected = _backend.select_minmax_scores(summary, summary, summary)
-    assert selected is (score if supported else None)
+    if expected_schedule is None:
+        assert selected is None
+    else:
+        assert isinstance(selected, partial)
+        assert selected.func is score
+        assert selected.keywords == {"schedule": expected_schedule}
     probe.assert_called_once_with(summary.device)
 
 
+@pytest.mark.parametrize(
+    ("target", "expected_schedule"),
+    [
+        (AcceleratorTarget("hip", "gfx1201"), (32, 64, 16)),
+        (AcceleratorTarget("cuda", "sm120"), (128, 32, 16)),
+    ],
+)
 @pytest.mark.parametrize("query_blocks", [65, 128, 384, 385])
 @pytest.mark.parametrize("query_heads_per_kv_head", [1, 3])
 def test_score_selection_accepts_large_query_chunks(
-    monkeypatch, query_blocks, query_heads_per_kv_head
+    monkeypatch, target, expected_schedule, query_blocks, query_heads_per_kv_head
 ):
     score = Mock()
     monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
-    monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
-    )
+    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     query = torch.empty(1, 2 * query_heads_per_kv_head, query_blocks, 128)
     primary = torch.empty(1, 2, 17, 128)
-    assert _backend.select_minmax_scores(query, primary, primary) is score
+    selected = _backend.select_minmax_scores(query, primary, primary)
+    assert isinstance(selected, partial)
+    assert selected.func is score
+    assert selected.keywords == {"schedule": expected_schedule}
 
 
 @pytest.fixture(params=[32, 384], ids=["small_query", "large_query"])

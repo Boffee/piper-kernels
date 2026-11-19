@@ -16,6 +16,9 @@ from piper_kernels.attention.sparse_piper_attention._routes import (
     PackedRouteBuilder,
     _select_portable_routes,
 )
+from piper_kernels.attention.sparse_piper_attention._routes_triton import (
+    build_force_tile_bitmask,
+)
 
 pytestmark = pytest.mark.gpu
 
@@ -47,7 +50,7 @@ def _layout(counts, device):
     )
 
 
-def _expected_routes(scores, counts, *, query_block_offset=0):
+def _expected_routes(scores, counts, *, query_block_offset=0, force_tile_mask=None):
     layout = _layout(counts, "cpu")
     routes = torch.full(
         (scores.shape[0], query_block_offset + scores.shape[2] + 2, layout.routes_per_query),
@@ -60,6 +63,7 @@ def _expected_routes(scores, counts, *, query_block_offset=0):
         layout.route_head_offsets.tolist(),
         counts,
         query_block_offset=query_block_offset,
+        force_tile_mask=force_tile_mask,
     )
     return routes
 
@@ -189,3 +193,87 @@ def test_route_selector_graph_replay_uses_updated_scores(route_selector):
         graph.replay()
         expected = _expected_routes(scores, [1, 129, 513])[:, :5]
         torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("branch", ["shift24", "shift16", "shift8", "shift0_ties", "full_keep"])
+def test_radix_early_exit_branches_match_portable_policy(route_selector, branch):
+    key_blocks = 1029
+    # Construct bit-level score patterns so the k-th boundary resolves at each shift.
+    raw = torch.zeros((1, 2, 2, key_blocks), dtype=torch.int32)
+    base_bits = 0x3F800000  # +1.0 in IEEE FP32
+    indices = torch.arange(key_blocks, dtype=torch.int32)
+    if branch == "shift24":
+        # Distinct top-byte patterns isolate the top-16 bin on pass 24 (bin_count == 16).
+        raw[:, :, :, :16] = 0x42000000
+        raw[:, :, :, 16:] = 0x3F800000
+        counts = [16, 16]
+    elif branch == "shift16":
+        # Shared top byte 0x3F; 8 repeats of the highest bits 16..22 hit bin_count == 8 on
+        # pass 16 for count=8, while count=1 exercises fallback to pass 0 index tie-breaks.
+        raw[:] = base_bits | (((key_blocks - 1 - indices) & 0x7F) << 16)
+        counts = [1, 8]
+    elif branch == "shift8":
+        # Identical top 16 bits; unique bits 8..15 resolve exact boundary at pass 8.
+        raw[:] = base_bits | (((key_blocks - 1 - indices) & 0xFF) << 8)
+        counts = [4, 4]
+    elif branch == "shift0_ties":
+        # Identical top 24 bits and repeated low bytes force pass 0 + index tie-breaks.
+        raw[:] = base_bits | ((key_blocks - 1 - (indices % 32)) & 0xFF)
+        counts = [7, 257]
+    else:
+        raw[:] = base_bits
+        counts = [key_blocks, key_blocks]
+    scores = raw.view(torch.float32)
+    # Flip head 1 rows cleanly with varied magnitudes across passes when not shift0_ties.
+    scores[0, 1, 1] = scores[0, 1, 1].flip(dims=(-1,))
+    expected = _expected_routes(scores, counts, query_block_offset=0)[:, :2]
+    layout = _layout(counts, "cuda")
+    actual = torch.full((1, 2, sum(counts)), 0xA5A5, device="cuda", dtype=torch.uint16)
+    route_selector(
+        scores.cuda(),
+        actual,
+        layout.head_keep_blocks,
+        layout.route_head_offsets,
+        query_block_offset=0,
+    )
+    torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("counts", "include_extreme"),
+    [
+        ([3, 3], False),
+        ([3, 4], True),
+        ([3, 17], False),
+        ([3, 17], True),
+    ],
+)
+def test_radix_early_exit_with_forced_tiles_and_extremes(route_selector, counts, include_extreme):
+    key_blocks = 515
+    forced_ids = [2, 100, 514]
+    scores = torch.randn(
+        (1, 2, 2, key_blocks), dtype=torch.float32, generator=torch.Generator().manual_seed(548)
+    )
+    # Place +inf, +/-finfo.max, and -inf in non-forced positions so bin 0xFF splits across shifts.
+    if include_extreme:
+        scores[:, :, :, 0] = float("inf")
+        scores[:, :, :, 1] = torch.finfo(torch.float32).max
+        scores[:, :, :, 3] = -torch.finfo(torch.float32).max
+        scores[:, :, :, 4] = float("-inf")
+    force_ids = (
+        torch.tensor(forced_ids, device="cuda", dtype=torch.int32).expand(2, -1).contiguous()
+    )
+    force_counts = torch.full((2,), len(forced_ids), device="cuda", dtype=torch.int32)
+    force_mask = build_force_tile_bitmask(force_ids, force_counts, key_blocks)
+    layout = _layout(counts, "cuda")
+    actual = torch.full((1, 2, sum(counts)), 0xA5A5, device="cuda", dtype=torch.uint16)
+    route_selector(
+        scores.cuda(),
+        actual,
+        layout.head_keep_blocks,
+        layout.route_head_offsets,
+        query_block_offset=0,
+        force_tile_mask=force_mask,
+    )
+    expected = _expected_routes(scores, counts, force_tile_mask=force_mask.cpu())[:, :2]
+    torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)

@@ -3,6 +3,7 @@
 import pytest
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.sparse_piper_attention._amd import policy as amd_policy
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 
 
@@ -66,3 +67,38 @@ def test_each_target_selects_at_most_one_load_path(target, tma, async_copy):
 @pytest.mark.parametrize(("head_dim", "max_registers"), [(64, 168), (128, None)])
 def test_sm8x_caps_only_d64_registers(head_dim, max_registers):
     assert policy.select_sm8x_max_registers(head_dim) == max_registers
+
+
+@pytest.mark.parametrize(
+    ("target", "supported"),
+    [
+        (AcceleratorTarget("cuda", "sm120"), True),
+        *[(AcceleratorTarget("cuda", f"sm{arch}"), False) for arch in (80, 86, 87, 89)],
+        (AcceleratorTarget("cuda", "sm121"), False),
+        (AcceleratorTarget("cuda", "sm90"), False),
+        (AcceleratorTarget("cuda", "sm100"), False),
+        (AcceleratorTarget("hip", "gfx1201"), False),
+        (AcceleratorTarget("cpu"), False),
+    ],
+)
+def test_minmax_score_kernel_is_limited_to_exact_sm120(target, supported):
+    assert policy.supports_minmax_scores(target) is supported
+
+
+@pytest.mark.parametrize(
+    ("query_blocks", "expected"),
+    [
+        (1, (64, 64, 16)),
+        (27, (64, 64, 16)),
+        (64, (64, 64, 16)),
+        (65, (128, 32, 16)),
+        (128, (128, 32, 16)),
+        (384, (128, 32, 16)),
+    ],
+)
+def test_sm120_minmax_score_schedule_switches_at_chunk_crossover(query_blocks, expected):
+    assert policy.select_sm120_minmax_score_schedule(query_blocks) == expected
+
+
+def test_amd_minmax_score_schedule_preserves_rdna4_tiles():
+    assert amd_policy.select_minmax_score_schedule() == (32, 64, 16)

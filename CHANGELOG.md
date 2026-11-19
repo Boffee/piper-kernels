@@ -46,6 +46,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   faster end-to-end in compiled dense and sparse pipelines with unchanged peak memory.
   Sparse Q/K/V and dense K/V outputs are bitwise-identical, while dense Q scales stay
   within 1 ULP under Triton's default FP fusion with identical INT8 codes.
+- On RTX 5090 (SM120), `SparsePiperAttention` and sparse-Piper fusions now use
+  fused IEEE FP32 min/max routing scores alongside early-exit radix route
+  selection shared across native sparse targets, cutting routing time by about
+  1.7–2.5× at 110K–221K tokens (up to 5% faster standalone attention and 2.9%
+  faster compiled INT8 pipelines at 1/16 keep) with 80–127 MiB lower fused peak
+  scratch allocation and exact FP32 score (`<= 2e-5` vs FP64) and top-k parity.
 
 ### Removed
 

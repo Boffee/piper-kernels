@@ -3,8 +3,13 @@
 import torch
 
 
-def assert_fusion_output_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    """Enforce a 0.1% relative-L2 pipeline accuracy bound.
+def assert_fusion_output_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    relative_l2: float = 1e-3,
+) -> None:
+    """Enforce a relative-L2 pipeline accuracy bound (0.1% by default).
 
     FP32 reduction/FMA changes can cross quantization boundaries even when the
     final activation dtype is FP32. Primitive tests check accumulation and bias
@@ -18,7 +23,7 @@ def assert_fusion_output_close(actual: torch.Tensor, expected: torch.Tensor) -> 
     actual_values, expected_values = actual.double(), expected.double()
     error = (actual_values - expected_values).norm()
     reference_norm = expected_values.norm()
-    assert bool(error <= 1e-3 * reference_norm), (
+    assert bool(error <= relative_l2 * reference_norm), (
         f"fusion output error norm {error.item():.6g} exceeds "
-        f"0.001 * reference norm {reference_norm.item():.6g}"
+        f"{relative_l2:g} * reference norm {reference_norm.item():.6g}"
     )

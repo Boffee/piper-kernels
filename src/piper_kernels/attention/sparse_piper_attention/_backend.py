@@ -166,7 +166,7 @@ def select_minmax_scores(
     key_primary: torch.Tensor,
     key_aux: torch.Tensor,
 ) -> MinmaxScores | None:
-    """Use tiled FP32 scoring for D128 min/max summaries on RDNA4."""
+    """Use tiled FP32 scoring for D128 min/max summaries on RDNA4 and SM120."""
     if _score_backend is None:
         return None
     tensors = query_summary, key_primary, key_aux
@@ -194,7 +194,13 @@ def select_minmax_scores(
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
         return None
     target = AcceleratorTarget.from_device(query_summary.device)
-    return _score_backend.minmax_scores if amd_policy.supports_target(target) else None
+    if amd_policy.supports_target(target):
+        schedule = amd_policy.select_minmax_score_schedule()
+    elif nvidia_policy.supports_minmax_scores(target):
+        schedule = nvidia_policy.select_sm120_minmax_score_schedule(query_summary.shape[2])
+    else:
+        return None
+    return partial(_score_backend.minmax_scores, schedule=schedule)
 
 
 def fill_full_keep_routes(routes: torch.Tensor, sparse_key_blocks: int) -> None:
