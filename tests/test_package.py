@@ -79,6 +79,8 @@ from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 from piper_kernels._residual import ResidualAdd, validate_residual_add
+from piper_kernels._distributed import _fx as distributed_fx
+assert hasattr(distributed_fx, "has_c10d_collectives")
 residual_input = torch.ones(2, 32)
 validate_residual_add(
     residual_input,
@@ -136,11 +138,15 @@ import sys
 import piper_kernels.linear.convrot as convrot
 
 assert "piper_kernels.linear.convrot.int8._compile" not in sys.modules
+assert "piper_kernels.linear.convrot.int8._distributed_compile" not in sys.modules
+assert "piper_kernels._distributed._fx" not in sys.modules
 assert "piper_kernels.linear._preparation_sharing" not in sys.modules
 assert "piper_kernels.fusions.convrot_int8_sparse_piper._compile" not in sys.modules
 assert "piper_kernels.attention.sparse_piper_attention._quantized_dispatch" not in sys.modules
 convrot.convrot_int8_compile_options()
 assert "piper_kernels.linear.convrot.int8._compile" in sys.modules
+assert "piper_kernels.linear.convrot.int8._distributed_compile" in sys.modules
+assert "piper_kernels._distributed._fx" in sys.modules
 assert "piper_kernels.linear._preparation_sharing" in sys.modules
 assert "piper_kernels.fusions.convrot_int8_sparse_piper._compile" not in sys.modules
 assert "piper_kernels.attention.sparse_piper_attention._quantized_dispatch" not in sys.modules
@@ -191,10 +197,16 @@ import sys
 from piper_kernels.fusions import convrot_int8_sparse_piper
 
 assert "piper_kernels.fusions.convrot_int8_sparse_piper._compile" not in sys.modules
+assert "piper_kernels.fusions.convrot_int8_sparse_piper._distributed_compile" not in sys.modules
+assert "piper_kernels.fusions.convrot_int8_sparse_piper.distributed_output" not in sys.modules
+assert "piper_kernels.fusions.convrot_int8_sparse_piper.kv_gather" not in sys.modules
 assert "piper_kernels.fusions.convrot_int8_sparse_piper._output_compile" not in sys.modules
 assert "piper_kernels.fusions.convrot_int8_sparse_piper.output" not in sys.modules
 convrot_int8_sparse_piper.convrot_int8_sparse_piper_compile_options()
 assert "piper_kernels.fusions.convrot_int8_sparse_piper._compile" in sys.modules
+assert "piper_kernels.fusions.convrot_int8_sparse_piper._distributed_compile" in sys.modules
+assert "piper_kernels.fusions.convrot_int8_sparse_piper.distributed_output" in sys.modules
+assert "piper_kernels.fusions.convrot_int8_sparse_piper.kv_gather" in sys.modules
 assert "piper_kernels.fusions.convrot_int8_sparse_piper._output_compile" in sys.modules
 assert "piper_kernels.fusions.convrot_int8_sparse_piper.output" in sys.modules
 assert "piper_kernels.linear.convrot.int8._compile" in sys.modules

@@ -19,7 +19,7 @@ from piper_kernels.linear import _input_activation_compile as input_activation_c
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 
-from . import _compile_fx
+from . import _compile_fx, _distributed_compile
 
 type _PreparedInputNodes = _compile_fx.PreparedInputNodes
 
@@ -234,6 +234,7 @@ class _CompilePass(CustomInferenceAwareGraphPass):
         projection_views.normalize_projection_views(graph)
         _fold_gelu_tanh_inputs(graph)
         preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
+        _distributed_compile.fold_quantized_all_gather(graph)
 
     def uuid(self) -> bytes:
         return inductor_options.compute_compile_pass_uuid(self)

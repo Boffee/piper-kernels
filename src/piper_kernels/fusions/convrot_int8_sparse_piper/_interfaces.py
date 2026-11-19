@@ -1,6 +1,6 @@
 """Operation contracts for fused projections into shared sparse-attention storage."""
 
-from typing import Protocol
+from typing import Literal, Protocol
 
 import torch
 
@@ -58,6 +58,23 @@ class ProjectionBackend(Protocol):
         write it starting at local row zero, with neutral tail padding.
         """
 
+    def partial_row_block_size(
+        self,
+        input_qdata: torch.Tensor,
+        weight_qdata: torch.Tensor,
+        *,
+        operation: Literal["key", "value"],
+        head_dim: int,
+        rotary_dim: int = 0,
+        value_format: ValueFormat = ValueFormat.TRANSPOSED,
+    ) -> int | None:
+        """Return the aligned row block height for partial K/V launches, or ``None``.
+
+        Partial launches (``start_row_block != 0`` or ``num_row_blocks is not None``)
+        require a non-``None`` return value and row ranges lying within full
+        ``block_m`` blocks of the sequence length.
+        """
+
     def project_key(  # noqa: PLR0913
         self,
         input_qdata: torch.Tensor,
@@ -73,6 +90,8 @@ class ProjectionBackend(Protocol):
         *,
         out: KeyOutput,
         bias: torch.Tensor | None = None,
+        start_row_block: int = 0,
+        num_row_blocks: int | None = None,
     ) -> None:
         """Fill (K, scales, center, center_scales, summaries, auxiliary), D=64 or 128.
 
@@ -80,7 +99,9 @@ class ProjectionBackend(Protocol):
         uses one summary tensor and an empty auxiliary [B,H,0,D]. K is
         tile-centered by its K64 INT8 residual rotated midpoint (two signed terms per tile);
         routing summaries describe the uncentered FP32 transform values before
-        BF16 K storage.
+        BF16 K storage. Partial row-block launches require a backend whose
+        ``partial_row_block_size(..., operation="key")`` returns an aligned
+        ``block_m`` height and full-block bounds within ``sequence_length // block_m``.
         """
 
     def project_value(
@@ -94,10 +115,14 @@ class ProjectionBackend(Protocol):
         value_format: ValueFormat,
         out: ValueOutput,
         bias: torch.Tensor | None = None,
+        start_row_block: int = 0,
+        num_row_blocks: int | None = None,
     ) -> None:
         """Fill (V, multipliers[B,H,S/64,1], value_mean[B,H,S/64,D]), D=64 or 128.
 
         V is allocated in value_format and written directly in that final format.
         Each K64 tile of V is centered around its BF16 per-tile mean
-        ``value_mean``; padded tail blocks write zero means.
+        ``value_mean``; padded tail blocks write zero means. Partial row-block
+        launches require ``partial_row_block_size(..., operation="value", value_format=...)``
+        to return an aligned ``block_m`` height with full-block bounds.
         """

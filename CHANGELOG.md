@@ -5,6 +5,18 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Sequence-sharded (`Shard(1)`) ConvRot INT8 and fused sparse Piper attention
+  blocks compiled with `convrot_int8_compile_options` and
+  `convrot_int8_sparse_piper_compile_options` now fold PyTorch TP+SP collective
+  boundaries automatically (rounding peer and local rank residual updates into
+  `base` in two steps on 64-token rank-aligned sequences when paired with
+  `residual_updates_compile_options`). On 2x RX 9070 XT over `piper_relay`,
+  compiled 8-block MiniMax-H3 hybrid TP+SP runs 1.90x faster than single-GPU
+  streaming at 16K tokens (41.07 vs 77.93 ms/block, 7-iteration median) with
+  lower peak memory (1587 vs 1644 MiB).
+
 ### Changed
 
 - On RX 9070 XT with Triton 3.9, ConvRot INT8 linears and fused FFNs run

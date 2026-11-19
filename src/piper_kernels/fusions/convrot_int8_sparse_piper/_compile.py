@@ -35,7 +35,7 @@ from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
 
-from . import _backend, _layout, _output_compile
+from . import _backend, _distributed_compile, _layout, _output_compile
 from . import key as key_operators  # noqa: F401 - registers the K projection
 from . import value as value_operators  # noqa: F401 - registers the V projections
 
@@ -569,12 +569,15 @@ class _CompilePass(CustomInferenceAwareGraphPass):
             projection_views.normalize_projection_views(graph)
             _fold_sparse_piper_projection(graph)
             _output_compile._fold_attention_output(graph)
-            if residual_fold.fold_residual_adds(
+            changed = residual_fold.fold_residual_adds(
                 graph,
                 _ops.convrot_int8_sparse_piper_projected_query_attention_output.default,
                 _ops.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default,
                 _HEAD_SLICING,
-            ):
+            )
+            changed = _distributed_compile.fold_distributed_attention_output(graph) or changed
+            changed = _distributed_compile.fold_prepare_gather_project_kv(graph) or changed
+            if changed:
                 # Drop the operands that only the replaced output read.
                 graph.eliminate_dead_code()
                 graph.lint()
