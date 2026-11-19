@@ -47,11 +47,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   4–13% faster standalone (~9% in compiled D=128 H3 blocks). Batched sparse `value_mean`
   accumulation and per-row dense epilogue normalization slightly reassociate FP32
   arithmetic within INT8 tolerances, while sparse V projection outputs are unchanged.
-- On RTX 5090 (SM120), `D=128` `sparse_piper_attention` runs 8–9% faster standalone and
-  5–8% faster in compiled long-sequence pipelines, with unchanged peak memory. Batched
-  BF16 tensor-core `value_mean` accumulation and packed FP32 recurrence FMAs slightly
-  change `D=128` rounding within INT8 tolerances, while `D=64` and SM8x outputs are
-  unchanged.
+- On RTX 5090 (SM120), `D=128` `sparse_piper_attention` runs 10–11% faster standalone
+  and 3–9% faster in compiled `1/8`-keep 20K–110K pipelines, with unchanged peak memory.
+  Batched BF16 tensor-core `value_mean` accumulation and reordered FP32 score reductions
+  slightly change `D=128` rounding within INT8 tolerances, while `D=64` and SM8x outputs
+  are unchanged.
 - On RTX 5090 (SM120), `D=128` `convrot_int8_sparse_piper` and `convrot_int8_piper`
   Q/K/V projections use TMA operand loads across all `K64`-aligned input widths,
   running 7–10% faster on standalone 110K-token sparse Q/K/V phases and up to 1.3%

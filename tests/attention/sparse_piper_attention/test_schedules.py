@@ -119,6 +119,7 @@ def test_skip_dense_routing_matches_materialized_routes(monkeypatch, sequence):
     direct.launch(direct.query, actual.transpose(1, 2))
     with torch.cuda.graph(graph):
         direct.launch(direct.query, actual.transpose(1, 2))
+    actual.fill_(float("nan"))
     graph.replay()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -249,6 +250,67 @@ def test_d128_chunked_value_mean_and_dense_suffix_match_fp64(sequence, coarse):
     assert torch.all(guarded[:, (0, -1)] == 123.0)
 
 
+def _assert_manual_d128_routes_match_fp64(
+    total_tiles: int, selected: list[int], generator: torch.Generator
+) -> None:
+    """Verify manually routed D128 tiles with NaN-poisoned unselected V means."""
+    sequence = total_tiles * 64
+    route_count = len(selected)
+    value_mean = torch.full(
+        (1, 1, total_tiles, 128), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    value_mean[0, 0, selected] = torch.randn(
+        (route_count, 128), device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    context = _prepare_sparse_piper_context_from_quantized(
+        torch.randint(
+            -31, 32, (1, 1, sequence, 128), device="cuda", dtype=torch.int8, generator=generator
+        ),
+        torch.full((1, 1, total_tiles), 0.05, device="cuda"),
+        torch.randint(
+            -31,
+            32,
+            (1, 1, total_tiles, 2, 128),
+            device="cuda",
+            dtype=torch.int8,
+            generator=generator,
+        ),
+        torch.tensor([0.04, 0.002], device="cuda").expand(1, 1, total_tiles, 2).contiguous(),
+        torch.randint(
+            -128, 128, (1, 1, 128, sequence), device="cuda", dtype=torch.int8, generator=generator
+        ),
+        torch.exp2(
+            torch.empty((1, 1, total_tiles, 1), device="cuda").uniform_(-8, 8, generator=generator)
+        ),
+        value_mean,
+        torch.tensor([route_count], device="cuda", dtype=torch.int32),
+        torch.tensor([0, route_count], device="cuda", dtype=torch.int32),
+        value_format=ValueFormat.TRANSPOSED,
+        sparse_key_blocks=total_tiles,
+        routes_per_query=route_count,
+        logical_sequence_length=sequence,
+    )
+    routes = torch.tensor(selected, device="cuda", dtype=torch.uint16).expand(1, 1, route_count)
+    query = _prepare_sparse_piper_query_from_quantized(
+        torch.randint(
+            -31, 32, (1, 1, 64, 128), device="cuda", dtype=torch.int8, generator=generator
+        ),
+        torch.full((1, 1, 2), 0.05, device="cuda"),
+        routes.contiguous(),
+        context,
+    )
+    manual_prepared = _PreparedSparsePiperAttention(
+        require_attention_backend(context.key).bind_context(context), query
+    )
+    manual_output = torch.empty((1, 1, 64, 128), device="cuda", dtype=torch.bfloat16)
+    manual_prepared.launch(manual_prepared.query, manual_output)
+    expected = reference_prepared_query(manual_prepared, 0, 0, 0, output_dtype=torch.float64)
+    actual = manual_output[0, 0]
+    assert torch.isfinite(actual).all()
+    error = (actual.double() - expected).norm() / expected.norm().clamp_min(1e-30)
+    assert error < 0.015, (route_count, error.item())
+
+
 @pytest.mark.gpu
 @requires_sm120
 def test_d128_padded_blocks_and_unselected_value_means_match_fp64():
@@ -266,57 +328,36 @@ def test_d128_padded_blocks_and_unselected_value_means_match_fp64():
 
     generator = torch.Generator(device="cuda").manual_seed(911)
     for selected in ([3, 7, 15, 22, 31], list(range(1, 35))):
-        route_count = len(selected)
-        value_mean = torch.full(
-            (1, 1, tiles, 128), float("nan"), device="cuda", dtype=torch.bfloat16
-        )
-        value_mean[0, 0, selected] = torch.randn(
-            (route_count, 128), device="cuda", dtype=torch.bfloat16, generator=generator
-        )
-        context = _prepare_sparse_piper_context_from_quantized(
-            torch.randint(
-                -31, 32, (1, 1, sequence, 128), device="cuda", dtype=torch.int8, generator=generator
-            ),
-            torch.full((1, 1, tiles), 0.05, device="cuda"),
-            torch.randint(
-                -31, 32, (1, 1, tiles, 2, 128), device="cuda", dtype=torch.int8, generator=generator
-            ),
-            torch.tensor([0.04, 0.002], device="cuda").expand(1, 1, tiles, 2).contiguous(),
-            torch.randint(
-                -128,
-                128,
-                (1, 1, 128, sequence),
-                device="cuda",
-                dtype=torch.int8,
-                generator=generator,
-            ),
-            torch.exp2(
-                torch.empty((1, 1, tiles, 1), device="cuda").uniform_(-8, 8, generator=generator)
-            ),
-            value_mean,
-            torch.tensor([route_count], device="cuda", dtype=torch.int32),
-            torch.tensor([0, route_count], device="cuda", dtype=torch.int32),
-            value_format=ValueFormat.TRANSPOSED,
-            sparse_key_blocks=tiles,
-            routes_per_query=route_count,
-            logical_sequence_length=sequence,
-        )
-        routes = torch.tensor(selected, device="cuda", dtype=torch.uint16).expand(1, 1, route_count)
-        query = _prepare_sparse_piper_query_from_quantized(
-            torch.randint(
-                -31, 32, (1, 1, 64, 128), device="cuda", dtype=torch.int8, generator=generator
-            ),
-            torch.full((1, 1, 2), 0.05, device="cuda"),
-            routes.contiguous(),
-            context,
-        )
-        manual_prepared = _PreparedSparsePiperAttention(
-            require_attention_backend(context.key).bind_context(context), query
-        )
-        manual_output = torch.empty((1, 1, 64, 128), device="cuda", dtype=torch.bfloat16)
-        manual_prepared.launch(manual_prepared.query, manual_output)
-        expected = reference_prepared_query(manual_prepared, 0, 0, 0, output_dtype=torch.float64)
-        actual = manual_output[0, 0]
-        assert torch.isfinite(actual).all()
-        error = (actual.double() - expected).norm() / expected.norm().clamp_min(1e-30)
-        assert error < 0.015, (route_count, error.item())
+        _assert_manual_d128_routes_match_fp64(tiles, selected, generator)
+
+
+@pytest.mark.gpu
+@requires_sm120
+@pytest.mark.parametrize("tile_count", [1, 2, 15, 16, 17, 32, 33, 49])
+def test_d128_smem_alias_chunk_boundaries_match_fp64(tile_count):
+    total_tiles = 52
+    generator = torch.Generator(device="cuda").manual_seed(977 + tile_count)
+    selected = torch.randperm(total_tiles, device="cuda", generator=generator)[:tile_count].tolist()
+    _assert_manual_d128_routes_match_fp64(total_tiles, selected, generator)
+
+
+@pytest.mark.gpu
+@requires_sm120
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_d128_output_dtypes_and_cuda_graph_match_fp64(dtype):
+    sequence = 33 * 64
+    _operands, prepared = _prepared(sequence, (0.25, 0.5, 0.75, 1.0), head_dim=128, kv_heads=2)
+    output = torch.empty(
+        (1, prepared.query.data.shape[1], sequence, 128), device="cuda", dtype=dtype
+    )
+    prepared.launch(prepared.query, output)
+    _assert_sampled_d128_matches_fp64(prepared, output.transpose(1, 2), (0, 16, 32))
+
+    replayed = torch.empty_like(output)
+    graph = torch.cuda.CUDAGraph()
+    prepared.launch(prepared.query, replayed)
+    with torch.cuda.graph(graph):
+        prepared.launch(prepared.query, replayed)
+    replayed.fill_(float("nan"))
+    graph.replay()
+    torch.testing.assert_close(replayed, output, atol=0, rtol=0)
