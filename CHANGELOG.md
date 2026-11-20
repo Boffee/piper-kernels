@@ -21,6 +21,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Breaking: Require Python 3.14+, PyTorch 2.15+, and Triton 3.9+ across
+  all platforms, dropping Python 3.13, PyTorch 2.14, and Triton 3.8
+  support.
 - On RX 9070 XT (`Triton 3.9`), fused ConvRot INT8 sparse Piper Q/K/V
   projections automatically use RDNA4 Gluon kernels across aligned `D=64` and
   `D=128` operands (preserving partial K/V gather overlap and shared Triton

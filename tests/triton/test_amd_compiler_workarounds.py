@@ -152,8 +152,7 @@ def test_compiler_hook_rewrites_only_opted_in_kernels(
     [
         ("7.15", "3.9.0", True, True, True),
         ("7.15", "3.10.0+gitabc", True, True, True),
-        ("7.15", "3.8.0", False, True, True),
-        ("7.15", "3.7.0", False, False, False),
+        ("7.15", "3.8.0", False, False, False),
         (None, "3.9.0", True, True, False),
     ],
 )

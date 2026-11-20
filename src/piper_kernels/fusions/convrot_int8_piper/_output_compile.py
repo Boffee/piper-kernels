@@ -125,7 +125,7 @@ def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple, dict] | None:  # noq
     try:
         values = cast(tuple[Any, ...], map_arg(arguments, _metadata))
         query_shape = output._validate_inputs(*values, **kwargs)
-    except (KeyError, TypeError, ValueError, RuntimeError):
+    except KeyError, TypeError, ValueError, RuntimeError:
         return None
     if any(
         not statically_known_true(a == b)

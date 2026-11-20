@@ -41,7 +41,7 @@ def supports_residual_add(
     return bool(
         all(
             value.ndim == base.ndim
-            and all(map(_same_dimension, value.shape, base.shape))
+            and all(map(_same_dimension, value.shape, base.shape, strict=True))
             and value.dtype is base.dtype
             and value.device == base.device
             and value.layout is torch.strided

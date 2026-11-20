@@ -31,7 +31,7 @@ Validated Linux RX 9070 XT (`gfx1201`) setup with stable ROCm 10.2.0, PyTorch
 same AMD index with `triton-windows>=3.9,<3.10`):
 
 ```shell
-uv --no-config venv --python 3.13 .venv-rocm
+uv --no-config venv --python 3.14 .venv-rocm
 uv --no-config pip install --python .venv-rocm/bin/python \
   --index-url https://stable.repo.amd.com/rocm/whl-next/ \
   "torch[device-gfx1201]==2.15.0+rocm10.2.0"

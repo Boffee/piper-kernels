@@ -43,7 +43,7 @@ Tests mirror [`tests/`](../tests) structure.
 
 ## Code conventions
 
-Target Python 3.13 and the Ruff and Pyright settings in
+Target Python 3.14 and the Ruff and Pyright settings in
 [`pyproject.toml`](../pyproject.toml). Use typed module boundaries that express
 invariants; contain `Any` at external/dynamic boundaries and document why.
 
