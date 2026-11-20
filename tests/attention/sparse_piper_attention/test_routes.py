@@ -68,7 +68,10 @@ def _expected_routes(scores, counts, *, query_block_offset=0, force_tile_mask=No
     return routes
 
 
-@pytest.mark.parametrize("key_blocks", [1, 7, 511, 512, 513, 1562, 4097, 65_536])
+@pytest.mark.parametrize(
+    "key_blocks",
+    [1, 7, 511, 512, 513, 1024, 1025, 1562, 2048, 2049, 4097, 65_536],
+)
 @pytest.mark.parametrize("strided", [False, True])
 def test_stable_routes_match_portable_policy(route_selector, key_blocks, strided):
     generator = torch.Generator().manual_seed(546)
@@ -195,9 +198,9 @@ def test_route_selector_graph_replay_uses_updated_scores(route_selector):
         torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("key_blocks", [1029, 2053])
 @pytest.mark.parametrize("branch", ["shift24", "shift16", "shift8", "shift0_ties", "full_keep"])
-def test_radix_early_exit_branches_match_portable_policy(route_selector, branch):
-    key_blocks = 1029
+def test_radix_early_exit_branches_match_portable_policy(route_selector, key_blocks, branch):
     # Construct bit-level score patterns so the k-th boundary resolves at each shift.
     raw = torch.zeros((1, 2, 2, key_blocks), dtype=torch.int32)
     base_bits = 0x3F800000  # +1.0 in IEEE FP32
@@ -208,14 +211,14 @@ def test_radix_early_exit_branches_match_portable_policy(route_selector, branch)
         raw[:, :, :, 16:] = 0x3F800000
         counts = [16, 16]
     elif branch == "shift16":
-        # Shared top byte 0x3F; 8 repeats of the highest bits 16..22 hit bin_count == 8 on
-        # pass 16 for count=8, while count=1 exercises fallback to pass 0 index tie-breaks.
+        # Shared top byte 0x3F; (key_blocks // 128) repeats of the highest bits 16..22
+        # hit bin_count == rank on pass 16, while count=1 forces pass 0 index tie-breaks.
         raw[:] = base_bits | (((key_blocks - 1 - indices) & 0x7F) << 16)
-        counts = [1, 8]
+        counts = [1, key_blocks // 128]
     elif branch == "shift8":
-        # Identical top 16 bits; unique bits 8..15 resolve exact boundary at pass 8.
+        # Identical top 16 bits; (key_blocks // 256) repeats resolve at pass 8.
         raw[:] = base_bits | (((key_blocks - 1 - indices) & 0xFF) << 8)
-        counts = [4, 4]
+        counts = [key_blocks // 256, key_blocks // 256]
     elif branch == "shift0_ties":
         # Identical top 24 bits and repeated low bytes force pass 0 + index tie-breaks.
         raw[:] = base_bits | ((key_blocks - 1 - (indices % 32)) & 0xFF)
@@ -239,6 +242,7 @@ def test_radix_early_exit_branches_match_portable_policy(route_selector, branch)
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("key_blocks", [515, 2055])
 @pytest.mark.parametrize(
     ("counts", "include_extreme"),
     [
@@ -248,9 +252,10 @@ def test_radix_early_exit_branches_match_portable_policy(route_selector, branch)
         ([3, 17], True),
     ],
 )
-def test_radix_early_exit_with_forced_tiles_and_extremes(route_selector, counts, include_extreme):
-    key_blocks = 515
-    forced_ids = [2, 100, 514]
+def test_radix_early_exit_with_forced_tiles_and_extremes(
+    route_selector, key_blocks, counts, include_extreme
+):
+    forced_ids = [2, 100, key_blocks - 1]
     scores = torch.randn(
         (1, 2, 2, key_blocks), dtype=torch.float32, generator=torch.Generator().manual_seed(548)
     )

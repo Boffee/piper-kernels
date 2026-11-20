@@ -5,6 +5,7 @@ import pytest
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._amd import policy as amd_policy
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
+from piper_kernels.attention.sparse_piper_attention._plan import MinmaxScoreSchedule
 
 
 @pytest.mark.parametrize(
@@ -88,17 +89,28 @@ def test_minmax_score_kernel_is_limited_to_exact_sm120(target, supported):
 @pytest.mark.parametrize(
     ("query_blocks", "expected"),
     [
-        (1, (64, 64, 16)),
-        (27, (64, 64, 16)),
-        (64, (64, 64, 16)),
-        (65, (128, 32, 16)),
-        (128, (128, 32, 16)),
-        (384, (128, 32, 16)),
+        (1, MinmaxScoreSchedule(64, 64, 16)),
+        (27, MinmaxScoreSchedule(64, 64, 16)),
+        (64, MinmaxScoreSchedule(64, 64, 16)),
+        (65, MinmaxScoreSchedule(128, 32, 16)),
+        (128, MinmaxScoreSchedule(128, 32, 16)),
+        (384, MinmaxScoreSchedule(128, 32, 16)),
     ],
 )
 def test_sm120_minmax_score_schedule_switches_at_chunk_crossover(query_blocks, expected):
     assert policy.select_sm120_minmax_score_schedule(query_blocks) == expected
 
 
-def test_amd_minmax_score_schedule_preserves_rdna4_tiles():
-    assert amd_policy.select_minmax_score_schedule() == (32, 64, 16)
+@pytest.mark.parametrize(
+    ("query_blocks", "expected"),
+    [
+        (1, MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True)),
+        (27, MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True)),
+        (64, MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True)),
+        (127, MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True)),
+        (128, MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True)),
+        (384, MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True)),
+    ],
+)
+def test_amd_minmax_score_schedule_switches_at_chunk_crossover(query_blocks, expected):
+    assert amd_policy.select_minmax_score_schedule(query_blocks) == expected

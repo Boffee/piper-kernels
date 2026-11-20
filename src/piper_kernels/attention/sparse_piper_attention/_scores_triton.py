@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.runtime import device_context
 
 from ._plan import MinmaxScoreSchedule
@@ -103,7 +104,7 @@ def minmax_scores(
     """Contract validated D128 summaries into one contiguous FP32 score tensor."""
     batch, heads, query_blocks, _ = query_summary.shape
     key_blocks = key_primary.shape[2]
-    block_m, block_n, block_k = schedule
+    block_m, block_n, block_k, lds_only_fences = schedule
     output = query_summary.new_empty((batch, heads, query_blocks, key_blocks))
     with device_context(query_summary.device):
         _minmax_scores_kernel[
@@ -127,6 +128,7 @@ def minmax_scores(
             block_k=block_k,
             num_warps=4,
             num_stages=1,
+            **lds_only_fence_options(lds_only_fences),
         )
     return output
 

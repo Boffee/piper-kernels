@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels._grid import select_block_grid
 from piper_kernels.attention.kernels.sparse_piper import triton as sparse_piper_kernels
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 
@@ -31,6 +32,8 @@ _BLOCK_ROWS = 64
         "stride_ih",
         "stride_il",
         "stride_ir",
+        "heads",
+        "heads_inner",
     ]
 )
 def _block_summary_kernel(  # noqa: PLR0913, PLR0917
@@ -44,26 +47,27 @@ def _block_summary_kernel(  # noqa: PLR0913, PLR0917
     stride_ih: int,
     stride_il: int,
     stride_ir: int,
+    heads: int,
+    heads_inner: int,
     block_rows: tl.constexpr,
     head_dim: tl.constexpr,
-    heads: tl.constexpr,
     query_summary: tl.constexpr,
     mean_pool_summary: tl.constexpr,
     mask_block_lengths: tl.constexpr,
     mask_ragged_tail: tl.constexpr,
 ) -> None:
-    block = tl.program_id(0)
-    batch_head = block // logical_block_count
-    logical_block = block % logical_block_count
-    batch = batch_head // heads
-    head = batch_head % heads
+    pid0 = tl.program_id(0)
+    pid1 = tl.program_id(1)
+    batch = tl.program_id(2).to(tl.int64)
+    logical_block = tl.where(heads_inner != 0, pid1, pid0).to(tl.int64)
+    head = tl.where(heads_inner != 0, pid0, pid1).to(tl.int64)
     row_offsets = tl.arange(0, block_rows)[:, None]
     feature_offsets = tl.arange(0, head_dim)[None, :]
     input_offsets = (
         batch * stride_ib
         + head * stride_ih
         + logical_block * stride_il
-        + row_offsets * stride_ir
+        + row_offsets.to(tl.int64) * stride_ir
         + feature_offsets
     )
     if mask_block_lengths:
@@ -83,6 +87,7 @@ def _block_summary_kernel(  # noqa: PLR0913, PLR0917
     primary = tl.reshape(primary, (head_dim,))
     auxiliary = tl.reshape(auxiliary, (head_dim,))
 
+    block = (batch * heads + head) * logical_block_count + logical_block
     output_offsets = block * head_dim + tl.arange(0, head_dim)
     tl.store(output_primary_ptr + output_offsets, primary)
     if not mean_pool_summary and not query_summary:
@@ -107,7 +112,7 @@ def sequence_block_summaries(
         or query.shape[-1] not in SUPPORTED_HEAD_DIMS
         or key.shape[-1] != query.shape[-1]
         or query.shape[2] < 1
-        or key.shape[2] < _BLOCK_ROWS
+        or key.shape[2] < 1
     ):
         raise ValueError("optimized summaries require nonempty ragged Q/K with D64/D128 K")
     if query.device.type != "cuda" or query.dtype not in SUPPORTED_DTYPES:
@@ -161,7 +166,8 @@ def sequence_block_summaries(
         ) -> None:
             logical_rows = sequence.shape[2]
             logical_blocks = (logical_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
-            _block_summary_kernel[(batch * sequence.shape[1] * logical_blocks,)](
+            grid, heads_inner = select_block_grid(sequence, logical_blocks)
+            _block_summary_kernel[grid](
                 sequence,
                 primary,
                 aux,
@@ -172,9 +178,10 @@ def sequence_block_summaries(
                 stride_ih=sequence.stride(1),
                 stride_il=_BLOCK_ROWS * sequence.stride(2),
                 stride_ir=sequence.stride(2),
+                heads=sequence.shape[1],
+                heads_inner=heads_inner,
                 block_rows=_BLOCK_ROWS,
                 head_dim=head_dim,
-                heads=sequence.shape[1],
                 query_summary=query,
                 mean_pool_summary=mean_pool_summary,
                 mask_block_lengths=block_lengths is not None,

@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels._grid import select_block_grid
 
 from ._rotation import SIGNED_HADAMARD_MASK
 
@@ -366,7 +367,7 @@ def quantize_query_per_thread_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["query_length"])
+@triton.jit(do_not_specialize=["query_length", "heads_inner"])
 def quantize_query_per_warp_kernel(
     query_ptr,
     output_ptr,
@@ -381,10 +382,13 @@ def quantize_query_per_warp_kernel(
     stride_on,
     stride_sb,
     stride_sh,
+    heads_inner,
     head_dim: tl.constexpr,
 ):
-    scale_group = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
+    pid0 = tl.program_id(0)
+    pid1 = tl.program_id(1)
+    scale_group = tl.where(heads_inner != 0, pid1, pid0).to(tl.int64)
+    head = tl.where(heads_inner != 0, pid0, pid1).to(tl.int64)
     batch = tl.program_id(2).to(tl.int64)
     offsets_n = scale_group * 32 + tl.arange(0, 32)
     offsets_d = tl.arange(0, head_dim)
@@ -575,7 +579,9 @@ def quantize_key_per_block_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["key_length", "heads", "tile_count", "storage_key_length"])
+@triton.jit(
+    do_not_specialize=["key_length", "heads", "tile_count", "storage_key_length", "heads_inner"]
+)
 def quantize_key_tile_centered_per_block_kernel(
     key_ptr,
     output_ptr,
@@ -595,13 +601,16 @@ def quantize_key_tile_centered_per_block_kernel(
     stride_sb,
     stride_sh,
     heads,
+    heads_inner,
     mask_block_lengths: tl.constexpr,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):
     """Quantize K with per-block (K64) tile centering and 2-term rotated midpoints."""
-    scale_group = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
+    pid0 = tl.program_id(0)
+    pid1 = tl.program_id(1)
+    scale_group = tl.where(heads_inner != 0, pid1, pid0).to(tl.int64)
+    head = tl.where(heads_inner != 0, pid0, pid1).to(tl.int64)
     batch = tl.program_id(2).to(tl.int64)
     rows = tl.arange(0, block_n)
     offsets_n = scale_group * block_n + rows
@@ -684,8 +693,9 @@ def prepare_tile_centered_key(
         dtype=torch.float32,
     )
     lengths_or_placeholder = block_lengths if block_lengths is not None else key_scale
+    grid, heads_inner = select_block_grid(key, tile_count)
     with device_context(key.device):
-        quantize_key_tile_centered_per_block_kernel[(tile_count, heads, batch)](
+        quantize_key_tile_centered_per_block_kernel[grid](
             key,
             key_int8,
             key_scale,
@@ -704,6 +714,7 @@ def prepare_tile_centered_key(
             key_scale.stride(0),
             key_scale.stride(1),
             heads,
+            heads_inner,
             mask_block_lengths=block_lengths is not None,
             head_dim=head_dim,
             block_n=_KEY_BLOCK,
@@ -747,7 +758,8 @@ def prepare_query(
             )
             if storage_scale_groups != logical_scale_groups:
                 query_scale[:, :, logical_scale_groups:].zero_()
-            quantize_query_per_warp_kernel[(logical_scale_groups, heads, batch)](
+            grid, heads_inner = select_block_grid(query, logical_scale_groups)
+            quantize_query_per_warp_kernel[grid](
                 query,
                 query_int8,
                 query_scale,
@@ -761,6 +773,7 @@ def prepare_query(
                 query_int8.stride(2),
                 query_scale.stride(0),
                 query_scale.stride(1),
+                heads_inner,
                 head_dim=head_dim,
                 num_warps=4,
             )

@@ -29,6 +29,7 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _resolve_route_layout,
 )
 from piper_kernels.attention.sparse_piper_attention._interfaces import AttentionBackend
+from piper_kernels.attention.sparse_piper_attention._plan import MinmaxScoreSchedule
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_context_from_quantized,
     _prepare_sparse_piper_query_from_quantized,
@@ -148,11 +149,17 @@ def test_missing_score_implementation_does_not_probe_device(monkeypatch):
 @pytest.mark.parametrize(
     ("target", "expected_schedule"),
     [
-        (AcceleratorTarget("hip", "gfx1200"), (32, 64, 16)),
-        (AcceleratorTarget("hip", "gfx1201"), (32, 64, 16)),
+        (
+            AcceleratorTarget("hip", "gfx1200"),
+            MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True),
+        ),
+        (
+            AcceleratorTarget("hip", "gfx1201"),
+            MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True),
+        ),
         (AcceleratorTarget("hip", "gfx1100"), None),
         (AcceleratorTarget("hip", "gfx942"), None),
-        (AcceleratorTarget("cuda", "sm120"), (64, 64, 16)),
+        (AcceleratorTarget("cuda", "sm120"), MinmaxScoreSchedule(64, 64, 16)),
         (AcceleratorTarget("cuda", "sm89"), None),
         (AcceleratorTarget("cuda", "sm80"), None),
         (AcceleratorTarget("cpu"), None),
@@ -187,13 +194,34 @@ def test_score_selection_is_independent_and_uses_operand_target(
 
 
 @pytest.mark.parametrize(
-    ("target", "expected_schedule"),
+    ("target", "query_blocks", "expected_schedule"),
     [
-        (AcceleratorTarget("hip", "gfx1201"), (32, 64, 16)),
-        (AcceleratorTarget("cuda", "sm120"), (128, 32, 16)),
+        (
+            AcceleratorTarget("hip", "gfx1201"),
+            65,
+            MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True),
+        ),
+        (
+            AcceleratorTarget("hip", "gfx1201"),
+            128,
+            MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True),
+        ),
+        (
+            AcceleratorTarget("hip", "gfx1201"),
+            384,
+            MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True),
+        ),
+        (
+            AcceleratorTarget("hip", "gfx1201"),
+            385,
+            MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True),
+        ),
+        (AcceleratorTarget("cuda", "sm120"), 65, MinmaxScoreSchedule(128, 32, 16)),
+        (AcceleratorTarget("cuda", "sm120"), 128, MinmaxScoreSchedule(128, 32, 16)),
+        (AcceleratorTarget("cuda", "sm120"), 384, MinmaxScoreSchedule(128, 32, 16)),
+        (AcceleratorTarget("cuda", "sm120"), 385, MinmaxScoreSchedule(128, 32, 16)),
     ],
 )
-@pytest.mark.parametrize("query_blocks", [65, 128, 384, 385])
 @pytest.mark.parametrize("query_heads_per_kv_head", [1, 3])
 def test_score_selection_accepts_large_query_chunks(
     monkeypatch, target, expected_schedule, query_blocks, query_heads_per_kv_head
@@ -327,8 +355,8 @@ def test_score_fallback_keeps_autograd(monkeypatch, query_blocks):
         (AcceleratorTarget("cuda", "sm120"), True, True),
         (AcceleratorTarget("cuda", "sm89"), True, True),
         (AcceleratorTarget("cuda", "sm86"), True, True),
-        (AcceleratorTarget("hip", "gfx1200"), True, False),
-        (AcceleratorTarget("hip", "gfx1201"), True, False),
+        (AcceleratorTarget("hip", "gfx1200"), True, True),
+        (AcceleratorTarget("hip", "gfx1201"), True, True),
         (AcceleratorTarget("cuda", "sm121"), False, False),
         (AcceleratorTarget("cuda", "sm90"), False, False),
         (AcceleratorTarget("hip", "gfx1100"), False, False),
@@ -359,6 +387,7 @@ def test_auxiliary_selection_is_independent_of_attention(
         shape=(1, 1, 128, 128),
         dtype=dtype,
         stride=lambda dim: 1,
+        requires_grad=False,
     )
     routes = SimpleNamespace(device=query.device)
     assert _backend.select_route_selector(routes) is (route_selector if routes_supported else None)
@@ -427,6 +456,86 @@ def test_summary_selection_preserves_tensor_constraints(monkeypatch, invalid):
     else:
         key = key.to("meta")
     assert _backend.select_sequence_summaries(query, key) is None
+
+
+@pytest.mark.parametrize("grad_operand", ["query", "key"])
+def test_summary_selection_preserves_autograd(monkeypatch, grad_operand):
+    monkeypatch.setattr(
+        _backend, "_summary_backend", SimpleNamespace(sequence_block_summaries=Mock())
+    )
+    monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
+    query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16, requires_grad=grad_operand == "query")
+    key = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16, requires_grad=grad_operand == "key")
+    with torch.enable_grad():
+        assert _backend.select_sequence_summaries(query, key) is None
+
+
+@pytest.mark.parametrize(
+    ("sparse_key_blocks", "expected_block_k"),
+    [
+        (1, 512),
+        (512, 512),
+        (513, 1024),
+        (1024, 1024),
+        (1025, 2048),
+        (2048, 2048),
+        (2049, None),
+        (65_536, None),
+    ],
+)
+def test_radix_route_dispatch_selects_single_load_or_tiled_kernel(
+    monkeypatch, sparse_key_blocks, expected_block_k
+):
+    if _backend._route_backend is None:
+        pytest.skip("requires Triton")
+    routes_triton = _backend._route_backend
+    assert routes_triton._select_single_load_block_k(sparse_key_blocks) == expected_block_k
+
+    cuda_device = torch.device("cuda", 0)
+
+    def fake_tensor(shape, dtype):
+        strides = []
+        stride = 1
+        for size in reversed(shape):
+            strides.append(stride)
+            stride *= max(size, 1)
+        strides.reverse()
+        return SimpleNamespace(
+            shape=shape,
+            ndim=len(shape),
+            dtype=dtype,
+            device=cuda_device,
+            is_contiguous=lambda: True,
+            stride=lambda dim=None: strides[dim] if dim is not None else tuple(strides),
+        )
+
+    single_launch = Mock()
+    single_kernel = MagicMock()
+    single_kernel.__getitem__.return_value = single_launch
+    tiled_launch = Mock()
+    tiled_kernel = MagicMock()
+    tiled_kernel.__getitem__.return_value = tiled_launch
+    monkeypatch.setattr(routes_triton, "device_context", lambda _device: nullcontext())
+    monkeypatch.setattr(
+        routes_triton, "_single_load_radix_select_packed_routes_kernel", single_kernel
+    )
+    monkeypatch.setattr(routes_triton, "_tiled_radix_select_packed_routes_kernel", tiled_kernel)
+
+    routes_triton.tiled_radix_select_packed_routes(
+        fake_tensor((1, 2, 3, sparse_key_blocks), torch.float32),
+        fake_tensor((1, 3, 2), torch.uint16),
+        fake_tensor((2,), torch.int32),
+        fake_tensor((3,), torch.int32),
+        query_block_offset=0,
+    )
+    if expected_block_k is not None:
+        single_kernel.__getitem__.assert_called_once_with((3, 2, 1))
+        assert single_launch.call_args.kwargs["block_k"] == expected_block_k
+        tiled_kernel.__getitem__.assert_not_called()
+    else:
+        tiled_kernel.__getitem__.assert_called_once_with((3, 2, 1))
+        assert tiled_launch.call_args.kwargs["selector_tile"] == routes_triton._SELECTOR_TILE
+        single_kernel.__getitem__.assert_not_called()
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
