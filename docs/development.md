@@ -149,6 +149,13 @@ nearby shapes. Put model-specific assumptions in opt-in `specializations/`.
 Compile or dispatch coverage alone does not prove on-device correctness or
 speedup; measure with the [benchmark guide](../benchmarks/README.md).
 
+During kernel prototyping and schedule exploration, batch multiple candidate
+variants into one script run on a single anchor workload instead of testing one
+change per round trip. Inspect generated IR and ISA (vector loads/stores such as
+`buffer_load_b64`/`buffer_store_b64`, VGPR counts, scratch spills, and shared
+memory) on a few canary configurations before sweeping the full variant space or
+running the full benchmark catalog.
+
 ## Checks
 
 In the default CUDA environment:
@@ -195,6 +202,15 @@ and cold-import isolation when consolidating — matching line or branch coverag
 alone does not prove test equivalence. When trimming a matrix, state which
 retained tests cover the dropped cases and compare `--durations=20` across
 repeated runs with matching hardware, dependency versions, and cache state.
+
+For offline `GluonASTSource` compile tests, include
+`[["tt.divisibility", 16]]` in pointer argument `attrs` to match contiguous
+PyTorch allocations so compiler vectorization and spill checks reflect live
+launches. Gate broad ad-hoc compile sweeps on a small canary subset and
+parallelize them across CPU workers (`ProcessPoolExecutor`); in permanent test
+suites, avoid multiplying identical-ISA targets (such as `gfx1200` and
+`gfx1201`) across every option flag when one target already covers variant
+codegen.
 
 ## Commits and pull requests
 

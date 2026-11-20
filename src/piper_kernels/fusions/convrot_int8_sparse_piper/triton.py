@@ -10,12 +10,13 @@ import triton
 
 from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat, padded_sequence_length
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 
 from . import _kernels
 from ._interfaces import KeyOutput, QueryOutput, ValueOutput
+from ._layout import TILE_ROWS, resolve_row_block_launches
 
 
 def project_query(
@@ -115,28 +116,18 @@ def _launch_full_and_tail_blocks(
         input_features % execution_plan.block_k == 0
         and heads % execution_plan.heads_per_program == 0
     )
-    if start_row_block != 0 or num_row_blocks is not None:
-        if start_row_block < 0:
-            raise ValueError("start_row_block must be non-negative")
-        full_row_blocks = sequence_length // execution_plan.block_m
-        if num_row_blocks is None:
-            if sequence_length % execution_plan.block_m != 0:
-                raise ValueError("partial row-block launches require full block_m alignment")
-            block_count = full_row_blocks - start_row_block
-        else:
-            block_count = num_row_blocks
-        if block_count < 0 or start_row_block + block_count > full_row_blocks:
-            raise ValueError(
-                "partial row-block range must stay within full block_m blocks of sequence_length"
-            )
-        if block_count > 0:
-            launch((block_count, head_blocks, batch), start_row_block, True, aligned_shape)
-        return
-    full_row_blocks = sequence_length // execution_plan.block_m
-    if full_row_blocks:
-        launch((full_row_blocks, head_blocks, batch), 0, True, aligned_shape)
-    if sequence_length % execution_plan.block_m:
-        launch((1, head_blocks, batch), full_row_blocks, False, False)
+    for block_count, row_block_offset, aligned_rows in resolve_row_block_launches(
+        sequence_length,
+        execution_plan.block_m,
+        start_row_block=start_row_block,
+        num_row_blocks=num_row_blocks,
+    ):
+        launch(
+            (block_count, head_blocks, batch),
+            row_block_offset,
+            aligned_rows,
+            aligned_shape if aligned_rows else False,
+        )
 
 
 def project_key(
@@ -240,8 +231,8 @@ def project_value(
 ) -> None:
     """Launch K64 tile-centered INT8 values, multipliers, and BF16 per-tile means."""
     value, value_scale_multiplier, value_mean = out
-    batch, heads, _storage_tiles, head_dim = value_mean.shape
-    storage_sequence_length = padded_sequence_length(input_qdata.shape[1])
+    batch, heads, storage_tiles, head_dim = value_mean.shape
+    storage_sequence_length = storage_tiles * TILE_ROWS
     block_n = head_dim * execution_plan.heads_per_program
     sequence_length = input_qdata.shape[1]
     has_block_lengths = block_lengths is not None
