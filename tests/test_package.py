@@ -122,7 +122,7 @@ assert torch.isfinite(weight.dequantize()).all()
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
-@pytest.mark.parametrize("family", ["swiglu_ffn", "sparse_piper", "projection"])
+@pytest.mark.parametrize("family", ["sparse_piper", "projection"])
 def test_convrot_int8_fusion_packages_have_explicit_names(family: str) -> None:
     current = f"piper_kernels.fusions.convrot_int8_{family}"
     assert importlib.import_module(current).__name__ == current

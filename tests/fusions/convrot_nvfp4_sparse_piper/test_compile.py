@@ -21,12 +21,8 @@ from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper._compile import (
     compile_pass as fusion_compile_pass,
 )
-from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import (
-    convrot_nvfp4_swiglu_ffn_compile_options,
-)
-from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn._compile import (
-    compile_pass as ffn_compile_pass,
-)
+from piper_kernels.fusions.ffn import ffn_compile_options
+from piper_kernels.fusions.ffn._compile import compile_pass as ffn_compile_pass
 from piper_kernels.fusions.nvfp4_sparse_piper import _output
 from piper_kernels.fusions.nvfp4_sparse_piper import key as fused_key
 from piper_kernels.fusions.nvfp4_sparse_piper import query as fused_query
@@ -36,7 +32,6 @@ from piper_kernels.linear.convrot.nvfp4._compile import (
     compile_pass as convrot_nvfp4_compile_pass,
 )
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
-from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
@@ -69,19 +64,14 @@ def test_compile_options_install_idempotent_passes() -> None:
 @pytest.mark.parametrize("sparse_first", [False, True])
 def test_compile_options_compose_with_convrot_nvfp4_ffn(sparse_first: bool) -> None:
     if sparse_first:
-        options = convrot_nvfp4_swiglu_ffn_compile_options(
-            convrot_nvfp4_sparse_piper_compile_options()
-        )
+        options = ffn_compile_options(convrot_nvfp4_sparse_piper_compile_options())
     else:
-        options = convrot_nvfp4_sparse_piper_compile_options(
-            convrot_nvfp4_swiglu_ffn_compile_options()
-        )
+        options = convrot_nvfp4_sparse_piper_compile_options(ffn_compile_options())
 
     passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(passes, tuple)
     assert passes == (
         ffn_compile_pass,
-        nvfp4_compile_pass,
         convrot_nvfp4_compile_pass,
         fusion_compile_pass,
     )

@@ -10,10 +10,9 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._input_activations import apply_input_activation
-from piper_kernels.fusions.convrot_int8_ffn import _core as ffn_core
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as sparse_output
-from piper_kernels.fusions.convrot_int8_swiglu_ffn import _compile as ffn_compile
-from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as ffn
+from piper_kernels.fusions.ffn import _compile as ffn_compile
+from piper_kernels.fusions.ffn import _convrot_int8 as ffn
 from piper_kernels.linear.convrot.int8 import _backend, reference
 
 
@@ -62,7 +61,7 @@ def test_ffn_uses_operations_with_paired_projection_and_reused_buffers(operation
     backend, select = operations
     value = torch.linspace(-1, 1, 160).reshape(2, 5, 16)
     gate, up, down = _weight(32, 16), _weight(32, 16, offset=2), _weight(20, 32)
-    actual = ffn._run_chunked_swiglu_ffn(value, *gate, 16, *up, 16, *down, 16, chunk_rows)
+    actual = ffn.convrot_int8_ffn_op(value, *up, 16, *down, 16, "swiglu", chunk_rows, *gate, 16)
     gate_result = reference.linear(value, *gate[:2], 16, gate[2])
     up_result = reference.linear(value, *up[:2], 16, up[2])
     expected = reference.linear(
@@ -96,7 +95,7 @@ def test_ffn_rejects_missing_backend_before_allocating_workspace(monkeypatch):
     allocate = Mock(side_effect=AssertionError("workspace allocated without a backend"))
     monkeypatch.setattr(torch, "empty", allocate)
     with pytest.raises(ValueError, match="optimized linear is unavailable"):
-        ffn._run_chunked_swiglu_ffn(value, *gate, 16, *up, 16, *down, 16, 4)
+        ffn.convrot_int8_ffn_op(value, *up, 16, *down, 16, "swiglu", 4, *gate, 16)
     select.assert_called_once_with(value)
     allocate.assert_not_called()
 
@@ -106,10 +105,10 @@ def test_ffn_core_supports_one_source_gelu_topology(operations, chunk_rows):
     backend, select = operations
     value = torch.linspace(-1, 1, 160).reshape(2, 5, 16)
     up, down = _weight(32, 16), _weight(20, 32)
-    actual = ffn_core.run_chunked_ffn(
+    actual = ffn.run_chunked_ffn(
         value,
-        (ffn_core.LinearOperands(*up, 16, None),),
-        ffn_core.LinearOperands(*down, 16, None),
+        (ffn.LinearOperands(*up, 16, None),),
+        ffn.LinearOperands(*down, 16, None),
         "gelu_tanh",
         chunk_rows,
     )
@@ -173,7 +172,7 @@ def test_ffn_compiler_uses_backend_support_not_device_family(monkeypatch, device
         module, value = _semantic_ffn_graph(device)
         ffn_compile.compile_pass(module.graph, is_inference=True)
     targets = [node.target for node in module.graph.nodes]
-    assert (torch.ops.piper_kernels.convrot_int8_swiglu_ffn.default in targets) is supported
+    assert (torch.ops.piper_kernels.convrot_int8_ffn.default in targets) is supported
     assert targets.count(torch.ops.piper_kernels.convrot_int8_linear.default) == (
         0 if supported else 3
     )
@@ -199,7 +198,7 @@ def test_ffn_compiler_preserves_unfused_consumers(monkeypatch, argument_count):
         ffn_compile.compile_pass(graph, is_inference=True)
         graph.lint()
     assert len(consumer.args) == argument_count
-    assert consumer.args[0].target == torch.ops.piper_kernels.convrot_int8_swiglu_ffn.default
+    assert consumer.args[0].target == torch.ops.piper_kernels.convrot_int8_ffn.default
     assert down not in graph.nodes
 
 
@@ -252,7 +251,7 @@ def test_sparse_gate_uses_selected_projection_operation(operations):
     assert backend.linear_prepared.call_count == 2
 
 
-@pytest.mark.parametrize("module", [ffn_core, ffn, ffn_compile, sparse_output])
+@pytest.mark.parametrize("module", [ffn, ffn_compile, sparse_output])
 def test_shared_orchestration_does_not_depend_on_vendor_launch_interfaces(module):
     tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
     forbidden = tuple(
@@ -272,7 +271,7 @@ def test_shared_orchestration_does_not_depend_on_vendor_launch_interfaces(module
                 "prepare_input_with_plan",
                 "execute_prepared_linear",
             }
-            if module in (ffn_core, ffn, ffn_compile):
+            if module in (ffn, ffn_compile):
                 assert node.attr not in {"from_device", "cuda_capability_at_least"}
 
 

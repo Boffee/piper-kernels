@@ -64,9 +64,7 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     value as value_ops,
 )
-from piper_kernels.fusions.convrot_int8_swiglu_ffn import (
-    convrot_int8_swiglu_ffn_compile_options,
-)
+from piper_kernels.fusions.ffn import ffn_compile_options
 from piper_kernels.fusions.residual_updates import residual_updates_compile_options
 from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8 import _backend as convrot_linear_backend
@@ -2032,7 +2030,7 @@ def _build_compile_options(capture: FunctionalTargetCapturePass) -> dict[str, An
     opts: dict[str, Any] = {}
     opts = residual_updates_compile_options(opts)
     opts = convrot_int8_sparse_piper_compile_options(opts)
-    opts = convrot_int8_swiglu_ffn_compile_options(opts)
+    opts = ffn_compile_options(opts)
     opts = convrot_int8_compile_options(opts)
     return capture.wrap_options(opts)
 
@@ -2214,7 +2212,7 @@ def _check_dynamic_tpsp_blocks(
     )
     assert _KV_GATHER_OP in capture.target_names, f"hybrid: {capture.target_names}"
     assert _ATTN_RS_RESIDUAL_OP in capture.target_names, f"hybrid: {capture.target_names}"
-    assert "piper_kernels.convrot_int8_swiglu_ffn_residual_add_.default" in capture.target_names, (
+    assert "piper_kernels.convrot_int8_ffn_update_.default" in capture.target_names, (
         f"hybrid: {capture.target_names}"
     )
 
@@ -2331,7 +2329,7 @@ def _check_batched(
     # 1D sequence-length `gate_indices` broadcast over batch=2 intentionally lowers without
     # `residual_add_`, exercising batched standalone `projected_query_attention_reduce_scatter`.
     assert _ATTN_RS_OP in capture.target_names
-    assert "piper_kernels.convrot_int8_swiglu_ffn.default" in capture.target_names
+    assert "piper_kernels.convrot_int8_ffn.default" in capture.target_names
 
 
 def _check_unaligned_local_seq_fallback(
@@ -2491,9 +2489,7 @@ def _check_standalone(
         standalone,
         options=cap_sa.wrap_options(
             convrot_int8_compile_options(
-                convrot_int8_swiglu_ffn_compile_options(
-                    convrot_int8_sparse_piper_compile_options({})
-                )
+                ffn_compile_options(convrot_int8_sparse_piper_compile_options({}))
             )
         ),
     )
@@ -2510,7 +2506,7 @@ def _check_standalone(
         sa_ref = _WrapStandalone(_LIVE_HEADS).to(device).eval()
         _quantize_module_linears(sa_ref, weights, norms, device=device)
         sa_ref_opts = convrot_int8_compile_options(
-            convrot_int8_swiglu_ffn_compile_options(convrot_int8_sparse_piper_compile_options({}))
+            ffn_compile_options(convrot_int8_sparse_piper_compile_options({}))
         )
         compiled_sa_ref = torch.compile(sa_ref, options=sa_ref_opts)
         ref_sa_out = compiled_sa_ref(sa_h.to(device), cos_all, sin_all)
@@ -2521,7 +2517,7 @@ def _check_standalone(
     assert not any(name.startswith("_c10d_functional.") for name in cap_sa.target_names)
     assert _KV_GATHER_OP in cap_sa.target_names
     assert _ATTN_RS_OP in cap_sa.target_names
-    assert "piper_kernels.convrot_int8_swiglu_ffn.default" in cap_sa.target_names
+    assert "piper_kernels.convrot_int8_ffn.default" in cap_sa.target_names
 
 
 def _check_bias_fp16_and_projected_gate(
@@ -2893,7 +2889,7 @@ def _build_dense_compile_options(capture: FunctionalTargetCapturePass | None) ->
     opts: dict[str, Any] = {}
     opts = residual_updates_compile_options(opts)
     opts = convrot_int8_piper_compile_options(opts, fuse_output=True)
-    opts = convrot_int8_swiglu_ffn_compile_options(opts)
+    opts = ffn_compile_options(opts)
     opts = convrot_int8_compile_options(opts)
     return opts if capture is None else capture.wrap_options(opts)
 
@@ -2980,7 +2976,7 @@ def _check_dense_dynamic_tpsp_blocks(
     assert _DENSE_KEY_OP in capture.target_names
     assert _DENSE_VALUE_OP in capture.target_names
     assert _DENSE_ATTN_RS_RESIDUAL_OP in capture.target_names
-    assert "piper_kernels.convrot_int8_swiglu_ffn_residual_add_.default" in capture.target_names
+    assert "piper_kernels.convrot_int8_ffn_update_.default" in capture.target_names
 
 
 def _check_dense_causal_and_unaligned(
@@ -3110,9 +3106,7 @@ def _check_dense_batched_and_standalone(
     _parallelize_dense_attention_module(sa_mod, mesh)
     cap_sa = FunctionalTargetCapturePass()
     sa_opts = convrot_int8_compile_options(
-        convrot_int8_swiglu_ffn_compile_options(
-            convrot_int8_piper_compile_options({}, fuse_output=True)
-        )
+        ffn_compile_options(convrot_int8_piper_compile_options({}, fuse_output=True))
     )
     compiled_sa = torch.compile(sa_mod, options=cap_sa.wrap_options(sa_opts))
     torch.manual_seed(1404)
@@ -3615,9 +3609,7 @@ def _2gpu_block_worker(rank: int, world: int, store_path: str, backend: str) -> 
                 _quantize_module_linears(ref_block, weights, norms, device=device)
                 ref_opts = residual_updates_compile_options(
                     convrot_int8_compile_options(
-                        convrot_int8_swiglu_ffn_compile_options(
-                            convrot_int8_sparse_piper_compile_options({})
-                        )
+                        ffn_compile_options(convrot_int8_sparse_piper_compile_options({}))
                     )
                 )
                 ref_fn = torch.compile(

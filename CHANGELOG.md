@@ -16,6 +16,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- **Breaking:** Consolidated all format- and activation-specific FFN fusion packages
+  under `piper_kernels.fusions` into `piper_kernels.fusions.ffn` with a single
+  `ffn_compile_options()` helper covering ConvRot INT8, NVFP4, and ConvRot NVFP4
+  SwiGLU and `tanh`-GELU FFNs (including indexed gated updates and in-place residual
+  adds), removing the legacy `{convrot_int8,nvfp4,convrot_nvfp4}_{gelu,swiglu}_ffn`
+  subpackages.
 - **Breaking:** Require Python 3.14+, PyTorch 2.15+, and Triton 3.9+ across all
   platforms, dropping Python 3.13, PyTorch 2.14, and Triton 3.8 support.
 - **Breaking (numerical):** `piper_attention` (and `convrot_int8_piper_compile_options`)

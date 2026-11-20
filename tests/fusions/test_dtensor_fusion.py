@@ -14,19 +14,14 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
-from piper_kernels.fusions.convrot_int8_gelu_ffn import convrot_int8_gelu_ffn_compile_options
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
 )
-from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
-from piper_kernels.fusions.convrot_nvfp4_gelu_ffn import convrot_nvfp4_gelu_ffn_compile_options
 from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
     convrot_nvfp4_sparse_piper_compile_options,
 )
-from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import convrot_nvfp4_swiglu_ffn_compile_options
-from piper_kernels.fusions.nvfp4_gelu_ffn import nvfp4_gelu_ffn_compile_options
+from piper_kernels.fusions.ffn import ffn_compile_options
 from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_options
-from piper_kernels.fusions.nvfp4_swiglu_ffn import nvfp4_swiglu_ffn_compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
@@ -45,15 +40,11 @@ pytestmark = [
 ]
 
 _FFN_OPTIONS = {
-    "convrot_int8": convrot_int8_swiglu_ffn_compile_options,
-    "nvfp4": nvfp4_swiglu_ffn_compile_options,
-    "convrot_nvfp4": convrot_nvfp4_swiglu_ffn_compile_options,
+    "convrot_int8": ffn_compile_options,
+    "nvfp4": ffn_compile_options,
+    "convrot_nvfp4": ffn_compile_options,
 }
-_GELU_FFN_OPTIONS = {
-    "convrot_int8": convrot_int8_gelu_ffn_compile_options,
-    "nvfp4": nvfp4_gelu_ffn_compile_options,
-    "convrot_nvfp4": convrot_nvfp4_gelu_ffn_compile_options,
-}
+_GELU_FFN_OPTIONS = _FFN_OPTIONS
 _ATTENTION_OPTIONS = {
     "convrot_int8": convrot_int8_sparse_piper_compile_options,
     "nvfp4": nvfp4_sparse_piper_compile_options,
@@ -229,7 +220,11 @@ def _weight(format_name, source, *, high_first=False):
 
 
 def _ffn_target(format_name):
-    return f"piper_kernels.{format_name}_swiglu_ffn.default"
+    return (
+        "piper_kernels.convrot_int8_ffn.default"
+        if format_name == "convrot_int8"
+        else "piper_kernels.nvfp4_ffn.default"
+    )
 
 
 def _assert_ffn_fused(capture, format_name):
@@ -238,7 +233,7 @@ def _assert_ffn_fused(capture, format_name):
 
 
 def _assert_gelu_ffn_fused(capture, format_name):
-    assert capture.target_names.count(f"piper_kernels.{format_name}_gelu_ffn.default") == 1
+    assert capture.target_names.count(_ffn_target(format_name)) == 1
     _assert_no_separate_linears(capture)
 
 

@@ -177,10 +177,10 @@ output buffers:
 
 ```python
 from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
-from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
+from piper_kernels.fusions.ffn import ffn_compile_options
 from piper_kernels.fusions.residual_updates import residual_updates_compile_options
 
-options = convrot_int8_swiglu_ffn_compile_options()
+options = ffn_compile_options()
 options = convrot_int8_piper_compile_options(options, fuse_output=True)
 options = residual_updates_compile_options(options)
 

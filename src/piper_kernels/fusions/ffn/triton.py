@@ -1,13 +1,9 @@
-"""FP32 SwiGLU preparation inside the chunked ConvRot NVFP4 FFN."""
+"""Specialized FP32 SwiGLU ConvRot NVFP4 preparation kernels for chunked FFNs."""
 
 # pyright: reportCallIssue=false, reportIndexIssue=false
-# ruff: noqa: ANN001, ANN202
-# Triton infers device pointer types from the launch arguments.
+# Triton infers device pointer types from launch arguments.
 
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import ClassVar
 
 import torch
 import triton
@@ -19,7 +15,6 @@ from piper_kernels.linear.convrot.nvfp4 import triton as convrot_backend
 from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
 from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
 from piper_kernels.weights.convrot import triton as rotation
-from piper_kernels.weights.convrot._rotation import validate_group_size
 from piper_kernels.weights.convrot.nvfp4.triton import (
     _preparation_num_warps,
     _rotated_row_amax_kernel,
@@ -103,14 +98,14 @@ def _swiglu_quantize_kernel(
     tl.store(scale_ptr + scale_offsets, scales, blocks < elements // 16)
 
 
-def prepare(
+def prepare_convrot_nvfp4_swiglu(
     projections: torch.Tensor,
     per_tensor_scale: torch.Tensor | None,
     dynamic_activation_scale: bool,
     group_size: int,
     high_first: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Read the runner's adjacent [value | gate] workspace without copying either half.
+    """Read the runner's adjacent ``[value | gate]`` workspace without copying either half.
 
     Dynamic scaling remains local to the current FFN chunk. SwiGLU and rotation
     retain FP32 arithmetic through NVFP4 encoding for both scale modes.
@@ -187,30 +182,4 @@ def prepare(
     return qdata, scale, per_tensor_scale
 
 
-@dataclass(frozen=True, slots=True)
-class ConvRotSwiGLUPreparation:
-    """Apply SwiGLU, rotate, and prepare ConvRot NVFP4 down inputs."""
-
-    source_projection_count: ClassVar[int] = 2
-    group_size: int
-    high_first: bool
-
-    def __post_init__(self) -> None:
-        validate_group_size(self.group_size)
-
-    def prepare(
-        self,
-        projections: torch.Tensor,
-        activation_per_tensor_scale: torch.Tensor | None,
-        dynamic_activation_scale: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return prepare(
-            projections,
-            activation_per_tensor_scale,
-            dynamic_activation_scale,
-            self.group_size,
-            self.high_first,
-        )
-
-
-__all__ = ["ConvRotSwiGLUPreparation", "prepare"]
+__all__ = ["prepare_convrot_nvfp4_swiglu"]

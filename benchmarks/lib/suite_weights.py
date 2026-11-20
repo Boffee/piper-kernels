@@ -217,34 +217,29 @@ def _ffn_launch(
             return F.linear(activated, weights[-1])
 
         return run, None
+    activation_fn = "gelu_tanh" if case.activation == "gelu" else "swiglu"
     if format_name == "convrot_int8":
-        from piper_kernels.fusions.convrot_int8_ffn import _core
-        from piper_kernels.fusions.convrot_int8_gelu_ffn import triton as gelu
+        from piper_kernels.fusions.ffn import _convrot_int8 as int8_ffn
         from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
         packed = [cast(ConvRotInt8Tensor, weight) for weight in weights]
         linears = tuple(
-            _core.LinearOperands(weight.qdata, weight.scale, None, weight.group_size, None)
+            int8_ffn.LinearOperands(weight.qdata, weight.scale, None, weight.group_size, None)
             for weight in packed
         )
-        chunk_rows = (
-            gelu._default_chunk_rows(source, packed[0].qdata, packed[-1].qdata, adds_residual=False)
-            if case.activation == "gelu"
-            else _core.DEFAULT_CHUNK_ROWS
+        chunk_rows = int8_ffn.default_chunk_rows(
+            source, packed[0].qdata, packed[-1].qdata, activation_fn, adds_residual=False
         )
         return partial(
-            _core.run_chunked_ffn,
+            int8_ffn.run_chunked_ffn,
             source,
             linears[:-1],
             linears[-1],
-            "gelu_tanh" if case.activation == "gelu" else "swiglu",
+            activation_fn,
             chunk_rows,
         ), chunk_rows
 
-    from piper_kernels.fusions.convrot_nvfp4_gelu_ffn import triton as rotated_gelu
-    from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import triton as rotated_swiglu
-    from piper_kernels.fusions.nvfp4_ffn import _core as nv_core
-    from piper_kernels.fusions.nvfp4_gelu_ffn import triton as nv_gelu
+    from piper_kernels.fusions.ffn import _nvfp4 as nvfp4_ffn
     from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
     from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
@@ -254,23 +249,28 @@ def _ffn_launch(
         for weight in nv_weights
     ]
     nv_linears = tuple(
-        nv_core.LinearOperands(
-            weight.qdata, weight.scale, weight.per_tensor_scale, None, None, True, weight.high_first
+        nvfp4_ffn.LinearOperands(
+            weight.qdata,
+            weight.scale,
+            weight.per_tensor_scale,
+            None,
+            None,
+            True,
+            group,
+            weight.high_first,
         )
-        for weight in nv_weights
+        for weight, group in zip(nv_weights, groups, strict=True)
     )
-    if case.activation == "gelu":
-        preparation = rotated_gelu._preparation_backends(groups[0], groups[-1], False, False)
-        chunk_rows = nv_gelu._default_chunk_rows(
-            source, nv_weights[0].qdata, nv_weights[-1].qdata, adds_residual=False
-        )
-    else:
-        preparation = rotated_swiglu._preparation_backends(
-            groups[1], groups[0], groups[-1], False, False, False
-        )
-        chunk_rows = nv_core.DEFAULT_CHUNK_ROWS
+    chunk_rows = nvfp4_ffn.default_chunk_rows(
+        source, nv_weights[0].qdata, nv_weights[-1].qdata, activation_fn, adds_residual=False
+    )
     return partial(
-        nv_core.run_chunked_ffn, source, nv_linears[:-1], nv_linears[-1], chunk_rows, *preparation
+        nvfp4_ffn.run_chunked_ffn,
+        source,
+        nv_linears[:-1],
+        nv_linears[-1],
+        activation_fn,
+        chunk_rows,
     ), chunk_rows
 
 
