@@ -1,5 +1,6 @@
-"""Convolution dispatch and vendor-owned launch policy contracts."""
+"""Convolution dispatch and unified target launch policy contracts."""
 
+import builtins
 import sys
 from functools import partial
 from unittest.mock import Mock
@@ -8,14 +9,10 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.conv3d.convrot.int8 import _backend, _ops, reference
-from piper_kernels.conv3d.convrot.int8._amd import policy as amd
-from piper_kernels.conv3d.convrot.int8._dispatch import default_execution_plan
-from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia
-from piper_kernels.conv3d.convrot.int8._plan import ConvolutionSchedule
+from piper_kernels.conv3d.convrot.int8 import _ops, _policy, reference
 
-_nvidia_plan = partial(
-    nvidia.select_execution_plan,
+_plan = partial(
+    _policy.select_execution_plan,
     channels=128,
     outputs=128,
     input_rows=1024,
@@ -24,55 +21,52 @@ _nvidia_plan = partial(
     weight_aligned=True,
     group_norm=False,
 )
-SM120 = partial(_nvidia_plan, AcceleratorTarget("cuda", "sm120"))
-SM8X = partial(_nvidia_plan, AcceleratorTarget("cuda", "sm89"))
-RDNA4 = partial(
-    amd.select_execution_plan,
-    AcceleratorTarget("hip", "gfx1201"),
-    channels=128,
-    outputs=128,
-    input_rows=1024,
-    output_rows=1024,
-    output_height=16,
-    weight_aligned=True,
-    group_norm=False,
-)
+SM120 = partial(_plan, AcceleratorTarget("cuda", "sm120"))
+SM8X = partial(_plan, AcceleratorTarget("cuda", "sm89"))
+RDNA4 = partial(_plan, AcceleratorTarget("hip", "gfx1201"))
 
 
 @pytest.mark.parametrize(
-    ("target", "vendor"),
+    ("target", "supported"),
     [
-        (AcceleratorTarget("cuda", "sm120"), "nvidia"),
-        (AcceleratorTarget("cuda", "sm89"), "nvidia"),
-        (AcceleratorTarget("cuda", "sm86"), "nvidia"),
-        (AcceleratorTarget("cuda", "sm80"), "nvidia"),
-        (AcceleratorTarget("cuda", "sm90"), None),
-        (AcceleratorTarget("cuda", "sm100"), None),
-        (AcceleratorTarget("cuda", "sm75"), None),
-        (AcceleratorTarget("hip", "gfx1200"), "amd"),
-        (AcceleratorTarget("hip", "gfx1201"), "amd"),
-        (AcceleratorTarget("hip", "gfx1100"), None),
-        (AcceleratorTarget("hip", "gfx942"), None),
-        (AcceleratorTarget("hip", "gfx9999"), None),
-        (AcceleratorTarget("cpu", "cpu"), None),
+        (AcceleratorTarget("cuda", "sm120"), True),
+        (AcceleratorTarget("cuda", "sm89"), True),
+        (AcceleratorTarget("cuda", "sm86"), True),
+        (AcceleratorTarget("cuda", "sm80"), True),
+        (AcceleratorTarget("cuda", "sm90"), False),
+        (AcceleratorTarget("cuda", "sm100"), False),
+        (AcceleratorTarget("cuda", "sm75"), False),
+        (AcceleratorTarget("hip", "gfx1200"), True),
+        (AcceleratorTarget("hip", "gfx1201"), True),
+        (AcceleratorTarget("hip", "gfx1100"), False),
+        (AcceleratorTarget("hip", "gfx942"), False),
+        (AcceleratorTarget("hip", "gfx9999"), False),
+        (AcceleratorTarget("cpu", "cpu"), False),
     ],
 )
 @pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
-def test_select_backend_uses_target_policy(monkeypatch, target, vendor, platform):
+def test_target_policy_selection(monkeypatch, target, supported, platform):
     monkeypatch.setattr(sys, "platform", platform)
-    if vendor == "amd" and platform not in ("linux", "win32"):
-        vendor = None
-    implementations = {"nvidia": object(), "amd": object(), None: None}
-    monkeypatch.setattr(_backend, "_nvidia_backend", implementations["nvidia"])
-    monkeypatch.setattr(_backend, "_amd_backend", implementations["amd"])
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    assert _backend.select_backend(torch.empty(0)) is implementations[vendor]
+    expected = supported and not (target.is_amd_hip and platform not in ("linux", "win32"))
+    assert _policy.supports_target(target) is expected
 
 
 def test_missing_triton_uses_reference(monkeypatch):
-    monkeypatch.setattr(_backend, "_nvidia_backend", None)
-    monkeypatch.setattr(_backend, "_amd_backend", None)
-    assert _backend.select_backend(torch.empty(0)) is None
+    monkeypatch.setattr(
+        AcceleratorTarget,
+        "from_device",
+        lambda device: AcceleratorTarget("cuda", "sm120"),
+    )
+    monkeypatch.delitem(sys.modules, "piper_kernels.conv3d.convrot.int8.triton", raising=False)
+    original_import = builtins.__import__
+
+    def without_triton(name, *args, **kwargs):
+        if name == "triton" or name.startswith("triton."):
+            raise ModuleNotFoundError("Triton intentionally unavailable", name="triton")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_triton)
+    assert _ops._select_native_backend(torch.empty(0)) is None
 
 
 @pytest.mark.parametrize("fused", [False, True])
@@ -99,8 +93,8 @@ def test_custom_op_uses_selected_backend_or_reference(monkeypatch, fused):
     expected = torch.zeros(1, 4, 1, 3, 3, dtype=torch.float16)
     implementation = Mock()
     getattr(implementation, name).return_value = expected
-    select = Mock(return_value=implementation)
-    monkeypatch.setattr(_backend, "select_backend", select)
+    select = Mock(return_value=(implementation, AcceleratorTarget("cuda", "sm120")))
+    monkeypatch.setattr(_ops, "_select_native_backend", select)
     torch.testing.assert_close(op(*args), expected)
     select.assert_called_once_with(activation)
     getattr(implementation, name).assert_called_once()
@@ -173,13 +167,13 @@ def test_nvidia_descriptor_policy(channels, outputs, height, aligned, expected):
 
 @pytest.mark.parametrize("architecture", ["sm80", "sm86", "sm87", "sm89"])
 def test_nvidia_selects_sm8x_policy_for_the_family(architecture):
-    assert _nvidia_plan(AcceleratorTarget("cuda", architecture)) == SM8X()
+    assert _plan(AcceleratorTarget("cuda", architecture)) == SM8X()
 
 
 @pytest.mark.parametrize("target", [AcceleratorTarget("cuda", "sm90"), AcceleratorTarget("cpu")])
-def test_nvidia_policy_rejects_unsupported_targets(target):
-    with pytest.raises(ValueError, match="no NVIDIA policy"):
-        _nvidia_plan(target)
+def test_policy_rejects_unsupported_targets(target):
+    with pytest.raises(ValueError, match="no native policy"):
+        _plan(target)
 
 
 @pytest.mark.parametrize(
@@ -204,11 +198,10 @@ def test_strided_execution_selects_preparation_from_input_rows(fused):
     # 200,000 input rows cross the preparation threshold; 12,500 output rows do not.
     activation = torch.empty(1, 256, 1, 1, 1).expand(1, 256, 1, 400, 500)
     weight = torch.empty(256, 3, 3, 3, 256, dtype=torch.int8)
-    plan = default_execution_plan(
+    plan = _policy.default_execution_plan(
         activation,
         weight,
         (1, 4, 4),
-        policy=nvidia,
         target=AcceleratorTarget("cuda", "sm120"),
         group_norm=fused,
         padding=(1, 1, 1, 1, 2, 0),
@@ -225,17 +218,16 @@ def test_tuning_tile_recomputes_descriptor_eligibility(architecture, aligned, bl
     storage = torch.empty(192 * 27 * 128 + 1, dtype=torch.int8)
     weight = (storage[:-1] if aligned else storage[1:]).view(192, 3, 3, 3, 128)
     select = partial(
-        default_execution_plan,
+        _policy.default_execution_plan,
         activation,
         weight,
         (1, 1, 1),
-        policy=nvidia,
         target=AcceleratorTarget("cuda", architecture),
         group_norm=False,
         padding=(1, 1, 1, 1, 2, 0),
     )
     production = select()
-    tile = ConvolutionSchedule(64, block_n, 128, 4, 3)
+    tile = _policy.ConvolutionSchedule(64, block_n, 128, 4, 3)
     candidate = select(convolution_schedule=tile)
     assert candidate.convolution == tile
     assert candidate.preparation == production.preparation
@@ -246,17 +238,17 @@ def test_tuning_tile_recomputes_descriptor_eligibility(architecture, aligned, bl
 
 
 def test_amd_policy_rejects_unsupported_platform(monkeypatch):
-    monkeypatch.setattr(amd.sys, "platform", "darwin")
-    assert not amd.supports_target(AcceleratorTarget("hip", "gfx1201"))
+    monkeypatch.setattr(_policy.sys, "platform", "darwin")
+    assert not _policy.supports_target(AcceleratorTarget("hip", "gfx1201"))
 
 
 @pytest.mark.parametrize("channels", [64, 128, 256, 512, 1024, 2048, 4096])
 def test_amd_preparation_bounds_rotation_tile_and_never_uses_descriptors(channels):
     for fused in (False, True):
-        schedule = amd._preparation_schedule(channels, 32768, group_norm=fused)
+        schedule = RDNA4(channels=channels, input_rows=32768, group_norm=fused).preparation
         assert schedule.block_m * channels <= 4096
         assert schedule.block_m > 0
-        assert schedule == amd._preparation_schedule(channels, 16, group_norm=fused)
+        assert schedule == RDNA4(channels=channels, input_rows=16, group_norm=fused).preparation
     assert not RDNA4(channels=channels, outputs=256, output_height=256).use_weight_descriptor
 
 

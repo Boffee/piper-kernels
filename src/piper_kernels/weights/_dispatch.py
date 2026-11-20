@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
+from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.utils import TorchAOBaseTensor, _dispatch__torch_dispatch__
 
 if TYPE_CHECKING:
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from .convrot.int8.tensor import ConvRotInt8Tensor
     from .nvfp4.tensor import PiperNVFP4Tensor
 type QuantizedWeight = ConvRotInt8Tensor | PiperNVFP4Tensor
+_WeightT = TypeVar("_WeightT", bound="QuantizedWeight")
 
 
 def _torch_dispatch(
@@ -91,3 +93,92 @@ def _explicit_to_copy_args(
     if copy is not True:
         return None
     return parsed_args, parsed_kwargs
+
+
+def to_quantized_weight(
+    tensor: _WeightT,
+    super_to: Callable[..., object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+    *,
+    format_name: str,
+) -> _WeightT:
+    """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
+    tensor._validate_memory_format(kwargs.get("memory_format"))
+    explicit_copy_args = _explicit_to_copy_args(args, kwargs)
+    if explicit_copy_args is None:
+        return cast(_WeightT, super_to(*args, **kwargs))
+    to_args, to_kwargs = explicit_copy_args
+    options = tensor._get_to_kwargs(*to_args, **to_kwargs)
+    dtype = options["dtype"]
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError(f"{format_name} logical dtype must be floating point, got {dtype}")
+    device = options["device"]
+    non_blocking = options["non_blocking"]
+    copied = cast(
+        _WeightT,
+        tensor._apply_fn_to_data(
+            lambda value: value.to(
+                device=device,
+                non_blocking=non_blocking,
+                copy=True,
+            )
+        ),
+    )
+    if dtype is not copied.dtype:
+        copied = cast(_WeightT, copied._rebuild_with_logical_dtype(dtype))
+    return copied
+
+
+def register_conversion_ops(cls: type[TorchAOBaseTensor], *, format_name: str) -> None:
+    """Preserve quantized storage across logical dtype and device conversion."""
+
+    def _to_copy(
+        func: Callable[..., torch.Tensor],
+        _types: tuple[type, ...],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        tensor = cast("QuantizedWeight", args[0])
+        assert isinstance(tensor, cls)
+        arguments = dict(kwargs)
+        dtype = arguments.pop("dtype", tensor.dtype)
+        device = arguments.pop("device", tensor.device)
+        non_blocking = arguments.pop("non_blocking", False)
+        copy = arguments.pop("copy", False)
+        memory_format = arguments.pop("memory_format", None)
+        tensor._validate_memory_format(memory_format)
+        layout = arguments.pop("layout", None)
+        pin_memory = arguments.pop("pin_memory", None)
+        if arguments:
+            raise NotImplementedError(
+                f"unsupported {format_name} conversion arguments: {arguments}"
+            )
+        if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise TypeError(f"{format_name} logical dtype must be floating point, got {dtype}")
+        metadata_only = (
+            torch.device(device) == tensor.device
+            and dtype is not tensor.dtype
+            and not copy
+            and memory_format in (None, torch.preserve_format)
+            and layout in (None, tensor.layout)
+            and pin_memory is None
+        )
+        moved = (
+            tensor
+            if metadata_only
+            else cast(
+                "QuantizedWeight",
+                tensor._apply_fn_to_data(
+                    lambda value: func(value, device=device, non_blocking=non_blocking)
+                ),
+            )
+        )
+        if dtype is not moved.dtype:
+            moved = moved._rebuild_with_logical_dtype(dtype)
+        return cast(
+            torch.Tensor,
+            return_and_correct_aliasing(func, args, kwargs, moved),
+        )
+
+    cls.implements(torch.ops.aten._to_copy.default)(_to_copy)

@@ -1,4 +1,21 @@
-"""Fold explicit zero/spatial reflection padding into quantized convolutions."""
+"""Fold explicit zero/spatial reflection padding into quantized convolutions.
+
+This optional pre-grad Inductor pass lowers standard ``F.conv3d`` calls on
+``ConvRotInt8Tensor`` weights and absorbs exclusive chains of zero padding and
+spatial reflection without altering ordinary floating-point convolutions:
+
+- Weight storage (``qdata``, ``scale``, ``act_per_tensor_scale``) is read
+  through runtime ``getattr`` nodes rather than captured values so compiled
+  graphs observe offload refills and activation-scale replacement.
+- Padding is represented in ``F.pad`` order ``(W_l, W_r, H_t, H_b, T_f, T_b)``.
+  Zero pads compose by addition; one spatial reflection combines with temporal
+  zeros, while shared pads, nonzero constants, cropping, temporal reflection,
+  and mixed spatial zero/reflection borders remain separate operations.
+- Autocast FP32->FP16 casts commute with zero/reflection padding and stay in
+  place so padding-only fusion preserves eager autocast rounding.
+- Static and symbolic shapes are supported when reflection bounds are
+  statically proven without introducing shape guards or runtime asserts.
+"""
 
 from collections.abc import Iterator, Mapping
 from typing import cast
@@ -12,8 +29,8 @@ from torch.nn import functional
 from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
-from . import _arguments, _functional
-from ._padding import Padding
+from . import _functional
+from ._policy import Padding
 
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
 
@@ -60,12 +77,12 @@ def lower_standard_convolutions(graph: torch.fx.Graph) -> None:
     for node, autocast in _autocast_contexts(graph):
         if node.target is not functional.conv3d:
             continue
-        bound = _arguments.bind_conv3d_arguments(functional.conv3d, node.args, dict(node.kwargs))
+        bound = _functional.bind_conv3d_arguments(functional.conv3d, node.args, dict(node.kwargs))
         weight = bound.weight
         weight_value = get_tensor_metadata(weight)
         if not isinstance(weight_value, ConvRotInt8Tensor):
             continue
-        stride, padding = _arguments.convolution_parameters(bound)
+        stride, padding = _functional.convolution_parameters(bound)
         _functional._weight_storage(weight_value)
         input_node, bias = bound.input, bound.bias
         input_value = get_tensor_metadata(input_node)

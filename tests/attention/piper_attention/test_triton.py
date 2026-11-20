@@ -534,41 +534,6 @@ def test_gluon_storage_holds_whole_query_and_key_tiles() -> None:
     assert prepared.context.value.shape[3] == 128
 
 
-@pytest.mark.parametrize("key_length", [1, 63, 64, 193])
-@pytest.mark.parametrize("is_causal", [False, True])
-def test_unspecialized_value_stride_matches_specialized_preparation(
-    key_length: int,
-    is_causal: bool,
-) -> None:
-    torch.manual_seed(97 + key_length)
-    query_length = key_length if is_causal else 129
-    query = torch.randn(1, 2, query_length, 128, device="cuda", dtype=torch.bfloat16)
-    key = torch.randn(1, 2, key_length, 128, device="cuda", dtype=torch.bfloat16)
-    value = torch.randn_like(key)
-    plan = replace(
-        _triton_plan(query, is_causal),
-        use_tensor_descriptors=False,
-        num_stages=3,
-    )
-    arguments = (query, key, value, 128**-0.5, is_causal)
-
-    with torch.no_grad():
-        specialized = _prepare_piper_attention(
-            *arguments,
-            execution_plan=replace(plan, unspecialized_value_stride=False),
-        )
-        unspecialized = _prepare_piper_attention(
-            *arguments,
-            execution_plan=replace(plan, unspecialized_value_stride=True),
-        )
-
-    assert torch.equal(unspecialized.context.value, specialized.context.value)
-    assert torch.equal(
-        unspecialized.context.value_scale_multiplier,
-        specialized.context.value_scale_multiplier,
-    )
-
-
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("sequence", [193, 8192, 32768])
 @pytest.mark.parametrize("head_dim", [64, 128])

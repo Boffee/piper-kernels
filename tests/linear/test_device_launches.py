@@ -21,7 +21,6 @@ from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispa
 from piper_kernels.linear.convrot.int8._generic import triton as generic
 from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
 from piper_kernels.weights.convrot import triton as rotation
-from piper_kernels.weights.convrot.int8 import _backend as int8_updates
 from piper_kernels.weights.convrot.int8 import _gguf
 from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
@@ -130,7 +129,7 @@ def test_gguf_probes_and_launches_on_tensor_device_then_restores_caller(launches
 @pytest.mark.parametrize("operation", ["prepare_input", "add_", "addmm_"])
 def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation, monkeypatch):
     # Exercise the bounded fallback independently of the current device's dot support.
-    monkeypatch.setattr(int8_weight_triton, "select_addmm_plan", lambda *args: None)
+    monkeypatch.setattr(int8_weight_triton, "_supports_fused_addmm", lambda *args: False)
     for module, name in (
         (rotation, "rotate_groups_kernel"),
         (generic, "quantize_rows_kernel"),
@@ -144,9 +143,9 @@ def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation, m
         if operation == "prepare_input":
             _generic.prepare_input(value, 256)
         elif operation == "add_":
-            int8_updates.add_(qdata, scale, value, 256, 1.0, 0.5)
+            int8_weight_triton._add_(qdata, scale, value, 256, 1.0, 0.5)
         else:
-            int8_updates.addmm_(
+            int8_weight_triton._addmm_(
                 qdata,
                 scale,
                 value[:, :16],
@@ -179,7 +178,7 @@ def test_fused_int8_merge_restores_device_after_all_passes(
             pytest.raises(RuntimeError, match="simulated kernel failure") if fail else nullcontext()
         )
         with error_context:
-            int8_updates.addmm_(qdata, scale, left, right, 64, 0.5, 0.25)
+            int8_weight_triton._addmm_(qdata, scale, left, right, 64, 0.5, 0.25)
     expected = ["merge_lora_tiles_kernel"]
     if width > 128 and not fail:
         expected += ["reduce_row_scales_kernel", "merge_lora_tiles_kernel"]

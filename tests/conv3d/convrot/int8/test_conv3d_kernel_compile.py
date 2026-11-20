@@ -10,9 +10,8 @@ from triton.compiler import ASTSource
 
 from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.conv3d.convrot.int8 import _policy
 from piper_kernels.conv3d.convrot.int8 import triton as kernels
-from piper_kernels.conv3d.convrot.int8._amd import policy as amd_policy
-from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
 
 
 @pytest.mark.parametrize("channels", [64, 128, 256, 512, 1024, 4096])
@@ -33,8 +32,7 @@ from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
     ],
 )
 def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, target):
-    policy = amd_policy if target.backend == "hip" else nvidia_policy
-    plan = policy.select_execution_plan(
+    plan = _policy.select_execution_plan(
         AcceleratorTarget.from_compiler_target(target),
         channels=channels,
         outputs=128,
@@ -121,7 +119,7 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
 def test_amd_preparation_compiles_without_intermediate_rounding(
     architecture, channels, dtype, fused
 ):
-    schedule = amd_policy._preparation_schedule(channels, 1024, group_norm=fused)
+    schedule = _policy._amd_preparation_schedule(channels)
     signature = {
         "input_ptr": f"*{dtype}",
         "output_ptr": "*i8",

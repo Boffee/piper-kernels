@@ -8,8 +8,9 @@ import torch
 
 from piper_kernels.weights._update import (
     narrow_rounding_seed,
+    validate_add_operands,
+    validate_addmm_operands,
     validate_real_scalar,
-    validate_update_operands,
 )
 from piper_kernels.weights.nvfp4 import _layout
 from piper_kernels.weights.nvfp4._backend import supports_triton, triton_backend
@@ -80,21 +81,10 @@ def _validate_addmm(
 ) -> None:
     operation = _operation(weight, "addmm_")
     _validate_storage(weight, operation=operation)
-    if mat1.ndim != 2 or mat2.ndim != 2:
-        raise ValueError(
-            f"{operation} matrices must be 2-D, "
-            f"got shapes {tuple(mat1.shape)} and {tuple(mat2.shape)}"
-        )
-    expected_mat1 = (weight.shape[0], mat2.shape[0])
-    expected_mat2 = (mat1.shape[1], weight.shape[1])
-    if tuple(mat1.shape) != expected_mat1 or tuple(mat2.shape) != expected_mat2:
-        raise ValueError(
-            f"{operation} shape mismatch: expected "
-            f"mat1 {expected_mat1} and mat2 {expected_mat2} for weight "
-            f"{tuple(weight.shape)}, got {tuple(mat1.shape)} and {tuple(mat2.shape)}"
-        )
-    validate_update_operands(
-        (mat1, mat2),
+    validate_addmm_operands(
+        tuple(weight.shape),
+        mat1,
+        mat2,
         device=weight.device,
         dtype=weight.orig_dtype,
         differentiable_storage=(weight.scale, weight.per_tensor_scale),
@@ -108,13 +98,9 @@ def _validate_add(
 ) -> None:
     operation = _operation(weight, "add_")
     _validate_storage(weight, operation=operation)
-    if tuple(update.shape) != tuple(weight.shape):
-        raise ValueError(
-            f"{operation} shape mismatch: expected update {tuple(weight.shape)}, "
-            f"got {tuple(update.shape)}"
-        )
-    validate_update_operands(
-        (update,),
+    validate_add_operands(
+        tuple(weight.shape),
+        update,
         device=weight.device,
         dtype=weight.orig_dtype,
         differentiable_storage=(weight.scale, weight.per_tensor_scale),

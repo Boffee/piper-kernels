@@ -133,6 +133,48 @@ def load_gguf_rotated_chunk(
 
 
 @triton.jit
+def load_rotated_chunk(
+    input_ptr,
+    input_row_offset,
+    packed_row_offset,
+    row_width,
+    chunk_start: tl.constexpr,
+    chunk_offsets,
+    chunk_size: tl.constexpr,
+    group_size: tl.constexpr,
+    inverse_sqrt_group: tl.constexpr,
+    activation_fn: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+    gguf_quant_type: tl.constexpr,
+):
+    """Load one group-aligned dense/activated or packed GGUF slice and rotate it."""
+    if gguf_quant_type >= 0:
+        return load_gguf_rotated_chunk(
+            input_ptr,
+            packed_row_offset,
+            row_width,
+            chunk_start,
+            chunk_offsets,
+            chunk_size,
+            group_size,
+            inverse_sqrt_group,
+            gguf_quant_type,
+        )
+    return load_activated_rotated_chunk(
+        input_ptr,
+        input_row_offset,
+        row_width,
+        chunk_start,
+        chunk_offsets,
+        chunk_size,
+        group_size,
+        inverse_sqrt_group,
+        activation_fn,
+        accelerator_backend,
+    )
+
+
+@triton.jit
 def rotate_groups_kernel(
     input_ptr,
     output_ptr,
@@ -177,6 +219,7 @@ def rotate_input(
 __all__ = [
     "load_activated_rotated_chunk",
     "load_gguf_rotated_chunk",
+    "load_rotated_chunk",
     "rotate_groups_kernel",
     "rotate_hadamard_groups",
     "rotate_hadamard_stage",

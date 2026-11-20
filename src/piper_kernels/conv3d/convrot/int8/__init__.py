@@ -2,8 +2,7 @@
 
 from collections.abc import Mapping
 
-from ._functional import conv3d, group_norm_silu_conv3d
-from ._padding import SpatialPadding
+from ._functional import SpatialPadding, conv3d, group_norm_silu_conv3d
 from .module import ConvRotInt8Conv3d
 
 

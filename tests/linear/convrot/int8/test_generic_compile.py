@@ -11,7 +11,6 @@ from triton.compiler import ASTSource
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.weights.convrot.int8 import triton as kernels_weights
-from piper_kernels.weights.convrot.int8._policy import select_addmm_plan
 from piper_kernels.weights.convrot.triton import rotate_groups_kernel
 
 # Triton 3.9 removed RDNA2 (gfx103x) compile targets.
@@ -56,8 +55,8 @@ _TARGETS = [
 def test_fused_lora_merge_compiles(
     target, dtype, group_size, width, rank, write_maxima, stochastic
 ):
-    plan = select_addmm_plan(AcceleratorTarget.from_compiler_target(target), group_size)
-    assert plan is not None
+    assert kernels_weights._supports_fused_addmm(AcceleratorTarget.from_compiler_target(target))
+    block_n = max(128, group_size)
     compiled = triton.compile(
         ASTSource(
             kernels_weights.merge_lora_tiles_kernel,
@@ -87,15 +86,18 @@ def test_fused_lora_merge_compiles(
                 "has_base": True,
                 "stochastic": stochastic,
                 "write_maxima": write_maxima,
-                "single_tile": width <= plan.block_n,
+                "single_tile": width <= block_n,
                 "accelerator_backend": target.backend,
-                "block_m": plan.block_m,
-                "block_n": plan.block_n,
-                "block_k": plan.block_k,
+                "block_m": kernels_weights._ADDMM_BLOCK_M,
+                "block_n": block_n,
+                "block_k": kernels_weights._ADDMM_BLOCK_K,
             },
         ),
         target=target,
-        options={"num_warps": plan.num_warps, "num_stages": plan.num_stages},
+        options={
+            "num_warps": kernels_weights._ADDMM_NUM_WARPS,
+            "num_stages": kernels_weights._ADDMM_NUM_STAGES,
+        },
     )
     assert compiled.asm["hsaco" if target.backend == "hip" else "ptx"]
     assert compiled.metadata.shared <= 65536
