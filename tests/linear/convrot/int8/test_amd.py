@@ -18,9 +18,9 @@ from piper_kernels.linear.convrot.int8._amd import triton as amd
 from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-from piper_kernels.weights.convrot.int8 import _backend as int8_updates
 from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
 from piper_kernels.weights.convrot.int8 import _quantization as int8_quantization
+from piper_kernels.weights.convrot.int8 import _update as int8_updates
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 
 pytestmark = pytest.mark.skipif(
@@ -40,11 +40,10 @@ def test_amd_selection_and_independent_auxiliary_support(monkeypatch, architectu
     target = AcceleratorTarget("hip", architecture)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     monkeypatch.setattr(runtime, "supports_device", lambda device: True)
-    value = SimpleNamespace(device=torch.device("cuda"))
+    value = SimpleNamespace(device=torch.device("cuda"), shape=(2, 256), numel=lambda: 512)
     expected = amd if platform in ("linux", "win32") else None
     assert _backend.select_linear_backend(value) is expected
-    assert int8_updates.select_add(value) is int8_updates.add_
-    assert int8_updates.select_addmm(value) is int8_updates.addmm_
+    assert int8_updates._use_triton(value)
     assert int8_gguf.select_gguf_converter(value) is int8_weight_triton.convert_gguf_out
     assert _backend.select_dequantized_mean(value) is generic_mean.dequantized_input_mean
 
@@ -70,11 +69,10 @@ def test_amd_missing_runtime_falls_back(monkeypatch):
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
     )
-    value = SimpleNamespace(device=torch.device("cuda"))
+    value = SimpleNamespace(device=torch.device("cuda"), shape=(2, 256), numel=lambda: 512)
     assert _backend.select_linear_backend(value) is None
     assert _backend.select_preparation_backend(value) is _generic
-    assert int8_updates.select_add(value) is int8_updates.add_
-    assert int8_updates.select_addmm(value) is int8_updates.addmm_
+    assert int8_updates._use_triton(value)
 
 
 @pytest.mark.parametrize(

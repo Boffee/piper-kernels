@@ -259,13 +259,13 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         """Include the rotation group in AOTAutograd's persistent-cache key."""
         return repr((super()._stable_hash_for_caching(), self.group_size))
 
-    def _rebuild_with_orig_dtype(self, orig_dtype: torch.dtype) -> ConvRotNVFP4Tensor:
+    def _rebuild_with_logical_dtype(self, dtype: torch.dtype) -> ConvRotNVFP4Tensor:
         """Preserve the concrete wrapper and rotation metadata across conversion."""
         return type(self)(
             self.qdata,
             self.scale,
             self.block_size,
-            orig_dtype,
+            dtype,
             self.group_size,
             self.per_tensor_scale,
             self.act_per_tensor_scale,

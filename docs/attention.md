@@ -158,8 +158,7 @@ For quantized projection/output fusion, pass the matching helper to
 |---|---|
 | ConvRot INT8 + dense Piper | `convrot_int8_piper` |
 | ConvRot INT8 + sparse Piper | `convrot_int8_sparse_piper` |
-| NVFP4 + sparse Piper | `nvfp4_sparse_piper` |
-| ConvRot NVFP4 + sparse Piper | `convrot_nvfp4_sparse_piper` |
+| NVFP4 / ConvRot NVFP4 + sparse Piper | `nvfp4_sparse_piper` |
 
 Each exports `<package_name>_compile_options()`. ConvRot INT8 dense fusion
 supports MHA/GQA and optional `fuse_output=True` (bounded attention-to-output

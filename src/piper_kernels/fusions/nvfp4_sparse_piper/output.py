@@ -1,40 +1,13 @@
-"""Bounded sparse Piper attention followed by an NVFP4 projection."""
+"""Bounded sparse Piper attention followed by an NVFP4 or ConvRot NVFP4 projection."""
 
 from __future__ import annotations
-
-from dataclasses import dataclass
 
 import torch
 
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.sparse_piper import _output as output_common
-from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
-from piper_kernels.weights.nvfp4.triton import dynamic_scale as nvfp4_dynamic_scale
 
 from . import _output
-
-
-@dataclass(frozen=True, slots=True)
-class _StandardPreparation:
-    """Ordinary NVFP4 preparation for the shared attention-output runner."""
-
-    high_first: bool
-
-    def dynamic_scale(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
-        return nvfp4_dynamic_scale(input)
-
-    def prepare_static_out(
-        self,
-        input: torch.Tensor,  # noqa: A002 - match linear terminology
-        per_tensor_scale: torch.Tensor,
-        out: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return nvfp4_backend.prepare_static_out(
-            input,
-            per_tensor_scale,
-            out,
-            high_first=self.high_first,
-        )
 
 
 @torch.library.custom_op(
@@ -92,6 +65,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
     dynamic_activation_scale: bool = False,
+    group_size: int | None = None,
 ) -> torch.Tensor:
     gate_projection = _output.prepare_optional_gate_projection(
         key,
@@ -137,15 +111,16 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         activation_per_tensor_scale,
         bias,
         query_chunk_rows,
-        _StandardPreparation(high_first),
         block_lengths,
         coarse_gate,
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
         gate_projection,
+        high_first=high_first,
         output_dtype=output_dtype,
         dynamic_activation_scale=dynamic_activation_scale,
+        group_size=group_size,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
     )
@@ -202,8 +177,10 @@ def _projected_query_attention_output_op_fake(
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
     dynamic_activation_scale: bool = False,
+    group_size: int | None = None,
 ) -> torch.Tensor:
     del high_first, dynamic_activation_scale
+    _output.validate_optional_group_size(group_size, 2 * weight_qdata.shape[1])
     sequence_length = output_common.validate_output_metadata(
         key,
         logical_sequence_length,
@@ -263,6 +240,7 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
     dynamic_activation_scale: bool = False,
+    group_size: int | None = None,
 ) -> torch.Tensor:
     gate_projection = _output.prepare_optional_gate_projection(
         query,
@@ -299,15 +277,16 @@ def _attention_output_op(  # noqa: PLR0913, PLR0917
         activation_per_tensor_scale,
         bias,
         query_chunk_rows,
-        _StandardPreparation(high_first),
         block_lengths,
         coarse_gate,
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
         gate_projection,
+        high_first=high_first,
         output_dtype=output_dtype,
         dynamic_activation_scale=dynamic_activation_scale,
+        group_size=group_size,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
     )
@@ -355,8 +334,10 @@ def _attention_output_op_fake(
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
     dynamic_activation_scale: bool = False,
+    group_size: int | None = None,
 ) -> torch.Tensor:
     del high_first, dynamic_activation_scale
+    _output.validate_optional_group_size(group_size, 2 * weight_qdata.shape[1])
     sequence_length = output_common.validate_output_metadata(
         query,
         logical_sequence_length,

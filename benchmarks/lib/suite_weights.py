@@ -41,13 +41,15 @@ def _support(
     target = AcceleratorTarget.from_device(device)
     if format_name == "convrot_int8":
         if convolution:
-            from piper_kernels.conv3d.convrot.int8._amd import policy as amd
-            from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia
+            from piper_kernels.conv3d.convrot.int8 import _policy
+
+            supported = _policy.supports_target(target)
         else:
             from piper_kernels.linear.convrot.int8._amd import policy as amd
             from piper_kernels.linear.convrot.int8._nvidia import policy as nvidia
 
-        if not (amd.supports_target(target) or nvidia.supports_target(target)):
+            supported = amd.supports_target(target) or nvidia.supports_target(target)
+        if not supported:
             return "no native ConvRot INT8 backend for this accelerator"
     elif not target.is_cuda_capability(12, 0):
         return "native NVFP4 execution requires exact NVIDIA SM120"

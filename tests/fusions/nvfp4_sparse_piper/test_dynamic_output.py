@@ -10,7 +10,6 @@ from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor, per_tensor_am
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
 )
-from piper_kernels.fusions.convrot_nvfp4_sparse_piper import output as convrot_output
 from piper_kernels.fusions.nvfp4_sparse_piper import output
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_ops
 from piper_kernels.linear.nvfp4 import _ops
@@ -55,14 +54,14 @@ def test_dynamic_output_reuses_storage_and_replays(
     qdata = ((weight.qdata & 15) << 4) | (weight.qdata >> 4) if high_first else weight.qdata
     bias = torch.randn(output_features, device="cuda", dtype=torch.float32)
     projection_args = (qdata, weight.scale, weight.per_tensor_scale, None, bias)
-    op = output._attention_output_op if group_size is None else convrot_output._attention_output_op
-    op_args = (
-        *attention_args,
-        *projection_args,
-        *((group_size,) if group_size is not None else ()),
-        128,
-    )
-    op_kwargs = {"dynamic_activation_scale": True, "output_dtype": dtype, "high_first": high_first}
+    op = output._attention_output_op
+    op_args = (*attention_args, *projection_args, 128)
+    op_kwargs = {
+        "dynamic_activation_scale": True,
+        "output_dtype": dtype,
+        "high_first": high_first,
+        "group_size": group_size,
+    }
 
     def reference() -> torch.Tensor:
         attended = _sparse_piper_attention_from_quantized_op(*attention_args, output_dtype=dtype)

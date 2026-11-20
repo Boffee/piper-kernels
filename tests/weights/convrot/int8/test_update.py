@@ -6,9 +6,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-from piper_kernels.weights.convrot.int8 import _backend as int8_updates
+from piper_kernels.weights.convrot.int8 import _update as int8_updates
 from piper_kernels.weights.convrot.int8 import _update_reference as int8_update_reference
 
 _GPU_MARKS = [
@@ -21,15 +22,13 @@ _DEVICES = ["cpu", pytest.param("cuda", marks=_GPU_MARKS)]
 @pytest.mark.parametrize("device", ["cpu", "meta"])
 @pytest.mark.parametrize("operation", ["add", "addmm"])
 def test_update_storage_entrypoints_reject_convolution_weights(device, operation):
-    from piper_kernels.weights.convrot.int8 import _update  # noqa: PLC0415
-
     qdata = torch.empty(2, 3, 3, 3, 64, dtype=torch.int8, device=device)
     scale = torch.ones(2, 1, device=device)
     calls = {
-        "add": lambda: _update.add_(
+        "add": lambda: int8_updates.add_(
             qdata, scale, torch.float32, 64, torch.empty(qdata.shape, device=device)
         ),
-        "addmm": lambda: _update.addmm_(
+        "addmm": lambda: int8_updates.addmm_(
             qdata,
             scale,
             torch.float32,
@@ -362,7 +361,7 @@ def test_addmm_matches_full_product(
     qdata, scale = weight.qdata, weight.scale
     monkeypatch.setattr(int8_triton, "_UPDATE_WORKSPACE_BYTES", 7 * width * left.element_size())
     if batched:
-        monkeypatch.setattr(int8_triton, "select_addmm_plan", lambda *args, **kwargs: None)
+        monkeypatch.setattr(int8_triton, "_supports_fused_addmm", lambda *args, **kwargs: False)
 
     with torch.autocast("cuda", dtype=autocast_dtype, enabled=autocast_dtype is not None):
         # The original full-product path is the oracle, including matmul autocast.
@@ -410,7 +409,7 @@ def test_addmm_snapshots_factors_aliasing_weight_storage(monkeypatch, batched, o
     expected = weight.clone()
     qdata, scale = weight.qdata, weight.scale
     if batched:
-        monkeypatch.setattr(int8_triton, "select_addmm_plan", lambda *args, **kwargs: None)
+        monkeypatch.setattr(int8_triton, "_supports_fused_addmm", lambda *args, **kwargs: False)
         monkeypatch.setattr(
             int8_triton, "_UPDATE_WORKSPACE_BYTES", 256 * width * left.element_size()
         )
@@ -427,8 +426,7 @@ def test_addmm_snapshots_factors_aliasing_weight_storage(monkeypatch, batched, o
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU")
 def test_addmm_workspace_does_not_grow_with_full_product():
-    from piper_kernels._triton.targets import AcceleratorTarget  # noqa: PLC0415
-    from piper_kernels.weights.convrot.int8._policy import select_addmm_plan  # noqa: PLC0415
+    from piper_kernels.weights.convrot.int8 import triton as int8_triton  # noqa: PLC0415
 
     rows, width, rank = 4097, 8192, 16
     weight = ConvRotInt8Tensor.from_quantized(
@@ -450,7 +448,7 @@ def test_addmm_workspace_does_not_grow_with_full_product():
     peak_scratch = torch.cuda.max_memory_allocated() - baseline
     # The dense BF16 product is over 64 MiB. Fusion needs only tile maxima
     # and row scales; the fallback retains a single 32 MiB product batch.
-    fused = select_addmm_plan(AcceleratorTarget.from_device(weight.device), 64) is not None
+    fused = int8_triton._supports_fused_addmm(AcceleratorTarget.from_device(weight.device))
     assert peak_scratch < (3 if fused else 40) * 1024 * 1024
 
 
@@ -557,7 +555,7 @@ def test_addmm_zero_coefficients_and_rank(device):
 def test_execution_error_is_not_retried_after_an_inplace_update(monkeypatch):
     qdata, scale = torch.zeros(2, 32, dtype=torch.int8), torch.ones(2, 1)
 
-    def partial_update(*args):
+    def partial_update(*args, **kwargs):
         qdata.fill_(3)
         raise RuntimeError("kernel execution failed")
 
@@ -566,7 +564,7 @@ def test_execution_error_is_not_retried_after_an_inplace_update(monkeypatch):
     monkeypatch.setattr(int8_updates, "_triton_backend", SimpleNamespace(add_=partial_update))
     monkeypatch.setattr(int8_update_reference, "add_", fallback)
     with pytest.raises(RuntimeError, match="kernel execution failed"):
-        int8_updates.add_(qdata, scale, torch.ones(2, 32), 16, 1.0, 1.0)
+        int8_updates.add_(qdata, scale, torch.float32, 16, torch.ones(2, 32), beta=1.0, alpha=1.0)
     assert (qdata == 3).all()
     fallback.assert_not_called()
 
@@ -629,3 +627,25 @@ def test_updates_reject_invalid_coefficients_before_mutation(operation, coeffici
     with pytest.raises(error, match=f"{coefficient} must be"):
         getattr(weight, f"{operation}_")(*operands, **{"alpha": 0, coefficient: value})
     assert versions == (weight.qdata._version, weight.scale._version)
+
+
+@pytest.mark.parametrize(
+    ("target", "supported"),
+    [
+        (AcceleratorTarget("cuda", "sm80"), True),
+        (AcceleratorTarget("cuda", "sm89"), True),
+        (AcceleratorTarget("cuda", "sm120"), True),
+        (AcceleratorTarget("hip", "gfx1030"), True),
+        (AcceleratorTarget("hip", "gfx1100"), True),
+        (AcceleratorTarget("hip", "gfx942"), True),
+        (AcceleratorTarget("hip", "gfx1201"), True),
+        (AcceleratorTarget("cuda", "sm75"), False),
+        (AcceleratorTarget("cuda"), False),
+        (AcceleratorTarget("cpu"), False),
+    ],
+)
+def test_fused_addmm_target_support(target: AcceleratorTarget, supported: bool) -> None:
+    pytest.importorskip("triton")
+    from piper_kernels.weights.convrot.int8 import triton as int8_triton  # noqa: PLC0415
+
+    assert int8_triton._supports_fused_addmm(target) is supported

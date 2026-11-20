@@ -1261,7 +1261,6 @@ def _prepare_piper_context(
                 value,
                 storage_key_length=storage_key_length,
                 store_log_scale=not plan.derive_value_log_bound,
-                unspecialized_value_stride=plan.unspecialized_value_stride,
             )
         )
 

@@ -56,9 +56,7 @@ def _sm89_execution_plan(
     prologue. Already quantized causal D64 Q runs 16 rows per warp instead, which
     trims diagonal work by 0.5-8%. D128 gives each warp 16 rows under a register
     cap that fits two CTAs per SM; there the prologue would cost more than the Q
-    preparation pass it replaces. V quantization leaves the V row stride
-    unspecialized, which keeps SM89 within SM120's compile count and is also 3-5x
-    faster here.
+    preparation pass it replaces.
     """
     wide = head_dim == 128
     return PiperAttentionExecutionPlan(
@@ -69,7 +67,6 @@ def _sm89_execution_plan(
         derive_value_log_bound=True,
         num_stages=1,
         use_packed_probability_conversion=True,
-        unspecialized_value_stride=True,
         attention_kernel="gluon_async_copy",
         max_registers=232 if wide else None,
         fuse_query_quantization=not wide and not quantized_query,

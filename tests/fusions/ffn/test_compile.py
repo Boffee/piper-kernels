@@ -122,6 +122,7 @@ def test_compile_options_compose_with_sparse_piper_and_residual_updates(ffn_firs
     assert nvfp4_opts[_POST_GRAD_PRE_PASS] == (
         ffn_compile_pass,
         nvfp4_compile_pass,
+        convrot_nvfp4_compile_pass,
         nvfp4_sparse_compile_pass,
     )
 

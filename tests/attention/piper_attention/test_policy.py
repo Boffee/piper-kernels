@@ -165,7 +165,6 @@ def test_ragged_causal_d64_loop_motion_is_specific_to_sm120(
                 derive_value_log_bound=True,
                 num_stages=1,
                 use_packed_probability_conversion=True,
-                unspecialized_value_stride=True,
                 attention_kernel="gluon_async_copy",
                 max_registers=232,
             ),
@@ -228,7 +227,6 @@ def test_sm89_runs_the_gluon_kernel_in_every_mode(
     assert plan.fuse_query_quantization is fuse_query_quantization
     assert plan.derive_value_log_bound
     assert plan.use_packed_probability_conversion
-    assert plan.unspecialized_value_stride
     assert not plan.grouped_qk
     assert not plan.split_pv_head_dim
     assert not plan.use_tensor_descriptors
@@ -483,7 +481,6 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
         "output_ctas_per_sm": 0,
         "strided_output_query_group": 0,
         "ragged_strided_output_maxnreg": None,
-        "unspecialized_value_stride": False,
         "attention_kernel": "triton",
         "max_registers": None,
         "fuse_query_quantization": False,

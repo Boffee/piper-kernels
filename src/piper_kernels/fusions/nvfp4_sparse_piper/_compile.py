@@ -27,6 +27,7 @@ from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear.convrot.nvfp4 import _compile as convrot_nvfp4_compile
 from piper_kernels.linear.nvfp4 import _chunking as nvfp4_chunking
 from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx
@@ -373,10 +374,10 @@ compile_pass = _CompilePass()
 def nvfp4_sparse_piper_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Canonicalize repeated NVFP4 projections before sparse-attention fusion."""
+    """Canonicalize repeated NVFP4 and ConvRot NVFP4 projections before sparse fusion."""
     return inductor_options.add_ordered_post_grad_passes(
         options,
-        (nvfp4_compile.compile_pass, compile_pass),
+        (nvfp4_compile.compile_pass, convrot_nvfp4_compile.compile_pass, compile_pass),
     )
 
 

@@ -23,47 +23,6 @@ _MAX_ROTATION_CHUNK_SIZE = 16_384
 
 
 @triton.jit
-def _load_source_chunk(
-    input_ptr,
-    input_row_offset,
-    packed_row_offset,
-    row_width,
-    chunk_start: tl.constexpr,
-    chunk_offsets,
-    chunk_size: tl.constexpr,
-    group_size: tl.constexpr,
-    inverse_sqrt_group: tl.constexpr,
-    activation_fn: tl.constexpr,
-    accelerator_backend: tl.constexpr,
-    gguf_quant_type: tl.constexpr,
-):
-    if gguf_quant_type >= 0:
-        return convrot_backend.load_gguf_rotated_chunk(
-            input_ptr,
-            packed_row_offset,
-            row_width,
-            chunk_start,
-            chunk_offsets,
-            chunk_size,
-            group_size,
-            inverse_sqrt_group,
-            gguf_quant_type,
-        )
-    return convrot_backend.load_activated_rotated_chunk(
-        input_ptr,
-        input_row_offset,
-        row_width,
-        chunk_start,
-        chunk_offsets,
-        chunk_size,
-        group_size,
-        inverse_sqrt_group,
-        activation_fn,
-        accelerator_backend,
-    )
-
-
-@triton.jit
 def _rotated_chunk_amax(
     input_ptr,
     input_row_offset,
@@ -78,7 +37,7 @@ def _rotated_chunk_amax(
     gguf_quant_type: tl.constexpr,
 ):
     chunk_offsets = tl.arange(0, chunk_size)
-    values = _load_source_chunk(
+    values = convrot_backend.load_rotated_chunk(
         input_ptr,
         input_row_offset,
         packed_row_offset,
@@ -197,7 +156,7 @@ def _rotate_quantize_chunk(
 ):
     """Rotate and encode one power-of-two row chunk into standard NVFP4 storage."""
     chunk_offsets = tl.arange(0, chunk_size)
-    values = _load_source_chunk(
+    values = convrot_backend.load_rotated_chunk(
         input_ptr,
         input_row_offset,
         packed_row_offset,

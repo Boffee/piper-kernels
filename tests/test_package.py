@@ -13,7 +13,7 @@ import piper_kernels.attention.sage_attention_2pp
 import piper_kernels.attention.sparse_piper_attention
 import piper_kernels.fusions
 import piper_kernels.fusions.convrot_int8_sparse_piper
-import piper_kernels.fusions.convrot_nvfp4_sparse_piper
+import piper_kernels.fusions.nvfp4_sparse_piper
 import piper_kernels.linear
 import piper_kernels.linear.convrot
 import piper_kernels.linear.convrot.int8
@@ -31,8 +31,8 @@ from piper_kernels import (
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
 )
-from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
-    convrot_nvfp4_sparse_piper_compile_options,
+from piper_kernels.fusions.nvfp4_sparse_piper import (
+    nvfp4_sparse_piper_compile_options,
 )
 from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
 from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options, convrot_nvfp4_linear
@@ -72,9 +72,6 @@ importlib.util.find_spec = find_spec
 
 import torch
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-from piper_kernels.weights.convrot.int8._plan import AddmmExecutionPlan
-from piper_kernels.weights.convrot.int8._policy import select_addmm_plan
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops
 from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
@@ -98,8 +95,6 @@ assert _backend.select_linear_backend(torch.ones(1)) is None
 assert "triton" not in sys.modules
 assert hasattr(torch.ops.piper_kernels, "convrot_int8_prepare_input")
 assert generic_dispatch._triton_backend is None
-assert select_addmm_plan(AcceleratorTarget("cuda", "sm80"), 64) is not None
-assert AddmmExecutionPlan().block_n == 128
 from piper_kernels.fusions.convrot_int8_projection._validation import validate_qk_projection_inputs
 assert validate_qk_projection_inputs(
     torch.ones(1, 64, 32, dtype=torch.int8),
@@ -117,7 +112,9 @@ assert "triton" not in sys.modules
 prepared, scales = _ops.prepare_input(torch.ones(2, 32), 16)
 assert prepared.shape == (2, 32) and scales.shape == (2,)
 weight.add_(torch.ones(7, 32))
+weight.addmm_(torch.ones(7, 2), torch.ones(2, 32))
 assert torch.isfinite(weight.dequantize()).all()
+assert "triton" not in sys.modules
 """
     subprocess.run([sys.executable, "-c", script], check=True)
 
@@ -237,18 +234,19 @@ assert "piper_kernels.linear.convrot.int8._compile" in sys.modules
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
-def test_convrot_nvfp4_sparse_piper_compiler_integration_is_loaded_lazily() -> None:
+def test_nvfp4_sparse_piper_compiler_integration_is_loaded_lazily() -> None:
     script = """
 import sys
-from piper_kernels.fusions import convrot_nvfp4_sparse_piper
+from piper_kernels.fusions import nvfp4_sparse_piper
 
-assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper._compile" not in sys.modules
-assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper._output_compile" not in sys.modules
-assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper.output" not in sys.modules
-convrot_nvfp4_sparse_piper.convrot_nvfp4_sparse_piper_compile_options()
-assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper._compile" in sys.modules
-assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper._output_compile" in sys.modules
-assert "piper_kernels.fusions.convrot_nvfp4_sparse_piper.output" in sys.modules
+assert "piper_kernels.fusions.nvfp4_sparse_piper._compile" not in sys.modules
+assert "piper_kernels.fusions.nvfp4_sparse_piper._output_compile" not in sys.modules
+assert "piper_kernels.fusions.nvfp4_sparse_piper.output" not in sys.modules
+nvfp4_sparse_piper.nvfp4_sparse_piper_compile_options()
+assert "piper_kernels.fusions.nvfp4_sparse_piper._compile" in sys.modules
+assert "piper_kernels.fusions.nvfp4_sparse_piper._output_compile" in sys.modules
+assert "piper_kernels.fusions.nvfp4_sparse_piper.output" in sys.modules
+assert "piper_kernels.linear.nvfp4._compile" in sys.modules
 assert "piper_kernels.linear.convrot.nvfp4._compile" in sys.modules
 """
     subprocess.run([sys.executable, "-c", script], check=True)
@@ -285,12 +283,12 @@ def test_public_packages_import() -> None:
         "piper_kernels.attention.sparse_piper_attention"
     )
     assert piper_kernels.fusions.__name__ == "piper_kernels.fusions"
-    assert piper_kernels.fusions.convrot_nvfp4_sparse_piper.__name__ == (
-        "piper_kernels.fusions.convrot_nvfp4_sparse_piper"
+    assert piper_kernels.fusions.nvfp4_sparse_piper.__name__ == (
+        "piper_kernels.fusions.nvfp4_sparse_piper"
     )
     assert (
-        piper_kernels.fusions.convrot_nvfp4_sparse_piper.convrot_nvfp4_sparse_piper_compile_options
-        is convrot_nvfp4_sparse_piper_compile_options
+        piper_kernels.fusions.nvfp4_sparse_piper.nvfp4_sparse_piper_compile_options
+        is nvfp4_sparse_piper_compile_options
     )
     assert piper_kernels.fusions.convrot_int8_sparse_piper.__name__ == (
         "piper_kernels.fusions.convrot_int8_sparse_piper"
