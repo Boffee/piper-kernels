@@ -20,9 +20,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 )
 from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
 from piper_kernels.fusions.convrot_nvfp4_gelu_ffn import convrot_nvfp4_gelu_ffn_compile_options
-from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
-    convrot_nvfp4_sparse_piper_compile_options,
-)
 from piper_kernels.fusions.convrot_nvfp4_swiglu_ffn import convrot_nvfp4_swiglu_ffn_compile_options
 from piper_kernels.fusions.nvfp4_gelu_ffn import nvfp4_gelu_ffn_compile_options
 from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_options
@@ -33,7 +30,6 @@ from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 from piper_kernels.weights.nvfp4._layout import swap_packed_pairs
 
 from .convrot_int8_sparse_piper.test_compile import _MeanPoolSparseProjectionAttentionOutput
-from .convrot_nvfp4_sparse_piper.test_compile import _ConvRotSparseProjectionAttentionOutput
 from .nvfp4_sparse_piper.test_compile import _SparseProjectionAttentionOutput
 
 pytestmark = [
@@ -57,7 +53,7 @@ _GELU_FFN_OPTIONS = {
 _ATTENTION_OPTIONS = {
     "convrot_int8": convrot_int8_sparse_piper_compile_options,
     "nvfp4": nvfp4_sparse_piper_compile_options,
-    "convrot_nvfp4": convrot_nvfp4_sparse_piper_compile_options,
+    "convrot_nvfp4": nvfp4_sparse_piper_compile_options,
 }
 _FFN_PROJECTIONS = ("gate", "value", "down")
 _GELU_FFN_PROJECTIONS = ("up", "down")
@@ -325,19 +321,20 @@ def test_dtensor_ffn_preserves_externally_used_gate(mesh, format_name):
 def _attention(format_name):
     if format_name == "convrot_int8":
         return _MeanPoolSparseProjectionAttentionOutput().eval()
-    if format_name == "nvfp4":
-        return _SparseProjectionAttentionOutput(dynamic=True, routing="mean").eval()
-    return _ConvRotSparseProjectionAttentionOutput(dynamic=True, routing="mean").eval()
+    group_size = None if format_name == "nvfp4" else 64
+    return _SparseProjectionAttentionOutput(
+        dynamic=True, routing="mean", group_size=group_size
+    ).eval()
 
 
 def _assert_attention_fused(capture, format_name):
+    projection_prefix = "convrot_int8" if format_name == "convrot_int8" else "nvfp4"
     assert (
         capture.target_names.count(
-            f"piper_kernels.{format_name}_sparse_piper_projected_query_attention_output.default"
+            f"piper_kernels.{projection_prefix}_sparse_piper_projected_query_attention_output.default"
         )
         == 1
     )
-    projection_prefix = "convrot_int8" if format_name == "convrot_int8" else "nvfp4"
     for operation in ("project_key", "project_value"):
         assert (
             capture.target_names.count(
