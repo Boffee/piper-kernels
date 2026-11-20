@@ -13,8 +13,6 @@ from pathlib import Path
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
-
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentInfo:
@@ -147,12 +145,14 @@ def capture_environment(repository: Path | None = None) -> EnvironmentInfo:
     if torch.cuda.is_available():
         gpu_index = torch.cuda.current_device()
         gpu_name = torch.cuda.get_device_name(gpu_index)
-        target = AcceleratorTarget.from_device(torch.device("cuda", gpu_index))
-        gpu_architecture = target.architecture
-        if target.is_nvidia_cuda:
+        if accelerator_backend == "rocm":
+            raw_arch = getattr(torch.cuda.get_device_properties(gpu_index), "gcnArchName", None)
             gpu_architecture = (
-                target.architecture.upper() if target.architecture is not None else None
+                raw_arch.split(":", 1)[0] if isinstance(raw_arch, str) and raw_arch else None
             )
+        elif accelerator_backend == "cuda":
+            major, minor = torch.cuda.get_device_capability(gpu_index)
+            gpu_architecture = f"SM{major}{minor}"
             driver_version = _nvidia_driver_version()
 
     git_revision, git_dirty = _git_state(repository)

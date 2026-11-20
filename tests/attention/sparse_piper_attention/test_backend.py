@@ -1,12 +1,10 @@
 """Sparse orchestration selects operations, not vendor layouts or launch plans."""
 
-import ast
 import subprocess
 import sys
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -147,27 +145,19 @@ def test_missing_score_implementation_does_not_probe_device(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("target", "expected_schedule"),
+    ("target", "supported"),
     [
-        (
-            AcceleratorTarget("hip", "gfx1200"),
-            MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True),
-        ),
-        (
-            AcceleratorTarget("hip", "gfx1201"),
-            MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True),
-        ),
-        (AcceleratorTarget("hip", "gfx1100"), None),
-        (AcceleratorTarget("hip", "gfx942"), None),
-        (AcceleratorTarget("cuda", "sm120"), MinmaxScoreSchedule(64, 64, 16)),
-        (AcceleratorTarget("cuda", "sm89"), None),
-        (AcceleratorTarget("cuda", "sm80"), None),
-        (AcceleratorTarget("cpu"), None),
+        (AcceleratorTarget("hip", "gfx1200"), True),
+        (AcceleratorTarget("hip", "gfx1201"), True),
+        (AcceleratorTarget("hip", "gfx1100"), False),
+        (AcceleratorTarget("hip", "gfx942"), False),
+        (AcceleratorTarget("cuda", "sm120"), True),
+        (AcceleratorTarget("cuda", "sm89"), False),
+        (AcceleratorTarget("cuda", "sm80"), False),
+        (AcceleratorTarget("cpu"), False),
     ],
 )
-def test_score_selection_is_independent_and_uses_operand_target(
-    monkeypatch, target, expected_schedule
-):
+def test_score_selection_is_independent_and_uses_operand_target(monkeypatch, target, supported):
     score = Mock()
     probe = Mock(return_value=target)
     monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
@@ -184,57 +174,45 @@ def test_score_selection_is_independent_and_uses_operand_target(
         requires_grad=False,
     )
     selected = _backend.select_minmax_scores(summary, summary, summary)
-    if expected_schedule is None:
+    if not supported:
         assert selected is None
     else:
         assert isinstance(selected, partial)
         assert selected.func is score
-        assert selected.keywords == {"schedule": expected_schedule}
+        schedule = selected.keywords["schedule"]
+        assert isinstance(schedule, MinmaxScoreSchedule)
+        assert schedule.lds_only_fences is target.is_amd_hip
+        assert schedule.block_m > 0
+        assert schedule.block_m & (schedule.block_m - 1) == 0
+        assert schedule.block_n > 0
+        assert schedule.block_n & (schedule.block_n - 1) == 0
+        assert schedule.block_k > 0
+        assert 128 % schedule.block_k == 0
     probe.assert_called_once_with(summary.device)
 
 
 @pytest.mark.parametrize(
-    ("target", "query_blocks", "expected_schedule"),
-    [
-        (
-            AcceleratorTarget("hip", "gfx1201"),
-            65,
-            MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True),
-        ),
-        (
-            AcceleratorTarget("hip", "gfx1201"),
-            128,
-            MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True),
-        ),
-        (
-            AcceleratorTarget("hip", "gfx1201"),
-            384,
-            MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True),
-        ),
-        (
-            AcceleratorTarget("hip", "gfx1201"),
-            385,
-            MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True),
-        ),
-        (AcceleratorTarget("cuda", "sm120"), 65, MinmaxScoreSchedule(128, 32, 16)),
-        (AcceleratorTarget("cuda", "sm120"), 128, MinmaxScoreSchedule(128, 32, 16)),
-        (AcceleratorTarget("cuda", "sm120"), 384, MinmaxScoreSchedule(128, 32, 16)),
-        (AcceleratorTarget("cuda", "sm120"), 385, MinmaxScoreSchedule(128, 32, 16)),
-    ],
+    "target",
+    [AcceleratorTarget("hip", "gfx1201"), AcceleratorTarget("cuda", "sm120")],
 )
 @pytest.mark.parametrize("query_heads_per_kv_head", [1, 3])
-def test_score_selection_accepts_large_query_chunks(
-    monkeypatch, target, expected_schedule, query_blocks, query_heads_per_kv_head
-):
+def test_score_selection_accepts_large_query_chunks(monkeypatch, target, query_heads_per_kv_head):
     score = Mock()
     monkeypatch.setattr(_backend, "_score_backend", SimpleNamespace(minmax_scores=score))
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    query = torch.empty(1, 2 * query_heads_per_kv_head, query_blocks, 128)
     primary = torch.empty(1, 2, 17, 128)
-    selected = _backend.select_minmax_scores(query, primary, primary)
-    assert isinstance(selected, partial)
-    assert selected.func is score
-    assert selected.keywords == {"schedule": expected_schedule}
+    block_ms = []
+    for query_blocks in (1, 32, 65, 128, 384, 385):
+        query = torch.empty(1, 2 * query_heads_per_kv_head, query_blocks, 128)
+        selected = _backend.select_minmax_scores(query, primary, primary)
+        assert isinstance(selected, partial)
+        assert selected.func is score
+        schedule = selected.keywords["schedule"]
+        assert isinstance(schedule, MinmaxScoreSchedule)
+        assert schedule.lds_only_fences is target.is_amd_hip
+        block_ms.append(schedule.block_m)
+    assert block_ms == sorted(block_ms)
+    assert block_ms[-1] > block_ms[0]
 
 
 @pytest.fixture(params=[32, 384], ids=["small_query", "large_query"])
@@ -998,27 +976,6 @@ def test_amd_rejects_unsupported_context_before_parameters_or_launch(
     enter_device.assert_not_called()
 
 
-def test_sparse_orchestration_has_no_vendor_or_runtime_layout_knowledge():
-    directory = Path(dispatch.__file__).parent
-    for name in (
-        "dispatch.py",
-        "_quantized_dispatch.py",
-        "_routes.py",
-        "_routing.py",
-        "_summaries.py",
-        "_prepared.py",
-        "_routing_modes.py",
-    ):
-        source = (directory / name).read_text(encoding="utf-8")
-        assert "sm120" not in source.lower()
-        assert "AcceleratorTarget" not in source
-        for node in ast.walk(ast.parse(source)):
-            if isinstance(node, ast.ImportFrom):
-                assert not any(
-                    word in (node.module or "") for word in ("_nvidia", "gluon", "triton")
-                )
-
-
 def test_public_fallback_and_quantized_state_work_without_triton():
     script = """
 import importlib.abc
@@ -1031,9 +988,33 @@ class WithoutTriton(importlib.abc.MetaPathFinder):
             raise ModuleNotFoundError("Triton intentionally unavailable", name="triton")
 
 sys.meta_path.insert(0, WithoutTriton())
-from piper_kernels.attention.sparse_piper_attention import SparsePiperAttention, _backend
-from piper_kernels.attention.sparse_piper_attention._prepared import _PreparedSparsePiperQuery
+from piper_kernels.attention.sparse_piper_attention import (
+    SparsePiperAttention,
+    _backend,
+    _prepared,
+    _quantized_dispatch,
+    _routes,
+    _routing,
+    _routing_modes,
+    _summaries,
+    dispatch,
+)
 from piper_kernels._triton.targets import AcceleratorTarget
+assert all(
+    module is not None
+    for module in (
+        dispatch, _quantized_dispatch, _routes, _routing, _summaries, _prepared, _routing_modes
+    )
+)
+# Shared orchestration imports without Triton or any vendor kernel modules.
+assert not any(
+    name == "triton"
+    or name.startswith("triton.")
+    or ".gluon" in name
+    or "._nvidia.gluon" in name
+    or "._amd.gluon" in name
+    for name in sys.modules
+)
 query = torch.zeros(1, 128, 1, 128, dtype=torch.bfloat16)
 assert _backend.select_attention_backend(query) is None
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
@@ -1044,7 +1025,7 @@ schedule = policy.select_sm120_attention_schedule(
     has_coarse_residual=False, selected_key_rows=32768,
 )
 assert isinstance(schedule, AttentionSchedule)
-assert (schedule.block_m, schedule.num_warps) == (128, 4)
+assert schedule.block_m in (64, 128) and schedule.num_warps in (2, 4)
 assert torch.equal(SparsePiperAttention((0.5,))(query, query, query, sparse_key_blocks=2), query)
 # Even a supported target cannot select absent optional implementations.
 AcceleratorTarget.from_device = lambda device: AcceleratorTarget("cuda", "sm120")

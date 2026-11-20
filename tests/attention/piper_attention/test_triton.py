@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 from _accelerators import exact_sm120_available
-from lib.triton_inspection import compiled_artifact
+from _triton_inspection import compiled_artifact
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.tools.tensor_descriptor import TensorDescriptor

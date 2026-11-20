@@ -14,7 +14,7 @@ from typing import Any, Protocol
 from .cases import catalog_metadata
 from .environment import EnvironmentInfo
 from .quality import QualityCheck, QualityMetrics
-from .timing import PhaseTimings
+from .timing import Timing
 
 SCHEMA_VERSION = 1
 type JSONValue = str | int | float | bool | list[JSONValue] | dict[str, JSONValue] | None
@@ -43,7 +43,7 @@ class OutputTarget:
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkRecord[
-    TimingsT: SerializableRecord | None = PhaseTimings,
+    TimingsT: SerializableRecord | None = Timing,
     QualityT: QualityMetrics | QualityCheck = QualityMetrics,
 ]:
     """One provider, shape, configuration, timing, and quality observation."""

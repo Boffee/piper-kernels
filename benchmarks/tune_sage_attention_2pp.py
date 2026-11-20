@@ -23,7 +23,7 @@ from lib.attention_tuning import (
 )
 from lib.case_cli import apply_case
 from lib.environment import capture_environment
-from lib.providers import BenchmarkProvider, Implementation
+from lib.providers import Implementation, Operation
 from lib.quality import measure_quality
 from lib.reporting import output_target
 from lib.tuning import (
@@ -153,11 +153,11 @@ def _make_candidate(
     production_plan: SageAttention2ppExecutionPlan,
     config: AttentionConfig,
     target: AcceleratorTarget,
-) -> Implementation[BenchmarkProvider[AttentionInputs, torch.Tensor]]:
-    query, _, _ = inputs
+) -> Implementation[Operation[torch.Tensor]]:
+    query, key, value = inputs
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
 
-    def make_provider() -> BenchmarkProvider[AttentionInputs, torch.Tensor]:
+    def build_operation() -> Operation[torch.Tensor]:
         plan = _resolve_plan(
             choice,
             production_plan,
@@ -166,25 +166,17 @@ def _make_candidate(
             is_causal=config.is_causal,
         )
 
-        def prepare() -> AttentionInputs:
-            # Match benchmark_attention.py: the hot device phase is the complete
-            # public SageAttention2++ operator, including statistics and quantization kernels.
-            return inputs
-
-        def run(prepared: AttentionInputs) -> torch.Tensor:
-            prepared_query, prepared_key, prepared_value = prepared
+        def run() -> torch.Tensor:
             return sage_attention_2pp_backend._run_sage_attention_2pp(
-                prepared_query,
-                prepared_key,
-                prepared_value,
+                query,
+                key,
+                value,
                 scale,
                 config.is_causal,
                 execution_plan=plan,
             )
 
-        return BenchmarkProvider(
-            name=f"sage_attention_2pp_{choice.name.replace('-', '_')}",
-            prepare=prepare,
+        return Operation(
             run=run,
             synchronize=torch.cuda.synchronize,
             configuration={
@@ -206,7 +198,7 @@ def _make_candidate(
             "implementation": "pure_triton",
             "algorithm": "sage_attention_2pp",
         },
-        build=make_provider,
+        build=build_operation,
     )
 
 

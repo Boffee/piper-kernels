@@ -126,6 +126,7 @@ def run_implementation(
             torch.cuda.synchronize(device)
         record = replace(record, stage="validation")
         _check_finite(output)
+        assert operation.check is not None, "suite operations must supply a quality check"
         check = operation.check(output)
         record = replace(record, quality=check)
         check.metrics.validate(check.relative_l2_limit, check.reference)

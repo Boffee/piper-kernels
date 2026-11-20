@@ -6,7 +6,7 @@ import importlib
 import math
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
@@ -21,16 +21,11 @@ class _TritonTesting(Protocol):
         quantiles: list[float],
     ) -> Sequence[float]: ...
 
-    def do_bench_cudagraph(
-        self, function: Callable[[], Any], *, rep: int, return_mode: str
-    ) -> float: ...
-
 
 class ClockDomain(StrEnum):
     """Clock domains used by benchmark timing implementations."""
 
     DEVICE_EVENT = "device_event"
-    GRAPH_DEVICE_EVENT = "graph_device_event"
     SYNCHRONIZED_WALL = "synchronized_wall"
 
 
@@ -83,149 +78,6 @@ class Timing:
             "clock": self.clock.value,
             "sample_count": self.sample_count,
         }
-
-
-@dataclass(frozen=True, slots=True)
-class PhaseTimings:
-    """Standard benchmark phases.
-
-    ``first_call_ms`` is the synchronized first operator invocation, including
-    any lazy compilation. ``preparation`` and ``operator_end_to_end`` use a
-    synchronized wall clock so they include host work. ``prepared_execution``
-    uses device events on already-prepared inputs.
-    """
-
-    warmup_ms: int
-    measurement_time_ms: int
-    first_call_ms: float | None
-    preparation: Timing | None
-    prepared_execution: Timing
-    operator_end_to_end: Timing | None
-
-    def __post_init__(self) -> None:
-        if self.warmup_ms < 0 or self.measurement_time_ms <= 0:
-            raise ValueError("warmup must be non-negative and measurement time must be positive")
-
-    def as_dict(self) -> dict[str, float | str | dict[str, float | str | None] | None]:
-        """Return stable machine-readable field names."""
-        return {
-            "warmup_ms": self.warmup_ms,
-            "measurement_time_ms": self.measurement_time_ms,
-            "first_call_ms": self.first_call_ms,
-            "first_call_clock": (
-                None if self.first_call_ms is None else ClockDomain.SYNCHRONIZED_WALL.value
-            ),
-            "preparation": None if self.preparation is None else self.preparation.as_dict(),
-            "prepared_execution": self.prepared_execution.as_dict(),
-            "operator_end_to_end": (
-                None if self.operator_end_to_end is None else self.operator_end_to_end.as_dict()
-            ),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class SampleTimings:
-    """Fixed-count synchronized wall measurements of a complete operator.
-
-    Unlike ``PhaseTimings``, these describe individual calls, not time windows
-    or an independently measured prepared-execution phase.
-    """
-
-    warmup_calls: int
-    samples_ms: tuple[float, ...]
-    operator_end_to_end: Timing = field(init=False)
-
-    def __post_init__(self) -> None:
-        if self.warmup_calls < 0:
-            raise ValueError("warmup calls must be non-negative")
-        object.__setattr__(
-            self,
-            "operator_end_to_end",
-            Timing.from_samples(self.samples_ms, ClockDomain.SYNCHRONIZED_WALL),
-        )
-
-    def as_dict(self) -> dict[str, object]:
-        """Report actual call counts and samples without inventing time windows."""
-        return {
-            "warmup_calls": self.warmup_calls,
-            "sample_count": len(self.samples_ms),
-            "operator_end_to_end": self.operator_end_to_end.as_dict(),
-            "samples_ms": list(self.samples_ms),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class DeviceTimings:
-    """Repeated median measurements with cache flushing and graph replay kept separate."""
-
-    warmup_ms: int
-    measurement_time_ms: int
-    cache_flushed_samples_ms: tuple[float, ...]
-    graph_samples_ms: tuple[float, ...]
-    cache_flushed: Timing = field(init=False)
-    graph: Timing = field(init=False)
-
-    def __post_init__(self) -> None:
-        if self.warmup_ms < 0 or self.measurement_time_ms <= 0:
-            raise ValueError("warmup must be non-negative and measurement time must be positive")
-        if len(self.cache_flushed_samples_ms) != len(self.graph_samples_ms):
-            raise ValueError("cache-flushed and graph measurements require equal sample counts")
-        object.__setattr__(
-            self,
-            "cache_flushed",
-            Timing.from_samples(self.cache_flushed_samples_ms, ClockDomain.DEVICE_EVENT),
-        )
-        object.__setattr__(
-            self,
-            "graph",
-            Timing.from_samples(self.graph_samples_ms, ClockDomain.GRAPH_DEVICE_EVENT),
-        )
-
-    def as_dict(self) -> dict[str, object]:
-        """Describe the actual device measurements without inventing wall-clock phases."""
-        return {
-            "warmup_ms": self.warmup_ms,
-            "measurement_time_ms": self.measurement_time_ms,
-            "sample_count": len(self.graph_samples_ms),
-            "sample_statistic": "median",
-            "cache_flushed": self.cache_flushed.as_dict(),
-            "graph": self.graph.as_dict(),
-            "cache_flushed_samples_ms": list(self.cache_flushed_samples_ms),
-            "graph_samples_ms": list(self.graph_samples_ms),
-        }
-
-
-def measure_device(
-    function: Callable[[], Any],
-    *,
-    warmup_ms: int,
-    measurement_time_ms: int,
-    samples: int = 3,
-) -> DeviceTimings:
-    """Use the same cache-flushed and graph timing protocol on CUDA and ROCm."""
-    if samples < 1 or warmup_ms < 0 or measurement_time_ms <= 0:
-        raise ValueError("requires positive samples/duration and non-negative warmup")
-    testing = cast(_TritonTesting, importlib.import_module("triton.testing"))
-    cold, graph = [], []
-    for _ in range(samples):
-        cold.append(triton_benchmark(function, warmup_ms, measurement_time_ms).median_ms)
-        graph.append(
-            testing.do_bench_cudagraph(function, rep=measurement_time_ms, return_mode="median")
-        )
-    return DeviceTimings(warmup_ms, measurement_time_ms, tuple(cold), tuple(graph))
-
-
-def time_first_call(
-    function: Callable[[], Any],
-    synchronize: Callable[[], None] | None = None,
-) -> tuple[Any, float]:
-    """Run and synchronize the first invocation, returning output and wall time."""
-    sync = synchronize or (lambda: None)
-    sync()
-    started = time.perf_counter()
-    output = function()
-    sync()
-    return output, (time.perf_counter() - started) * 1_000
 
 
 def _linear_quantile(ordered_values: Sequence[float], quantile: float) -> float:

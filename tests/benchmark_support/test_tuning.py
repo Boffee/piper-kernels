@@ -2,11 +2,12 @@ from collections.abc import Callable
 
 import pytest
 from lib.cases import CATALOG_VERSION
-from lib.providers import BenchmarkProvider, Implementation, ProviderPhase
+from lib.providers import Implementation, Operation
 from lib.quality import QualityMetrics
 from lib.reporting import OutputFormat, OutputTarget
 from lib.timing import ClockDomain, Timing
 from lib.tuning import (
+    TuningPhase,
     TuningStatus,
     UnsupportedTuningCandidateError,
     boolean_tuning_axis,
@@ -45,14 +46,12 @@ def _timer(
     return Timing(latency, latency, latency, ClockDomain.DEVICE_EVENT)
 
 
-def _candidate(name: str, latency: int) -> Implementation[BenchmarkProvider[int, int]]:
+def _candidate(name: str, latency: int) -> Implementation[Operation[int]]:
     return Implementation(
         name=name,
         configuration={"block_m": latency * 64},
-        build=lambda: BenchmarkProvider(
-            name=name,
-            prepare=lambda: latency,
-            run=lambda prepared: prepared,
+        build=lambda: Operation(
+            run=lambda: latency,
             configuration={"resolved": True},
         ),
     )
@@ -140,12 +139,12 @@ def test_tuning_rejects_quality_before_spending_measurement_time(environment) ->
     ],
 )
 def test_tuning_records_expected_candidate_failures(environment, error: Exception | None) -> None:
-    def make_provider() -> BenchmarkProvider[None, None]:
+    def build_operation() -> Operation[None]:
         assert error is not None, "unsupported factory must not run"
         raise error
 
     run = tune_candidates(
-        (Implementation("unsupported", make_provider, "unavailable" if error is None else None),),
+        (Implementation("unsupported", build_operation, "unavailable" if error is None else None),),
         tuning="attention",
         shape={},
         environment=environment,
@@ -157,12 +156,12 @@ def test_tuning_records_expected_candidate_failures(environment, error: Exceptio
 
 
 def test_tuning_propagates_unexpected_failures(environment) -> None:
-    def make_provider() -> BenchmarkProvider[None, None]:
+    def build_operation() -> Operation[None]:
         raise RuntimeError("implementation bug")
 
     with pytest.raises(RuntimeError, match="implementation bug"):
         tune_candidates(
-            (Implementation("broken", make_provider),),
+            (Implementation("broken", build_operation),),
             tuning="attention",
             shape={},
             environment=environment,
@@ -184,21 +183,19 @@ def test_end_to_end_phase_uses_wall_timer(environment, monkeypatch: pytest.Monke
         function()
         return Timing(1.0, 1.0, 1.0, ClockDomain.SYNCHRONIZED_WALL)
 
-    def make_provider() -> BenchmarkProvider[int, int]:
-        return BenchmarkProvider(
-            name="end-to-end",
-            prepare=lambda: calls.append("prepare") or 1,
-            run=lambda value: calls.append("run") or value,
+    def build_operation() -> Operation[int]:
+        return Operation(
+            run=lambda: calls.append("run") or 1,
             synchronize=lambda: calls.append("synchronize"),
         )
 
     monkeypatch.setattr("lib.tuning.synchronized_wall_benchmark", wall_timer)
     run = tune_candidates(
-        (Implementation("end-to-end", make_provider),),
+        (Implementation("end-to-end", build_operation),),
         tuning="attention",
         shape={},
         environment=environment,
-        phase=ProviderPhase.OPERATOR_END_TO_END,
+        phase=TuningPhase.OPERATOR_END_TO_END,
         warmup_ms=2,
         measurement_time_ms=5,
     )
@@ -206,7 +203,7 @@ def test_end_to_end_phase_uses_wall_timer(environment, monkeypatch: pytest.Monke
     assert run.winner is not None
     assert run.winner.timing is not None
     assert run.winner.timing.clock is ClockDomain.SYNCHRONIZED_WALL
-    assert calls == ["prepare", "run", "synchronize", "prepare", "run"]
+    assert calls == ["run", "synchronize", "run"]
 
 
 @pytest.mark.parametrize(
@@ -218,7 +215,7 @@ def test_end_to_end_phase_uses_wall_timer(environment, monkeypatch: pytest.Monke
 )
 def test_tuning_validates_candidate_lists(
     environment,
-    candidates: tuple[Implementation[BenchmarkProvider[int, int]], ...],
+    candidates: tuple[Implementation[Operation[int]], ...],
     error: str,
 ) -> None:
     with pytest.raises(ValueError, match=error):

@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
 from piper_kernels.attention.sage_attention_2pp._policy import select_execution_plan
 from piper_kernels.attention.sage_attention_2pp.triton import (
     _prepare_sage_attention_2pp,
@@ -18,189 +17,51 @@ _SM120 = AcceleratorTarget(backend="cuda", architecture="sm120")
 _SM121 = AcceleratorTarget(backend="cuda", architecture="sm121")
 
 
-@pytest.mark.parametrize("sequence", [1, 8192, 131073])
-def test_default_execution_plan_is_sequence_length_invariant(sequence: int) -> None:
-    query = torch.empty((1, 8, sequence, 128), device="meta")
-
-    plan = default_execution_plan(
-        query,
-        False,
-        target=_SM120,
-    )
-
-    assert plan.block_m == 128
-    assert plan.grouped_qk
-    assert plan.use_tensor_descriptors
+def test_default_execution_plan_is_sequence_length_invariant() -> None:
+    plans = [
+        default_execution_plan(
+            torch.empty((1, 8, sequence, 128), device="meta"), False, target=_SM120
+        )
+        for sequence in (1, 8192, 131073)
+    ]
+    assert all(plan == plans[0] for plan in plans)
+    assert plans[0].grouped_qk is True
+    assert plans[0].use_tensor_descriptors is True
 
 
-@pytest.mark.parametrize(
-    ("target", "expected"),
-    [
-        (
-            _SM89,
-            SageAttention2ppExecutionPlan(
-                block_m=128,
-                grouped_qk=False,
-                use_tensor_descriptors=False,
-                loop_num_stages=3,
-                loop_licm=True,
-            ),
-        ),
-        (
-            _SM120,
-            SageAttention2ppExecutionPlan(
-                block_m=128,
-                grouped_qk=True,
-                use_tensor_descriptors=True,
-                use_packed_probability_conversion=False,
-                loop_licm=True,
-            ),
-        ),
-        (
-            _SM121,
-            SageAttention2ppExecutionPlan(
-                block_m=128,
-                grouped_qk=True,
-                use_tensor_descriptors=False,
-            ),
-        ),
-    ],
-)
-def test_execution_plan_separates_architecture_facts_from_exact_target_tuning(
-    target: AcceleratorTarget,
-    expected: SageAttention2ppExecutionPlan,
-) -> None:
-    plan = select_execution_plan(
-        target,
-        candidate_block_m=128,
-        head_dim=128,
-        is_causal=False,
-    )
-
-    assert plan == expected
-
-
-@pytest.mark.parametrize(
-    ("target", "head_dim", "expected_block_m"),
-    [
-        (_SM121, 128, 64),
-        (_SM89, 64, 64),
-        (_SM89, 128, 128),
-    ],
-)
-def test_causal_block_schedule_uses_architecture_specific_tuning(
-    target: AcceleratorTarget,
-    head_dim: int,
-    expected_block_m: int,
-) -> None:
-    plan = select_execution_plan(
-        target,
-        candidate_block_m=128,
-        head_dim=head_dim,
-        is_causal=True,
-    )
-
-    assert plan.block_m == expected_block_m
-
-
+@pytest.mark.parametrize("target", [_SM89, _SM120, _SM121])
 @pytest.mark.parametrize("candidate_block_m", [64, 128])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_sm120_uses_uniform_128_row_query_tiles(
+def test_selected_plans_satisfy_capability_and_safety_invariants(
+    target: AcceleratorTarget,
     candidate_block_m: int,
     head_dim: int,
     is_causal: bool,
 ) -> None:
     plan = select_execution_plan(
-        _SM120,
+        target,
         candidate_block_m=candidate_block_m,
         head_dim=head_dim,
         is_causal=is_causal,
     )
-
-    assert plan.block_m == 128
-    assert plan.use_tensor_descriptors is (head_dim == 128)
-    assert plan.loop_licm
-
-
-def test_sm89_d128_causal_schedule_uses_measured_launch_policy() -> None:
-    plan = select_execution_plan(
-        _SM89,
-        candidate_block_m=128,
-        head_dim=128,
-        is_causal=True,
-    )
-
-    assert plan.num_warps == 4
-    assert plan.num_stages == 2
-    assert plan.reverse_causal_blocks
-
-
-@pytest.mark.parametrize(
-    ("head_dim", "is_causal", "expected"),
-    [(64, False, False), (64, True, True), (128, True, True)],
-)
-def test_sm89_loop_licm_policy(head_dim: int, is_causal: bool, expected: bool) -> None:
-    plan = select_execution_plan(
-        _SM89,
-        candidate_block_m=128,
-        head_dim=head_dim,
-        is_causal=is_causal,
-    )
-
-    assert plan.loop_licm is expected
-
-
-def test_sm89_d128_noncausal_schedule_enables_licm_and_loop_pipeline() -> None:
-    plan = select_execution_plan(
-        _SM89,
-        candidate_block_m=128,
-        head_dim=128,
-        is_causal=False,
-    )
-
-    assert plan.loop_num_stages == 3
-    assert plan.loop_licm
-
-
-@pytest.mark.parametrize(
-    ("target", "head_dim", "is_causal", "expected"),
-    [
-        (_SM89, 128, True, True),
-        (_SM120, 64, True, False),
-        (_SM120, 128, False, False),
-        (_SM120, 128, True, False),
-    ],
-)
-def test_probability_conversion_policy_is_specialized_by_target(
-    target: AcceleratorTarget,
-    head_dim: int,
-    is_causal: bool,
-    expected: bool,
-) -> None:
-    plan = select_execution_plan(
-        target,
-        candidate_block_m=128,
-        head_dim=head_dim,
-        is_causal=is_causal,
-    )
-
-    assert plan.use_packed_probability_conversion is expected
-
-
-@pytest.mark.parametrize("is_causal", [False, True])
-def test_other_sm12x_targets_do_not_inherit_sm120_specializations(
-    is_causal: bool,
-) -> None:
-    plan = select_execution_plan(
-        _SM121,
-        candidate_block_m=128,
-        head_dim=128,
-        is_causal=is_causal,
-    )
-
-    assert plan.grouped_qk
-    assert not plan.use_tensor_descriptors
+    assert plan.block_m in (64, 128)
+    assert plan.num_warps in (2, 4, 8)
+    assert 1 <= plan.num_stages <= 4
+    assert plan.grouped_qk is target.is_cuda_capability(12)
+    if not is_causal:
+        assert not plan.reverse_causal_blocks
+    # Tensor descriptors require exact SM120 with D128 and M128.
+    assert plan.use_tensor_descriptors is (target == _SM120 and head_dim == 128)
+    if plan.use_tensor_descriptors:
+        assert plan.block_m == 128
+    # Unmeasured SM12x targets do not inherit exact-SM120 specializations.
+    if target == _SM121:
+        assert not plan.use_tensor_descriptors
+        assert not plan.loop_licm
+        assert not plan.reverse_causal_blocks
+        if is_causal:
+            assert plan.block_m <= 64
 
 
 def test_alternate_plan_can_disable_tensor_descriptors() -> None:

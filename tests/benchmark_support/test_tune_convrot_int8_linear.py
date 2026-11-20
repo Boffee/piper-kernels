@@ -3,14 +3,14 @@
 import pytest
 import torch
 from lib.convrot import ConvRotConfig, ConvRotShape
-from lib.convrot_int8_providers import make_convrot_int8_workload
-from lib.providers import ProviderPhase
+from lib.tuning import TuningPhase
 from tune_convrot_int8_linear import (
     _candidate_plans,
     _make_candidate,
     _parse_args,
     _plan_name,
     _validate_args,
+    make_convrot_int8_workload,
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -49,7 +49,7 @@ def test_tuner_defaults_to_complete_production_device_path() -> None:
     assert arguments.dtype == "bfloat16"
     assert arguments.input_activation is None
     assert not arguments.bias
-    assert arguments.phase is ProviderPhase.PREPARED_EXECUTION
+    assert arguments.phase is TuningPhase.PREPARED_EXECUTION
     assert arguments.fuse_rotation_quantization is None
     assert arguments.fused_num_warps is None
     assert arguments.rotation_num_warps is None
@@ -327,12 +327,10 @@ def test_candidate_provider_injects_plan_into_complete_operator(
         return torch.empty((2, 96), device="meta")
 
     monkeypatch.setattr(workload.backend, "run_linear", fake_run)
-    provider = _make_candidate(plan, workload).build()
+    operation = _make_candidate(plan, workload).build()
 
-    prepared = provider.prepare()
-    output = provider.run(prepared)
+    output = operation.run()
 
-    assert prepared is workload.inputs
     assert output.shape == (2, 96)
     assert calls[0][1]["execution_plan"] is plan
     assert calls[0][1]["activation_fn"] is None

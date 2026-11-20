@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import uuid
 from functools import partial
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -35,6 +36,12 @@ if TYPE_CHECKING:
     from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 _GROUP_SIZE = 64
+
+
+def _linear_backend() -> ModuleType:
+    from piper_kernels.linear.convrot.int8 import _backend as linear_backend
+
+    return linear_backend
 
 
 def _projection(
@@ -155,8 +162,9 @@ class Pipeline(torch.nn.Module):
         from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
             _sparse_piper_attention_from_quantized_op,
         )
-        from piper_kernels.linear.convrot.int8 import _backend as linear_backend
         from piper_kernels.linear.convrot.int8 import _ops
+
+        linear_backend = _linear_backend()
 
         qw, kw, vw, ow = (
             cast("ConvRotInt8Tensor", layer.weight)
@@ -348,7 +356,8 @@ def _unsupported_reason(case: PipelineCase, device: torch.device) -> str | None:
         return "sparse pipeline requires 1 through 65536 complete K64 prefix blocks"
     from piper_kernels.fusions.convrot_int8_piper import _backend as dense_backend
     from piper_kernels.fusions.convrot_int8_sparse_piper import _backend as sparse_backend
-    from piper_kernels.linear.convrot.int8 import _backend as linear_backend
+
+    linear_backend = _linear_backend()
 
     probe = torch.empty(0, device=device)
     backend = dense_backend if case.keep_ratio is None else sparse_backend

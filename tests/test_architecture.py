@@ -19,45 +19,25 @@ _MAX_CUSTOM_OPS = 52
 _MAX_COMPILER_PASSES = 2
 _MAX_PATTERN_MATCHER_PASSES = 0
 
-# Legacy tests that inspect src/ ASTs (shrink and remove entries over time).
-_TEST_AST_ALLOWLIST = frozenset(
-    {
-        "tests/attention/sparse_piper_attention/test_backend.py",
-        "tests/fusions/convrot_int8_sparse_piper/test_backend.py",
-        "tests/fusions/test_convrot_int8_backend.py",
-        "tests/triton/test_device_launches.py",
-    }
-)
+# Legacy tests that inspect src/ ASTs (empty: zero AST tests outside this file).
+_TEST_AST_ALLOWLIST: frozenset[str] = frozenset()
 
 # Only the ptxas spill-sidecar helper may force a single recovery compile on sidecar miss.
 _TRITON_ALWAYS_COMPILE_ALLOWLIST = frozenset({"tests/_nvidia_resources.py"})
 
 # Legacy private piper_kernels imports in benchmarks/ (lower/delete on cleanup).
 _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
-    "benchmarks/benchmark_attention.py": 2,
-    "benchmarks/benchmark_convrot_int8.py": 2,
-    "benchmarks/benchmark_convrot_int8_conv3d.py": 2,
-    "benchmarks/benchmark_convrot_int8_preparation.py": 6,
-    "benchmarks/benchmark_integer_pv_dot.py": 2,
-    "benchmarks/benchmark_sparse_piper.py": 8,
-    "benchmarks/benchmark_sparse_piper_projection.py": 5,
-    "benchmarks/benchmark_sparse_piper_scores.py": 5,
-    "benchmarks/lib/attention_providers.py": 8,
-    "benchmarks/lib/convrot.py": 3,
-    "benchmarks/lib/convrot_int8_providers.py": 4,
-    "benchmarks/lib/environment.py": 1,
-    "benchmarks/lib/sparse_piper.py": 1,
-    "benchmarks/lib/suite_attention.py": 10,
-    "benchmarks/lib/suite_pipeline.py": 12,
-    "benchmarks/lib/suite_weights.py": 7,
+    "benchmarks/lib/suite_attention.py": 9,
+    "benchmarks/lib/suite_pipeline.py": 11,
+    "benchmarks/lib/suite_weights.py": 6,
     "benchmarks/tune_convrot_int8_linear.py": 3,
     "benchmarks/tune_piper_attention.py": 4,
     "benchmarks/tune_sage_attention_2pp.py": 2,
 }
 
 # Legacy private piper_kernels import totals in tests/ (lower as tests decouple).
-_MAX_TEST_PRIVATE_IMPORT_FILES = 162
-_MAX_TEST_PRIVATE_IMPORTS = 695
+_MAX_TEST_PRIVATE_IMPORT_FILES = 159
+_MAX_TEST_PRIVATE_IMPORTS = 687
 
 _PASS_BASE_NAMES = frozenset(
     {
@@ -278,3 +258,43 @@ def test_test_private_import_ratchet() -> None:
         f"(max {_MAX_TEST_PRIVATE_IMPORTS}); test public contracts and compiler "
         "invariants instead (see AGENTS.md and docs/development.md#writing-tests)."
     )
+
+
+def test_every_native_launch_and_descriptor_has_an_explicit_device_context() -> None:
+    """Audit native launch ownership across src/ without importing optional dependencies."""
+    unguarded: list[str] = []
+    native_calls: list[str] = []
+
+    class Audit(ast.NodeVisitor):
+        depth = 0
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if any(isinstance(d, ast.Attribute) and d.attr == "jit" for d in node.decorator_list):
+                return
+            self.generic_visit(node)
+
+        def visit_With(self, node: ast.With) -> None:
+            guarded = any(
+                isinstance(item.context_expr, ast.Call)
+                and ast.unparse(item.context_expr.func) in ("device_context", "torch.cuda.device")
+                for item in node.items
+            )
+            self.depth += guarded
+            self.generic_visit(node)
+            self.depth -= guarded
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Subscript) or (
+                isinstance(node.func, ast.Name)
+                and node.func.id in ("TensorDescriptor", "install_uint8_int8_dot_hook")
+            ):
+                location = f"{path.relative_to(_SRC_ROOT)}:{node.lineno}"
+                native_calls.append(location)
+                if not self.depth:
+                    unguarded.append(location)
+            self.generic_visit(node)
+
+    for path in _iter_python_files(_SRC_ROOT):
+        Audit().visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+    assert native_calls
+    assert not unguarded, unguarded

@@ -108,32 +108,13 @@ Compare matching case revisions, providers, scopes, and protocols. Confirm a
 promising result with repeated fresh-process runs on an otherwise idle device.
 Record clock/power settings and validate each architecture independently.
 
-## Diagnostics and offline tuning
-
-These tools answer narrower questions and retain their labeled phase/clock
-records. Use complete-call suite results for integration comparisons.
-
-| Question | Tool |
-|---|---|
-| Attention preparation, compiler inspection, optional canonical Sage | [Dense attention diagnostic](benchmark_attention.py) |
-| Sparse stages and routing scores | [Sparse attention](benchmark_sparse_piper.py), [scores](benchmark_sparse_piper_scores.py) |
-| Q/K/V projection phases | [Sparse projections](benchmark_sparse_piper_projection.py) |
-| Linear preparation, compiler inspection, optional external comparison | [Linear](benchmark_convrot_int8.py), [preparation](benchmark_convrot_int8_preparation.py) |
-| Convolution layouts, schedules, and standard-call fusion (`--standard-calls`) | [Conv3D](benchmark_convrot_int8_conv3d.py) |
-| Integer arithmetic/compiler behavior | [Integer PV dot](benchmark_integer_pv_dot.py) |
-
-Operation diagnostics accept `--case` to use a parent workload from the shared
-catalog. Use full option names; `--case` rejects workload overrides. Saved records
-store `case_id` and `catalog_version` at the top level, with workload dimensions
-in `shape`. Custom experiments have null catalog metadata.
-Device-event timing measures stream work; graph replay removes per-call host
-work. Neither should be compared directly with the suite's synchronized wall
-time. Compiler resource counts describe limits, not achieved occupancy.
+## Offline tuning
 
 The [Piper Attention](tune_piper_attention.py),
 [SageAttention2++](tune_sage_attention_2pp.py), and
-[INT8 linear](tune_convrot_int8_linear.py) tuners accept the same cases and search
-implementation-specific schedules offline:
+[INT8 linear](tune_convrot_int8_linear.py) tuners accept `--case` from the shared
+catalog (rejecting conflicting workload overrides) and search implementation-specific
+schedules offline on top of the same `Operation` / `Implementation` harness:
 
 ```shell
 uv run python benchmarks/tune_piper_attention.py --case attention-video-low \
@@ -141,17 +122,19 @@ uv run python benchmarks/tune_piper_attention.py --case attention-video-low \
   --json artifacts/attention-tuning.json
 ```
 
+Saved tuning records store `case_id` and `catalog_version` at the top level, with
+workload dimensions in `shape`; custom experiments record null catalog metadata.
 Candidate limits and quality gates keep searches explicit; unexpected failures
 propagate. Nothing modifies production policy or enables runtime autotuning.
-Attention schedule searches currently target NVIDIA. Use nearby shapes when
-judging a policy change; see [performance tuning](../docs/development.md#performance-tuning).
+Attention schedule searches currently target NVIDIA. Device-event `--phase
+prepared_execution` timings should not be compared directly with the suite's
+synchronized wall time. Use nearby shapes when judging a policy change; see
+[performance tuning](../docs/development.md#performance-tuning).
 
 The [ROCm workflow](../.github/workflows/rocm.yml) runs the same small cases and
 saves their records on a provisioned RDNA4 runner. It requires the environment
 described in the development guide; the workflow alone is not hardware evidence.
 
 Add a workload to the catalog and its operation adapter, reusing the common
-input, provider, quality, and reporting utilities in `lib/`. Suite operations
-measure complete calls; diagnostic providers expose preparation and execution
-phases. Both use the same deferred implementation factories and result metadata.
-Avoid another standalone performance runner for a model or accelerator.
+input, provider, quality, and reporting utilities in `lib/`. Avoid adding
+standalone performance runners for a model or accelerator.

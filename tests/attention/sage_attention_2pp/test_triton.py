@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 from _accelerators import exact_sm120_available
-from lib.triton_inspection import compiled_artifact
+from _triton_inspection import compiled_artifact
 
 import piper_kernels.attention.sage_attention_2pp.triton as sage_attention_2pp_backend
 from piper_kernels import sage_attention_2pp

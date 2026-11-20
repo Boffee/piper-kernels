@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
+from types import ModuleType
+from typing import Any, Protocol, cast
 
 import torch
 from lib.case_cli import apply_case
@@ -20,15 +22,10 @@ from lib.convrot import (
     ConvRotInputs,
     ConvRotShape,
     convrot_dtype,
-)
-from lib.convrot_int8_providers import (
-    ConvRotInt8Workload,
-    make_convrot_int8_workload,
-    make_planned_convrot_int8_provider,
-    planned_convrot_int8_configuration,
+    make_convrot_inputs,
 )
 from lib.environment import capture_environment
-from lib.providers import BenchmarkProvider, Implementation
+from lib.providers import Implementation, Operation
 from lib.quality import measure_quality
 from lib.reporting import output_target
 from lib.tuning import (
@@ -42,9 +39,104 @@ from lib.tuning import (
     validate_tuning_candidate_count,
 )
 
-from piper_kernels.linear.convrot.int8._nvidia import _plan as convrot_int8_plan
-from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
-from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
+from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
+from piper_kernels.linear.convrot.int8.reference import linear as reference_linear
+from piper_kernels.weights.convrot import SUPPORTED_GROUP_SIZES
+
+_MATMUL_KERNEL_VALUES = ("triton", "gluon_async_copy", "gluon_tma")
+_MATMUL_GROUP_M_VALUES = (0, 8, 16)
+
+
+class _ExecutionPlan(Protocol):
+    @property
+    def fuse_rotation_quantization(self) -> bool: ...
+    @property
+    def fused_num_warps(self) -> int: ...
+    @property
+    def rotation_num_warps(self) -> int: ...
+    @property
+    def quantization_num_warps(self) -> int: ...
+    @property
+    def matmul_block_m(self) -> int: ...
+    @property
+    def matmul_block_n(self) -> int: ...
+    @property
+    def matmul_block_k(self) -> int: ...
+    @property
+    def matmul_num_warps(self) -> int: ...
+    @property
+    def matmul_num_stages(self) -> int: ...
+
+    def as_dict(self) -> dict[str, object]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ConvRotInt8Workload:
+    """Tensors and production policy for one ConvRot INT8 tuning case."""
+
+    shape: ConvRotShape
+    config: ConvRotConfig
+    inputs: ConvRotInputs
+    production_plan: _ExecutionPlan
+    backend: ModuleType
+
+    def common_configuration(self) -> dict[str, object]:
+        """Return provider-neutral workload metadata."""
+        logical_input_layout = "up_gate" if self.shape.input_activation == "swiglu" else "plain"
+        return {
+            **self.config.as_dict(),
+            "input_activation": self.shape.input_activation or "none",
+            "logical_input_layout": logical_input_layout,
+            "provider_input_layout": logical_input_layout,
+            "has_bias": self.shape.has_bias,
+            "prepared_execution_scope": "complete_operator_on_fixed_source_tensors",
+        }
+
+    def reference(self) -> torch.Tensor:
+        """Evaluate the complete workload with the shared portable reference."""
+        activation, qdata, scale, bias = self.inputs
+        return reference_linear(
+            activation,
+            qdata,
+            scale,
+            self.config.group_size,
+            bias,
+            activation_fn=self.shape.input_activation,
+        )
+
+
+def make_convrot_int8_workload(
+    shape: ConvRotShape,
+    config: ConvRotConfig,
+    *,
+    device: torch.device,
+    target: AcceleratorTarget | None = None,
+) -> ConvRotInt8Workload:
+    """Create tensors and resolve policy; an explicit target permits offline inspection."""
+    resolved_target = AcceleratorTarget.from_device(device) if target is None else target
+    backend = next(
+        (
+            candidate
+            for candidate in (nvidia, amd)
+            if candidate.policy.supports_target(resolved_target)
+        ),
+        None,
+    )
+    if backend is None:
+        raise ValueError(f"ConvRot INT8 tuning has no optimized backend for {resolved_target}")
+    inputs = make_convrot_inputs(shape, config, device=device)
+    production_plan = backend.default_execution_plan(
+        inputs[1], target=resolved_target, rows=shape.rows
+    )
+    return ConvRotInt8Workload(
+        shape=shape,
+        config=config,
+        inputs=inputs,
+        production_plan=production_plan,
+        backend=backend,
+    )
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -141,14 +233,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--matmul-kernel",
-        choices=convrot_int8_plan._MATMUL_KERNEL_VALUES,
+        choices=_MATMUL_KERNEL_VALUES,
         nargs="+",
         help="NVIDIA implementations to compare; omitted axes retain the production value",
     )
     parser.add_argument(
         "--matmul-group-m",
         type=int,
-        choices=convrot_int8_plan._MATMUL_GROUP_M_VALUES,
+        choices=_MATMUL_GROUP_M_VALUES,
         nargs="+",
         help="NVIDIA GEMM row-tile grouping; zero disables grouping",
     )
@@ -166,8 +258,8 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _candidate_plans(
     args: argparse.Namespace,
-    production_plan: LinearExecutionPlan,
-) -> tuple[LinearExecutionPlan, ...]:
+    production_plan: _ExecutionPlan,
+) -> tuple[_ExecutionPlan, ...]:
     """Build a bounded explicit search around the production execution plan."""
     fusion_axis = boolean_tuning_axis(
         args.fuse_rotation_quantization,
@@ -191,7 +283,7 @@ def _candidate_plans(
         args.quantization_num_warps if not fusion_axis[0] else None,
         production_plan.quantization_num_warps,
     )
-    axes = {
+    axes: dict[str, tuple[object, ...]] = {
         "fuse_rotation_quantization": fusion_axis,
         "fused_num_warps": fused_warps_axis,
         "rotation_num_warps": rotation_warps_axis,
@@ -202,7 +294,7 @@ def _candidate_plans(
         "matmul_num_warps": tuning_axis(args.matmul_num_warps, production_plan.matmul_num_warps),
         "matmul_num_stages": tuning_axis(args.matmul_num_stages, production_plan.matmul_num_stages),
     }
-    if isinstance(production_plan, convrot_int8_plan.NvidiaExecutionPlan):
+    if isinstance(production_plan, nvidia.policy.NvidiaExecutionPlan):
         axes.update(
             matmul_kernel=tuning_axis(args.matmul_kernel, production_plan.matmul_kernel),
             matmul_group_m=tuning_axis(args.matmul_group_m, production_plan.matmul_group_m),
@@ -214,7 +306,11 @@ def _candidate_plans(
     skipped: dict[str, int] = {}
     for values in product(*axes.values()):
         try:
-            plan = replace(production_plan, **dict(zip(axes, values, strict=True)))
+            # All backend execution plans are frozen dataclasses validated on construction.
+            plan = cast(
+                _ExecutionPlan,
+                replace(cast(Any, production_plan), **dict(zip(axes, values, strict=True))),
+            )
         except ValueError as error:
             reason = str(error)
             skipped[reason] = skipped.get(reason, 0) + 1
@@ -227,7 +323,7 @@ def _candidate_plans(
     return tuple(plans)
 
 
-def _plan_name(plan: LinearExecutionPlan) -> str:
+def _plan_name(plan: _ExecutionPlan) -> str:
     preparation = (
         f"fused-pw{plan.fused_num_warps}"
         if plan.fuse_rotation_quantization
@@ -235,7 +331,7 @@ def _plan_name(plan: LinearExecutionPlan) -> str:
     )
     implementation = (
         f"{plan.matmul_kernel}-g{plan.matmul_group_m}-"
-        if isinstance(plan, convrot_int8_plan.NvidiaExecutionPlan)
+        if isinstance(plan, nvidia.policy.NvidiaExecutionPlan)
         else ""
     )
     return (
@@ -246,24 +342,41 @@ def _plan_name(plan: LinearExecutionPlan) -> str:
 
 
 def _make_candidate(
-    plan: LinearExecutionPlan,
+    plan: _ExecutionPlan,
     workload: ConvRotInt8Workload,
-) -> Implementation[BenchmarkProvider[ConvRotInputs, torch.Tensor]]:
+) -> Implementation[Operation[torch.Tensor]]:
     """Wrap one plan around the complete production-paid ConvRot device path."""
     name = _plan_name(plan)
-    configuration = planned_convrot_int8_configuration(workload, plan)
+    configuration: dict[str, object] = {
+        **workload.common_configuration(),
+        "algorithm": "convrot_int8_linear",
+        **plan.as_dict(),
+    }
 
-    def make_provider() -> BenchmarkProvider[ConvRotInputs, torch.Tensor]:
-        return make_planned_convrot_int8_provider(
-            workload,
-            plan,
-            name=f"convrot_int8_linear_{name.replace('-', '_')}",
+    def build_operation() -> Operation[torch.Tensor]:
+        activation, qdata, scale, bias = workload.inputs
+
+        def run() -> torch.Tensor:
+            return workload.backend.run_linear(
+                activation,
+                qdata,
+                scale,
+                bias,
+                workload.config.group_size,
+                activation_fn=workload.shape.input_activation,
+                execution_plan=plan,
+            )
+
+        return Operation(
+            run=run,
+            configuration=configuration,
+            synchronize=torch.cuda.synchronize,
         )
 
     return Implementation(
         name=name,
         configuration=configuration,
-        build=make_provider,
+        build=build_operation,
     )
 
 

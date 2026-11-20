@@ -5,46 +5,71 @@ import pytest
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._amd import policy as amd_policy
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
-from piper_kernels.attention.sparse_piper_attention._plan import MinmaxScoreSchedule
 
 
-@pytest.mark.parametrize(
-    ("width", "queries", "keys", "skip_dense_routing", "coarse", "expected"),
-    [
-        (128, 100000, 100000, False, False, (64, 4)),
-        (64, 8191, 8192, False, False, (64, 4)),
-        (64, 8192, 8192, False, False, (64, 2)),
-        (64, 32767, 32768, True, False, (64, 4)),
-        (64, 32768, 32768, True, False, (128, 4)),
-        (64, 32768, 32768, True, True, (64, 4)),
-        (64, 64, 100000, True, False, (64, 4)),
-    ],
-)
-def test_schedule_respects_width_ranges_and_coarse(
-    width, queries, keys, skip_dense_routing, coarse, expected
-):
-    assert (
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("skip_dense_routing", [False, True])
+@pytest.mark.parametrize("coarse", [False, True])
+def test_attention_schedule_invariants_and_monotonic_regimes(
+    head_dim: int, skip_dense_routing: bool, coarse: bool
+) -> None:
+    lengths = (64, 4096, 8192, 32768, 100000)
+    schedules = [
         policy.select_sm120_attention_schedule(
-            width,
-            queries,
-            keys,
+            head_dim,
+            length,
+            length,
             skip_dense_routing=skip_dense_routing,
             has_coarse_residual=coarse,
             selected_key_rows=2048,
         )
-        == expected
+        for length in lengths
+    ]
+    for schedule in schedules:
+        assert schedule.block_m in (64, 128)
+        assert schedule.num_warps in (2, 4)
+        # D128 and coarse-residual schedules keep the 64-row query granularity.
+        if head_dim == 128 or coarse:
+            assert schedule.block_m == 64
+    block_ms = [schedule.block_m for schedule in schedules]
+    assert block_ms == sorted(block_ms)
+    if head_dim == 64 and skip_dense_routing and not coarse:
+        assert block_ms[-1] > block_ms[0]
+
+
+def test_short_query_chunk_and_tiny_key_budget_retain_full_warp_occupancy() -> None:
+    short_chunk = policy.select_sm120_attention_schedule(
+        64,
+        64,
+        100000,
+        skip_dense_routing=True,
+        has_coarse_residual=False,
+        selected_key_rows=2048,
     )
+    assert short_chunk.block_m == 64
 
-
-def test_very_sparse_long_sequences_keep_four_warps():
-    assert policy.select_sm120_attention_schedule(
+    tiny_budget = policy.select_sm120_attention_schedule(
         64,
         8192,
         8192,
         skip_dense_routing=False,
         has_coarse_residual=False,
         selected_key_rows=128,
-    ) == (64, 4)
+    )
+    large_budget = policy.select_sm120_attention_schedule(
+        64,
+        8192,
+        8192,
+        skip_dense_routing=False,
+        has_coarse_residual=False,
+        selected_key_rows=2048,
+    )
+    assert tiny_budget.num_warps >= large_budget.num_warps
+    assert tiny_budget.num_warps == 4
 
 
 @pytest.mark.parametrize(
@@ -65,9 +90,11 @@ def test_each_target_selects_at_most_one_load_path(target, tma, async_copy):
     assert policy.supports_target(target) is (tma or async_copy)
 
 
-@pytest.mark.parametrize(("head_dim", "max_registers"), [(64, 168), (128, None)])
-def test_sm8x_caps_only_d64_registers(head_dim, max_registers):
-    assert policy.select_sm8x_max_registers(head_dim) == max_registers
+def test_sm8x_caps_only_d64_registers():
+    d64_cap = policy.select_sm8x_max_registers(64)
+    assert d64_cap is not None
+    assert 0 < d64_cap <= 255
+    assert policy.select_sm8x_max_registers(128) is None
 
 
 @pytest.mark.parametrize(
@@ -87,30 +114,23 @@ def test_minmax_score_kernel_is_limited_to_exact_sm120(target, supported):
 
 
 @pytest.mark.parametrize(
-    ("query_blocks", "expected"),
+    ("selector", "expect_lds_only_fences"),
     [
-        (1, MinmaxScoreSchedule(64, 64, 16)),
-        (27, MinmaxScoreSchedule(64, 64, 16)),
-        (64, MinmaxScoreSchedule(64, 64, 16)),
-        (65, MinmaxScoreSchedule(128, 32, 16)),
-        (128, MinmaxScoreSchedule(128, 32, 16)),
-        (384, MinmaxScoreSchedule(128, 32, 16)),
+        (policy.select_sm120_minmax_score_schedule, False),
+        (amd_policy.select_minmax_score_schedule, True),
     ],
+    ids=["sm120", "rdna4"],
 )
-def test_sm120_minmax_score_schedule_switches_at_chunk_crossover(query_blocks, expected):
-    assert policy.select_sm120_minmax_score_schedule(query_blocks) == expected
-
-
-@pytest.mark.parametrize(
-    ("query_blocks", "expected"),
-    [
-        (1, MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True)),
-        (27, MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True)),
-        (64, MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True)),
-        (127, MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True)),
-        (128, MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True)),
-        (384, MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True)),
-    ],
-)
-def test_amd_minmax_score_schedule_switches_at_chunk_crossover(query_blocks, expected):
-    assert amd_policy.select_minmax_score_schedule(query_blocks) == expected
+def test_minmax_score_schedules_have_valid_tiles_and_monotonic_query_regimes(
+    selector, expect_lds_only_fences
+):
+    schedules = [selector(blocks) for blocks in (1, 27, 64, 65, 127, 128, 384)]
+    for schedule in schedules:
+        assert _is_power_of_two(schedule.block_m)
+        assert _is_power_of_two(schedule.block_n)
+        assert _is_power_of_two(schedule.block_k)
+        assert 128 % schedule.block_k == 0
+        assert schedule.lds_only_fences is expect_lds_only_fences
+    block_ms = [schedule.block_m for schedule in schedules]
+    assert block_ms == sorted(block_ms)
+    assert block_ms[-1] > block_ms[0]

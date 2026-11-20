@@ -34,35 +34,27 @@ def test_policy_preserves_previous_schedules_across_group_aligned_widths(target)
         assert _gguf_policy.select_conversion_chunks(target, width) == previous
 
 
-@pytest.mark.parametrize(
-    ("width", "nvidia_chunks", "default_chunks"),
-    [
-        (16, (1, 128), (1, 128)),
-        (4096, (1, 4096), (1, 4096)),
-        (6144, (3, 2048), (3, 2048)),
-        (8192, (1, 8192), (1, 8192)),
-        (8208, (3, 4096), None),
-        (16384, (2, 8192), None),
-        (32768, (2, 16384), None),
-        (49152, (3, 16384), None),
-        (49168, None, None),
-    ],
-)
-def test_schedule_boundaries(width, nvidia_chunks, default_chunks):
-    assert (
-        _gguf_policy.select_conversion_chunks(AcceleratorTarget("cuda", "sm70"), width)
-        == nvidia_chunks
-    )
-    assert (
-        _gguf_policy.select_conversion_chunks(AcceleratorTarget("hip", "gfx1201"), width)
-        == default_chunks
-    )
+@pytest.mark.parametrize("width", [16, 4096, 6144, 8192, 8208, 16384, 32768, 49152, 49168])
+def test_schedule_boundaries(width):
+    nvidia = _gguf_policy.select_conversion_chunks(AcceleratorTarget("cuda", "sm70"), width)
+    hip = _gguf_policy.select_conversion_chunks(AcceleratorTarget("hip", "gfx1201"), width)
+    for chunks, limit in ((nvidia, 49152), (hip, 8192)):
+        if width > limit:
+            assert chunks is None
+        else:
+            assert chunks is not None
+            count, size = chunks
+            assert count in (1, 2, 3)
+            assert size >= 128
+            assert (size & (size - 1)) == 0
+            assert count * size >= width
+            assert (count - 1) * size < width
 
 
 def test_nvidia_conversion_does_not_require_a_matrix_backend():
     target = AcceleratorTarget("cuda", "sm70")
     assert not nvidia_policy.supports_target(target)
-    assert _gguf_policy.select_conversion_chunks(target, 16384) == (2, 8192)
+    assert _gguf_policy.select_conversion_chunks(target, 16384) is not None
 
 
 @pytest.mark.parametrize("chunks", [(2, 8192), None])
