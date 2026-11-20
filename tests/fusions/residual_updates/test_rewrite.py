@@ -4,9 +4,9 @@ import pytest
 import torch
 from _compile_capture import FunctionalTargetCapturePass
 
+from piper_kernels import compile_options
 from piper_kernels._triton import runtime
 from piper_kernels.fusions.residual_updates import _compile as residual_compile
-from piper_kernels.fusions.residual_updates import residual_updates_compile_options
 from piper_kernels.fusions.residual_updates._graph import RESIDUAL_ADD
 
 _aten = torch.ops.aten
@@ -68,7 +68,7 @@ def test_gated_sums_from_the_copied_input_become_chained_adds(
         updates, python_indexing=python_indexing, gate_first=gate_first
     )
 
-    residual_compile._compile_pass(graph, True)
+    residual_compile.fold_residual_updates(graph)
 
     adds = _adds(graph)
     assert len(adds) == updates
@@ -96,7 +96,7 @@ def test_sums_stay_unless_each_can_add_into_the_copied_input(monkeypatch, suppor
     monkeypatch.setattr(runtime, "supports_device", lambda device: supported)
     graph, _ = _copy_back_graph(2, **graph_options)
 
-    residual_compile._compile_pass(graph, True)
+    residual_compile.fold_residual_updates(graph)
 
     assert not _adds(graph)
     assert sum(node.target is _aten.add.Tensor for node in graph.nodes) == 2
@@ -112,7 +112,7 @@ def test_cpu_block_keeps_its_sums_and_runs():
     indices = torch.randint(0, 3, (8,))
     expected = hidden + gate[indices] * update
     capture = FunctionalTargetCapturePass()
-    options = capture.wrap_options(residual_updates_compile_options())
+    options = capture.wrap_options(compile_options(residual_updates=True))
 
     torch._dynamo.reset()
     with torch.no_grad():

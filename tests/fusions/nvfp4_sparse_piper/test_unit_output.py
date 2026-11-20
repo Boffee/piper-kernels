@@ -7,11 +7,8 @@ import torch
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 
-from piper_kernels.fusions.nvfp4_sparse_piper import (
-    _output,
-    nvfp4_sparse_piper_compile_options,
-    output,
-)
+from piper_kernels import compile_options
+from piper_kernels.fusions.nvfp4_sparse_piper import _output, output
 
 from .._accuracy import assert_fusion_output_close
 from .test_compile import _run_explicit_attention_output, _SparseProjectionAttentionOutput
@@ -76,7 +73,7 @@ def test_compile_fuses_unit_output(
         dtype=torch.bfloat16,
     )
     model.output.weight.act_per_tensor_scale = torch.ones((), device="cuda", dtype=torch.float32)
-    options = nvfp4_sparse_piper_compile_options()
+    options = compile_options(attention=True)
     capture = TargetCapturePass()
     with torch.no_grad():
         expected = _run_explicit_attention_output(model, hidden_states)

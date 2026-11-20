@@ -12,7 +12,7 @@ from torch._dynamo.utils import ReinplaceCounters
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
-from piper_kernels.fusions.residual_updates import residual_updates_compile_options
+from piper_kernels import compile_options
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
@@ -614,7 +614,7 @@ def assert_copy_back_computes_ffn_inside_its_add(
         )
         torch._dynamo.reset()
         ReinplaceCounters.clear()
-        options = capture.wrap_options(residual_updates_compile_options(fusion_options))
+        options = capture.wrap_options(compile_options(fusion_options, residual_updates=True))
         result = torch.compile(copy_back, fullgraph=True, options=options)(base, *operands)
 
     assert result.data_ptr() == base.data_ptr()

@@ -2,11 +2,10 @@
 
 import pytest
 import torch
-from torch._inductor.pattern_matcher import CallFunction, KeywordArg, Match
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from piper_kernels.fusions.projected_qk import _compile, _pattern
+from piper_kernels.fusions.projected_qk import _compile
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -59,60 +58,44 @@ def _transform_graph(dtype, affine, *, full_rotary=False):
     return torch.fx.symbolic_trace(transform).graph
 
 
-def _transform_pattern(dtype, affine, *, full_rotary=False):
-    return _pattern.normalized_rope_pattern(
-        CallFunction(torch.ops.aten.clone.default, KeywordArg("features"), _users=1),
-        shape_name="shape",
-        norm_weight_name="weight",
-        norm_epsilon_name="epsilon",
-        cos_name="cos",
-        sin_name="sin",
-        rotary_dim_name="width",
-        half_rotary_dim_name="half_width",
-        activation_dtype=dtype,
-        affine=affine,
-        full_rotary=full_rotary,
-    )
-
-
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("affine", [False, True])
-def test_transform_pattern_uses_caller_captures_for_every_dtype_and_norm(dtype, affine):
+def test_transform_matcher_captures_every_dtype_and_norm(dtype, affine):
     graph = _transform_graph(dtype, affine)
     output = next(node for node in reversed(graph.nodes) if node.op == "call_function")
-    match = _transform_pattern(dtype, affine).match(output)
-    assert isinstance(match, Match)
-    assert set(match.kwargs) == {
-        "features",
-        "shape",
-        "epsilon",
-        "cos",
-        "sin",
-        "width",
-        "half_width",
-    } | ({"weight"} if affine else set())
-    assert match.kwargs["shape"] == (1, 192, 2, 128)
-    assert match.kwargs["width"] == 96
-    assert match.kwargs["half_width"] == 48
+    projected = next(node for node in graph.nodes if node.target is torch.ops.aten.clone.default)
+    match = _compile.match_normalized_rope(output)
+    assert isinstance(match, _compile.NormalizedRopeMatch)
+    assert match.projection_node is projected
+    assert match.shape == (1, 192, 2, 128)
+    assert match.rotary_dim == 96
+    assert match.half_rotary_dim == 48
+    assert match.norm_epsilon == 1e-5
+    assert (match.norm_weight is not None) is affine
+    assert match.activation_dtype is (None if dtype is torch.float32 else dtype)
 
 
-def test_transform_pattern_rejects_an_escaping_normalized_intermediate():
+def test_transform_matcher_rejects_an_escaping_normalized_intermediate():
     graph = _transform_graph(torch.bfloat16, True)
     output = next(node for node in reversed(graph.nodes) if node.op == "call_function")
     normalization = next(node for node in graph.nodes if node.target is torch.ops.aten.mul.Tensor)
     graph.call_function(torch.ops.aten.neg.default, (normalization,))
-    assert not _transform_pattern(torch.bfloat16, True).match(output)
+    assert _compile.match_normalized_rope(output) is None
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("affine", [False, True])
-def test_transform_pattern_supports_canonical_full_rope(dtype, affine):
+def test_transform_matcher_supports_canonical_full_rope(dtype, affine):
     graph = _transform_graph(dtype, affine, full_rotary=True)
     output = next(node for node in reversed(graph.nodes) if node.op == "call_function")
-    match = _transform_pattern(dtype, affine, full_rotary=True).match(output)
-    assert isinstance(match, Match)
-    assert "width" not in match.kwargs
-    assert match.kwargs["half_width"] == 64
+    projected = next(node for node in graph.nodes if node.target is torch.ops.aten.clone.default)
+    match = _compile.match_normalized_rope(output)
+    assert isinstance(match, _compile.NormalizedRopeMatch)
+    assert match.projection_node is projected
+    assert match.rotary_dim is None
+    assert match.half_rotary_dim == 64
+    assert (match.norm_weight is not None) is affine
+    assert match.activation_dtype is (None if dtype is torch.float32 else dtype)
 
 
 def _node(graph, name, value):

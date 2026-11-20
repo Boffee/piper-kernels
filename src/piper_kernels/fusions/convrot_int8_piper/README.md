@@ -7,11 +7,12 @@ Q quantization. Compatible normalized RoPE K and plain projected V also fuse;
 unsupported K/V transforms or escaping operands retain the Q-only path.
 Projections sharing an input and static-scale setting reuse input preparation.
 
-`fuse_output=True` additionally matches Q projection, attention, and an exclusive
-ConvRot INT8 output projection. The matched output layout is BHSD transposed to
-BSHD with merged heads. Output fusion is disabled by default. These are
-multi-kernel pipelines behind compiler boundaries. The pass runs before ordinary
-ConvRot optimizations and preserves caller-supplied options.
+`compile_options(attention_output=True)` additionally matches Q projection,
+attention, and an exclusive ConvRot INT8 output projection. The matched output
+layout is BHSD transposed to BSHD with merged heads. Output fusion is disabled by
+default. These are multi-kernel pipelines behind compiler boundaries. The
+unified post-grad pass orders projection fusion before linear preparation sharing
+and output fusion after it, while preserving caller-supplied options.
 
 ## Matching and numerical contract
 
@@ -131,7 +132,7 @@ attention, and routing-score buffers then halve with the heads, at a small speed
 
 ## Sequence-parallel output collectives
 
-When `fuse_output=True`, `_OutputCompilePass` runs
+When `attention_output=True`, the unified post-grad pass runs
 [`_distributed_compile.py`](_distributed_compile.py) via the shared
 [`_distributed_fold.py`](../attention/_distributed_fold.py) helper to rewrite
 `convrot_int8_piper_projected_query_attention_output -> reduce_scatter_tensor` (and an

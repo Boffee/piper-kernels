@@ -17,16 +17,14 @@ spatial reflection without altering ordinary floating-point convolutions:
   statically proven without introducing shape guards or runtime asserts.
 """
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from typing import cast
 
 import torch
 from torch._C._nn import pad as torch_pad
-from torch._inductor.custom_graph_pass import CustomGraphPass
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.nn import functional
 
-from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 from . import _functional
@@ -238,28 +236,4 @@ def fuse_padding(graph: torch.fx.Graph) -> None:
         graph.lint()
 
 
-class _CompilePass(CustomGraphPass):
-    def __call__(self, graph: torch.fx.Graph) -> None:
-        fuse_padding(graph)
-
-    def uuid(self) -> bytes:
-        return inductor_options.compute_compile_pass_uuid(self)
-
-
-compile_pass = _CompilePass()
-
-
-def convrot_int8_conv3d_compile_options(
-    options: Mapping[str, object] | None = None,
-) -> dict[str, object]:
-    """Enable optional padding fusion for standard ConvRot INT8 Conv3D calls."""
-    combined = dict(options) if options is not None else {}
-    existing = combined.get("pre_grad_custom_pass")
-    passes = (
-        tuple(existing)
-        if isinstance(existing, (tuple, list))
-        else (() if existing is None else (existing,))
-    )
-    if not any(item is compile_pass for item in passes):
-        combined["pre_grad_custom_pass"] = (*passes, compile_pass)
-    return combined
+__all__ = ["fp16_cast_source", "fuse_padding", "get_tensor_metadata", "lower_standard_convolutions"]

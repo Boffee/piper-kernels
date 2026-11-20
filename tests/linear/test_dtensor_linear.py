@@ -14,9 +14,7 @@ from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, 
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
-from piper_kernels.linear.convrot import convrot_int8_compile_options
-from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options
-from piper_kernels.linear.nvfp4 import nvfp4_compile_options
+from piper_kernels import compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
@@ -24,9 +22,9 @@ from piper_kernels.weights.nvfp4._layout import swap_packed_pairs
 from piper_kernels.weights.sharding import shard_quantized_weight
 
 _FORMATS = {
-    "int8": (ConvRotInt8Tensor, convrot_int8_compile_options),
-    "nvfp4": (PiperNVFP4Tensor, nvfp4_compile_options),
-    "convrot_nvfp4": (ConvRotNVFP4Tensor, convrot_nvfp4_compile_options),
+    "int8": (ConvRotInt8Tensor, compile_options),
+    "nvfp4": (PiperNVFP4Tensor, compile_options),
+    "convrot_nvfp4": (ConvRotNVFP4Tensor, compile_options),
 }
 
 
@@ -80,10 +78,13 @@ def _compile_linear(linear, format_name, device_type):
     if device_type == "cpu":
         return torch.compile(linear, fullgraph=True, backend="aot_eager")
     _, compile_options = _FORMATS[format_name]
+    # PyTorch 2.15's DTensor._stable_hash_for_caching() omits nested local tensor
+    # subclasses, so compiling the same F.linear across INT8 and NVFP4 DTensors of
+    # equal logical shape collides in AOTAutogradCache unless FX caching is off.
     return torch.compile(
         linear,
         fullgraph=True,
-        options=compile_options({"triton.cudagraphs": False}),
+        options=compile_options({"triton.cudagraphs": False, "fx_graph_cache": False}),
     )
 
 

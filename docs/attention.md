@@ -151,37 +151,43 @@ routing policy reuses compiled graphs (including compatible fusions). Because
 runtime profiles disable automatic CUDA graph capture around those ops, use
 explicit CUDA graphs when a profile is fixed and recapture if it changes.
 
-For quantized projection/output fusion, pass the matching helper to
+For quantized projection/output fusion, pass `piper_kernels.compile_options` to
 `torch.compile(..., options=...)` following [compiler options](weights.md#compile-a-model):
 
-| Projection format and attention | Helper package under `piper_kernels.fusions` |
-|---|---|
-| ConvRot INT8 + dense Piper | `convrot_int8_piper` |
-| ConvRot INT8 + sparse Piper | `convrot_int8_sparse_piper` |
-| NVFP4 / ConvRot NVFP4 + sparse Piper | `nvfp4_sparse_piper` |
+```python
+from piper_kernels import compile_options
 
-Each exports `<package_name>_compile_options()`. ConvRot INT8 dense fusion
-supports MHA/GQA and optional `fuse_output=True` (bounded attention-to-output
-execution, off by default); dense targets NVIDIA SM89/SM120 and AMD RDNA4, sparse
-targets SM8x/SM120 and RDNA4. See the
+# Dense or sparse projection fusions (ConvRot INT8, NVFP4, ConvRot NVFP4):
+options = compile_options(attention=True)
+# Add bounded dense ConvRot INT8 attention-to-output fusion (off by default):
+options = compile_options(attention=True, attention_output=True)
+```
+
+`attention=True` folds eligible ConvRot INT8 dense/sparse and NVFP4 / ConvRot
+NVFP4 sparse Piper projection patterns (including sparse bounded output fusion);
+`attention_output=True` additionally enables bounded dense ConvRot INT8
+attention-to-output fusion (and implies `attention=True`). ConvRot INT8 dense
+fusion supports MHA/GQA and targets NVIDIA SM89/SM120 and AMD RDNA4; sparse
+targets SM8x/SM120 and RDNA4 (NVFP4 / ConvRot NVFP4 target SM120). See the
 [fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md) for
 matchers, storage contracts, and bounded-window internals.
 
 ### Update a residual stream in place
 
 When a compiled block writes gated attention and FFN outputs back into its
-residual input via `hidden.copy_(...)`, `residual_updates_compile_options`
+residual input via `hidden.copy_(...)`, `compile_options(residual_updates=True)`
 computes eligible additions in place without allocating intermediate full-size
 output buffers:
 
 ```python
-from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
-from piper_kernels.fusions.ffn import ffn_compile_options
-from piper_kernels.fusions.residual_updates import residual_updates_compile_options
+from piper_kernels import compile_options
 
-options = ffn_compile_options()
-options = convrot_int8_piper_compile_options(options, fuse_output=True)
-options = residual_updates_compile_options(options)
+options = compile_options(
+    ffn=True,
+    attention=True,
+    attention_output=True,
+    residual_updates=True,
+)
 
 
 def update_block(hidden, *block_inputs):

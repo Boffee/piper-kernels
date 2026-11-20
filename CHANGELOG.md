@@ -8,29 +8,39 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 ### Added
 
 - Sequence-sharded (`Shard(1)`) ConvRot INT8 linears and fused dense
-  (`convrot_int8_piper_compile_options(..., fuse_output=True)`) or sparse Piper
-  attention blocks now fold PyTorch TP+SP collective boundaries automatically, including
-  two-step in-place residual add folding when paired with
-  `residual_updates_compile_options`. Measured faster with lower peak memory across 2×
-  RX 9070 XT dense and sparse attention blocks.
+  (`compile_options(attention_output=True)`) or sparse Piper attention blocks now fold
+  PyTorch TP+SP collective boundaries automatically, including two-step in-place residual
+  add folding when paired with `residual_updates=True`. Measured faster with lower peak
+  memory across 2× RX 9070 XT dense and sparse attention blocks.
 
 ### Changed
 
+- **Breaking:** Unified all post-grad and pre-grad Inductor rewrites into a single
+  phase-ordered compiler pipeline exposed through `piper_kernels.compile_options(options=None, *, linear=True, ffn=False, attention=False, attention_output=False, residual_updates=False, conv3d=False)`
+  with feature-flag-hashed FX cache keys, replacing all individual
+  `*_compile_options` helpers (`convrot_int8_compile_options`, `nvfp4_compile_options`,
+  `convrot_nvfp4_compile_options`, `ffn_compile_options`,
+  `convrot_int8_piper_compile_options`, `convrot_int8_sparse_piper_compile_options`,
+  `nvfp4_sparse_piper_compile_options`, `residual_updates_compile_options`, and
+  `convrot_int8_conv3d_compile_options`). MiniMax-H3 specialization helpers remain in
+  `piper_kernels.specializations.minimax_h3_vae` and hook into the unified pipeline.
+  NVFP4 / ConvRot NVFP4 sparse-Piper attention fusion now also matches semantic linears
+  (such as cross-attention query projections or `linear=False`).
 - **Breaking:** Consolidated all format- and activation-specific FFN fusion packages
-  under `piper_kernels.fusions` into `piper_kernels.fusions.ffn` with a single
-  `ffn_compile_options()` helper covering ConvRot INT8, NVFP4, and ConvRot NVFP4
-  SwiGLU and `tanh`-GELU FFNs (including indexed gated updates and in-place residual
-  adds), removing the legacy `{convrot_int8,nvfp4,convrot_nvfp4}_{gelu,swiglu}_ffn`
-  subpackages.
-- **Breaking:** `nvfp4_sparse_piper_compile_options` now folds both plain NVFP4 and
+  under `piper_kernels.fusions` into `piper_kernels.fusions.ffn`, covering ConvRot INT8,
+  NVFP4, and ConvRot NVFP4 SwiGLU and `tanh`-GELU FFNs (including indexed gated updates
+  and in-place residual adds), and removed the legacy
+  `{convrot_int8,nvfp4,convrot_nvfp4}_{gelu,swiglu}_ffn` subpackages.
+- **Breaking:** `piper_kernels.fusions.nvfp4_sparse_piper` now folds both plain NVFP4 and
   ConvRot NVFP4 sparse-Piper attention blocks, and the separate
   `piper_kernels.fusions.convrot_nvfp4_sparse_piper` package has been removed.
 - **Breaking:** Require Python 3.14+, PyTorch 2.15+, and Triton 3.9+ across all
   platforms, dropping Python 3.13, PyTorch 2.14, and Triton 3.8 support.
-- **Breaking (numerical):** `piper_attention` (and `convrot_int8_piper_compile_options`)
-  now center keys and values independently per `1024`-token KV chunk (`K1024 + V1024`)
-  for both non-causal and causal attention instead of sequence-wide reductions. Outputs
-  differ from prior releases, so callers should revalidate end-to-end quality.
+- **Breaking (numerical):** `piper_attention` (and dense ConvRot INT8 Piper attention
+  fusions) now center keys and values independently per `1024`-token KV chunk
+  (`K1024 + V1024`) for both non-causal and causal attention instead of sequence-wide
+  reductions. Outputs differ from prior releases, so callers should revalidate end-to-end
+  quality.
 - **Breaking (numerical):** `SparsePiperAttention` / `sparse_piper_attention` and
   sparse-Piper compiler fusions now center keys and values independently per `64`-token
   tile (`K64 + V64`) instead of using sequence-wide global mean reductions. Numerical

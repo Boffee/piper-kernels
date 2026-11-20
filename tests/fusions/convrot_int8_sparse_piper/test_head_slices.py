@@ -9,15 +9,10 @@ from torch._dynamo.utils import ReinplaceCounters
 from torch._inductor.utils import run_and_get_code
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import SparsePiperAttention
+from piper_kernels import SparsePiperAttention, compile_options
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
-from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    convrot_int8_sparse_piper_compile_options,
-    key,
-    value,
-)
+from piper_kernels.fusions.convrot_int8_sparse_piper import key, value
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
-from piper_kernels.fusions.residual_updates import residual_updates_compile_options
 
 from ._helpers import output_available
 from .test_attention import _HEAD_DIM, _INPUT_FEATURES, _operands
@@ -116,7 +111,7 @@ def _compile_copy_back(model: torch.nn.Module, capture: FunctionalTargetCaptureP
     def copy_back(hidden, gate_indices):
         return hidden.copy_(model(hidden, gate_indices))
 
-    options = residual_updates_compile_options(convrot_int8_sparse_piper_compile_options())
+    options = compile_options(attention=True, residual_updates=True)
     torch._dynamo.reset()
     return torch.compile(copy_back, fullgraph=True, options=capture.wrap_options(options))
 
@@ -138,9 +133,9 @@ def test_each_head_slice_projects_its_context_before_its_add(attention, value_pr
     torch._dynamo.reset()
     with torch.no_grad():
         # One add, without the residual rewrite.
-        expected = torch.compile(
-            model, fullgraph=True, options=convrot_int8_sparse_piper_compile_options()
-        )(hidden.clone(), gate_indices)
+        expected = torch.compile(model, fullgraph=True, options=compile_options(attention=True))(
+            hidden.clone(), gate_indices
+        )
     capture = FunctionalTargetCapturePass()
     compiled = _compile_copy_back(model, capture)
     ReinplaceCounters.clear()

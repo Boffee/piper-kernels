@@ -6,12 +6,11 @@ import math
 from collections.abc import Mapping
 
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 
 from piper_kernels import _inductor_options as inductor_options
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-from piper_kernels.linear.convrot.int8 import _compile as convrot_int8_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx as convrot_int8_compile_fx
 
 from . import _ops  # noqa: F401 - registers the prepared H3 linear
@@ -50,14 +49,9 @@ _SPECIALIZED_PREPARED_TARGET = (
 
 
 def _static_linear_shape(
-    node: torch.fx.Node,
-    *,
-    weight_index: int,
+    input_node: object,
+    weight_node: object,
 ) -> tuple[_LinearShape, torch.Tensor, torch.Tensor] | None:
-    if node.kwargs or len(node.args) <= weight_index:
-        return None
-    input_node = node.args[0]
-    weight_node = node.args[weight_index]
     if not isinstance(input_node, torch.fx.Node) or not isinstance(weight_node, torch.fx.Node):
         return None
     input_value = preparation_sharing.tensor_metadata(input_node)
@@ -98,15 +92,15 @@ def _specialize_linears(
 ) -> bool:
     changed = False
     for node in list(graph.nodes):
-        if node.op != "call_function":
+        if node.op != "call_function" or node.target not in (_LINEAR_TARGET, _PREPARED_TARGET):
             continue
-        if node.target == _LINEAR_TARGET:
-            weight_index = 1
-        elif node.target == _PREPARED_TARGET:
-            weight_index = 2
-        else:
+        bound = linear_fx.bind_arguments(node)
+        if bound is None:
             continue
-        shape_and_device = _static_linear_shape(node, weight_index=weight_index)
+        is_semantic = node.target == _LINEAR_TARGET
+        input_node = bound["input"] if is_semantic else bound["input_qdata"]
+        weight_node = bound["weight_qdata"]
+        shape_and_device = _static_linear_shape(input_node, weight_node)
         if shape_and_device is None:
             continue
         shape, input_value, weight_value = shape_and_device
@@ -119,17 +113,13 @@ def _specialize_linears(
         if schedule is None:
             continue
         with graph.inserting_before(node):
-            if node.target == _LINEAR_TARGET:
-                arguments = node.args + (None,) * (7 - len(node.args))
-                (
-                    input_node,
-                    weight_qdata,
-                    weight_scale,
-                    bias,
-                    group_size,
-                    activation_fn,
-                    input_scale,
-                ) = arguments
+            if is_semantic:
+                weight_qdata = bound["weight_qdata"]
+                weight_scale = bound["weight_scale"]
+                bias = bound["bias"]
+                group_size = bound["group_size"]
+                activation_fn = bound["activation_fn"]
+                input_scale = bound["input_scale"]
                 assert isinstance(input_node, torch.fx.Node)
                 assert isinstance(weight_qdata, torch.fx.Node)
                 assert isinstance(weight_scale, torch.fx.Node)
@@ -156,7 +146,15 @@ def _specialize_linears(
                     list(schedule),
                 )
             else:
-                replacement_args = (*node.args, list(schedule))
+                replacement_args = (
+                    bound["input_qdata"],
+                    bound["input_scale"],
+                    bound["weight_qdata"],
+                    bound["weight_scale"],
+                    bound["bias"],
+                    bound["logical_dtype"],
+                    list(schedule),
+                )
             replacement = graph.call_function(
                 _SPECIALIZED_PREPARED_TARGET,
                 args=replacement_args,
@@ -171,28 +169,17 @@ def _specialize_linears(
     return changed
 
 
-class _CompilePass(CustomInferenceAwareGraphPass):
-    """Apply measured schedules without changing the H3 attention implementation."""
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        if is_inference:
-            _specialize_linears(graph)
-
-    def uuid(self) -> bytes:
-        return inductor_options.compute_compile_pass_uuid(self)
-
-
-compile_pass = _CompilePass()
+_HOOK = inductor_options.GraphPassHook(
+    key="piper_kernels.specializations.minimax_h3_vae.linear",
+    apply=_specialize_linears,
+)
 
 
 def minimax_h3_vae_convrot_int8_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Install ordinary ConvRot rewriting followed by the H3 VAE schedules."""
-    return inductor_options.add_ordered_post_grad_passes(
-        options,
-        (convrot_int8_compile.compile_pass, compile_pass),
-    )
+    return inductor_options.add_post_grad_hook(options, _HOOK, linear=True)
 
 
 __all__ = ["minimax_h3_vae_convrot_int8_compile_options"]

@@ -204,7 +204,7 @@ causal zero frames automatically, accept `padding="none"|"reflect"|"reflect_righ
 (`height, width > 1`), retain FP32 input precision under autocast, and accept an
 optional FP16 residual.
 
-Both APIs work under `torch.compile`; `convrot_int8_conv3d_compile_options`
+Both APIs work under `torch.compile`; `compile_options(conv3d=True)`
 additionally fuses explicit zero/spatial-reflection padding chains. See the
 [Conv3D implementation](../src/piper_kernels/conv3d/convrot/int8/triton.py),
 [padding compiler pass](../src/piper_kernels/conv3d/convrot/int8/_compile.py),
@@ -213,27 +213,30 @@ The sections below (updates, GGUF, trellis, sharding) cover 2-D weights only.
 
 ## Compile a model
 
-Operators work with `torch.compile` directly; pass a format/fusion helper through
-`torch.compile(options=...)` (without `mode`) to share input preparation or fuse
-blocks while leaving unmatched ops unchanged:
+Operators work with `torch.compile` directly; pass `piper_kernels.compile_options`
+through `torch.compile(options=...)` (without `mode`) to share input preparation
+or fuse blocks while leaving unmatched ops unchanged:
 
 ```python
-from piper_kernels.linear.convrot import convrot_int8_compile_options
+from piper_kernels import compile_options
 
-compiled_layer = torch.compile(linear_layer, options=convrot_int8_compile_options())
+compiled_layer = torch.compile(linear_layer, options=compile_options())
 ```
 
-- **Linears**: `convrot_int8_compile_options` (`piper_kernels.linear.convrot`),
-  `nvfp4_compile_options` (`piper_kernels.linear.nvfp4`), and
-  `convrot_nvfp4_compile_options` (`piper_kernels.linear.convrot.nvfp4`) share input
-  preparation across compatible linears (INT8 also fuses exclusive `tanh`-GELU inputs)
-  while preserving static/dynamic scales.
-- **FFNs**: `ffn_compile_options` (`piper_kernels.fusions.ffn`) fuses FP16/BF16
-  ConvRot INT8, NVFP4, and ConvRot NVFP4 SwiGLU and exclusive `tanh`-GELU FFNs
-  while preserving scales (compose with the corresponding linear compile options
-  to normalize unfused linears). When updating a residual stream, see
-  [in-place residual updates](attention.md#update-a-residual-stream-in-place).
-- **Attention**: see [attention](attention.md#compile-and-fuse-projections).
+Repeated calls compose by unioning enabled flags into one phase-ordered compiler
+pipeline (regardless of call order) while preserving unrelated Inductor options:
+
+- **Linears (`linear=True`, default)**: shares input preparation across compatible
+  ConvRot INT8, NVFP4, and ConvRot NVFP4 linears (INT8 also fuses exclusive
+  `tanh`-GELU inputs) while preserving static/dynamic scales.
+- **FFNs (`ffn=True`)**: fuses FP16/BF16 ConvRot INT8, NVFP4, and ConvRot NVFP4
+  SwiGLU and exclusive `tanh`-GELU FFNs while preserving scales. When updating a
+  residual stream, enable `residual_updates=True` (see
+  [in-place residual updates](attention.md#update-a-residual-stream-in-place)).
+- **Attention (`attention=True`, `attention_output=True`)**: see
+  [attention](attention.md#compile-and-fuse-projections).
+- **Conv3D (`conv3d=True`)**: fuses explicit zero/spatial-reflection padding
+  chains before ConvRot INT8 Conv3D.
 
 Static INT8 weights bypass AOTAutograd's persistent disk cache (Inductor caching
 and graph reuse remain enabled). There is no hidden prepared-weight cache.
@@ -356,10 +359,10 @@ distributed_layer = parallelize_module(distributed_layer, mesh, plan)
 ```
 
 Use `Shard(0)` bias for `dim=0` and `Replicate()` for `dim=1`. Sequence-sharded
-(`Shard(1)`) ConvRot INT8 linears and dense (`fuse_output=True`) or sparse Piper
-attention fusions fold `PrepareModuleInput`/`RowwiseParallel(output_layouts=Shard(1))`
+(`Shard(1)`) ConvRot INT8 linears and dense (`attention_output=True`) or sparse
+Piper attention fusions fold `PrepareModuleInput`/`RowwiseParallel(output_layouts=Shard(1))`
 collectives automatically (and fold reduce-scatters into two-step in-place residual adds
-with `residual_updates_compile_options`); see
+with `residual_updates=True`); see
 [sequence-parallel output collectives](../src/piper_kernels/fusions/convrot_int8_piper/README.md#sequence-parallel-output-collectives)
 for alignment and fallback details. For other fused sharded blocks, keep full heads or
 FFN intermediate shards local, unwrap activations around fusions, keep collectives

@@ -1,10 +1,12 @@
 """Fold dense Q projection, attention, and a token-major ConvRot output linear."""
 
+from __future__ import annotations
+
 from typing import Any, cast
 
 import torch
 from torch.fx.experimental.symbolic_shapes import statically_known_true
-from torch.fx.node import map_arg
+from torch.fx.node import Argument, map_arg
 
 from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as sharing
@@ -12,40 +14,60 @@ from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 
 from . import output
 
+_aten = torch.ops.aten
 _RESHAPES = (
-    torch.ops.aten.reshape.default,
-    torch.ops.aten.view.default,
-    torch.ops.aten._unsafe_view.default,
+    _aten.reshape.default,
+    _aten.view.default,
+    _aten._unsafe_view.default,
+)
+_QUERY_PROJECTION_ARG_NAMES = (
+    "input_qdata",
+    "input_scale",
+    "weight_qdata",
+    "weight_scale",
+    "norm_weight",
+    "cos",
+    "sin",
+    "norm_epsilon",
+    "softmax_scale",
+    "bias",
 )
 
 
-def _attention_source(node: object) -> torch.fx.Node | None:  # noqa: PLR0911
+def _attention_source(node: object) -> tuple[torch.fx.Node, dict[str, Argument]] | None:  # noqa: PLR0911
     """Require an exclusive BHSD -> BSHD -> merged-head path."""
     if not isinstance(node, torch.fx.Node) or node.target not in _RESHAPES:
         return None
-    while node.target in (*_RESHAPES, torch.ops.aten.clone.default):
-        if len(node.users) != 1 or not node.args or not isinstance(node.args[0], torch.fx.Node):
+    while node.op == "call_function" and node.target in (*_RESHAPES, _aten.clone.default):
+        if len(node.users) != 1:
             return None
-        node = node.args[0]
-    if len(node.users) != 1 or not node.args or not isinstance(node.args[0], torch.fx.Node):
+        bound = linear_fx.bind_arguments(node)
+        if bound is None or not isinstance(bound.get("self"), torch.fx.Node):
+            return None
+        node = bound["self"]
+        assert isinstance(node, torch.fx.Node)
+    if len(node.users) != 1:
         return None
-    if node.target is torch.ops.aten.transpose.int:
-        if node.args[1:] not in ((1, 2), (2, 1)):
+    transpose = linear_fx.bind_call(node, _aten.transpose.int)
+    if transpose is not None:
+        if (transpose["dim0"], transpose["dim1"]) not in ((1, 2), (2, 1)):
             return None
-    elif node.target is torch.ops.aten.permute.default:
-        if not isinstance(node.args[1], (tuple, list)) or tuple(node.args[1]) != (0, 2, 1, 3):
-            return None
+        attention = transpose["self"]
     else:
+        permute = linear_fx.bind_call(node, _aten.permute.default)
+        if (
+            permute is None
+            or not isinstance(permute["dims"], (tuple, list))
+            or tuple(permute["dims"]) != (0, 2, 1, 3)
+        ):
+            return None
+        attention = permute["self"]
+    if not isinstance(attention, torch.fx.Node) or len(attention.users) != 1:
         return None
-    attention = node.args[0]
-    return (
-        attention
-        if attention.target is torch.ops.piper_kernels.piper_attention_from_quantized.default
-        and len(attention.users) == 1
-        and not attention.kwargs
-        and len(attention.args) == 13
-        else None
+    attn_bound = linear_fx.bind_call(
+        attention, torch.ops.piper_kernels.piper_attention_from_quantized.default
     )
+    return None if attn_bound is None else (attention, attn_bound)
 
 
 def _metadata(node: torch.fx.Node) -> torch.Tensor | int | torch.SymInt:
@@ -55,20 +77,19 @@ def _metadata(node: torch.fx.Node) -> torch.Tensor | int | torch.SymInt:
     return value
 
 
-def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple, dict] | None:  # noqa: PLR0911
-    if (
-        linear.op != "call_function"
-        or linear.target is not torch.ops.piper_kernels.convrot_int8_linear.default
-        or linear.kwargs
-        or len(linear.args) != 7
-        or linear.args[5] is not None
-        or not isinstance(linear.args[0], torch.fx.Node)
-    ):
+def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple[Argument, ...], dict[str, Any]] | None:  # noqa: PLR0911, PLR0912
+    linear_bound = linear_fx.bind_call(linear, torch.ops.piper_kernels.convrot_int8_linear.default)
+    if linear_bound is None or linear_bound["activation_fn"] is not None:
         return None
-    attention = _attention_source(linear.args[0])
-    if attention is None:
+    linear_input = linear_bound["input"]
+    if not isinstance(linear_input, torch.fx.Node):
         return None
-    q, qs, *context = attention.args
+    matched_attention = _attention_source(linear_input)
+    if matched_attention is None:
+        return None
+    attention, attn_bound = matched_attention
+    q = attn_bound["query"]
+    qs = attn_bound["query_scale"]
     if not isinstance(q, torch.fx.Node) or not isinstance(qs, torch.fx.Node):
         return None
     producer = linear_fx.ordered_tuple_output_producer(
@@ -76,12 +97,14 @@ def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple, dict] | None:  # noq
     )
     if (
         producer is None
-        or len(producer.args) != 10
         or set(producer.users) != {q, qs}
         or any(set(node.users) != {attention} for node in (q, qs))
     ):
         return None
-    input_value = sharing.tensor_metadata(linear.args[0])
+    producer_bound = linear_fx.bind_arguments(producer)
+    if producer_bound is None:
+        return None
+    input_value = sharing.tensor_metadata(linear_input)
     attention_value = sharing.tensor_metadata(attention)
     projected = sharing.tensor_metadata(linear)
     if input_value is None or attention_value is None or projected is None:
@@ -102,24 +125,23 @@ def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple, dict] | None:  # noq
     ):
         return None
     # Native operands were validated by the preceding projection/attention rewrite.
-    key, ks, kc, value, multiplier, logs, mean, _query_length, key_length, causal, dtype = context
-    arguments = (
-        *producer.args,
-        key,
-        ks,
-        kc,
-        value,
-        multiplier,
-        logs,
-        mean,
-        key_length,
-        causal,
-        dtype,
-        linear.args[1],
-        linear.args[2],
-        linear.args[3],
-        linear.args[4],
-        linear.args[6],
+    arguments: tuple[Argument, ...] = (
+        *(producer_bound[name] for name in _QUERY_PROJECTION_ARG_NAMES),
+        attn_bound["key"],
+        attn_bound["key_scale"],
+        attn_bound["key_center"],
+        attn_bound["value"],
+        attn_bound["multiplier"],
+        attn_bound["log_scale"],
+        attn_bound["value_mean"],
+        attn_bound["key_length"],
+        attn_bound["is_causal"],
+        attn_bound["output_dtype"],
+        linear_bound["weight_qdata"],
+        linear_bound["weight_scale"],
+        linear_bound["bias"],
+        linear_bound["group_size"],
+        linear_bound["input_scale"],
     )
     kwargs = {"head_dim": head_dim}
     try:

@@ -304,14 +304,16 @@ def guarded_find_spec(name, *args, **kwargs):
 builtins.__import__ = guarded_import
 importlib.util.find_spec = guarded_find_spec
 
+import piper_kernels
 import piper_kernels.fusions.ffn as ffn_pkg
 assert "piper_kernels.fusions.ffn._compile" not in sys.modules
 assert "piper_kernels.fusions.ffn._convrot_int8" not in sys.modules
 assert "piper_kernels.fusions.ffn._nvfp4" not in sys.modules
 assert "piper_kernels.fusions.ffn.triton" not in sys.modules
 
-options = ffn_pkg.ffn_compile_options()
+options = piper_kernels.compile_options(ffn=True)
 assert "post_grad_custom_pre_pass" in options
+assert "piper_kernels.fusions.ffn._compile" not in sys.modules
 assert "piper_kernels.fusions.ffn._convrot_int8" not in sys.modules
 assert "piper_kernels.fusions.ffn._nvfp4" not in sys.modules
 assert "piper_kernels.fusions.ffn.triton" not in sys.modules
@@ -328,12 +330,12 @@ def test_plain_nvfp4_graph_folding_does_not_register_convrot() -> None:
 import sys
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
-from piper_kernels.fusions.ffn import ffn_compile_options
-from piper_kernels.fusions.ffn._compile import compile_pass
+from piper_kernels import compile_options
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops  # noqa: F401
 from piper_kernels.weights.nvfp4 import _layout
 
-ffn_compile_options()
+options = compile_options(ffn=True)
+compiler_pass = options["post_grad_custom_pre_pass"][0]
 assert not hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
 
 with FakeTensorMode():
@@ -363,7 +365,7 @@ with FakeTensorMode():
     down = linear("down", mul, 128, 64)
     graph.output(down)
 
-    compile_pass(graph, is_inference=True)
+    compiler_pass(graph, is_inference=True)
     targets = [n.target for n in graph.nodes if n.op == "call_function"]
     assert torch.ops.piper_kernels.nvfp4_ffn.default in targets
 

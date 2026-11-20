@@ -8,16 +8,10 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from piper_kernels import compile_options
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
-from piper_kernels.fusions.nvfp4_sparse_piper._compile import (
-    compile_pass as nvfp4_sparse_compile_pass,
-)
-from piper_kernels.linear.convrot.nvfp4._compile import (
-    compile_pass as convrot_nvfp4_compile_pass,
-)
-from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
 
 
 def _placeholder(
@@ -177,6 +171,7 @@ def build_attention_graph(  # noqa: PLR0913
     k_affine: bool = True,
     with_force_tiles: bool = False,
     group_size: int | None = None,
+    distinct_query_input: bool = False,
 ) -> torch.fx.Graph:
     graph = torch.fx.Graph()
     with FakeTensorMode():
@@ -184,6 +179,15 @@ def build_attention_graph(  # noqa: PLR0913
             graph,
             "input",
             torch.empty((1, 192, 256), device="cuda", dtype=torch.bfloat16),
+        )
+        query_input = (
+            _placeholder(
+                graph,
+                "query_input",
+                torch.empty((1, 192, 256), device="cuda", dtype=torch.bfloat16),
+            )
+            if distinct_query_input
+            else input
         )
         activation_scales = tuple(
             None
@@ -198,7 +202,7 @@ def build_attention_graph(  # noqa: PLR0913
         projected = tuple(
             _semantic_linear(
                 graph,
-                input,
+                query_input if prefix == "q" else input,
                 prefix,
                 activation_scale,
                 dynamic=dynamic,
@@ -494,13 +498,19 @@ def build_mixed_quantized_attention_output_graph(
     return graph
 
 
-def run_nvfp4_passes(graph: torch.fx.Graph, monkeypatch: pytest.MonkeyPatch) -> None:
+def run_nvfp4_passes(
+    graph: torch.fx.Graph,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    linear: bool = True,
+) -> None:
     """Run the unified NVFP4 + ConvRot NVFP4 sparse-Piper pass pipeline on a fake graph."""
     monkeypatch.setattr(
         AcceleratorTarget,
         "from_device",
         classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
     )
-    nvfp4_compile_pass(graph, is_inference=True)
-    convrot_nvfp4_compile_pass(graph, is_inference=True)
-    nvfp4_sparse_compile_pass(graph, is_inference=True)
+    passes = compile_options(linear=linear, attention=True)["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=True)

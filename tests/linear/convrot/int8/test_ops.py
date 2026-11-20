@@ -4,8 +4,8 @@ import pytest
 import torch
 from _compile_capture import TargetCapturePass
 
+from piper_kernels import compile_options
 from piper_kernels._input_activations import apply_input_activation
-from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8 import _backend, _ops, dispatch, reference
 from piper_kernels.weights.convrot.int8 import _update
 from piper_kernels.weights.convrot.int8 import _update_reference as int8_update_reference
@@ -117,8 +117,7 @@ def test_compiled_preparation_sharing_resolves_backend_at_execution(monkeypatch)
         )
 
     capture = TargetCapturePass()
-    options = convrot_int8_compile_options()
-    options["post_grad_custom_pre_pass"] = (options["post_grad_custom_pre_pass"], capture)
+    options = capture.wrap_options(compile_options())
     compiled = torch.compile(two_projections, fullgraph=True, options=options)
     with torch.inference_mode():
         expected = two_projections(value, weight, scale, bias)
@@ -232,7 +231,7 @@ def test_compiled_static_sharing_and_scale_mutation(monkeypatch, scales):
             _ops.linear(value, weight, weight_scale, bias, 16, None, second_scale),
         )
 
-    compiled = torch.compile(projections, fullgraph=True, options=convrot_int8_compile_options())
+    compiled = torch.compile(projections, fullgraph=True, options=compile_options())
     with torch.inference_mode():
         original = None
         for scale in (0.005, 0.02):

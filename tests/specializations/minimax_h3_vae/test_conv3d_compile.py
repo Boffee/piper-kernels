@@ -10,7 +10,7 @@ from piper_kernels.specializations.minimax_h3_vae import (
     minimax_h3_vae_convrot_int8_compile_options,
     minimax_h3_vae_convrot_int8_conv3d_compile_options,
 )
-from piper_kernels.specializations.minimax_h3_vae.conv3d._compile import compile_pass, fuse_conv3d
+from piper_kernels.specializations.minimax_h3_vae.conv3d._compile import fuse_conv3d
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
@@ -211,8 +211,9 @@ def test_compile_options_preserve_existing_pre_grad_pass_and_are_idempotent():
         pass
 
     options = minimax_h3_vae_convrot_int8_conv3d_compile_options({"pre_grad_custom_pass": existing})
-    options = minimax_h3_vae_convrot_int8_conv3d_compile_options(options)
-    assert options["pre_grad_custom_pass"] == (existing, compile_pass)
+    repeated = minimax_h3_vae_convrot_int8_conv3d_compile_options(options)
+    expected = minimax_h3_vae_convrot_int8_conv3d_compile_options()["pre_grad_custom_pass"][0]
+    assert repeated["pre_grad_custom_pass"] == (existing, expected)
 
 
 def test_encoder_and_decoder_options_are_independent_and_composable():
@@ -224,7 +225,8 @@ def test_encoder_and_decoder_options_are_independent_and_composable():
         minimax_h3_vae_convrot_int8_compile_options(encoder)
     )
     assert decoder["post_grad_custom_pre_pass"]
-    assert encoder["pre_grad_custom_pass"] == (compile_pass,)
+    assert isinstance(encoder["pre_grad_custom_pass"], tuple)
+    assert len(encoder["pre_grad_custom_pass"]) == 1
 
 
 @pytest.mark.parametrize("standard", [False, True])

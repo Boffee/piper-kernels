@@ -6,18 +6,8 @@ from _compile_capture import FunctionalTargetCapturePass, TargetCapturePass
 from torch._dynamo.utils import ReinplaceCounters
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import piper_attention
-from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
-from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    convrot_int8_sparse_piper_compile_options,
-)
-from piper_kernels.fusions.ffn import (
-    _convrot_int8 as int8_ffn,
-)
-from piper_kernels.fusions.ffn import ffn_compile_options
-from piper_kernels.fusions.residual_updates import _compile as residual_compile
-from piper_kernels.fusions.residual_updates import residual_updates_compile_options
-from piper_kernels.linear.convrot import convrot_int8_compile_options
+from piper_kernels import compile_options, piper_attention
+from piper_kernels.fusions.ffn import _convrot_int8 as int8_ffn
 from piper_kernels.linear.convrot.int8 import _ops
 
 from ..convrot_int8_piper.test_compile import _available
@@ -178,11 +168,13 @@ class _SparseResidualBlock(torch.nn.Module):
 
 def _options(capture, *, fuse_output=True, residual_updates_first=False):
     if residual_updates_first:
-        options = ffn_compile_options(residual_updates_compile_options())
-        options = convrot_int8_piper_compile_options(options, fuse_output=fuse_output)
+        options = compile_options(compile_options(residual_updates=True), ffn=True)
+        options = compile_options(options, attention=True, attention_output=fuse_output)
     else:
-        options = convrot_int8_piper_compile_options(ffn_compile_options(), fuse_output=fuse_output)
-        options = residual_updates_compile_options(options)
+        options = compile_options(
+            compile_options(ffn=True), attention=True, attention_output=fuse_output
+        )
+        options = compile_options(options, residual_updates=True)
     return capture.wrap_options(options)
 
 
@@ -243,7 +235,7 @@ def test_copy_back_block_updates_its_input_in_place(residual_updates_first):
 def test_sparse_attention_output_is_computed_inside_its_residual_add():
     model = _SparseResidualBlock()
     capture = FunctionalTargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options(ffn_compile_options())
+    options = compile_options(ffn=True, attention=True)
     hidden = torch.randn(1, model.sequence_length, model.width, device="cuda", dtype=torch.bfloat16)
     gate_indices = torch.randint(0, 3, (model.sequence_length,), device="cuda")
     torch._dynamo.reset()
@@ -261,7 +253,7 @@ def test_sparse_attention_output_is_computed_inside_its_residual_add():
     compiled = torch.compile(
         copy_back,
         fullgraph=True,
-        options=capture.wrap_options(residual_updates_compile_options(options)),
+        options=capture.wrap_options(compile_options(options, residual_updates=True)),
     )
     ReinplaceCounters.clear()
     with torch.no_grad():
@@ -311,9 +303,7 @@ def _compiled_without_rewrite(model, *arguments):
     """Run ``model`` with ordinary ConvRot INT8 linears, which round like the fused FFN."""
     torch._dynamo.reset()
     with torch.no_grad():
-        return torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
-            *arguments
-        )
+        return torch.compile(model, fullgraph=True, options=compile_options())(*arguments)
 
 
 @pytest.mark.gpu
@@ -321,7 +311,7 @@ def _compiled_without_rewrite(model, *arguments):
 def test_ffn_output_read_elsewhere_stays_materialized_before_its_add():
     model = Int8GatedUpdates(activation="gelu_tanh", expose="ffn")
     capture = FunctionalTargetCapturePass()
-    options = residual_updates_compile_options(ffn_compile_options())
+    options = compile_options(ffn=True, residual_updates=True)
 
     def copy_back(base, *operands):
         output, ffn = model(base, *operands)
@@ -386,18 +376,17 @@ def test_block_without_copy_back_keeps_its_input():
     assert _FFN_UPDATE in capture.targets
 
 
-def test_compile_options_run_the_rewrite_first_and_disable_buffer_reuse():
-    options = convrot_int8_piper_compile_options(fuse_output=True)
-    combined = residual_updates_compile_options(options)
+def test_compile_options_merge_residual_updates_and_disable_buffer_reuse():
+    options = compile_options(attention_output=True)
+    combined = compile_options(options, residual_updates=True)
 
     passes = combined["post_grad_custom_pre_pass"]
     assert isinstance(passes, tuple)
-    assert passes[0] is residual_compile._compile_pass
-    assert passes[1:] == options["post_grad_custom_pre_pass"]
+    assert len(passes) == 1
     assert combined["allow_buffer_reuse"] is False
-    # Fusion helpers applied afterward still run after it, and applying it again keeps one copy.
-    later = residual_updates_compile_options(ffn_compile_options(combined))
+    # Repeated composition merges flags into the same unified pass without duplicating it.
+    later = compile_options(compile_options(combined, ffn=True), residual_updates=True)
     later_passes = later["post_grad_custom_pre_pass"]
     assert isinstance(later_passes, tuple)
-    assert later_passes[0] is residual_compile._compile_pass
-    assert later_passes.count(residual_compile._compile_pass) == 1
+    assert len(later_passes) == 1
+    assert later == compile_options(ffn=True, attention_output=True, residual_updates=True)

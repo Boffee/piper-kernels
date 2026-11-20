@@ -6,10 +6,8 @@ import pytest
 import torch
 from _compile_capture import TargetCapturePass
 
-from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
-from piper_kernels.linear.convrot.int8._compile import (
-    compile_pass,
-)
+from piper_kernels import compile_options
+from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 
@@ -25,7 +23,10 @@ def _placeholder(
 
 def _run_compile_pass(graph: torch.fx.Graph, *, is_inference: bool) -> None:
     torch.fx.GraphModule({}, graph)
-    compile_pass(graph, is_inference=is_inference)
+    passes = compile_options()["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=is_inference)
 
 
 def _linear(
@@ -123,10 +124,12 @@ def test_pass_fails_closed_without_post_aot_tensor_metadata() -> None:
 
 
 def test_compile_options_install_the_convrot_pass() -> None:
-    options = convrot_int8_compile_options({"max_autotune": True})
+    options = compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
-    assert options["post_grad_custom_pre_pass"] is compile_pass
+    passes = options["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    assert len(passes) == 1
 
 
 @pytest.mark.gpu
@@ -160,11 +163,7 @@ def test_cuda_compile_options_fold_gelu_tanh(static) -> None:
     model = GeluProjection().eval()
     value = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
     capture = TargetCapturePass()
-    options = convrot_int8_compile_options()
-    options["post_grad_custom_pre_pass"] = (
-        options["post_grad_custom_pre_pass"],
-        capture,
-    )
+    options = capture.wrap_options(compile_options())
     with torch.no_grad():
         weight = model.projection.weight
         assert isinstance(weight, ConvRotInt8Tensor)
@@ -232,7 +231,7 @@ def test_cuda_compile_options_match_unmodified_compiled_linears() -> None:
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=convrot_int8_compile_options(),
+            options=compile_options(),
         )(activation)
 
     assert all(

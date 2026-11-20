@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 
-from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
@@ -79,26 +75,10 @@ class _PreparationRule:
 _PREPARATION_RULES = (_PreparationRule(),)
 
 
-class _CompilePass(CustomInferenceAwareGraphPass):
-    """Share compatible ConvRot NVFP4 input preparation."""
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        if is_inference:
-            projection_views.normalize_projection_views(graph)
-            preparation_sharing.share_preparation(graph, _PREPARATION_RULES)
-
-    def uuid(self) -> bytes:
-        return inductor_options.compute_compile_pass_uuid(self)
+def fold_linear(graph: torch.fx.Graph) -> bool:
+    """Normalize projection views and share compatible ConvRot NVFP4 preparation."""
+    changed = projection_views.normalize_projection_views(graph)
+    return preparation_sharing.share_preparation(graph, _PREPARATION_RULES) or changed
 
 
-compile_pass = _CompilePass()
-
-
-def convrot_nvfp4_compile_options(
-    options: Mapping[str, object] | None = None,
-) -> dict[str, object]:
-    """Return Inductor options that share ConvRot NVFP4 preparation."""
-    return inductor_options.add_post_grad_pass(options, compile_pass)
-
-
-__all__ = ["convrot_nvfp4_compile_options"]
+__all__ = ["fold_linear"]

@@ -17,7 +17,7 @@ import torch
 from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import SparsePiperAttention, piper_attention
+from piper_kernels import SparsePiperAttention, compile_options, piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _backend as dense_attention_backend
 from piper_kernels.attention.sparse_piper_attention import _backend as sparse_attention_backend
@@ -400,16 +400,11 @@ def _build(case: PipelineCase, device: torch.device, *, fused: bool) -> Operatio
     }
     capture: CaptureFusion | None = None
     if fused:
-        from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
-        from piper_kernels.fusions.convrot_int8_sparse_piper import (
-            convrot_int8_sparse_piper_compile_options,
-        )
-
         capture = CaptureFusion(sparse=case.keep_ratio is not None)
         options = (
-            convrot_int8_piper_compile_options(fuse_output=True)
+            compile_options(attention=True, attention_output=True)
             if case.keep_ratio is None
-            else convrot_int8_sparse_piper_compile_options()
+            else compile_options(attention=True)
         )
         passes = options["post_grad_custom_pre_pass"]
         assert isinstance(passes, tuple)

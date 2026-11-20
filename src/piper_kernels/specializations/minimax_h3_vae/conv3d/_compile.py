@@ -14,7 +14,6 @@ import operator
 from collections.abc import Mapping
 
 import torch
-from torch._inductor.custom_graph_pass import CustomGraphPass
 from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch.nn import functional
 
@@ -186,31 +185,17 @@ def fuse_conv3d(graph: torch.fx.Graph) -> None:
         graph.lint()
 
 
-class _CompilePass(CustomGraphPass):
-    def __call__(self, graph: torch.fx.Graph) -> None:
-        fuse_conv3d(graph)
-
-    def uuid(self) -> bytes:
-        return inductor_options.compute_compile_pass_uuid(self)
-
-
-compile_pass = _CompilePass()
+_HOOK = inductor_options.GraphPassHook(
+    key="piper_kernels.specializations.minimax_h3_vae.conv3d",
+    apply=fuse_conv3d,
+)
 
 
 def minimax_h3_vae_convrot_int8_conv3d_compile_options(
     options: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Install encoder fusion without loading decoder linear specializations."""
-    combined = dict(options) if options is not None else {}
-    existing = combined.get("pre_grad_custom_pass")
-    passes = (
-        tuple(existing)
-        if isinstance(existing, (list, tuple))
-        else (() if existing is None else (existing,))
-    )
-    if not any(item is compile_pass for item in passes):
-        combined["pre_grad_custom_pass"] = (*passes, compile_pass)
-    return combined
+    return inductor_options.add_pre_grad_hook(options, _HOOK)
 
 
 __all__ = ["minimax_h3_vae_convrot_int8_conv3d_compile_options"]

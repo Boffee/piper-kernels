@@ -6,9 +6,9 @@ from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
+from piper_kernels import compile_options
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_ops
-from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options
-from piper_kernels.linear.nvfp4 import _ops, nvfp4_compile_options, reference
+from piper_kernels.linear.nvfp4 import _ops, reference
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor, _layout
 
@@ -80,7 +80,7 @@ def test_empty_cuda_linear_matches_dense(dtype, dynamic, group_size, compiled, p
             _ops.linear_prepared(*operands, bias, dtype).reshape(shape),
         )
 
-    options = convrot_nvfp4_compile_options() if group_size else nvfp4_compile_options()
+    options = compile_options()
     call = torch.compile(projections, fullgraph=True, options=options) if compiled else projections
     with torch.no_grad():
         for shape in [(0, 256), (2, 0, 256)]:

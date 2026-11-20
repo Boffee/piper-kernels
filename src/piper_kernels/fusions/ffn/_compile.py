@@ -9,25 +9,22 @@ format extras and Triton lazily imported.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
 
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch.fx.node import Argument
 
-from piper_kernels import _inductor_options as inductor_options
 from piper_kernels import _input_activations as input_activations
 from piper_kernels.fusions.residual_updates import _gates as residual_gates
 from piper_kernels.linear import _bias
+from piper_kernels.linear import _compile_fx as linear_fx
+from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 
 _aten = torch.ops.aten
-_prims = torch.ops.prims
 
-_POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 _CONVROT_INT8_LINEAR = "piper_kernels::convrot_int8_linear"
 _NVFP4_LINEAR = "piper_kernels::nvfp4_linear"
 _CONVROT_NVFP4_LINEAR = "piper_kernels::convrot_nvfp4_linear"
@@ -38,13 +35,6 @@ _SEMANTIC_LINEAR_NAMES = frozenset(
         _CONVROT_INT8_LINEAR,
         _NVFP4_LINEAR,
         _CONVROT_NVFP4_LINEAR,
-    }
-)
-_LINEAR_PASS_MODULES = frozenset(
-    {
-        "piper_kernels.linear.convrot.int8._compile",
-        "piper_kernels.linear.nvfp4._compile",
-        "piper_kernels.linear.convrot.nvfp4._compile",
     }
 )
 
@@ -83,46 +73,14 @@ class _GatedUpdatesMatch:
     python_indexing: bool
 
 
-def _schema_name(node: torch.fx.Node) -> str | None:
-    if node.op != "call_function" or not isinstance(node.target, torch._ops.OpOverload):
-        return None
-    return node.target._schema.name
-
-
-def _bind_arguments(node: torch.fx.Node) -> dict[str, Argument]:
-    """Bind positional, keyword, and defaulted arguments by operator schema name."""
-    schema = cast(torch._ops.OpOverload, node.target)._schema
-    positional = [arg for arg in schema.arguments if not arg.kwarg_only]
-    values: dict[str, Argument] = {arg.name: arg.default_value for arg in schema.arguments}
-    for arg, value in zip(positional, node.args, strict=False):
-        values[arg.name] = value
-    values.update(node.kwargs)
-    return values
-
-
-def _bind_call(node: object, target: torch._ops.OpOverload) -> dict[str, Argument] | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target is not target
-    ):
-        return None
-    schema = target._schema
-    positional = [arg for arg in schema.arguments if not arg.kwarg_only]
-    valid_names = {arg.name for arg in schema.arguments}
-    if len(node.args) > len(positional) or not set(node.kwargs).issubset(valid_names):
-        return None
-    return _bind_arguments(node)
-
-
 def _parse_projection(node: object) -> _BoundProjection | None:
     if not isinstance(node, torch.fx.Node):
         return None
-    name = _schema_name(node)
+    name = linear_fx.schema_name(node)
     if name not in _SEMANTIC_LINEAR_NAMES:
         return None
-    bound = _bind_arguments(node)
-    if not isinstance(bound.get("input"), torch.fx.Node):
+    bound = linear_fx.bind_arguments(node)
+    if bound is None or not isinstance(bound.get("input"), torch.fx.Node):
         return None
     if name == _CONVROT_INT8_LINEAR and bound.get("activation_fn") is not None:
         return None
@@ -143,157 +101,28 @@ def _shape_matches(left: torch.Tensor, right: torch.Tensor) -> bool:
     )
 
 
-def _is_scalar(value: object, expected: float) -> bool:
-    return (
-        isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) == expected
-    )
-
-
-def _binary_args(node: object, target: torch._ops.OpOverload) -> tuple[Argument, Argument] | None:
-    bound = _bind_call(node, target)
-    if bound is None:
-        return None
-    if target is _aten.add.Tensor and not _is_scalar(bound.get("alpha"), 1.0):
-        return None
-    left = bound.get("self")
-    right = bound.get("other")
-    if left is None or right is None:
-        return None
-    return left, right
-
-
-def _unary_arg(node: object, target: torch._ops.OpOverload) -> torch.fx.Node | None:
-    bound = _bind_call(node, target)
-    if bound is None:
-        return None
-    source = bound.get("self")
-    return source if isinstance(source, torch.fx.Node) else None
-
-
-def _convert_dtype(node: object) -> tuple[torch.fx.Node, torch.dtype] | None:
-    bound = _bind_call(node, _prims.convert_element_type.default)
-    if bound is None:
-        return None
-    source = bound.get("a")
-    dtype = bound.get("dtype")
-    if not isinstance(source, torch.fx.Node) or not isinstance(dtype, torch.dtype):
-        return None
-    return source, dtype
-
-
-def _match_node_and_scalar(
-    node: object, target: torch._ops.OpOverload, scalar: float
-) -> torch.fx.Node | None:
-    args = _binary_args(node, target)
-    if args is None:
-        return None
-    left, right = args
-    if isinstance(left, torch.fx.Node) and _is_scalar(right, scalar):
-        return left
-    if isinstance(right, torch.fx.Node) and _is_scalar(left, scalar):
-        return right
-    return None
-
-
-def _match_gelu_cubic_body(
-    value: torch.fx.Node, shifted: torch.fx.Node
-) -> set[torch.fx.Node] | None:
-    """Match ``1 + tanh(scale * (v + cubic * v^3))`` and return its users of ``value``."""
-    tanh_node = _match_node_and_scalar(shifted, _aten.add.Tensor, 1.0)
-    scaled = (
-        _unary_arg(tanh_node, _aten.tanh.default)
-        if tanh_node is not None and len(tanh_node.users) == 1
-        else None
-    )
-    inner = (
-        _match_node_and_scalar(
-            scaled, _aten.mul.Tensor, input_activations.GELU_TANH_SCALE_COEFFICIENT
-        )
-        if scaled is not None and len(scaled.users) == 1
-        else None
-    )
-    inner_args = (
-        _binary_args(inner, _aten.add.Tensor)
-        if inner is not None and len(inner.users) == 1
-        else None
-    )
-    cubic_term = (
-        None
-        if inner_args is None
-        else inner_args[1]
-        if inner_args[0] is value
-        else inner_args[0]
-        if inner_args[1] is value
-        else None
-    )
-    cube = (
-        _match_node_and_scalar(
-            cubic_term, _aten.mul.Tensor, input_activations.GELU_TANH_CUBIC_COEFFICIENT
-        )
-        if isinstance(cubic_term, torch.fx.Node) and len(cubic_term.users) == 1
-        else None
-    )
-    cube_args = (
-        _binary_args(cube, _aten.mul.Tensor) if cube is not None and len(cube.users) == 1 else None
-    )
-    square = (
-        None
-        if cube_args is None
-        else cube_args[0]
-        if cube_args[1] is value
-        else cube_args[1]
-        if cube_args[0] is value
-        else None
-    )
-    if (
-        inner is None
-        or cube is None
-        or not isinstance(square, torch.fx.Node)
-        or len(square.users) != 1
-        or _binary_args(square, _aten.mul.Tensor) != (value, value)
-    ):
-        return None
-    return {square, cube, inner}
-
-
 def _match_gelu_tanh(
     activated: torch.fx.Node,
 ) -> tuple[_BoundProjection, torch.dtype] | None:
     """Match PyTorch's promoted FP32 tanh-GELU decomposition feeding a down linear."""
-    downcast = _convert_dtype(activated) if len(activated.users) == 1 else None
-    if downcast is None:
+    matched = input_activation_compile.match_gelu_tanh_input(
+        activated,
+        allow_unpromoted_fp32=False,
+    )
+    if matched is None:
         return None
-    prod, logical_dtype = downcast
-    prod_args = _binary_args(prod, _aten.mul.Tensor) if len(prod.users) == 1 else None
-    if prod_args is None:
+    source, logical_dtype = matched
+    if logical_dtype is None or len(source.users) != 1:
         return None
-    for half, shifted in (prod_args, prod_args[::-1]):
-        if (
-            not isinstance(half, torch.fx.Node)
-            or not isinstance(shifted, torch.fx.Node)
-            or len(half.users) != 1
-            or len(shifted.users) != 1
-        ):
-            continue
-        value = _match_node_and_scalar(half, _aten.mul.Tensor, 0.5)
-        if value is None:
-            continue
-        body_users = _match_gelu_cubic_body(value, shifted)
-        if body_users is None or set(value.users) != {half, *body_users}:
-            continue
-        upcast = _convert_dtype(value)
-        if upcast is not None and upcast[1] is torch.float32 and len(upcast[0].users) == 1:
-            up_projection = _parse_projection(upcast[0])
-            if up_projection is not None:
-                return up_projection, logical_dtype
-    return None
+    up_projection = _parse_projection(source)
+    return None if up_projection is None else (up_projection, logical_dtype)
 
 
 def _match_decomposed_silu(
     node: torch.fx.Node,
 ) -> tuple[torch.fx.Node, torch.fx.Node] | None:
     """Match ``x / (exp(-x) + 1)`` and return ``(x, neg_node)``."""
-    div_args = _binary_args(node, _aten.div.Tensor)
+    div_args = linear_fx.binary_args(node, _aten.div.Tensor)
     if div_args is None:
         return None
     numerator, denominator = div_args
@@ -303,16 +132,16 @@ def _match_decomposed_silu(
         or len(denominator.users) != 1
     ):
         return None
-    exp_node = _match_node_and_scalar(denominator, _aten.add.Tensor, 1.0)
+    exp_node = linear_fx.match_node_and_scalar(denominator, _aten.add.Tensor, 1.0)
     neg_node = (
-        _unary_arg(exp_node, _aten.exp.default)
+        linear_fx.unary_arg(exp_node, _aten.exp.default)
         if exp_node is not None and len(exp_node.users) == 1
         else None
     )
     if (
         neg_node is None
         or len(neg_node.users) != 1
-        or _unary_arg(neg_node, _aten.neg.default) is not numerator
+        or linear_fx.unary_arg(neg_node, _aten.neg.default) is not numerator
     ):
         return None
     return numerator, neg_node
@@ -328,7 +157,7 @@ def _match_promoted_silu(
     gate_fp32, neg_node = decomposed
     if set(gate_fp32.users) != {div_node, neg_node}:
         return None
-    upcast = _convert_dtype(gate_fp32)
+    upcast = linear_fx.convert_dtype(gate_fp32)
     if upcast is None or upcast[1] is not torch.float32 or len(upcast[0].users) != 1:
         return None
     projection = _parse_projection(upcast[0])
@@ -341,12 +170,12 @@ def _match_silu(
     """Match ``aten.silu`` or its decomposed/FP32-promoted form feeding SwiGLU."""
     if len(silu_node.users) != 1:
         return None
-    direct_gate = _unary_arg(silu_node, _aten.silu.default)
+    direct_gate = linear_fx.unary_arg(silu_node, _aten.silu.default)
     if direct_gate is not None:
         projection = _parse_projection(direct_gate) if len(direct_gate.users) == 1 else None
         return None if projection is None else (projection, None)
 
-    downcast = _convert_dtype(silu_node)
+    downcast = linear_fx.convert_dtype(silu_node)
     if downcast is not None:
         return _match_promoted_silu(*downcast)
 
@@ -363,7 +192,7 @@ def _match_swiglu(
     """Match ``value * silu(gate)`` in either operand order."""
     if len(activated.users) != 1:
         return None
-    mul_args = _binary_args(activated, _aten.mul.Tensor)
+    mul_args = linear_fx.binary_args(activated, _aten.mul.Tensor)
     if mul_args is None:
         return None
     for value_arg, silu_arg in (mul_args, mul_args[::-1]):
@@ -646,7 +475,7 @@ def _match_gated_update_term(
 ) -> tuple[torch.fx.Node, torch.fx.Node] | None:
     if not isinstance(gated_update_arg, torch.fx.Node) or len(gated_update_arg.users) != 1:
         return None
-    update_mul = _binary_args(gated_update_arg, _aten.mul.Tensor)
+    update_mul = linear_fx.binary_args(gated_update_arg, _aten.mul.Tensor)
     if update_mul is None:
         return None
     for update_gate_sel, reusable_arg in (update_mul, update_mul[::-1]):
@@ -712,7 +541,7 @@ def _match_gated_updates(
     if len(down_node.users) != 1:
         return None
     gated_ffn = next(iter(down_node.users))
-    mul_args = _binary_args(gated_ffn, _aten.mul.Tensor)
+    mul_args = linear_fx.binary_args(gated_ffn, _aten.mul.Tensor)
     if mul_args is None or len(gated_ffn.users) != 1:
         return None
     ffn_gate_sel = mul_args[1] if mul_args[0] is down_node else mul_args[0]
@@ -722,14 +551,14 @@ def _match_gated_updates(
         else None
     )
     output_node = next(iter(gated_ffn.users))
-    out_add = _binary_args(output_node, _aten.add.Tensor)
+    out_add = linear_fx.binary_args(output_node, _aten.add.Tensor)
     if selected_ffn is None or out_add is None:
         return None
     ffn_gate, gate_indices, python_indexing = selected_ffn
 
     hidden = out_add[1] if out_add[0] is gated_ffn else out_add[0]
     hidden_add = (
-        _binary_args(hidden, _aten.add.Tensor)
+        linear_fx.binary_args(hidden, _aten.add.Tensor)
         if isinstance(hidden, torch.fx.Node) and len(hidden.users) == 2
         else None
     )
@@ -941,7 +770,8 @@ def _fold_residual_adds(
             update: torch.fx.Node,
             add: dict[str, Argument],
         ) -> torch.fx.Node:
-            values = _bind_arguments(update)
+            values = linear_fx.bind_arguments(update)
+            assert values is not None
             input_val = _node_metadata(values["input"])
             up_weight = _node_metadata(values["up_weight_qdata"])
             down_weight = _node_metadata(values["down_weight_qdata"])
@@ -984,7 +814,8 @@ def _fold_residual_adds(
             update: torch.fx.Node,
             add: dict[str, Argument],
         ) -> torch.fx.Node:
-            values = _bind_arguments(update)
+            values = linear_fx.bind_arguments(update)
+            assert values is not None
             input_val = _node_metadata(values["input"])
             up_weight = _node_metadata(values["up_weight_qdata"])
             down_weight = _node_metadata(values["down_weight_qdata"])
@@ -1022,8 +853,11 @@ def _fold_residual_adds(
     return replaced
 
 
-def _fold_ffns(graph: torch.fx.Graph) -> bool:
-    schema_names = {name for node in graph.nodes if (name := _schema_name(node)) is not None}
+def fold_ffns(graph: torch.fx.Graph) -> bool:
+    """Fold semantic GELU-tanh and SwiGLU FFNs before ordinary linear normalization."""
+    schema_names = {
+        name for node in graph.nodes if (name := linear_fx.schema_name(node)) is not None
+    }
     has_convrot_int8 = _CONVROT_INT8_LINEAR in schema_names or _CONVROT_INT8_FFN in schema_names
     has_nvfp4 = (
         _NVFP4_LINEAR in schema_names
@@ -1078,54 +912,4 @@ def _fold_ffns(graph: torch.fx.Graph) -> bool:
     return changed
 
 
-class _CompilePass(CustomInferenceAwareGraphPass):
-    """Fold semantic GELU-tanh and SwiGLU FFNs before ordinary linear normalization."""
-
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        if is_inference:
-            _fold_ffns(graph)
-
-    def uuid(self) -> bytes:
-        return inductor_options.compute_compile_pass_uuid(self)
-
-
-compile_pass = _CompilePass()
-
-
-def ffn_compile_options(
-    options: Mapping[str, object] | None = None,
-) -> dict[str, object]:
-    """Install the unified FFN fusion pass ahead of any installed linear passes."""
-    combined = dict(options) if options is not None else {}
-    existing = combined.get(_POST_GRAD_PRE_PASS)
-    if existing is None:
-        passes: tuple[object, ...] = ()
-    elif isinstance(existing, (list, tuple)):
-        passes = tuple(existing)
-    else:
-        passes = (existing,)
-
-    if any(item is compile_pass for item in passes):
-        ffn_index = next(i for i, item in enumerate(passes) if item is compile_pass)
-        first_linear = next(
-            (i for i, item in enumerate(passes) if type(item).__module__ in _LINEAR_PASS_MODULES),
-            len(passes),
-        )
-        if ffn_index < first_linear:
-            combined[_POST_GRAD_PRE_PASS] = passes
-            return combined
-
-    remaining = tuple(item for item in passes if item is not compile_pass)
-    linear_index = next(
-        (i for i, item in enumerate(remaining) if type(item).__module__ in _LINEAR_PASS_MODULES),
-        len(remaining),
-    )
-    combined[_POST_GRAD_PRE_PASS] = (
-        *remaining[:linear_index],
-        compile_pass,
-        *remaining[linear_index:],
-    )
-    return combined
-
-
-__all__ = ["compile_pass", "ffn_compile_options"]
+__all__ = ["fold_ffns"]

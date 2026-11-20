@@ -4,9 +4,7 @@ import pytest
 import torch
 from _compile_capture import TargetCapturePass
 
-from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    convrot_int8_sparse_piper_compile_options,
-)
+from piper_kernels import compile_options
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 
 from .._accuracy import assert_fusion_output_close
@@ -81,7 +79,7 @@ def test_static_sparse_attention_preserves_independent_projection_scales(
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+            options=capture.wrap_options(compile_options(attention=True)),
         )(hidden_states, block_lengths, 2)
     assert_fusion_output_close(actual, expected)
     assert (
@@ -128,7 +126,7 @@ def test_static_sparse_scales_can_change_without_recompilation(monkeypatch, proj
     compiled = torch.compile(
         model,
         fullgraph=True,
-        options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+        options=capture.wrap_options(compile_options(attention=True)),
     )
     with torch.inference_mode():
         first = compiled(hidden_states)
@@ -172,7 +170,7 @@ def test_static_coarse_gate_keeps_valid_metadata_when_attention_escapes():
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+            options=capture.wrap_options(compile_options(attention=True)),
         )(hidden)
     for result, reference in zip(actual, expected, strict=True):
         assert_fusion_output_close(result, reference)
@@ -206,7 +204,7 @@ def test_chunk_preparation_preserves_batches_rope_tails_and_scale_updates(
     compiled = torch.compile(
         model,
         fullgraph=True,
-        options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+        options=capture.wrap_options(compile_options(attention=True)),
     )
     with torch.inference_mode():
         for iteration in range(2):
@@ -288,7 +286,7 @@ def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatc
         compiled = torch.compile(
             model,
             fullgraph=True,
-            options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+            options=capture.wrap_options(compile_options(attention=True)),
         )
         for _ in range(3):
             actual = compiled(hidden, **force_tiles)
