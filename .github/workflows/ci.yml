@@ -48,6 +48,28 @@ jobs:
       - name: Type check
         run: uv run pyright
 
+      # Triton caches compiled GPU binaries (cubin/hsaco/ptx/amdgcn) and ptxas
+      # spill sidecars, which are independent of the runner's host CPU ISA.
+      # Only main pushes save new snapshots so PR commits reuse main's warm cache
+      # without churning the repository's 10 GiB cache quota.
+      - name: Cache compiled Triton kernels (main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TRITON_CACHE_DIR }}
+          key: triton-v1-${{ runner.os }}-${{ runner.arch }}-py314-${{ hashFiles('uv.lock') }}-${{ hashFiles('src/**/*.py', 'tests/**/*.py', 'pyproject.toml') }}
+          restore-keys: |
+            triton-v1-${{ runner.os }}-${{ runner.arch }}-py314-${{ hashFiles('uv.lock') }}-
+
+      - name: Restore compiled Triton kernels (PR)
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TRITON_CACHE_DIR }}
+          key: triton-v1-${{ runner.os }}-${{ runner.arch }}-py314-${{ hashFiles('uv.lock') }}-${{ hashFiles('src/**/*.py', 'tests/**/*.py', 'pyproject.toml') }}
+          restore-keys: |
+            triton-v1-${{ runner.os }}-${{ runner.arch }}-py314-${{ hashFiles('uv.lock') }}-
+
       # Hosted runners vary between AVX2, AVX-512, and AMX CPUs. Inductor generates
       # C++ kernels for the runner's vector ISA but omits the ISA from its cache keys,
       # so kernels generated on one ISA compute wrong results when reused on another.
@@ -57,18 +79,15 @@ jobs:
           uv run python -c "from torch._inductor.cpu_vec_isa import pick_vec_isa;
           print('isa=' + str(pick_vec_isa()).replace(' ', '-'))" >> "$GITHUB_OUTPUT"
 
-      - name: Cache compiled kernels
+      - name: Cache compiled Inductor kernels
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ${{ env.TRITON_CACHE_DIR }}
-            ${{ env.TORCHINDUCTOR_CACHE_DIR }}
-          # Each source revision can save new entries. The compilers' own cache
-          # keys invalidate changed kernels when restoring an earlier snapshot of
-          # the same vector ISA.
-          key: compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler-target.outputs.isa }}-py314-${{ hashFiles('uv.lock') }}-${{ hashFiles('src/**/*.py', 'tests/**/*.py', 'benchmarks/**/*.py', 'pyproject.toml') }}
+          path: ${{ env.TORCHINDUCTOR_CACHE_DIR }}
+          # Each source revision can save new entries; Inductor's own cache keys
+          # invalidate changed graphs when restoring an earlier same-ISA snapshot.
+          key: inductor-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler-target.outputs.isa }}-py314-${{ hashFiles('uv.lock') }}-${{ hashFiles('src/**/*.py', 'pyproject.toml') }}
           restore-keys: |
-            compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler-target.outputs.isa }}-py314-${{ hashFiles('uv.lock') }}-
+            inductor-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler-target.outputs.isa }}-py314-${{ hashFiles('uv.lock') }}-
 
       - name: Test portable backends
         run: uv run pytest --durations=20

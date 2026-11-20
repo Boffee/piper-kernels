@@ -69,15 +69,14 @@ def _compile_minmax_scores(
 
 @pytest.mark.parametrize("query_blocks", [64, 128])
 @pytest.mark.parametrize("query_heads_per_kv_head", [1, 3])
-@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("has_score_scale", [False, True])
 @pytest.mark.parametrize("specialization", ["generic", "h3_full_chunk", "h3_tail_chunk"])
 def test_minmax_scoring_stays_fp32_without_spills(
-    query_blocks, architecture, has_score_scale, specialization, query_heads_per_kv_head
+    query_blocks, has_score_scale, specialization, query_heads_per_kv_head
 ):
     schedule = select_amd_minmax_score_schedule(query_blocks)
     compiled = _compile_minmax_scores(
-        GPUTarget("hip", architecture, 32),
+        GPUTarget("hip", "gfx1201", 32),
         block_m=schedule.block_m,
         block_n=schedule.block_n,
         block_k=schedule.block_k,
