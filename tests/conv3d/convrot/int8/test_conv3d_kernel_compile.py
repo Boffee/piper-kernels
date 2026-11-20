@@ -22,10 +22,6 @@ from piper_kernels.conv3d.convrot.int8 import triton as kernels
         GPUTarget("cuda", 120, 32),
         GPUTarget("cuda", 89, 32),
         pytest.param(
-            GPUTarget("hip", "gfx1200", 32),
-            marks=pytest.mark.skipif(sys.platform != "linux", reason="ROCm requires Linux"),
-        ),
-        pytest.param(
             GPUTarget("hip", "gfx1201", 32),
             marks=pytest.mark.skipif(sys.platform != "linux", reason="ROCm requires Linux"),
         ),
@@ -112,13 +108,10 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm requires Linux")
-@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("channels", [64, 256, 4096])
 @pytest.mark.parametrize("dtype", ["fp16", "fp32"])
 @pytest.mark.parametrize("fused", [False, True])
-def test_amd_preparation_compiles_without_intermediate_rounding(
-    architecture, channels, dtype, fused
-):
+def test_amd_preparation_compiles_without_intermediate_rounding(channels, dtype, fused):
     schedule = _policy._amd_preparation_schedule(channels)
     signature = {
         "input_ptr": f"*{dtype}",
@@ -155,7 +148,7 @@ def test_amd_preparation_compiles_without_intermediate_rounding(
         constexprs=constants,
     )
     compiled = triton.compile(
-        source, target=GPUTarget("hip", architecture, 32), options={"num_warps": schedule.num_warps}
+        source, target=GPUTarget("hip", "gfx1201", 32), options={"num_warps": schedule.num_warps}
     )
     assert compiled.asm["hsaco"]
     assert "arith.truncf" not in compiled.asm["ttir"]

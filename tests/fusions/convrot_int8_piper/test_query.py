@@ -301,15 +301,16 @@ def test_projection_selector_uses_validated_targets(monkeypatch, target, support
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="offline ROCm compilation requires Linux")
-@pytest.mark.parametrize("arch", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("affine", [False, True])
-def test_production_query_launches_compile_for_rdna4(monkeypatch, arch, head_dim, affine):
+def test_production_query_launches_compile_for_rdna4(monkeypatch, head_dim, affine):
     function = _kernels._project_query_kernel
     kernel = MagicMock()
     monkeypatch.setattr(_kernels, "_project_query_kernel", kernel)
     monkeypatch.setattr(projection, "device_context", lambda _: nullcontext())
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda _: AcceleratorTarget("hip", arch))
+    monkeypatch.setattr(
+        AcceleratorTarget, "from_device", lambda _: AcceleratorTarget("hip", "gfx1201")
+    )
     operands = _operands("meta", sequence=193, head_dim=head_dim, affine=affine)
     bias = torch.empty(3 * head_dim, device="meta", dtype=torch.bfloat16) if affine else None
     query._launch_query_projection(
@@ -319,7 +320,7 @@ def test_production_query_launches_compile_for_rdna4(monkeypatch, arch, head_dim
     assert len(calls) == 2
     assert [call.args[0] for call in kernel.__getitem__.call_args_list] == [(3, 3, 2), (1, 3, 2)]
     for call in calls:
-        compiled = _compile_rdna4_launch(function, call, arch)
+        compiled = _compile_rdna4_launch(function, call, "gfx1201")
         assert "v_wmma_i32_16x16x16_iu8" in compiled.asm["amdgcn"]
         assert compiled.metadata.shared <= 65536
         assert "arith.truncf" not in compiled.asm["ttgir"]

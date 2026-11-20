@@ -131,10 +131,13 @@ non-increasing ratchets on surface area and private imports in `tests/` and
 `benchmarks/`.
 
 Include `[["tt.divisibility", 16]]` on pointer `attrs` in offline `GluonASTSource`
-compile tests to match contiguous PyTorch tensors. Gate broad compile sweeps on a small
-canary subset parallelized across CPU workers, and avoid multiplying identical-ISA
-targets (such as `gfx1200` and `gfx1201`) across every option flag when one covers
-variant codegen.
+compile tests to match contiguous PyTorch tensors. Never disable compiler caches
+(`always_compile = True` or throwaway cache directories) in permanent tests; cache
+derived compiler metrics alongside `TRITON_CACHE_DIR` keyed by the compiled kernel hash
+instead. Gate broad compile sweeps on a small canary subset parallelized across CPU
+workers, and keep offline compile matrices to minimal distinct codegen paths rather than
+Cartesian target/flag products (avoiding multiplying identical-ISA targets such as
+`gfx1200` and `gfx1201` across every option flag when one covers variant codegen).
 ## Commits and pull requests
 
 Use standard Git commits (imperative subject `<= 72` chars without `feat:` prefixes,

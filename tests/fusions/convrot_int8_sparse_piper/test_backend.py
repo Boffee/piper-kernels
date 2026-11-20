@@ -798,7 +798,6 @@ def _compile_projection_call(function, call, target, *, operation, affine=True):
     [
         GPUTarget("cuda", 120, 32),
         GPUTarget("cuda", 89, 32),
-        GPUTarget("hip", "gfx1200", 32),
         GPUTarget("hip", "gfx1201", 32),
     ],
 )
@@ -839,11 +838,8 @@ def test_production_launches_compile_with_expected_storage_precision(
         assert all("f32" in line and "bf16" in line for line in truncations)
 
 
-@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_amd_aligned_value_projection_compiles_without_vgpr_spills(
-    monkeypatch, architecture, head_dim
-):
+def test_amd_aligned_value_projection_compiles_without_vgpr_spills(monkeypatch, head_dim):
     if sys.platform != "linux":
         pytest.skip("ROCm support is Linux-only")
     monkeypatch.setattr(amd.policy, "supports_gluon", lambda *args, **kwargs: False)
@@ -852,12 +848,12 @@ def test_amd_aligned_value_projection_compiles_without_vgpr_spills(
         "value",
         amd,
         head_dim,
-        target=AcceleratorTarget("hip", architecture),
+        target=AcceleratorTarget("hip", "gfx1201"),
         sequence=256,
         heads=4,
         input_features=256,
     )
-    target = GPUTarget("hip", architecture, 32)
+    target = GPUTarget("hip", "gfx1201", 32)
     calls = kernel.__getitem__.return_value.call_args_list
     assert len(calls) == 1
     assert calls[0].kwargs["aligned_projection"] is True
@@ -1062,15 +1058,14 @@ _AMD_V_COMPILE_VARIANTS = [
 ]
 
 
-@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_amd_gluon_kernels_compile_offline_across_rdna4_targets(architecture, operation, head_dim):
+def test_amd_gluon_kernels_compile_offline_for_rdna4(operation, head_dim):
     if sys.platform != "linux":
         pytest.skip("ROCm support is Linux-only")
     rotary_dim = 0 if operation == "value" else (48 if head_dim == 64 else 96)
     _compile_amd_gluon_kernel(
-        architecture,
+        "gfx1201",
         operation,
         head_dim=head_dim,
         rotary_dim=rotary_dim,

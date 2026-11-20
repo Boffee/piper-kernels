@@ -29,6 +29,9 @@ _TEST_AST_ALLOWLIST = frozenset(
     }
 )
 
+# Only the ptxas spill-sidecar helper may force a single recovery compile on sidecar miss.
+_TRITON_ALWAYS_COMPILE_ALLOWLIST = frozenset({"tests/_nvidia_resources.py"})
+
 # Legacy private piper_kernels imports in benchmarks/ (lower/delete on cleanup).
 _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
     "benchmarks/benchmark_attention.py": 2,
@@ -123,6 +126,20 @@ def _imports_ast(path: Path) -> bool:
     return False
 
 
+def _uses_always_compile(path: Path) -> bool:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "always_compile":
+            return True
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in {"always_compile", "TRITON_ALWAYS_COMPILE"}
+        ):
+            return True
+    return False
+
+
 def _count_src_metrics() -> tuple[int, int, int]:
     custom_ops = 0
     compiler_passes = 0
@@ -193,6 +210,22 @@ def test_no_new_ast_source_inspection_tests() -> None:
     stale = sorted(_TEST_AST_ALLOWLIST - actual)
     assert not stale, (
         f"Remove cleaned-up files from _TEST_AST_ALLOWLIST in tests/test_architecture.py: {stale}"
+    )
+
+
+def test_no_always_compile_in_tests() -> None:
+    """Prevent tests from bypassing Triton's persistent compiler cache."""
+    actual = {
+        path.relative_to(_REPO_ROOT).as_posix()
+        for path in _iter_python_files(_TESTS_ROOT)
+        if path.relative_to(_REPO_ROOT).as_posix() != "tests/test_architecture.py"
+        and _uses_always_compile(path)
+    }
+
+    unexpected = sorted(actual - _TRITON_ALWAYS_COMPILE_ALLOWLIST)
+    assert not unexpected, (
+        "Do not disable Triton's compiler cache with always_compile or TRITON_ALWAYS_COMPILE "
+        f"in tests (see docs/development.md#writing-tests): {unexpected}"
     )
 
 
