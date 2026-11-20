@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import pytest
 import torch
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
@@ -756,3 +758,272 @@ assert hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear") == register_conv
         check=True,
         timeout=180,
     )
+
+
+def _add_int8_linear_node(
+    graph: torch.fx.Graph,
+    name: str,
+    src: torch.fx.Node,
+    rows: int,
+    in_features: int,
+    out_features: int,
+    device: str,
+) -> torch.fx.Node:
+    weight = graph.placeholder(f"{name}_w")
+    weight.meta["val"] = torch.empty(out_features, in_features, dtype=torch.int8, device=device)
+    scale = graph.placeholder(f"{name}_s")
+    scale.meta["val"] = torch.empty(out_features, 1, dtype=torch.float32, device=device)
+    node = graph.call_function(
+        torch.ops.piper_kernels.convrot_int8_linear.default,
+        kwargs={
+            "input": src,
+            "weight_qdata": weight,
+            "weight_scale": scale,
+            "bias": None,
+            "group_size": 16,
+        },
+    )
+    node.meta["val"] = torch.empty(rows, out_features, dtype=torch.bfloat16, device=device)
+    return node
+
+
+def _add_nvfp4_meta_linear_node(
+    graph: torch.fx.Graph,
+    name: str,
+    src: torch.fx.Node,
+    rows: int,
+    features: int,
+) -> torch.fx.Node:
+    weight = graph.placeholder(f"{name}_q")
+    weight.meta["val"] = torch.empty(features, features // 2, dtype=torch.uint8, device="meta")
+    scale = graph.placeholder(f"{name}_s")
+    # Swizzled NVFP4 scale layout for 128x128 is (32, 32).
+    scale.meta["val"] = torch.empty(32, 32, dtype=torch.float8_e4m3fn, device="meta")
+    node = graph.call_function(
+        torch.ops.piper_kernels.nvfp4_linear.default,
+        kwargs={
+            "input": src,
+            "weight_qdata": weight,
+            "weight_scale": scale,
+            "weight_per_tensor_scale": None,
+            "activation_per_tensor_scale": None,
+            "bias": None,
+            "dynamic_activation_scale": True,
+            "high_first": False,
+        },
+    )
+    node.meta["val"] = torch.empty(rows, features, dtype=torch.bfloat16, device="meta")
+    return node
+
+
+def _fx_call(
+    graph: torch.fx.Graph,
+    target: torch._ops.OpOverload,
+    shape: tuple[int, ...],
+    val_dtype: torch.dtype,
+    device: str,
+    /,
+    **kwargs: object,
+) -> torch.fx.Node:
+    node = graph.call_function(target, kwargs=kwargs)  # type: ignore[arg-type]
+    node.meta["val"] = torch.empty(shape, dtype=val_dtype, device=device)
+    return node
+
+
+@pytest.mark.parametrize(
+    ("case", "alpha", "should_fold"),
+    [
+        ("gelu_tanh", 1, True),
+        ("gelu_tanh", 1.0, True),
+        ("gelu_tanh", 2, False),
+        ("swiglu_decomposed", 1, True),
+        ("swiglu_decomposed", 1.0, True),
+        ("swiglu_decomposed", 2, False),
+    ],
+)
+def test_schema_bound_activation_matching_accepts_kwargs_and_checks_alpha(
+    case: str,
+    alpha: int | float,
+    should_fold: bool,
+) -> None:
+    """Keyword activation operands and explicit alpha=1 must match; alpha!=1 must not."""
+    aten = torch.ops.aten
+    prims = torch.ops.prims
+    rows, features = 16, 128
+    shape = (rows, features)
+    with FakeTensorMode():
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.empty(shape, dtype=torch.bfloat16, device="meta")
+        if case == "gelu_tanh":
+            up = _add_nvfp4_meta_linear_node(graph, "up", x, rows, features)
+            up_fp32 = _fx_call(
+                graph,
+                prims.convert_element_type.default,
+                shape,
+                torch.float32,
+                "meta",
+                a=up,
+                dtype=torch.float32,
+            )
+            half = _fx_call(
+                graph, aten.mul.Tensor, shape, torch.float32, "meta", self=up_fp32, other=0.5
+            )
+            sq = _fx_call(
+                graph, aten.mul.Tensor, shape, torch.float32, "meta", self=up_fp32, other=up_fp32
+            )
+            cube = _fx_call(
+                graph, aten.mul.Tensor, shape, torch.float32, "meta", self=sq, other=up_fp32
+            )
+            cubic = _fx_call(
+                graph, aten.mul.Tensor, shape, torch.float32, "meta", self=cube, other=0.044715
+            )
+            inner = _fx_call(
+                graph,
+                aten.add.Tensor,
+                shape,
+                torch.float32,
+                "meta",
+                self=up_fp32,
+                other=cubic,
+                alpha=1,
+            )
+            scaled = _fx_call(
+                graph,
+                aten.mul.Tensor,
+                shape,
+                torch.float32,
+                "meta",
+                self=inner,
+                other=math.sqrt(2.0 / math.pi),
+            )
+            tanh_node = _fx_call(
+                graph, aten.tanh.default, shape, torch.float32, "meta", self=scaled
+            )
+            shifted = _fx_call(
+                graph,
+                aten.add.Tensor,
+                shape,
+                torch.float32,
+                "meta",
+                self=tanh_node,
+                other=1.0,
+                alpha=alpha,
+            )
+            prod = _fx_call(
+                graph, aten.mul.Tensor, shape, torch.float32, "meta", self=half, other=shifted
+            )
+            activated = _fx_call(
+                graph,
+                prims.convert_element_type.default,
+                shape,
+                torch.bfloat16,
+                "meta",
+                a=prod,
+                dtype=torch.bfloat16,
+            )
+        else:
+            val = _add_nvfp4_meta_linear_node(graph, "val", x, rows, features)
+            gate = _add_nvfp4_meta_linear_node(graph, "gate", x, rows, features)
+            neg = _fx_call(graph, aten.neg.default, shape, torch.bfloat16, "meta", self=gate)
+            exp = _fx_call(graph, aten.exp.default, shape, torch.bfloat16, "meta", self=neg)
+            denom = _fx_call(
+                graph,
+                aten.add.Tensor,
+                shape,
+                torch.bfloat16,
+                "meta",
+                self=exp,
+                other=1.0,
+                alpha=alpha,
+            )
+            silu = _fx_call(
+                graph, aten.div.Tensor, shape, torch.bfloat16, "meta", self=gate, other=denom
+            )
+            activated = _fx_call(
+                graph, aten.mul.Tensor, shape, torch.bfloat16, "meta", self=val, other=silu
+            )
+
+        down = _add_nvfp4_meta_linear_node(graph, "down", activated, rows, features)
+        graph.output(down)
+        ffn_compile_pass(graph, is_inference=True)
+        targets = [node.target for node in graph.nodes if node.op == "call_function"]
+
+    ffn_op = getattr(torch.ops.piper_kernels, "nvfp4_ffn", None)
+    folded = ffn_op is not None and ffn_op.default in targets
+    assert folded is should_fold
+    assert (torch.ops.piper_kernels.nvfp4_linear.default in targets) is not should_fold
+
+
+@pytest.mark.gpu
+@_GPU
+@pytest.mark.parametrize(
+    ("hidden_alpha", "output_alpha", "should_fold_update"),
+    [
+        (1, 1.0, True),
+        (2, 1, False),
+        (1, 2, False),
+    ],
+)
+def test_schema_bound_gated_updates_accept_kwargs_and_check_alpha(
+    hidden_alpha: int | float,
+    output_alpha: int | float,
+    should_fold_update: bool,
+) -> None:
+    """Keyword gated-update adds with alpha=1 must fold; alpha!=1 must reject update fusion."""
+    aten = torch.ops.aten
+    rows, width, hidden = 16, 64, 128
+    with FakeTensorMode():
+        graph = torch.fx.Graph()
+        base = graph.placeholder("base")
+        base.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+        src = graph.placeholder("src")
+        src.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+        update_gate = graph.placeholder("update_gate")
+        update_gate.meta["val"] = torch.empty(4, width, dtype=torch.bfloat16, device="cuda")
+        ffn_gate = graph.placeholder("ffn_gate")
+        ffn_gate.meta["val"] = torch.empty(4, width, dtype=torch.bfloat16, device="cuda")
+        indices = graph.placeholder("indices")
+        indices.meta["val"] = torch.empty(rows, dtype=torch.int64, device="cuda")
+
+        reusable = graph.call_function(aten.relu.default, (src,))
+        reusable.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+        sel_update = graph.call_function(aten.index_select.default, (update_gate, 0, indices))
+        sel_update.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+        gated_update = graph.call_function(
+            aten.mul.Tensor, kwargs={"self": sel_update, "other": reusable}
+        )
+        gated_update.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+        hidden_node = graph.call_function(
+            aten.add.Tensor,
+            kwargs={"self": base, "other": gated_update, "alpha": hidden_alpha},
+        )
+        hidden_node.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+
+        ffn_in = graph.call_function(aten.relu.default, (hidden_node,))
+        ffn_in.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+        val = _add_int8_linear_node(graph, "val", ffn_in, rows, width, hidden, "cuda")
+        gate = _add_int8_linear_node(graph, "gate", ffn_in, rows, width, hidden, "cuda")
+        silu = graph.call_function(aten.silu.default, kwargs={"self": gate})
+        silu.meta["val"] = torch.empty(rows, hidden, dtype=torch.bfloat16, device="cuda")
+        activated = graph.call_function(aten.mul.Tensor, kwargs={"self": val, "other": silu})
+        activated.meta["val"] = torch.empty(rows, hidden, dtype=torch.bfloat16, device="cuda")
+        down = _add_int8_linear_node(graph, "down", activated, rows, hidden, width, "cuda")
+
+        sel_ffn = graph.call_function(aten.index_select.default, (ffn_gate, 0, indices))
+        sel_ffn.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+        gated_ffn = graph.call_function(aten.mul.Tensor, kwargs={"self": sel_ffn, "other": down})
+        gated_ffn.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+        output = graph.call_function(
+            aten.add.Tensor,
+            kwargs={"self": hidden_node, "other": gated_ffn, "alpha": output_alpha},
+        )
+        output.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+        graph.output(output)
+        ffn_compile_pass(graph, is_inference=True)
+        targets = [node.target for node in graph.nodes if node.op == "call_function"]
+
+    assert (
+        torch.ops.piper_kernels.convrot_int8_ffn_update_.default in targets
+    ) is should_fold_update
+    assert (torch.ops.piper_kernels.convrot_int8_ffn.default in targets) is not should_fold_update

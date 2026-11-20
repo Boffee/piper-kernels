@@ -92,11 +92,27 @@ def _schema_name(node: torch.fx.Node) -> str | None:
 def _bind_arguments(node: torch.fx.Node) -> dict[str, Argument]:
     """Bind positional, keyword, and defaulted arguments by operator schema name."""
     schema = cast(torch._ops.OpOverload, node.target)._schema
+    positional = [arg for arg in schema.arguments if not arg.kwarg_only]
     values: dict[str, Argument] = {arg.name: arg.default_value for arg in schema.arguments}
-    for arg, value in zip(schema.arguments, node.args, strict=False):
+    for arg, value in zip(positional, node.args, strict=False):
         values[arg.name] = value
     values.update(node.kwargs)
     return values
+
+
+def _bind_call(node: object, target: torch._ops.OpOverload) -> dict[str, Argument] | None:
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.op != "call_function"
+        or node.target is not target
+    ):
+        return None
+    schema = target._schema
+    positional = [arg for arg in schema.arguments if not arg.kwarg_only]
+    valid_names = {arg.name for arg in schema.arguments}
+    if len(node.args) > len(positional) or not set(node.kwargs).issubset(valid_names):
+        return None
+    return _bind_arguments(node)
 
 
 def _parse_projection(node: object) -> _BoundProjection | None:
@@ -134,35 +150,32 @@ def _is_scalar(value: object, expected: float) -> bool:
 
 
 def _binary_args(node: object, target: torch._ops.OpOverload) -> tuple[Argument, Argument] | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target is not target
-        or node.kwargs
-        or len(node.args) != 2
-    ):
+    bound = _bind_call(node, target)
+    if bound is None:
         return None
-    return node.args[0], node.args[1]
+    if target is _aten.add.Tensor and not _is_scalar(bound.get("alpha"), 1.0):
+        return None
+    left = bound.get("self")
+    right = bound.get("other")
+    if left is None or right is None:
+        return None
+    return left, right
 
 
 def _unary_arg(node: object, target: torch._ops.OpOverload) -> torch.fx.Node | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target is not target
-        or node.kwargs
-        or len(node.args) != 1
-        or not isinstance(node.args[0], torch.fx.Node)
-    ):
+    bound = _bind_call(node, target)
+    if bound is None:
         return None
-    return node.args[0]
+    source = bound.get("self")
+    return source if isinstance(source, torch.fx.Node) else None
 
 
 def _convert_dtype(node: object) -> tuple[torch.fx.Node, torch.dtype] | None:
-    args = _binary_args(node, _prims.convert_element_type.default)
-    if args is None:
+    bound = _bind_call(node, _prims.convert_element_type.default)
+    if bound is None:
         return None
-    source, dtype = args
+    source = bound.get("a")
+    dtype = bound.get("dtype")
     if not isinstance(source, torch.fx.Node) or not isinstance(dtype, torch.dtype):
         return None
     return source, dtype
