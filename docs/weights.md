@@ -228,9 +228,10 @@ compiled_layer = torch.compile(linear_layer, options=convrot_int8_compile_option
   `convrot_nvfp4_compile_options` (`piper_kernels.linear.convrot.nvfp4`) share input
   preparation across compatible linears (INT8 also fuses exclusive `tanh`-GELU inputs)
   while preserving static/dynamic scales.
-- **FFNs**: `{convrot_int8,nvfp4,convrot_nvfp4}_{swiglu,gelu}_ffn_compile_options`
-  under `piper_kernels.fusions` fuse FP16/BF16 SwiGLU and exclusive `tanh`-GELU
-  FFNs while preserving scales. When updating a residual stream, see
+- **FFNs**: `ffn_compile_options` (`piper_kernels.fusions.ffn`) fuses FP16/BF16
+  ConvRot INT8, NVFP4, and ConvRot NVFP4 SwiGLU and exclusive `tanh`-GELU FFNs
+  while preserving scales (compose with the corresponding linear compile options
+  to normalize unfused linears). When updating a residual stream, see
   [in-place residual updates](attention.md#update-a-residual-stream-in-place).
 - **Attention**: see [attention](attention.md#compile-and-fuse-projections).
 

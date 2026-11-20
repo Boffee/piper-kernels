@@ -16,6 +16,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- **Breaking:** Consolidated all format- and activation-specific FFN fusion packages
+  under `piper_kernels.fusions` into `piper_kernels.fusions.ffn` with a single
+  `ffn_compile_options()` helper covering ConvRot INT8, NVFP4, and ConvRot NVFP4
+  SwiGLU and `tanh`-GELU FFNs (including indexed gated updates and in-place residual
+  adds), removing the legacy `{convrot_int8,nvfp4,convrot_nvfp4}_{gelu,swiglu}_ffn`
+  subpackages.
 - **Breaking:** `nvfp4_sparse_piper_compile_options` now folds both plain NVFP4 and
   ConvRot NVFP4 sparse-Piper attention blocks, and the separate
   `piper_kernels.fusions.convrot_nvfp4_sparse_piper` package has been removed.

@@ -7,24 +7,27 @@ from torch._dynamo.utils import ReinplaceCounters
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import piper_attention
-from piper_kernels.fusions.convrot_int8_gelu_ffn import convrot_int8_gelu_ffn_compile_options
-from piper_kernels.fusions.convrot_int8_gelu_ffn import triton as gelu_ffn
 from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
 )
-from piper_kernels.fusions.convrot_int8_swiglu_ffn import convrot_int8_swiglu_ffn_compile_options
-from piper_kernels.fusions.convrot_int8_swiglu_ffn import triton as swiglu_ffn
+from piper_kernels.fusions.ffn import (
+    _convrot_int8 as int8_ffn,
+)
+from piper_kernels.fusions.ffn import ffn_compile_options
 from piper_kernels.fusions.residual_updates import _compile as residual_compile
 from piper_kernels.fusions.residual_updates import residual_updates_compile_options
 from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8 import _ops
 
-from ..convrot_int8_gelu_ffn.test_compile import _gated_update_arguments, _GatedUpdates
 from ..convrot_int8_piper.test_compile import _available
 from ..convrot_int8_sparse_piper._helpers import output_available as _sparse_output_available
 from ..convrot_int8_sparse_piper.test_compile import _SparseProjectionAttentionOutput
-from ..convrot_int8_swiglu_ffn._helpers import SwiGluFfn
+from ..ffn._helpers import (
+    Int8GatedUpdates,
+    Int8SwiGluFfn,
+    make_int8_gated_update_arguments,
+)
 
 _kernels = torch.ops.piper_kernels
 _ATTENTION_OUTPUT = _kernels.convrot_int8_piper_projected_query_attention_output.default
@@ -37,13 +40,12 @@ _SPARSE_ATTENTION_OUTPUT = (
 _SPARSE_ATTENTION_RESIDUAL_ADD = (
     _kernels.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default
 )
-_FFN_UPDATES = swiglu_ffn._chunked_swiglu_ffn_gated_updates_op._opoverload
-_FFN_RESIDUAL_ADD = swiglu_ffn._chunked_swiglu_ffn_residual_add_op._opoverload
-_GELU_FFN_RESIDUAL_ADD = gelu_ffn._chunked_gelu_ffn_residual_add_op._opoverload
+_FFN = int8_ffn.convrot_int8_ffn_op._opoverload
+_FFN_UPDATE = int8_ffn.convrot_int8_ffn_update_op._opoverload
 _RESIDUAL_ADD = _kernels.residual_add_.default
 
 
-class _Ffn(SwiGluFfn):
+class _Ffn(Int8SwiGluFfn):
     output_features = 256
 
 
@@ -176,12 +178,10 @@ class _SparseResidualBlock(torch.nn.Module):
 
 def _options(capture, *, fuse_output=True, residual_updates_first=False):
     if residual_updates_first:
-        options = convrot_int8_swiglu_ffn_compile_options(residual_updates_compile_options())
+        options = ffn_compile_options(residual_updates_compile_options())
         options = convrot_int8_piper_compile_options(options, fuse_output=fuse_output)
     else:
-        options = convrot_int8_piper_compile_options(
-            convrot_int8_swiglu_ffn_compile_options(), fuse_output=fuse_output
-        )
+        options = convrot_int8_piper_compile_options(ffn_compile_options(), fuse_output=fuse_output)
         options = residual_updates_compile_options(options)
     return capture.wrap_options(options)
 
@@ -232,9 +232,9 @@ def test_copy_back_block_updates_its_input_in_place(residual_updates_first):
 
     # Dense attention adds in two head slices; see convrot_int8_piper/test_head_slices.py.
     assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
-    assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_FFN_UPDATE) == 1
     assert _ATTENTION_OUTPUT not in capture.targets
-    assert _FFN_UPDATES not in capture.targets
+    assert _FFN not in capture.targets
     assert _RESIDUAL_ADD not in capture.targets
 
 
@@ -243,7 +243,7 @@ def test_copy_back_block_updates_its_input_in_place(residual_updates_first):
 def test_sparse_attention_output_is_computed_inside_its_residual_add():
     model = _SparseResidualBlock()
     capture = FunctionalTargetCapturePass()
-    options = convrot_int8_sparse_piper_compile_options(convrot_int8_swiglu_ffn_compile_options())
+    options = convrot_int8_sparse_piper_compile_options(ffn_compile_options())
     hidden = torch.randn(1, model.sequence_length, model.width, device="cuda", dtype=torch.bfloat16)
     gate_indices = torch.randint(0, 3, (model.sequence_length,), device="cuda")
     torch._dynamo.reset()
@@ -273,7 +273,7 @@ def test_sparse_attention_output_is_computed_inside_its_residual_add():
     # Half the output projection's input is not a whole ConvRot group, so the add runs
     # as one slice; see convrot_int8_sparse_piper/test_head_slices.py.
     assert capture.targets.count(_SPARSE_ATTENTION_RESIDUAL_ADD) == 1
-    assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_FFN_UPDATE) == 1
     assert _SPARSE_ATTENTION_OUTPUT not in capture.targets
     assert _RESIDUAL_ADD not in capture.targets
 
@@ -288,9 +288,9 @@ def test_unfused_attention_output_stays_materialized_before_its_add():
     _assert_updates_input_in_place(model, compiled)
 
     assert capture.targets.count(_RESIDUAL_ADD) == 1
-    assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_FFN_UPDATE) == 1
     assert _ATTENTION_RESIDUAL_ADD not in capture.targets
-    assert _FFN_UPDATES not in capture.targets
+    assert _FFN not in capture.targets
 
 
 @pytest.mark.gpu
@@ -304,7 +304,7 @@ def test_every_gated_update_on_the_path_to_the_copy_adds_in_place():
 
     assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
     assert capture.targets.count(_RESIDUAL_ADD) == 1
-    assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_FFN_UPDATE) == 1
 
 
 def _compiled_without_rewrite(model, *arguments):
@@ -319,9 +319,9 @@ def _compiled_without_rewrite(model, *arguments):
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 def test_ffn_output_read_elsewhere_stays_materialized_before_its_add():
-    model = _GatedUpdates(expose_ffn=True)
+    model = Int8GatedUpdates(activation="gelu_tanh", expose="ffn")
     capture = FunctionalTargetCapturePass()
-    options = residual_updates_compile_options(convrot_int8_gelu_ffn_compile_options())
+    options = residual_updates_compile_options(ffn_compile_options())
 
     def copy_back(base, *operands):
         output, ffn = model(base, *operands)
@@ -331,7 +331,7 @@ def test_ffn_output_read_elsewhere_stays_materialized_before_its_add():
     compiled = torch.compile(
         copy_back, fullgraph=True, dynamic=True, options=capture.wrap_options(options)
     )
-    arguments = _gated_update_arguments(129)
+    arguments = make_int8_gated_update_arguments(model, 129)
     base = arguments[0]
     expected, expected_ffn = _compiled_without_rewrite(model, base.clone(), *arguments[1:])
     with torch.no_grad():
@@ -341,7 +341,8 @@ def test_ffn_output_read_elsewhere_stays_materialized_before_its_add():
     assert _relative_l2(base, expected) < 0.01
     assert _relative_l2(ffn, expected_ffn) < 0.01
     assert capture.targets.count(_RESIDUAL_ADD) == 2
-    assert _GELU_FFN_RESIDUAL_ADD not in capture.targets
+    assert _FFN_UPDATE not in capture.targets
+    assert capture.targets.count(_FFN) == 1
 
 
 @pytest.mark.gpu
@@ -364,7 +365,7 @@ def test_input_read_after_an_update_is_copied_instead_of_overwritten():
     # Inductor copies the input before the attention add, then adds into that copy.
     assert ReinplaceCounters.get_total_missed() == 1
     assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
-    assert capture.targets.count(_FFN_RESIDUAL_ADD) == 1
+    assert capture.targets.count(_FFN_UPDATE) == 1
 
 
 @pytest.mark.gpu
@@ -382,7 +383,7 @@ def test_block_without_copy_back_keeps_its_input():
     torch.testing.assert_close(hidden, original, atol=0, rtol=0)
     assert _ATTENTION_RESIDUAL_ADD not in capture.targets
     assert _ATTENTION_OUTPUT in capture.targets
-    assert _FFN_UPDATES in capture.targets
+    assert _FFN_UPDATE in capture.targets
 
 
 def test_compile_options_run_the_rewrite_first_and_disable_buffer_reuse():
@@ -395,7 +396,7 @@ def test_compile_options_run_the_rewrite_first_and_disable_buffer_reuse():
     assert passes[1:] == options["post_grad_custom_pre_pass"]
     assert combined["allow_buffer_reuse"] is False
     # Fusion helpers applied afterward still run after it, and applying it again keeps one copy.
-    later = residual_updates_compile_options(convrot_int8_swiglu_ffn_compile_options(combined))
+    later = residual_updates_compile_options(ffn_compile_options(combined))
     later_passes = later["post_grad_custom_pre_pass"]
     assert isinstance(later_passes, tuple)
     assert later_passes[0] is residual_compile._compile_pass

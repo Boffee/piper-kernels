@@ -40,18 +40,23 @@ def call_functional(
     target: torch._ops.OpOverload,
     values: Mapping[str, Argument],
 ) -> torch.fx.Node:
-    """Emit ``target``, which mutates only ``base``, as a functional call; return the new value.
+    """Emit ``target``, which mutates one tensor argument, as a functional call.
 
     Arguments are taken by schema name; omitted ones use their defaults. The graph
-    stays functional, so Inductor's reinplacing pass decides whether ``base`` is
-    updated in place or copied first. The new value carries ``base``'s metadata, so
-    passes that run later can match on it.
+    stays functional, so Inductor's reinplacing pass decides whether the mutated
+    operand is updated in place or copied first. The new value carries that operand's
+    metadata, so passes that run later can match on it.
     """
+    mutated = next(
+        argument.name
+        for argument in target._schema.arguments
+        if argument.alias_info is not None and argument.alias_info.is_write
+    )
     call = graph.call_function(_AUTO_FUNCTIONALIZED, (target,), dict(values))
-    # The call returns the operator's result (None) followed by the new ``base``.
+    # The call returns the operator's result (None) followed by the mutated tensor.
     result = graph.call_function(operator.getitem, (call, 1))
-    base = values["base"]
-    value = base.meta.get("val") if isinstance(base, torch.fx.Node) else None
+    mutated_node = values[mutated]
+    value = mutated_node.meta.get("val") if isinstance(mutated_node, torch.fx.Node) else None
     if isinstance(value, torch.Tensor):
         result.meta["val"] = value.clone()
         call.meta["val"] = (None, result.meta["val"])

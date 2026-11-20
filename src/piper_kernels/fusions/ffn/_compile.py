@@ -1,159 +1,1131 @@
-"""Projection-independent compiler rules for indexed FFN updates.
+"""Unified imperative anchor-based FX pass for quantized FFN fusions.
 
-Each FFN fusion registers three operators, and a block's form picks one:
-
-- ``<ffn>`` returns the FFN output, for an FFN its fusion matches without either of
-  the forms below.
-- ``<ffn>_gated_updates_`` serves a block that keeps its input and ends with
-  ``base + update_gate[i] * update + ffn_gate[i] * ffn(...)``: it stores that sum over
-  ``update``'s buffer, so neither sum allocates a new output.
-- ``<ffn>_residual_add_`` adds ``ffn_gate[i] * ffn(...)`` into ``base`` in place. In a
-  block that overwrites its input, the residual-update rewrite has already turned
-  both sums into residual adds, which the two-update pattern no longer matches;
-  :func:`fold_residual_adds` then computes the FFN inside its add.
+Matches semantic ConvRot INT8, NVFP4, and ConvRot NVFP4 GELU-tanh and SwiGLU
+FFNs directly from each ``down`` projection anchor using schema argument binding,
+folding optional indexed gated updates and copy-back residual adds while keeping
+format extras and Triton lazily imported.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Protocol, cast
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Literal, cast
 
 import torch
-from torch._inductor.pattern_matcher import Match
+from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
 from torch.fx.node import Argument
 
+from piper_kernels import _inductor_options as inductor_options
+from piper_kernels import _input_activations as input_activations
 from piper_kernels.fusions.residual_updates import _gates as residual_gates
-from piper_kernels.fusions.residual_updates import _graph as residual_graph
-from piper_kernels.fusions.residual_updates import _ops as residual_ops
+from piper_kernels.linear import _bias
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear import _projection_views as projection_views
 
-type FfnPatternValidator = Callable[[Match], bool]
+_aten = torch.ops.aten
+_prims = torch.ops.prims
+
+_POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
+_CONVROT_INT8_LINEAR = "piper_kernels::convrot_int8_linear"
+_NVFP4_LINEAR = "piper_kernels::nvfp4_linear"
+_CONVROT_NVFP4_LINEAR = "piper_kernels::convrot_nvfp4_linear"
+_CONVROT_INT8_FFN = "piper_kernels::convrot_int8_ffn"
+_NVFP4_FFN = "piper_kernels::nvfp4_ffn"
+_SEMANTIC_LINEAR_NAMES = frozenset(
+    {
+        _CONVROT_INT8_LINEAR,
+        _NVFP4_LINEAR,
+        _CONVROT_NVFP4_LINEAR,
+    }
+)
+_LINEAR_PASS_MODULES = frozenset(
+    {
+        "piper_kernels.linear.convrot.int8._compile",
+        "piper_kernels.linear.nvfp4._compile",
+        "piper_kernels.linear.convrot.nvfp4._compile",
+    }
+)
+
+type _Format = Literal["convrot_int8", "nvfp4"]
 
 
-class UpDownChunkRows(Protocol):
-    """An up/down FFN's chunk-size policy, from its input and weight metadata."""
+@dataclass(frozen=True, slots=True)
+class _BoundProjection:
+    """One semantic linear node parsed via its PyTorch operator schema."""
 
-    def __call__(
-        self,
-        input: torch.Tensor,  # noqa: A002 - match linear terminology
-        up_weight_qdata: torch.Tensor,
-        down_weight_qdata: torch.Tensor,
-        /,
-        *,
-        adds_residual: bool,
-    ) -> int: ...
+    node: torch.fx.Node
+    schema_name: str
+    args: dict[str, Argument]
+
+    @property
+    def format(self) -> _Format:
+        return "convrot_int8" if self.schema_name == _CONVROT_INT8_LINEAR else "nvfp4"
+
+    @property
+    def input_node(self) -> torch.fx.Node:
+        value = self.args["input"]
+        assert isinstance(value, torch.fx.Node)
+        return value
 
 
-def _metadata(match: Match, name: str) -> torch.Tensor | None:
-    argument = match.kwargs[name]
-    return (
-        preparation_sharing.tensor_metadata(argument)
-        if isinstance(argument, torch.fx.Node)
-        else None
-    )
+@dataclass(frozen=True, slots=True)
+class _GatedUpdatesMatch:
+    """Validated two-update indexed residual wrapper around an FFN."""
+
+    output_node: torch.fx.Node
+    base: torch.fx.Node
+    reusable_update: torch.fx.Node
+    update_gate: torch.fx.Node
+    ffn_gate: torch.fx.Node
+    gate_indices: torch.fx.Node
+    python_indexing: bool
+
+
+def _schema_name(node: torch.fx.Node) -> str | None:
+    if node.op != "call_function" or not isinstance(node.target, torch._ops.OpOverload):
+        return None
+    return node.target._schema.name
+
+
+def _bind_arguments(node: torch.fx.Node) -> dict[str, Argument]:
+    """Bind positional, keyword, and defaulted arguments by operator schema name."""
+    schema = cast(torch._ops.OpOverload, node.target)._schema
+    positional = [arg for arg in schema.arguments if not arg.kwarg_only]
+    values: dict[str, Argument] = {arg.name: arg.default_value for arg in schema.arguments}
+    for arg, value in zip(positional, node.args, strict=False):
+        values[arg.name] = value
+    values.update(node.kwargs)
+    return values
+
+
+def _bind_call(node: object, target: torch._ops.OpOverload) -> dict[str, Argument] | None:
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.op != "call_function"
+        or node.target is not target
+    ):
+        return None
+    schema = target._schema
+    positional = [arg for arg in schema.arguments if not arg.kwarg_only]
+    valid_names = {arg.name for arg in schema.arguments}
+    if len(node.args) > len(positional) or not set(node.kwargs).issubset(valid_names):
+        return None
+    return _bind_arguments(node)
+
+
+def _parse_projection(node: object) -> _BoundProjection | None:
+    if not isinstance(node, torch.fx.Node):
+        return None
+    name = _schema_name(node)
+    if name not in _SEMANTIC_LINEAR_NAMES:
+        return None
+    bound = _bind_arguments(node)
+    if not isinstance(bound.get("input"), torch.fx.Node):
+        return None
+    if name == _CONVROT_INT8_LINEAR and bound.get("activation_fn") is not None:
+        return None
+    return _BoundProjection(node=node, schema_name=name, args=bound)
+
+
+def _node_metadata(value: Argument) -> torch.Tensor | None:
+    return preparation_sharing.tensor_metadata(value) if isinstance(value, torch.fx.Node) else None
+
+
+def _dimension_matches(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
+    return preparation_sharing.dimension_key(left) == preparation_sharing.dimension_key(right)
 
 
 def _shape_matches(left: torch.Tensor, right: torch.Tensor) -> bool:
     return left.ndim == right.ndim and all(
-        preparation_sharing.dimension_key(left_dimension)
-        == preparation_sharing.dimension_key(right_dimension)
-        for left_dimension, right_dimension in zip(left.shape, right.shape, strict=True)
+        _dimension_matches(a, b) for a, b in zip(left.shape, right.shape, strict=True)
     )
 
 
-def valid_indexed_gated_updates(
-    match: Match,
-    valid_ffn_pattern: FfnPatternValidator,
+def _is_scalar(value: object, expected: float) -> bool:
+    return (
+        isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) == expected
+    )
+
+
+def _binary_args(node: object, target: torch._ops.OpOverload) -> tuple[Argument, Argument] | None:
+    bound = _bind_call(node, target)
+    if bound is None:
+        return None
+    if target is _aten.add.Tensor and not _is_scalar(bound.get("alpha"), 1.0):
+        return None
+    left = bound.get("self")
+    right = bound.get("other")
+    if left is None or right is None:
+        return None
+    return left, right
+
+
+def _unary_arg(node: object, target: torch._ops.OpOverload) -> torch.fx.Node | None:
+    bound = _bind_call(node, target)
+    if bound is None:
+        return None
+    source = bound.get("self")
+    return source if isinstance(source, torch.fx.Node) else None
+
+
+def _convert_dtype(node: object) -> tuple[torch.fx.Node, torch.dtype] | None:
+    bound = _bind_call(node, _prims.convert_element_type.default)
+    if bound is None:
+        return None
+    source = bound.get("a")
+    dtype = bound.get("dtype")
+    if not isinstance(source, torch.fx.Node) or not isinstance(dtype, torch.dtype):
+        return None
+    return source, dtype
+
+
+def _match_node_and_scalar(
+    node: object, target: torch._ops.OpOverload, scalar: float
+) -> torch.fx.Node | None:
+    args = _binary_args(node, target)
+    if args is None:
+        return None
+    left, right = args
+    if isinstance(left, torch.fx.Node) and _is_scalar(right, scalar):
+        return left
+    if isinstance(right, torch.fx.Node) and _is_scalar(left, scalar):
+        return right
+    return None
+
+
+def _match_gelu_cubic_body(
+    value: torch.fx.Node, shifted: torch.fx.Node
+) -> set[torch.fx.Node] | None:
+    """Match ``1 + tanh(scale * (v + cubic * v^3))`` and return its users of ``value``."""
+    tanh_node = _match_node_and_scalar(shifted, _aten.add.Tensor, 1.0)
+    scaled = (
+        _unary_arg(tanh_node, _aten.tanh.default)
+        if tanh_node is not None and len(tanh_node.users) == 1
+        else None
+    )
+    inner = (
+        _match_node_and_scalar(
+            scaled, _aten.mul.Tensor, input_activations.GELU_TANH_SCALE_COEFFICIENT
+        )
+        if scaled is not None and len(scaled.users) == 1
+        else None
+    )
+    inner_args = (
+        _binary_args(inner, _aten.add.Tensor)
+        if inner is not None and len(inner.users) == 1
+        else None
+    )
+    cubic_term = (
+        None
+        if inner_args is None
+        else inner_args[1]
+        if inner_args[0] is value
+        else inner_args[0]
+        if inner_args[1] is value
+        else None
+    )
+    cube = (
+        _match_node_and_scalar(
+            cubic_term, _aten.mul.Tensor, input_activations.GELU_TANH_CUBIC_COEFFICIENT
+        )
+        if isinstance(cubic_term, torch.fx.Node) and len(cubic_term.users) == 1
+        else None
+    )
+    cube_args = (
+        _binary_args(cube, _aten.mul.Tensor) if cube is not None and len(cube.users) == 1 else None
+    )
+    square = (
+        None
+        if cube_args is None
+        else cube_args[0]
+        if cube_args[1] is value
+        else cube_args[1]
+        if cube_args[0] is value
+        else None
+    )
+    if (
+        inner is None
+        or cube is None
+        or not isinstance(square, torch.fx.Node)
+        or len(square.users) != 1
+        or _binary_args(square, _aten.mul.Tensor) != (value, value)
+    ):
+        return None
+    return {square, cube, inner}
+
+
+def _match_gelu_tanh(
+    activated: torch.fx.Node,
+) -> tuple[_BoundProjection, torch.dtype] | None:
+    """Match PyTorch's promoted FP32 tanh-GELU decomposition feeding a down linear."""
+    downcast = _convert_dtype(activated) if len(activated.users) == 1 else None
+    if downcast is None:
+        return None
+    prod, logical_dtype = downcast
+    prod_args = _binary_args(prod, _aten.mul.Tensor) if len(prod.users) == 1 else None
+    if prod_args is None:
+        return None
+    for half, shifted in (prod_args, prod_args[::-1]):
+        if (
+            not isinstance(half, torch.fx.Node)
+            or not isinstance(shifted, torch.fx.Node)
+            or len(half.users) != 1
+            or len(shifted.users) != 1
+        ):
+            continue
+        value = _match_node_and_scalar(half, _aten.mul.Tensor, 0.5)
+        if value is None:
+            continue
+        body_users = _match_gelu_cubic_body(value, shifted)
+        if body_users is None or set(value.users) != {half, *body_users}:
+            continue
+        upcast = _convert_dtype(value)
+        if upcast is not None and upcast[1] is torch.float32 and len(upcast[0].users) == 1:
+            up_projection = _parse_projection(upcast[0])
+            if up_projection is not None:
+                return up_projection, logical_dtype
+    return None
+
+
+def _match_decomposed_silu(
+    node: torch.fx.Node,
+) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+    """Match ``x / (exp(-x) + 1)`` and return ``(x, neg_node)``."""
+    div_args = _binary_args(node, _aten.div.Tensor)
+    if div_args is None:
+        return None
+    numerator, denominator = div_args
+    if (
+        not isinstance(numerator, torch.fx.Node)
+        or not isinstance(denominator, torch.fx.Node)
+        or len(denominator.users) != 1
+    ):
+        return None
+    exp_node = _match_node_and_scalar(denominator, _aten.add.Tensor, 1.0)
+    neg_node = (
+        _unary_arg(exp_node, _aten.exp.default)
+        if exp_node is not None and len(exp_node.users) == 1
+        else None
+    )
+    if (
+        neg_node is None
+        or len(neg_node.users) != 1
+        or _unary_arg(neg_node, _aten.neg.default) is not numerator
+    ):
+        return None
+    return numerator, neg_node
+
+
+def _match_promoted_silu(
+    div_node: torch.fx.Node,
+    logical_dtype: torch.dtype,
+) -> tuple[_BoundProjection, torch.dtype] | None:
+    decomposed = _match_decomposed_silu(div_node) if len(div_node.users) == 1 else None
+    if decomposed is None:
+        return None
+    gate_fp32, neg_node = decomposed
+    if set(gate_fp32.users) != {div_node, neg_node}:
+        return None
+    upcast = _convert_dtype(gate_fp32)
+    if upcast is None or upcast[1] is not torch.float32 or len(upcast[0].users) != 1:
+        return None
+    projection = _parse_projection(upcast[0])
+    return None if projection is None else (projection, logical_dtype)
+
+
+def _match_silu(
+    silu_node: torch.fx.Node,
+) -> tuple[_BoundProjection, torch.dtype | None] | None:
+    """Match ``aten.silu`` or its decomposed/FP32-promoted form feeding SwiGLU."""
+    if len(silu_node.users) != 1:
+        return None
+    direct_gate = _unary_arg(silu_node, _aten.silu.default)
+    if direct_gate is not None:
+        projection = _parse_projection(direct_gate) if len(direct_gate.users) == 1 else None
+        return None if projection is None else (projection, None)
+
+    downcast = _convert_dtype(silu_node)
+    if downcast is not None:
+        return _match_promoted_silu(*downcast)
+
+    decomposed = _match_decomposed_silu(silu_node)
+    if decomposed is None or set(decomposed[0].users) != {silu_node, decomposed[1]}:
+        return None
+    projection = _parse_projection(decomposed[0])
+    return None if projection is None else (projection, None)
+
+
+def _match_swiglu(
+    activated: torch.fx.Node,
+) -> tuple[_BoundProjection, _BoundProjection, torch.dtype | None] | None:
+    """Match ``value * silu(gate)`` in either operand order."""
+    if len(activated.users) != 1:
+        return None
+    mul_args = _binary_args(activated, _aten.mul.Tensor)
+    if mul_args is None:
+        return None
+    for value_arg, silu_arg in (mul_args, mul_args[::-1]):
+        if not isinstance(value_arg, torch.fx.Node) or not isinstance(silu_arg, torch.fx.Node):
+            continue
+        if len(value_arg.users) != 1:
+            continue
+        value_projection = _parse_projection(value_arg)
+        if value_projection is None:
+            continue
+        matched_silu = _match_silu(silu_arg)
+        if matched_silu is None:
+            continue
+        gate_projection, logical_dtype = matched_silu
+        return value_projection, gate_projection, logical_dtype
+    return None
+
+
+def _valid_convrot_int8_bias(
+    bias: Argument,
+    *,
+    features: int | torch.SymInt,
+    input_value: torch.Tensor,
 ) -> bool:
-    """Validate indexed gated updates and prove their intermediate safe to reuse."""
-    if not valid_ffn_pattern(match):
+    if bias is None:
+        return True
+    value = _node_metadata(bias)
+    return bool(
+        value is not None
+        and value.ndim == 1
+        and _dimension_matches(value.shape[0], features)
+        and _bias.is_supported_dtype(value.dtype)
+        and value.device == input_value.device
+        and value.layout is torch.strided
+        and value.is_contiguous()
+    )
+
+
+def _valid_convrot_int8_ffn(  # noqa: PLR0911
+    sources: tuple[_BoundProjection, ...],
+    down: _BoundProjection,
+    promoted_dtype: torch.dtype | None,
+) -> bool:
+    from piper_kernels.linear.convrot.int8 import _backend, _compile_fx  # noqa: PLC0415
+
+    if any(p.format != "convrot_int8" for p in (*sources, down)):
         return False
-    input_value = _metadata(match, "ffn_input")
-    base = _metadata(match, "base")
-    reusable_update = _metadata(match, "reusable_update")
-    update_gate = _metadata(match, "update_gate")
-    gate_indices = _metadata(match, "gate_indices")
-    ffn_gate = _metadata(match, "ffn_gate")
-    output = preparation_sharing.tensor_metadata(match.output_node())
-    reusable_update_node = match.kwargs["reusable_update"]
+    if any(source.input_node is not sources[0].input_node for source in sources[1:]):
+        return False
+    input_value = _node_metadata(sources[0].input_node)
+    output_value = _node_metadata(down.node)
+    projections = (*sources, down)
+    weights = tuple(_node_metadata(p.args["weight_qdata"]) for p in projections)
+    scales = tuple(_node_metadata(p.args["weight_scale"]) for p in projections)
     if (
         input_value is None
-        or base is None
-        or reusable_update is None
-        or update_gate is None
-        or gate_indices is None
-        or ffn_gate is None
-        or output is None
-        or not isinstance(reusable_update_node, torch.fx.Node)
+        or output_value is None
+        or any(value is None for value in (*weights, *scales))
     ):
         return False
-    # Both adds share ``base``, which takes the FFN input's dtype and the result's shape.
-    return bool(
-        _shape_matches(base, output)
-        and base.dtype is input_value.dtype
-        and base.device == input_value.device
-        and residual_ops.supports_residual_add(base, reusable_update, update_gate, gate_indices)
-        and residual_ops.supports_residual_add(base, None, ffn_gate, gate_indices)
-        and preparation_sharing.operator_returns_fresh_tensor(reusable_update_node)
-        and len(reusable_update_node.users) == 1
+    if promoted_dtype is not None and promoted_dtype is not input_value.dtype:
+        return False
+    concrete_weights = cast(tuple[torch.Tensor, ...], weights)
+    concrete_scales = cast(tuple[torch.Tensor, ...], scales)
+    rows = math.prod(input_value.shape[:-1])
+    if any(
+        not _compile_fx.valid_input_scale(p.args["input_scale"], input_value.device)
+        for p in projections
+    ):
+        return False
+    if (
+        input_value.ndim == 0
+        or (isinstance(rows, int) and rows < 1)
+        or input_value.dtype not in (torch.float16, torch.bfloat16)
+        or input_value.layout is not torch.strided
+        or not input_value.is_contiguous()
+        or any(
+            weight.ndim != 2
+            or weight.dtype is not torch.int8
+            or weight.device != input_value.device
+            or weight.layout is not torch.strided
+            or not weight.is_contiguous()
+            for weight in concrete_weights
+        )
+        or any(
+            scale.dtype is not torch.float32
+            or scale.device != input_value.device
+            or scale.layout is not torch.strided
+            or not scale.is_contiguous()
+            for scale in concrete_scales
+        )
+        or _backend.select_linear_backend(input_value) is None
+    ):
+        return False
+
+    source_weights = concrete_weights[:-1]
+    source_scales = concrete_scales[:-1]
+    down_weight = concrete_weights[-1]
+    down_scale = concrete_scales[-1]
+    input_features = source_weights[0].shape[1]
+    intermediate_features = source_weights[0].shape[0]
+    output_features = down_weight.shape[0]
+    if (
+        not _dimension_matches(input_value.shape[-1], input_features)
+        or any(not _shape_matches(source_weights[0], source) for source in source_weights[1:])
+        or not _dimension_matches(down_weight.shape[1], intermediate_features)
+        or any(scale.shape != (intermediate_features, 1) for scale in source_scales)
+        or down_scale.shape != (output_features, 1)
+        or output_value.dtype is not input_value.dtype
+        or output_value.device != input_value.device
+        or output_value.ndim != input_value.ndim
+        or any(
+            not _dimension_matches(out_dim, in_dim)
+            for out_dim, in_dim in zip(output_value.shape[:-1], input_value.shape[:-1], strict=True)
+        )
+        or not _dimension_matches(output_value.shape[-1], output_features)
+    ):
+        return False
+
+    group_sizes = tuple(p.args["group_size"] for p in projections)
+    if any(
+        isinstance(group_size, bool) or not isinstance(group_size, int) or group_size < 1
+        for group_size in group_sizes
+    ):
+        return False
+    typed_groups = cast(tuple[int, ...], group_sizes)
+    source_groups = typed_groups[:-1]
+    down_group = typed_groups[-1]
+    if (
+        any(group != source_groups[0] for group in source_groups[1:])
+        or (isinstance(input_features, int) and input_features % source_groups[0])
+        or (isinstance(intermediate_features, int) and intermediate_features % down_group)
+    ):
+        return False
+    return all(
+        _valid_convrot_int8_bias(p.args["bias"], features=features, input_value=input_value)
+        for p, features in (
+            *((source, intermediate_features) for source in sources),
+            (down, output_features),
+        )
     )
 
 
-def fold_residual_adds(
-    graph: torch.fx.Graph,
-    ffn: torch._ops.OpOverload,
-    residual_add: torch._ops.OpOverload,
-    chunk_rows: UpDownChunkRows | None = None,
-) -> int:
-    """Compute each ``ffn`` call that only a residual add reads inside that add.
+def _parse_nvfp4_projections(
+    projections: tuple[_BoundProjection, ...],
+) -> tuple[tuple[object, int | None], ...] | None:
+    from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx  # noqa: PLC0415
 
-    ``residual_add`` takes ``ffn``'s arguments by name, with the add's ``base``,
-    ``gate`` as ``ffn_gate``, ``gate_indices``, and ``python_indexing``. An up/down FFN
-    whose chunk size depends on whether it adds into a residual passes that policy as
-    ``chunk_rows``; otherwise the FFN's chunk size carries over. Returns how many adds
-    it replaced.
-    """
-
-    def compute(
-        graph: torch.fx.Graph, update: torch.fx.Node, add: dict[str, Argument]
-    ) -> torch.fx.Node:
-        values = {
-            **residual_graph.bind_arguments(update),
-            "base": add["base"],
-            "ffn_gate": add["gate"],
-            "gate_indices": add["gate_indices"],
-            "python_indexing": add["python_indexing"],
-        }
-        if chunk_rows is not None:
-            # Post-grad graphs carry metadata on every tensor operand.
-            input_value, up_weight, down_weight = (
-                preparation_sharing.tensor_metadata(cast(torch.fx.Node, values[name]))
-                for name in ("input", "up_weight_qdata", "down_weight_qdata")
+    parsed: list[tuple[object, int | None]] = []
+    for projection in projections:
+        linear = nvfp4_compile_fx.SemanticLinearNodes.from_values(
+            tuple(
+                projection.args[name]
+                for name in (
+                    "input",
+                    "weight_qdata",
+                    "weight_scale",
+                    "weight_per_tensor_scale",
+                    "activation_per_tensor_scale",
+                    "bias",
+                    "dynamic_activation_scale",
+                    "high_first",
+                )
             )
-            assert input_value is not None
+        )
+        if linear is None:
+            return None
+        group_size: int | None = None
+        if projection.schema_name == _CONVROT_NVFP4_LINEAR:
+            raw_group = projection.args["group_size"]
+            if isinstance(raw_group, bool) or not isinstance(raw_group, int):
+                return None
+            group_size = raw_group
+        parsed.append((linear, group_size))
+    return tuple(parsed)
+
+
+def _valid_nvfp4_convrot_groups(
+    parsed: tuple[tuple[object, int | None], ...],
+) -> bool:
+    if not any(group is not None for _linear, group in parsed):
+        return True
+    from piper_kernels.linear.convrot.nvfp4 import (  # noqa: PLC0415
+        _compile_fx as convrot_nvfp4_compile_fx,
+    )
+    from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx  # noqa: PLC0415
+
+    return all(
+        convrot_nvfp4_compile_fx.validated_semantic_linear(
+            convrot_nvfp4_compile_fx.SemanticLinearNodes(
+                cast(nvfp4_compile_fx.SemanticLinearNodes, linear), group
+            ),
+            f"ConvRot NVFP4 FFN compiler projection {index}",
+        )
+        is not None
+        for index, (linear, group) in enumerate(parsed)
+        if group is not None
+    )
+
+
+def _valid_nvfp4_ffn(
+    sources: tuple[_BoundProjection, ...],
+    down: _BoundProjection,
+    promoted_dtype: torch.dtype | None,
+) -> bool:
+    from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx  # noqa: PLC0415
+
+    if any(p.format != "nvfp4" for p in (*sources, down)):
+        return False
+    if any(source.input_node is not sources[0].input_node for source in sources[1:]):
+        return False
+    parsed = _parse_nvfp4_projections((*sources, down))
+    if parsed is None:
+        return False
+    source_groups = tuple(group for _linear, group in parsed[:-1])
+    if any(group != source_groups[0] for group in source_groups[1:]) or not (
+        _valid_nvfp4_convrot_groups(parsed)
+    ):
+        return False
+
+    linears = tuple(cast(nvfp4_compile_fx.SemanticLinearNodes, linear) for linear, _ in parsed)
+    validated_sources = tuple(
+        nvfp4_compile_fx.validated_semantic_linear(
+            linear,
+            f"NVFP4 FFN compiler source projection {index}",
+        )
+        for index, linear in enumerate(linears[:-1])
+    )
+    validated_down = nvfp4_compile_fx.validated_semantic_linear(
+        linears[-1],
+        "NVFP4 FFN compiler down projection",
+    )
+    output_value = _node_metadata(down.node)
+    if (
+        validated_down is None
+        or output_value is None
+        or any(validated is None for validated in validated_sources)
+    ):
+        return False
+    source_values = tuple(v for v in validated_sources if v is not None)
+    input_value, source_shape = source_values[0]
+    down_input, down_shape = validated_down
+    source_linears = linears[:-1]
+    return bool(
+        (promoted_dtype is None or promoted_dtype is input_value.dtype)
+        and input_value.dtype in (torch.float16, torch.bfloat16)
+        and input_value.layout is torch.strided
+        and input_value.is_contiguous()
+        and all(value.dtype is input_value.dtype for value, _shape in source_values[1:])
+        and down_input.dtype is input_value.dtype
+        and all(
+            _dimension_matches(source_shape.rows, shape.rows) for _value, shape in source_values
+        )
+        and _dimension_matches(source_shape.rows, down_shape.rows)
+        and all(
+            _dimension_matches(source_shape.input_features, shape.input_features)
+            for _value, shape in source_values
+        )
+        and all(
+            _dimension_matches(source_shape.output_features, shape.output_features)
+            for _value, shape in source_values
+        )
+        and _dimension_matches(down_shape.input_features, source_shape.output_features)
+        and all(linear.high_first == source_linears[0].high_first for linear in source_linears[1:])
+        and output_value.dtype is input_value.dtype
+        and output_value.device == input_value.device
+        and output_value.ndim == input_value.ndim
+        and all(
+            _dimension_matches(out_dim, in_dim)
+            for out_dim, in_dim in zip(output_value.shape[:-1], input_value.shape[:-1], strict=True)
+        )
+        and _dimension_matches(output_value.shape[-1], down_shape.output_features)
+    )
+
+
+def _match_gated_update_term(
+    gated_update_arg: Argument,
+    gate_indices: torch.fx.Node,
+    python_indexing: bool,
+) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+    if not isinstance(gated_update_arg, torch.fx.Node) or len(gated_update_arg.users) != 1:
+        return None
+    update_mul = _binary_args(gated_update_arg, _aten.mul.Tensor)
+    if update_mul is None:
+        return None
+    for update_gate_sel, reusable_arg in (update_mul, update_mul[::-1]):
+        if (
+            not isinstance(update_gate_sel, torch.fx.Node)
+            or not isinstance(reusable_arg, torch.fx.Node)
+            or len(update_gate_sel.users) != 1
+            or len(reusable_arg.users) != 1
+            or not preparation_sharing.operator_returns_fresh_tensor(reusable_arg)
+        ):
+            continue
+        selected_update = residual_gates.selected_gate(update_gate_sel)
+        if selected_update is None:
+            continue
+        update_gate, update_indices, update_py_idx = selected_update
+        if update_indices is gate_indices and update_py_idx == python_indexing:
+            return update_gate, reusable_arg
+    return None
+
+
+def _valid_gated_updates_metadata(
+    ffn_input: torch.fx.Node,
+    base_arg: torch.fx.Node,
+    reusable_arg: torch.fx.Node,
+    update_gate: torch.fx.Node,
+    gate_indices: torch.fx.Node,
+    ffn_gate: torch.fx.Node,
+    output_node: torch.fx.Node,
+) -> bool:
+    input_val = _node_metadata(ffn_input)
+    base_val = _node_metadata(base_arg)
+    reusable_val = _node_metadata(reusable_arg)
+    update_gate_val = _node_metadata(update_gate)
+    indices_val = _node_metadata(gate_indices)
+    ffn_gate_val = _node_metadata(ffn_gate)
+    output_val = _node_metadata(output_node)
+    if (
+        input_val is None
+        or base_val is None
+        or reusable_val is None
+        or update_gate_val is None
+        or indices_val is None
+        or ffn_gate_val is None
+        or output_val is None
+    ):
+        return False
+    from piper_kernels.fusions.residual_updates import _ops as residual_ops  # noqa: PLC0415
+
+    return bool(
+        _shape_matches(base_val, output_val)
+        and base_val.dtype is input_val.dtype
+        and base_val.device == input_val.device
+        and residual_ops.supports_residual_add(base_val, reusable_val, update_gate_val, indices_val)
+        and residual_ops.supports_residual_add(base_val, None, ffn_gate_val, indices_val)
+    )
+
+
+def _match_gated_updates(
+    down_node: torch.fx.Node,
+    ffn_input: torch.fx.Node,
+) -> _GatedUpdatesMatch | None:
+    """Match ``base + update_gate[i] * reusable_update + ffn_gate[i] * down``."""
+    if len(down_node.users) != 1:
+        return None
+    gated_ffn = next(iter(down_node.users))
+    mul_args = _binary_args(gated_ffn, _aten.mul.Tensor)
+    if mul_args is None or len(gated_ffn.users) != 1:
+        return None
+    ffn_gate_sel = mul_args[1] if mul_args[0] is down_node else mul_args[0]
+    selected_ffn = (
+        residual_gates.selected_gate(ffn_gate_sel)
+        if isinstance(ffn_gate_sel, torch.fx.Node) and len(ffn_gate_sel.users) == 1
+        else None
+    )
+    output_node = next(iter(gated_ffn.users))
+    out_add = _binary_args(output_node, _aten.add.Tensor)
+    if selected_ffn is None or out_add is None:
+        return None
+    ffn_gate, gate_indices, python_indexing = selected_ffn
+
+    hidden = out_add[1] if out_add[0] is gated_ffn else out_add[0]
+    hidden_add = (
+        _binary_args(hidden, _aten.add.Tensor)
+        if isinstance(hidden, torch.fx.Node) and len(hidden.users) == 2
+        else None
+    )
+    if hidden_add is None:
+        return None
+
+    for base_arg, gated_update_arg in (hidden_add, hidden_add[::-1]):
+        if not isinstance(base_arg, torch.fx.Node):
+            continue
+        matched_term = _match_gated_update_term(gated_update_arg, gate_indices, python_indexing)
+        if matched_term is None:
+            continue
+        update_gate, reusable_arg = matched_term
+        if _valid_gated_updates_metadata(
+            ffn_input, base_arg, reusable_arg, update_gate, gate_indices, ffn_gate, output_node
+        ):
+            return _GatedUpdatesMatch(
+                output_node=output_node,
+                base=base_arg,
+                reusable_update=reusable_arg,
+                update_gate=update_gate,
+                ffn_gate=ffn_gate,
+                gate_indices=gate_indices,
+                python_indexing=python_indexing,
+            )
+    return None
+
+
+def _emit_convrot_int8_ffn(
+    graph: torch.fx.Graph,
+    sources: tuple[_BoundProjection, ...],
+    down: _BoundProjection,
+    activation_fn: input_activations.InputActivation,
+    gated: _GatedUpdatesMatch | None,
+) -> None:
+    from . import _convrot_int8  # noqa: PLC0415
+
+    up = sources[0]
+    gate = sources[1] if len(sources) == 2 else None
+    input_val = _node_metadata(up.input_node)
+    up_weight_val = _node_metadata(up.args["weight_qdata"])
+    down_weight_val = _node_metadata(down.args["weight_qdata"])
+    assert input_val is not None
+    assert up_weight_val is not None
+    assert down_weight_val is not None
+    chunk_rows = _convrot_int8.default_chunk_rows(
+        input_val,
+        up_weight_val,
+        down_weight_val,
+        activation_fn,
+        adds_residual=gated is not None,
+    )
+    common = (
+        up.input_node,
+        up.args["weight_qdata"],
+        up.args["weight_scale"],
+        up.args["bias"],
+        up.args["group_size"],
+        down.args["weight_qdata"],
+        down.args["weight_scale"],
+        down.args["bias"],
+        down.args["group_size"],
+        activation_fn,
+    )
+    trailing = (
+        None if gate is None else gate.args["weight_qdata"],
+        None if gate is None else gate.args["weight_scale"],
+        None if gate is None else gate.args["bias"],
+        None if gate is None else gate.args["group_size"],
+        up.args["input_scale"],
+        None if gate is None else gate.args["input_scale"],
+        down.args["input_scale"],
+    )
+    if gated is not None:
+        with graph.inserting_before(gated.output_node):
+            mutation = graph.call_function(
+                torch.ops.piper_kernels.convrot_int8_ffn_update_.default,
+                args=(
+                    *common,
+                    gated.reusable_update,
+                    gated.ffn_gate,
+                    gated.gate_indices,
+                    gated.python_indexing,
+                    chunk_rows,
+                    gated.base,
+                    gated.update_gate,
+                    *trailing,
+                ),
+            )
+        mutation.meta["val"] = None
+        gated.output_node.replace_all_uses_with(gated.reusable_update)
+        graph.erase_node(gated.output_node)
+        return
+
+    with graph.inserting_before(down.node):
+        replacement = graph.call_function(
+            torch.ops.piper_kernels.convrot_int8_ffn.default,
+            args=(*common, chunk_rows, *trailing),
+        )
+    replacement.meta = down.node.meta.copy()
+    replacement.meta.pop("eager_input_vals", None)
+    down.node.replace_all_uses_with(replacement)
+    graph.erase_node(down.node)
+
+
+def _nvfp4_projection_args(projection: _BoundProjection) -> tuple[Argument, ...]:
+    group_size = (
+        projection.args["group_size"] if projection.schema_name == _CONVROT_NVFP4_LINEAR else None
+    )
+    return (
+        projection.args["weight_qdata"],
+        projection.args["weight_scale"],
+        projection.args["weight_per_tensor_scale"],
+        projection.args["activation_per_tensor_scale"],
+        projection.args["bias"],
+        projection.args["dynamic_activation_scale"],
+        group_size,
+        projection.args["high_first"],
+    )
+
+
+def _emit_nvfp4_ffn(
+    graph: torch.fx.Graph,
+    sources: tuple[_BoundProjection, ...],
+    down: _BoundProjection,
+    activation_fn: input_activations.InputActivation,
+    gated: _GatedUpdatesMatch | None,
+) -> None:
+    from . import _nvfp4  # noqa: PLC0415
+
+    up = sources[0]
+    gate = sources[1] if len(sources) == 2 else None
+    input_val = _node_metadata(up.input_node)
+    up_weight_val = _node_metadata(up.args["weight_qdata"])
+    down_weight_val = _node_metadata(down.args["weight_qdata"])
+    assert input_val is not None
+    assert up_weight_val is not None
+    assert down_weight_val is not None
+    chunk_rows = _nvfp4.default_chunk_rows(
+        input_val,
+        up_weight_val,
+        down_weight_val,
+        activation_fn,
+        adds_residual=gated is not None,
+    )
+    common = (
+        up.input_node,
+        *_nvfp4_projection_args(up),
+        *_nvfp4_projection_args(down),
+        activation_fn,
+    )
+    gate_args: tuple[Argument, ...] = (
+        (None, None, None, None, None, False, None, False)
+        if gate is None
+        else _nvfp4_projection_args(gate)
+    )
+    if gated is not None:
+        with graph.inserting_before(gated.output_node):
+            mutation = graph.call_function(
+                torch.ops.piper_kernels.nvfp4_ffn_update_.default,
+                args=(
+                    *common,
+                    gated.reusable_update,
+                    gated.ffn_gate,
+                    gated.gate_indices,
+                    gated.python_indexing,
+                    chunk_rows,
+                    gated.base,
+                    gated.update_gate,
+                    *gate_args,
+                ),
+            )
+        mutation.meta["val"] = None
+        gated.output_node.replace_all_uses_with(gated.reusable_update)
+        graph.erase_node(gated.output_node)
+        return
+
+    with graph.inserting_before(down.node):
+        replacement = graph.call_function(
+            torch.ops.piper_kernels.nvfp4_ffn.default,
+            args=(*common, chunk_rows, *gate_args),
+        )
+    replacement.meta = down.node.meta.copy()
+    replacement.meta.pop("eager_input_vals", None)
+    down.node.replace_all_uses_with(replacement)
+    graph.erase_node(down.node)
+
+
+def _fold_residual_adds(
+    graph: torch.fx.Graph,
+    *,
+    has_convrot_int8: bool,
+    has_nvfp4: bool,
+) -> int:
+    has_auto_func = any(
+        node.op == "call_function" and node.target is torch.ops.higher_order.auto_functionalized
+        for node in graph.nodes
+    )
+    if not has_auto_func:
+        return 0
+    from piper_kernels.fusions.residual_updates import _graph as residual_graph  # noqa: PLC0415
+
+    replaced = 0
+    if has_convrot_int8:
+        from . import _convrot_int8  # noqa: PLC0415
+
+        def _compute_int8(
+            graph: torch.fx.Graph,
+            update: torch.fx.Node,
+            add: dict[str, Argument],
+        ) -> torch.fx.Node:
+            values = _bind_arguments(update)
+            input_val = _node_metadata(values["input"])
+            up_weight = _node_metadata(values["up_weight_qdata"])
+            down_weight = _node_metadata(values["down_weight_qdata"])
+            assert input_val is not None
             assert up_weight is not None
             assert down_weight is not None
-            values["chunk_rows"] = chunk_rows(
-                input_value, up_weight, down_weight, adds_residual=True
+            activation_fn = cast(input_activations.InputActivation, values["activation_fn"])
+            values.update(
+                output=add["base"],
+                base=None,
+                update_gate=None,
+                ffn_gate=add["gate"],
+                gate_indices=add["gate_indices"],
+                python_indexing=add["python_indexing"],
+                chunk_rows=_convrot_int8.default_chunk_rows(
+                    input_val,
+                    up_weight,
+                    down_weight,
+                    activation_fn,
+                    adds_residual=True,
+                ),
             )
-        return residual_graph.call_functional(graph, residual_add, values)
+            return residual_graph.call_functional(
+                graph,
+                torch.ops.piper_kernels.convrot_int8_ffn_update_.default,
+                values,
+            )
 
-    return residual_graph.compute_inside_adds(graph, ffn, compute)
+        replaced += residual_graph.compute_inside_adds(
+            graph,
+            torch.ops.piper_kernels.convrot_int8_ffn.default,
+            _compute_int8,
+        )
+
+    if has_nvfp4:
+        from . import _nvfp4  # noqa: PLC0415
+
+        def _compute_nvfp4(
+            graph: torch.fx.Graph,
+            update: torch.fx.Node,
+            add: dict[str, Argument],
+        ) -> torch.fx.Node:
+            values = _bind_arguments(update)
+            input_val = _node_metadata(values["input"])
+            up_weight = _node_metadata(values["up_weight_qdata"])
+            down_weight = _node_metadata(values["down_weight_qdata"])
+            assert input_val is not None
+            assert up_weight is not None
+            assert down_weight is not None
+            activation_fn = cast(input_activations.InputActivation, values["activation_fn"])
+            values.update(
+                output=add["base"],
+                base=None,
+                update_gate=None,
+                ffn_gate=add["gate"],
+                gate_indices=add["gate_indices"],
+                python_indexing=add["python_indexing"],
+                chunk_rows=_nvfp4.default_chunk_rows(
+                    input_val,
+                    up_weight,
+                    down_weight,
+                    activation_fn,
+                    adds_residual=True,
+                ),
+            )
+            return residual_graph.call_functional(
+                graph,
+                torch.ops.piper_kernels.nvfp4_ffn_update_.default,
+                values,
+            )
+
+        replaced += residual_graph.compute_inside_adds(
+            graph,
+            torch.ops.piper_kernels.nvfp4_ffn.default,
+            _compute_nvfp4,
+        )
+
+    return replaced
 
 
-def uses_python_indexing(match: Match) -> bool:
-    """Return whether a matched update's gate selection wraps negative indices."""
-    return any(
-        selected[2]
-        for node in match.nodes
-        if (selected := residual_gates.selected_gate(node)) is not None
+def _fold_ffns(graph: torch.fx.Graph) -> bool:
+    schema_names = {name for node in graph.nodes if (name := _schema_name(node)) is not None}
+    has_convrot_int8 = _CONVROT_INT8_LINEAR in schema_names or _CONVROT_INT8_FFN in schema_names
+    has_nvfp4 = (
+        _NVFP4_LINEAR in schema_names
+        or _CONVROT_NVFP4_LINEAR in schema_names
+        or _NVFP4_FFN in schema_names
     )
+    if not (has_convrot_int8 or has_nvfp4):
+        return False
+
+    projection_views.normalize_projection_views(graph)
+
+    changed = False
+    for node in list(graph.nodes):
+        down = _parse_projection(node)
+        if down is None:
+            continue
+        activated = down.input_node
+        gelu = _match_gelu_tanh(activated)
+        if gelu is not None:
+            up_proj, promoted_dtype = gelu
+            activation_fn: input_activations.InputActivation = "gelu_tanh"
+            sources: tuple[_BoundProjection, ...] = (up_proj,)
+        else:
+            swiglu = _match_swiglu(activated)
+            if swiglu is None:
+                continue
+            value_proj, gate_proj, promoted_dtype = swiglu
+            activation_fn = "swiglu"
+            sources = (value_proj, gate_proj)
+
+        if down.format == "convrot_int8":
+            if not _valid_convrot_int8_ffn(sources, down, promoted_dtype):
+                continue
+            gated = _match_gated_updates(down.node, sources[0].input_node)
+            _emit_convrot_int8_ffn(graph, sources, down, activation_fn, gated)
+        else:
+            if not _valid_nvfp4_ffn(sources, down, promoted_dtype):
+                continue
+            gated = _match_gated_updates(down.node, sources[0].input_node)
+            _emit_nvfp4_ffn(graph, sources, down, activation_fn, gated)
+        changed = True
+
+    residual_replaced = _fold_residual_adds(
+        graph,
+        has_convrot_int8=has_convrot_int8,
+        has_nvfp4=has_nvfp4,
+    )
+    changed = changed or residual_replaced > 0
+    if changed:
+        graph.eliminate_dead_code()
+        graph.lint()
+    return changed
 
 
-__all__ = [
-    "FfnPatternValidator",
-    "UpDownChunkRows",
-    "fold_residual_adds",
-    "uses_python_indexing",
-    "valid_indexed_gated_updates",
-]
+class _CompilePass(CustomInferenceAwareGraphPass):
+    """Fold semantic GELU-tanh and SwiGLU FFNs before ordinary linear normalization."""
+
+    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
+        if is_inference:
+            _fold_ffns(graph)
+
+    def uuid(self) -> bytes:
+        return inductor_options.compute_compile_pass_uuid(self)
+
+
+compile_pass = _CompilePass()
+
+
+def ffn_compile_options(
+    options: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Install the unified FFN fusion pass ahead of any installed linear passes."""
+    combined = dict(options) if options is not None else {}
+    existing = combined.get(_POST_GRAD_PRE_PASS)
+    if existing is None:
+        passes: tuple[object, ...] = ()
+    elif isinstance(existing, (list, tuple)):
+        passes = tuple(existing)
+    else:
+        passes = (existing,)
+
+    if any(item is compile_pass for item in passes):
+        ffn_index = next(i for i, item in enumerate(passes) if item is compile_pass)
+        first_linear = next(
+            (i for i, item in enumerate(passes) if type(item).__module__ in _LINEAR_PASS_MODULES),
+            len(passes),
+        )
+        if ffn_index < first_linear:
+            combined[_POST_GRAD_PRE_PASS] = passes
+            return combined
+
+    remaining = tuple(item for item in passes if item is not compile_pass)
+    linear_index = next(
+        (i for i, item in enumerate(remaining) if type(item).__module__ in _LINEAR_PASS_MODULES),
+        len(remaining),
+    )
+    combined[_POST_GRAD_PRE_PASS] = (
+        *remaining[:linear_index],
+        compile_pass,
+        *remaining[linear_index:],
+    )
+    return combined
+
+
+__all__ = ["compile_pass", "ffn_compile_options"]
