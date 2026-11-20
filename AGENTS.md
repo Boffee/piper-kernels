@@ -1,81 +1,54 @@
 # piper-kernels
 
-Instructions for coding agents working in this repository.
+Instructions for coding agents working in this repository. Start with
+[README.md](README.md) for entry points and [docs/development.md](docs/development.md)
+for architecture, validation, and tests.
 
-Start with [README.md](README.md) for the public entry point and topic map.
-[Development](docs/development.md) covers architecture, validation, and testing.
-API docstrings describe individual contracts; the guides explain how APIs work
-together.
+## Rules
 
-## Engineering
+1. **Strict core scope:** Core `piper_kernels` owns reusable runtime operators and
+   kernels only—no new single-model shape tables, hardcoded calibration constants, or
+   offline encoders; external tools and specializations use public APIs only.
+2. **Parameterize orthogonal axes:** Never add a Cartesian `<format>_<variant>_<op>`
+   package, compiler pass, or test suite; parameterize format, basis, activation, and
+   mutation, splitting a `custom_op` only when PyTorch's schema forces it (distinct
+   `mutates_args`).
+3. **Rule of Two (`<= 3` hops):** Do not add `_interfaces.py`, `_plan.py`, `_policy.py`,
+   `_dispatch.py`, or vendor subpackages (`_nvidia/`, `_amd/`) without `>= 2` genuinely
+   distinct implementations; keep `<= 3` module hops from public entry to kernel launch
+   and delete unused layers.
+4. **One compiler pipeline; anchor-match FX:** Put post-grad rewrites in one
+   phase-ordered pipeline (hash config flags into `uuid()`), and match FX graphs
+   imperatively from anchor ops via schema argument binding—never `2^k`
+   `PatternMatcherPass` loops or positional arg-count checks.
+5. **Specialize only the GPU loop:** Hardware divergence belongs inside
+   `@triton.jit`/`@gluon.jit` (parameterizing shared stages and peeled tails with
+   `constexpr`); write host orchestration, chunk/window drivers, peer exchange, and
+   tensor-subclass dispatch once.
+6. **Validate and dispatch once:** Validate metadata and resolve backend/plan once at
+   the boundary; follow the [validation contract](docs/development.md#validation-contract)
+   (no implicit content checks or readbacks, validate before mutating, never retry
+   partial mutations, restore device state on failure).
+7. **Shrink on refactors; generalize first:** Cleanup/architecture changes must reduce
+   net LOC and files (justify exceptions); generalize and delete superseded paths in the
+   same PR when adding variants.
+8. **Test contracts, not private plumbing:** Assert observable behavior and compiler
+   invariants in shared parametrized suites—never hardcoded tile tuples, private-global
+   monkeypatches, or `src/` AST checks outside
+   [`tests/test_architecture.py`](tests/test_architecture.py). Never raise its ceilings
+   without explicit approval; lower them as cleanup lands.
 
-- Lead with the problem: what goes wrong, for whom, how often, and how badly.
-  Design for production needs and foreseeable uses. Hypothetical problems
-  usually need a note or a contract before they need a mechanism.
-- Minimize how much a reader must understand to make a correct change.
-  Make ownership and invariants clear, and hide implementation details behind
-  useful interfaces. Consider the whole design: broader changes, including
-  to internal contracts, are welcome when they reduce special cases, coupling,
-  or duplicated knowledge. Remove what they supersede. Preserve unrelated
-  behavior; make intended behavior changes explicit.
-- State caller contracts in docs and docstrings. Validate supported metadata
-  and configuration at responsible boundaries. Within those boundaries, rely
-  on established contracts: avoid checking the same requirement redundantly or
-  adding defensive machinery for misuse the contract already forbids. Follow
-  the validation contract below for numerical tensor contents.
-- Use strong types and let pyright prove what it can. Contain loose types at
-  boundaries and explain why they are needed.
-- Base performance decisions on hardware and workload properties, supported by
-  representative measurements. Keep specialized assumptions explicit; see
-  [performance tuning](docs/development.md#performance-tuning).
-- Optimize development iteration speed: batch kernel-tuning candidates into
-  multi-variant scripts on one anchor workload, inspect IR/ISA (vectorization,
-  VGPRs, spills, LDS) on a small canary set before running broad sweeps, and keep
-  CPU-bound compile checks parallelized rather than serializing them inside live
-  GPU runs; see [ROCm regressions](docs/environments.md#rocm-regressions).
-- Keep documentation clear, concise, and coherent with the current library.
-  Rework the organization and examples when concepts change, consolidate
-  overlap, and remove obsolete material. Prefer one authoritative explanation
-  with links from other contexts. Release history belongs in `CHANGELOG.md`.
+## Contracts & checks
 
-## Contracts to preserve
-
-- [Attention](docs/attention.md) and [weights](docs/weights.md) describe public
-  shapes, numerical behavior, mutation, and backend support. Check the relevant
-  contract before changing an operator or compiler rewrite.
-- [Validation](docs/development.md#validation-contract) applies to inference,
-  dispatch, compiler/fake paths, and weight storage wrapping and lifecycle.
-  Do not add implicit tensor-content validation or readbacks to these paths.
-  Preserve required metadata checks and algorithmic guards for valid inputs;
-  numerical preconditions do not promise runtime rejection. Validate metadata
-  before mutating in-place or caller-owned storage, never retry after a launch
-  may have mutated output, and restore device state on failure.
-- The [execution-plan guide](docs/development.md#execution-plans-and-schedules)
-  covers backend conventions, optional imports, and compiler source tracking.
-  Read it before changing backend selection or moving kernel definitions.
-
-Follow the [code conventions](docs/development.md#code-conventions) for naming,
-types, and internal interfaces. Keep documentation with its
-[owner](docs/development.md#documentation-ownership).
-
-## Reviews
-
-Explain the failure, its impact, and where it occurs. Judge the resulting design
-and documentation, including ownership and duplicated behavior. Distinguish
-failures for supported inputs and missing required metadata checks from violations
-of documented numerical preconditions. A new capability needs a foreseeable use;
-an API documentation finding should show how the omission causes a caller to act
-wrongly or misinterpret the result.
-
-## Checks
-
-Target **Triton 3.9** (PyTorch 2.15) only during development and validation:
-verify `triton.__version__` before running tests or benchmarks rather than using
-legacy Triton 3.8 environments; see [environments](docs/environments.md).
-
-Follow [writing tests](docs/development.md#writing-tests) when changing coverage.
-Use the [development checks](docs/development.md#checks) for tests, lint,
-formatting, types, and hardware regressions. Write commits, pull request
-descriptions, and changelog entries using the
-[contributor writing conventions](docs/development.md#commits-and-pull-requests).
-See [VERSIONING.md](VERSIONING.md) for compatibility and releases.
+- Target Python 3.14, PyTorch 2.15, and **Triton 3.9** during development and
+  validation (verify `triton.__version__`; see [environments](docs/environments.md)).
+- Check [attention](docs/attention.md) and [weights](docs/weights.md) before changing
+  operators or rewrites; follow [development guide](docs/development.md) for
+  architecture, backend/compiler contracts, tests, checks, commits/PRs, and
+  [VERSIONING.md](VERSIONING.md) for compatibility.
+- **Reviews:** Identify the failure, impact, and location, and flag Cartesian cloning,
+  premature indirection, net surface-area growth on refactors, and whitebox test
+  coupling; distinguish contract bugs from documented numerical preconditions.
+- Use strong types (`pyright`), measured tuning
+  ([performance tuning](docs/development.md#performance-tuning)), and in-place doc edits
+  with one authoritative owner.

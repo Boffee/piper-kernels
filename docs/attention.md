@@ -46,14 +46,12 @@ multiple of `Hkv`, and query head `h` reads KV head `h // (Hq // Hkv)`. This inc
 multi-query attention with one KV head; do not repeat K/V yourself. Sage requires
 equal head counts.
 
-Dense Piper uses INT8 Q/K and per-token INT8 V with unsigned INT8 probabilities.
-Both non-causal and causal calls center K and V independently per 1024-token
-chunk (`K1024 + V1024`), without sequence-wide mean reductions. K centering adds
-the per-chunk `Q @ H(K_mean)` score bias and per-chunk V means are restored per
-chunk, so token-sharded chunks need no cross-chunk state; future tokens in later
-chunks cannot affect earlier outputs, while tokens sharing one causal chunk share
-its local chunk statistics. Sage uses INT8 Q/K and FP8 probabilities/V with
-FP16 tile accumulation. Their numerical results are not interchangeable.
+Dense Piper uses INT8 Q/K and per-token INT8 V, centering K and V independently per
+1024-token chunk (`K1024 + V1024`) on both non-causal and causal calls. Because chunks
+share no cross-chunk statistics, token-sharded chunks need no cross-chunk state and
+future tokens in later chunks never affect earlier outputs (tokens sharing a causal
+chunk share its local statistics). Sage uses INT8 Q/K and FP8 probabilities/V with
+FP16 accumulation. Their numerical results are not interchangeable.
 
 Dense Piper has native NVIDIA SM8x/SM12x and AMD RDNA4 backends. Sage's optimized
 path requires NVIDIA FP8 tensor cores with FP16 accumulation. See the
@@ -94,10 +92,8 @@ per-query-head budgets as a tuple of Python integers. Routes are recomputed from
 the current Q/K values on every call. The default `"minmax"` policy scores
 extrema summaries; `"mean"` scores block means. The application owns the ratio
 profile and its quality validation. Even a full keep budget uses sparse Piper's
-quantized arithmetic (`K64 + V64` per-tile centering: `K` centered per `K64` tile
-by its rotated midpoint with 2-term INT8 centers restored in scores, and `V`
-centered per `K64` tile by its BF16 mean restored in the numerator), which differs
-from dense Piper's `V` quantization.
+per-`K64` tile centering and quantization (`K64 + V64`), which differs numerically from
+dense Piper's `V` quantization.
 
 `sparse_key_blocks` counts complete physical blocks in the leading key prefix and
 must be between 1 and `min(sequence_length // 64, 65536)`. A compact partial final
@@ -119,43 +115,20 @@ quality comparisons; it is not the fallback used by this API.
 
 ### Caller-forced tiles (experimental)
 
-This path additionally accepts contiguous device INT32 `force_tile_ids`
-(`[query_blocks, capacity]`) and `force_tile_counts` (`[query_blocks]`). Every
-active ID in a row's counted prefix is shared across batches and heads and stays
-in the kept set, with remaining per-head slots filled by score selection. Dense
-query suffixes already attend every key and ignore routes.
+Pass contiguous device INT32 `force_tile_ids` (`[query_blocks, capacity]`) and
+`force_tile_counts` (`[query_blocks]`) to pin active prefix IDs across batches and
+heads, filling each head's remaining keep budget by score selection (dense suffixes
+ignore routes). As metadata-only caller preconditions: supply one row per physical
+query block, keep counts in `[0, min(capacity, min(budgets))]` where
+`budgets = attention.resolve_head_keep_blocks(sparse_key_blocks)` (budgets couple
+across heads, so recompute when the profile or `sparse_key_blocks` changes), and keep
+active IDs unique in `[0, sparse_key_blocks)`.
 
-As caller preconditions with metadata-only validation: supply one row per
-physical query block, keep counts in `[0, capacity]` and within every head's
-physical keep budget, and keep active IDs unique in `[0, sparse_key_blocks)`.
-Unused slots are ignored. Query budgets outside `torch.compile`:
-
-```python
-attention = SparsePiperAttention((0.5, 0.5))
-budgets = attention.resolve_head_keep_blocks(sparse_key_blocks=3)  # (2, 1)
-capacity = 2
-max_force_count = min(capacity, min(budgets))  # 1 across heads
-```
-
-Because rounding is coupled across heads, independently rounding ratios can
-overestimate a head's budget; recompute whenever the profile or `sparse_key_blocks`
-changes. ID and count values can update in place at fixed shapes without
-recompiling (zeros disable forcing), and explicit CUDA graphs replay updated
-buffers. Compatible ConvRot INT8, NVFP4, and ConvRot NVFP4 fusions preserve forced
-routing; the coarse residual is unaffected.
-
-To share one dynamic Torch graph across sequence lengths or force capacities,
-mark those dimensions dynamic on the model inputs and force tensors (and derive
-Python ints like `sparse_key_blocks` from tensor shapes when they vary):
-
-```python
-torch._dynamo.mark_dynamic(hidden_states, 1)  # [batch, sequence, features]
-torch._dynamo.mark_dynamic(force_tile_ids, (0, 1))
-torch._dynamo.mark_dynamic(force_tile_counts, 0)
-```
-
-Keep head counts and head dimensions fixed; shape guards, backend policies, and
-zero/singleton compiler specializations still apply.
+IDs and counts can update in place at fixed shapes without recompiling (zeros disable
+forcing), explicit CUDA graphs replay updated buffers, and compatible ConvRot/NVFP4
+fusions preserve forced routing (coarse residual is unaffected). For dynamic sequence
+lengths or force capacities in `torch.compile`, mark those dimensions with
+`torch._dynamo.mark_dynamic` on inputs and force tensors (head counts/dims stay fixed).
 
 ### Coarse residual
 
@@ -191,9 +164,8 @@ For quantized projection/output fusion, pass the matching helper to
 Each exports `<package_name>_compile_options()`. ConvRot INT8 dense fusion
 supports MHA/GQA and optional `fuse_output=True` (bounded attention-to-output
 execution, off by default); dense targets NVIDIA SM89/SM120 and AMD RDNA4, sparse
-targets SM8x/SM120 and RDNA4. On NVIDIA D128, Gluon projections keep the shared
-FP32 arithmetic but can differ from Triton by one INT8 code at rounding ties. See
-the [fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md) for
+targets SM8x/SM120 and RDNA4. See the
+[fusion guide](../src/piper_kernels/fusions/convrot_int8_piper/README.md) for
 matchers, storage contracts, and bounded-window internals.
 
 ### Update a residual stream in place
@@ -228,16 +200,11 @@ Q-projected ConvRot INT8 attention outputs fold into the add; row-broadcast gate
 stay unchanged. In-place adds round separately per update (`_nvidia` ConvRot INT8
 uses its [residual epilogues](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md#residual-epilogues)).
 
-When query and K/V head counts are even, half the output projection's input
-width is a multiple of the ConvRot group size, and a sparse coarse gate (if
-any) is a ConvRot INT8 projection of the attention's input, folded attention
-also runs in two sequential head halves; otherwise the whole attention runs as
-one slice. Slicing halves active K/V memory while keeping per-head sparse block
-selection intact, leaves dense attention speed unchanged (sparse runs slightly
-slower), and slightly alters numerics because each slice quantizes its own
-share of the output projection input. See
+Eligible folded attention runs in two sequential head slices when head counts are
+even and output widths align, trading slightly lower active K/V memory for small
+quantization rounding differences; see
 [in-place residual adds](../src/piper_kernels/fusions/convrot_int8_piper/README.md#in-place-residual-adds)
-for matcher and buffer-allocation details.
+for matcher, slicing, and buffer details.
 
 Return to [README](../README.md), [weights](weights.md), or
 [benchmarks](../benchmarks/README.md).
