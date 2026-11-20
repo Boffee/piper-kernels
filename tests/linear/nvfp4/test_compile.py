@@ -14,6 +14,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 
 from piper_kernels import compile_options
+from piper_kernels.linear.nvfp4 import _ops as _nvfp4_ops  # noqa: F401 - registers custom ops
 from piper_kernels.linear.nvfp4._compile_fx import coalesce_input_casts
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 

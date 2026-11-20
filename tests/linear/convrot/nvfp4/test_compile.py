@@ -16,6 +16,9 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 
 from piper_kernels import compile_options
+from piper_kernels.linear.convrot.nvfp4 import (
+    _ops as _convrot_nvfp4_ops,  # noqa: F401 - registers custom ops
+)
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
