@@ -10,13 +10,11 @@ from ._nvidia import policy as nvidia_projection_policy
 
 try:
     from . import triton as _projection
-    from ._amd import triton as _amd_projection
     from ._nvidia import dispatch as _nvidia_projection
 except ModuleNotFoundError as error:
     if error.name != "triton":
         raise
     _projection = None
-    _amd_projection = None
     _nvidia_projection = None
 
 
@@ -31,7 +29,7 @@ def select_projection_backend(
     target = AcceleratorTarget.from_device(input.device)
     if nvidia_projection_policy.supports_target(target):
         return _nvidia_projection
-    return _amd_projection if amd_policy.supports_target(target) else None
+    return _projection.amd_backend if amd_policy.supports_target(target) else None
 
 
 def require_projection_backend(

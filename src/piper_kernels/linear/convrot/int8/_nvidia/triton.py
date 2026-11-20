@@ -1,4 +1,10 @@
-"""Triton preparation and GEMM launchers for NVIDIA ConvRot INT8."""
+"""NVIDIA ConvRot INT8 preparation and kernel-dialect launchers.
+
+Routes validated 2-D GEMM and fused-residual calls between SM120 Gluon TMA
+(``gluon_tma``), SM8x Gluon async-copy (``gluon_async_copy``), and shared Triton
+kernels, falling back to the rounding-compatible grouped 128x64 Triton schedule
+when operands do not meet the selected Gluon kernel's alignment contract.
+"""
 
 # Triton launch options are not represented in Python call signatures.
 # pyright: reportCallIssue=false
@@ -16,9 +22,10 @@ from piper_kernels.weights.convrot.int8.triton import (
     rotate_quantize_rows_kernel,
 )
 
-from .._kernels.triton import int8_matmul_kernel, int8_residual_matmul_kernel
-from . import policy
-from ._plan import NvidiaExecutionPlan
+from .._plan import LinearExecutionPlan
+from ..triton import int8_matmul_kernel, int8_residual_matmul_kernel
+from . import gluon_async_copy, gluon_tma, policy
+from .policy import NvidiaExecutionPlan
 
 # A runtime M and per-tile tail branch keep one compiled kernel per schedule.
 dynamic_m_int8_matmul_kernel = triton.jit(do_not_specialize=["m"])(int8_matmul_kernel.fn)
@@ -221,3 +228,91 @@ def launch_int8_residual_matmul(
             num_stages=plan.matmul_num_stages,
             num_warps=plan.matmul_num_warps,
         )
+
+
+def launch_prepared_linear(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output: torch.Tensor,
+    second_weight: torch.Tensor,
+    second_scale: torch.Tensor,
+    second_bias: torch.Tensor | None,
+    *,
+    paired: bool,
+    logical_dtype: torch.dtype,
+    execution_plan: LinearExecutionPlan,
+    target: AcceleratorTarget | None = None,
+) -> None:
+    """Launch the plan's NVIDIA GEMM kernel, falling back to grouped Triton if unaligned."""
+    del logical_dtype, target
+    if not isinstance(execution_plan, NvidiaExecutionPlan):
+        raise TypeError("NVIDIA ConvRot execution requires a NvidiaExecutionPlan")
+    plan = execution_plan
+    launcher = launch_int8_matmul
+    if plan.matmul_kernel in ("gluon_async_copy", "gluon_tma"):
+        gluon_module = gluon_tma if plan.matmul_kernel == "gluon_tma" else gluon_async_copy
+        aligned = gluon_module.operands_aligned(input_qdata, weight_qdata)
+        if paired:
+            aligned = aligned and gluon_module.operands_aligned(second_weight)
+        if aligned:
+            launcher = gluon_module.launch_int8_matmul
+        else:
+            plan = policy.grouped_triton_plan(plan)
+    launcher(
+        input_qdata,
+        weight_qdata,
+        output,
+        input_scale,
+        weight_scale,
+        bias,
+        second_weight,
+        second_scale,
+        second_bias,
+        paired=paired,
+        execution_plan=plan,
+    )
+
+
+def try_launch_prepared_residual(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output: torch.Tensor,
+    residual_add: ResidualAdd,
+    *,
+    row_offset: int,
+    execution_plan: LinearExecutionPlan,
+    target: AcceleratorTarget,
+) -> bool:
+    """Launch an SM120 fused residual GEMM when supported; return False for fallback."""
+    if not isinstance(execution_plan, NvidiaExecutionPlan):
+        raise TypeError("NVIDIA ConvRot execution requires a NvidiaExecutionPlan")
+    plan = execution_plan
+    if not policy.supports_residual_epilogue(target, plan, residual_add.base.dtype):
+        return False
+    m, _k = input_qdata.shape
+    n = weight_qdata.shape[0]
+    if m and n:
+        residual_launcher = launch_int8_residual_matmul
+        if plan.matmul_kernel == "gluon_tma":
+            if gluon_tma.operands_aligned(input_qdata, weight_qdata):
+                residual_launcher = gluon_tma.launch_int8_residual_matmul
+            else:
+                plan = policy.grouped_triton_plan(plan)
+        residual_launcher(
+            input_qdata,
+            weight_qdata,
+            output,
+            input_scale,
+            weight_scale,
+            bias,
+            residual_add,
+            row_offset=row_offset,
+            execution_plan=plan,
+        )
+    return True

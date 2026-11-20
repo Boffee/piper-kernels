@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from types import ModuleType
 
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
-from piper_kernels.linear.convrot.int8._amd import triton as amd
-from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
+from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 from piper_kernels.linear.convrot.int8.reference import linear as reference_linear
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -28,7 +26,7 @@ class ConvRotInt8Workload:
     config: ConvRotConfig
     inputs: ConvRotInputs
     production_plan: LinearExecutionPlan
-    backend: ModuleType
+    backend: linear_backend.LinearBackend
 
     @property
     def input_preparation(self) -> str:
@@ -52,11 +50,11 @@ class ConvRotInt8Workload:
         return _run_convrot_int8_reference(self, self.inputs)
 
 
-def select_convrot_int8_backend(target: AcceleratorTarget) -> ModuleType:
+def select_convrot_int8_backend(target: AcceleratorTarget) -> linear_backend.LinearBackend:
     """Resolve the production policy while allowing explicit offline targets."""
-    for backend in (nvidia, amd):
-        if backend.policy.supports_target(target):
-            return backend
+    backend = linear_backend.select_linear_backend_for_target(target)
+    if backend is not None:
+        return backend
     raise ValueError(f"ConvRot INT8 benchmarking has no optimized backend for {target}")
 
 

@@ -9,7 +9,6 @@ import torch
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops, reference
-from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -42,7 +41,7 @@ def test_generic_update_selection_does_not_query_architecture(monkeypatch, devic
 
 
 def test_generic_package_exports_preparation():
-    assert _generic.prepare_input is generic_dispatch.prepare_input
+    assert _generic.__all__ == ["prepare_input"]
 
 
 @pytest.mark.gpu
@@ -53,7 +52,7 @@ def test_rocm_uses_shared_triton_without_a_tuned_backend(monkeypatch):
     monkeypatch.setattr(_backend, "_amd_backend", None)
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
     value = torch.randn(3, 256, device="cuda", dtype=torch.bfloat16)
-    assert generic_dispatch._use_triton(value)
+    assert _generic._use_triton(value)
     prepare = Mock(wraps=generic_triton.prepare_input)
     add = Mock(wraps=int8_weight_triton.add_)
     addmm = Mock(wraps=int8_weight_triton.addmm_)

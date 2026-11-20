@@ -14,7 +14,7 @@ from piper_kernels.fusions.convrot_int8_projection._validation import validate_q
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
-from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
+from piper_kernels.linear.convrot.int8._backend import LinearBackend
 from piper_kernels.weights.convrot.int8._quantization import (
     validate_activation_scale,
     validate_storage,

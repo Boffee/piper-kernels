@@ -7,7 +7,7 @@ import torch
 from piper_kernels._residual import ResidualAdd
 from piper_kernels.fusions.attention._output import ChunkProjector
 from piper_kernels.linear import _bias
-from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
+from piper_kernels.linear.convrot.int8._backend import LinearBackend
 from piper_kernels.weights.convrot.int8._quantization import validate_storage
 
 

@@ -1,13 +1,17 @@
-"""NVIDIA SM120 Gluon TMA GEMM and fused residual epilogue for ConvRot INT8 projections.
+"""NVIDIA SM120 Gluon TMA ring, GEMM, and fused residual epilogue for ConvRot INT8.
 
-The kernel loads row-major INT8 operands into swizzled shared memory through 2D TMA
+Loads row-major INT8 operands into swizzled shared memory through 2D TMA
 descriptors across an up-to-three-stage mbarrier ring and accumulates exact INT32
-products with m16n8k32 (k=64 sliced) MMAv2 instructions across a 128x256 CTA tile
-(two 64-row warp rows by four 64-column warp columns). TMA hardware zero-fills
-out-of-bounds M, N, and K elements, so ragged tiles require no masked K-loop
-duplication. Both kernels keep M unspecialized so one compiled binary serves every
-row count. Accumulation is exact INT32, and dequantization preserves the shared
-``(acc * input_scale) * weight_scale`` + explicit FMA bias rounding.
+products with m16n8k32 MMAv2 instructions. Both the standalone ``128x256`` linear
+GEMM (``mma_k=64``, 8 warps) and fused D128 Q/K/V projections (``block_n=128``,
+``mma_k=32``, 4 warps) share the parameterized TMA ring (:func:`_accumulate_tma` /
+:func:`accumulate_tma`) and :func:`build_matrix_descriptor`.
+
+TMA launches require contiguous INT8 operands whose pointers and feature width
+``K`` are positive 16-byte multiples (TMA hardware zero-fills out-of-bounds M, N,
+and K). Both linear kernels keep M unspecialized so one compiled binary serves
+every row count. Accumulation is exact INT32, and dequantization preserves the
+shared ``(acc * input_scale) * weight_scale`` + explicit FMA bias rounding.
 """
 
 # Gluon exposes low-level signatures that are not fully modeled by type checkers.
@@ -28,7 +32,7 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 from piper_kernels._residual import ResidualAdd
 from piper_kernels._triton.runtime import device_context
 
-from ._plan import NvidiaExecutionPlan
+from .policy import NvidiaExecutionPlan
 
 _BLOCK_M = 128
 _BLOCK_N = 256
@@ -47,6 +51,7 @@ _GL_BLOCK_M = gl.constexpr(_BLOCK_M)
 _GL_BLOCK_N = gl.constexpr(_BLOCK_N)
 _GL_BLOCK_K = gl.constexpr(_BLOCK_K)
 _GL_MMA_K = gl.constexpr(_MMA_K)
+_GL_MAX_STAGES = gl.constexpr(_MAX_STAGES)
 _GL_WARPS_M = gl.constexpr(_WARPS_M)
 _GL_WARPS_N = gl.constexpr(_WARPS_N)
 _GL_NUM_WARPS = gl.constexpr(_NUM_WARPS)
@@ -98,6 +103,7 @@ def _accumulate_tile(
     refill: gl.constexpr,
     paired: gl.constexpr,
     second,
+    mma_k: gl.constexpr,
 ):
     input_layout: gl.constexpr = gl.DotOperandLayout(0, accumulator.type.layout, k_width=4)
     weight_layout: gl.constexpr = gl.DotOperandLayout(1, accumulator.type.layout, k_width=4)
@@ -105,9 +111,9 @@ def _accumulate_tile(
     input_tile = input_ring.index(slot)
     weight_tile = weight_ring.index(slot)
     mbarrier.wait(barrier, phase=group & 1)
-    for k_slice in gl.static_range(0, _GL_BLOCK_K, _GL_MMA_K):
-        lhs = input_tile.slice(k_slice, _GL_MMA_K, dim=1).load(input_layout)
-        rhs = weight_tile.slice(k_slice, _GL_MMA_K, dim=1).permute([1, 0]).load(weight_layout)
+    for k_slice in gl.static_range(0, _GL_BLOCK_K, mma_k):
+        lhs = input_tile.slice(k_slice, mma_k, dim=1).load(input_layout)
+        rhs = weight_tile.slice(k_slice, mma_k, dim=1).permute([1, 0]).load(weight_layout)
         accumulator = mma_v2(lhs, rhs, accumulator)
     gl.barrier()
     if refill:
@@ -140,14 +146,16 @@ def _accumulate_tma(
     tail_refills: gl.constexpr,
     paired: gl.constexpr,
     second,
+    block_n: gl.constexpr = _GL_BLOCK_N,
+    mma_k: gl.constexpr = _GL_MMA_K,
 ):
-    """Accumulate the exact INT32 tile product through an up-to-three-stage TMA ring."""
+    """Accumulate the exact INT32 ``[128, block_n]`` product through a TMA ring."""
     # Allocate one shared-memory ring across paired weights so SMEM stays at 73.7 KiB.
     input_ring = gl.allocate_shared_memory(
         gl.int8, [stages, _GL_BLOCK_M, _GL_BLOCK_K], input_descriptor.layout
     )
     weight_ring = gl.allocate_shared_memory(
-        gl.int8, [stages, _GL_BLOCK_N, _GL_BLOCK_K], weight_descriptor.layout
+        gl.int8, [stages, block_n, _GL_BLOCK_K], weight_descriptor.layout
     )
     barriers = gl.allocate_shared_memory(gl.int64, [stages, 1], mbarrier.MBarrierLayout())
     for slot in gl.static_range(stages):
@@ -168,7 +176,7 @@ def _accumulate_tma(
             second,
         )
 
-    accumulator = gl.full([_GL_BLOCK_M, _GL_BLOCK_N], 0, gl.int32, mma_layout)
+    accumulator = gl.full([_GL_BLOCK_M, block_n], 0, gl.int32, mma_layout)
     for group in range(full_groups):
         for slot in gl.static_range(stages):
             accumulator = _accumulate_tile(
@@ -187,6 +195,7 @@ def _accumulate_tma(
                 True,
                 paired,
                 second,
+                mma_k,
             )
     for slot in gl.static_range(tail_refills):
         accumulator = _accumulate_tile(
@@ -205,6 +214,7 @@ def _accumulate_tma(
             True,
             paired,
             second,
+            mma_k,
         )
     for slot in gl.static_range(tail_refills, stages):
         accumulator = _accumulate_tile(
@@ -223,6 +233,7 @@ def _accumulate_tma(
             False,
             paired,
             second,
+            mma_k,
         )
         mbarrier.invalidate(barriers.index(slot))
     for slot in gl.static_range(tail_refills):
@@ -242,9 +253,49 @@ def _accumulate_tma(
             False,
             paired,
             second,
+            mma_k,
         )
         mbarrier.invalidate(barriers.index(slot))
     return accumulator
+
+
+@gluon.jit
+def accumulate_tma(
+    input_descriptor,
+    weight_descriptor,
+    row_m,
+    row_n,
+    input_features: gl.constexpr,
+    mma_layout: gl.constexpr,
+    block_n: gl.constexpr,
+    mma_k: gl.constexpr,
+):
+    """Accumulate one ``[128, block_n]`` INT32 tile for a compile-time ``input_features``.
+
+    Supports any ``input_features`` divisible by 64 using ``min(3, k_tiles)``
+    shared-memory ring stages and exact ring-order tail refilling and draining.
+    """
+    gl.static_assert(input_features >= _GL_BLOCK_K and input_features % _GL_BLOCK_K == 0)
+    num_k_tiles: gl.constexpr = input_features // _GL_BLOCK_K
+    stages: gl.constexpr = _GL_MAX_STAGES if num_k_tiles >= _GL_MAX_STAGES else num_k_tiles
+    refill_tiles: gl.constexpr = num_k_tiles - stages
+    full_groups: gl.constexpr = refill_tiles // stages
+    tail_refills: gl.constexpr = refill_tiles % stages
+    return _accumulate_tma(
+        input_descriptor,
+        weight_descriptor,
+        weight_descriptor,
+        row_m,
+        row_n,
+        full_groups,
+        mma_layout,
+        stages,
+        tail_refills,
+        False,
+        False,
+        block_n,
+        mma_k,
+    )
 
 
 @gluon.jit
@@ -298,6 +349,8 @@ def _project_tma_tile(
         tail_refills,
         paired,
         second,
+        _GL_BLOCK_N,
+        _GL_MMA_K,
     )
 
     offsets_m = pid_m * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, mma_layout))
@@ -444,7 +497,14 @@ def _int8_tma_residual_matmul_kernel(
     residual_has_reusable_update: gl.constexpr,
     residual_python_indexing: gl.constexpr,
 ):
-    """Project one 16-bit TMA-loaded INT8 tile and add a validated residual update."""
+    """Project one 16-bit TMA-loaded INT8 tile and add a validated residual update.
+
+    Reuses the 73.7 KiB TMA ring shared memory to stage the rounded 64 KiB 16-bit
+    projection tile and processes 32-row chunks so single- and two-update
+    (``ReusableUpdate``) epilogues stay free of register spills while mirroring
+    the shared Triton FP32 residual arithmetic and 16-bit projection rounding
+    boundary (see ``policy.supports_residual_epilogue``).
+    """
     pid_m, pid_n, _, projection = _project_tma_tile(
         input_descriptor,
         weight_descriptor,
@@ -534,14 +594,19 @@ def operands_aligned(*operands: torch.Tensor) -> bool:
     )
 
 
-def _build_matrix_descriptor(matrix: torch.Tensor, block_rows: int) -> TensorDescriptor:
-    layout = gl.NVMMASharedLayout.get_default_for([block_rows, _BLOCK_K], gl.int8)
+def build_matrix_descriptor(matrix: torch.Tensor, block_rows: int = _BLOCK_M) -> TensorDescriptor:
+    """Build a 2D TMA descriptor over contiguous INT8 rows (flattening leading dims)."""
+    if not matrix.is_contiguous():
+        raise ValueError("TMA operands must be contiguous")
+    width = matrix.shape[-1]
+    tile = [block_rows, _BLOCK_K]
+    layout = gl.NVMMASharedLayout.get_default_for(tile, gl.int8)
     with device_context(matrix.device):
         return TensorDescriptor(
             matrix,
-            [matrix.shape[0], matrix.shape[1]],
-            [matrix.stride(0), matrix.stride(1)],
-            [block_rows, _BLOCK_K],
+            [matrix.numel() // width, width],
+            [width, 1],
+            tile,
             layout,
         )
 
@@ -571,10 +636,10 @@ def launch_int8_matmul(
     m, k = input_qdata.shape
     n = weight_qdata.shape[0]
     stages, full_groups, tail_refills = _compute_k_schedule(k)
-    input_descriptor = _build_matrix_descriptor(input_qdata, _BLOCK_M)
-    weight_descriptor = _build_matrix_descriptor(weight_qdata, _BLOCK_N)
+    input_descriptor = build_matrix_descriptor(input_qdata, _BLOCK_M)
+    weight_descriptor = build_matrix_descriptor(weight_qdata, _BLOCK_N)
     second_weight_descriptor = (
-        _build_matrix_descriptor(second_weight, _BLOCK_N) if paired else weight_descriptor
+        build_matrix_descriptor(second_weight, _BLOCK_N) if paired else weight_descriptor
     )
     grid = (triton.cdiv(m, _BLOCK_M) * triton.cdiv(n, _BLOCK_N) * (2 if paired else 1),)
     with device_context(input_qdata.device):
@@ -618,8 +683,8 @@ def launch_int8_residual_matmul(
     m, k = input_qdata.shape
     n = weight_qdata.shape[0]
     stages, full_groups, tail_refills = _compute_k_schedule(k)
-    input_descriptor = _build_matrix_descriptor(input_qdata, _BLOCK_M)
-    weight_descriptor = _build_matrix_descriptor(weight_qdata, _BLOCK_N)
+    input_descriptor = build_matrix_descriptor(input_qdata, _BLOCK_M)
+    weight_descriptor = build_matrix_descriptor(weight_qdata, _BLOCK_N)
     gate = residual_add.gate
     reusable = residual_add.reusable
     reusable_gate = output if reusable is None else reusable.gate

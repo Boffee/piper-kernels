@@ -112,7 +112,8 @@ uses its separate window buffers (two when several windows overlap projection).
 The linear backend owns the residual addition: a native GEMM epilogue adds the
 projection directly into the residual, while the fallback first writes a bounded
 projection scratch window. Each add rounds `base` once per window row;
-see [residual epilogues](../../linear/convrot/int8/_nvidia/README.md#residual-epilogues)
+see [`LinearBackend.linear_prepared_residual`](../../linear/convrot/int8/_backend.py)
+and the [SM120 TMA residual epilogue](../../linear/convrot/int8/_nvidia/gluon_tma.py)
 for numerical and backend details.
 
 When its heads split into aligned halves, the fold runs this add in two head slices,
