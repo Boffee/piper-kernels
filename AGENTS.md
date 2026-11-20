@@ -34,9 +34,9 @@ for architecture, validation, and tests.
    same PR when adding variants.
 8. **Test contracts, not private plumbing:** Assert observable behavior and compiler
    invariants in shared parametrized suites—never hardcoded tile tuples, private-global
-   monkeypatches, or `src/` AST checks. Never raise ceilings in
-   [`tests/test_architecture.py`](tests/test_architecture.py) without explicit approval;
-   lower them as cleanup lands.
+   monkeypatches, or `src/` AST checks outside
+   [`tests/test_architecture.py`](tests/test_architecture.py). Never raise its ceilings
+   without explicit approval; lower them as cleanup lands.
 
 ## Contracts & checks
 

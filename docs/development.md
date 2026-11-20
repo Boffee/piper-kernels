@@ -115,8 +115,8 @@ ownership and untouched guard regions for in-place and caller-owned outputs.
 Assert observable invariants (fused op in compiled graph, compile/launch counts,
 spill/stack/shared-memory budgets, numerical accuracy vs an independent reference)
 rather than private plumbing (no hardcoded tile tuples, private `_` monkeypatches, or
-`src/` AST inspection; keep timings in `benchmarks/`). Preserve distinct scenarios and
-cold-import isolation when consolidating.
+`src/` AST inspection outside `tests/test_architecture.py`; keep timings in
+`benchmarks/`). Preserve distinct scenarios and cold-import isolation when consolidating.
 
 Select backends via `AcceleratorTarget` (ROCm RX 9070 XT reports CUDA `(12, 0)`), and
 use `exact_sm120_available()` from [`tests/_accelerators.py`](../tests/_accelerators.py)
