@@ -36,7 +36,7 @@ from piper_kernels.linear.convrot.int8 import _compile as linear_compile
 from piper_kernels.linear.convrot.int8 import _compile_fx
 from piper_kernels.weights.convrot import _rotation
 
-from . import _backend, _output_compile
+from . import _backend, _distributed_compile, _output_compile
 from . import key as key_operators  # noqa: F401 - registers the K projection
 from . import value as value_operators  # noqa: F401 - registers the V projection
 
@@ -555,6 +555,7 @@ class _OutputCompilePass(CustomInferenceAwareGraphPass):
             )
             or changed
         )
+        changed = _distributed_compile.fold_distributed_attention_output(graph) or changed
         if changed:
             graph.eliminate_dead_code()
             graph.lint()

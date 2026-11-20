@@ -214,6 +214,29 @@ assert "piper_kernels.linear.convrot.int8._compile" in sys.modules
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_convrot_int8_piper_compiler_integration_is_loaded_lazily() -> None:
+    script = """
+import sys
+from piper_kernels.fusions import convrot_int8_piper
+
+assert "piper_kernels.fusions.convrot_int8_piper._compile" not in sys.modules
+assert "piper_kernels.fusions.convrot_int8_piper._distributed_compile" not in sys.modules
+assert "piper_kernels.fusions.convrot_int8_piper.distributed_output" not in sys.modules
+assert "piper_kernels._distributed._peer_exchange" not in sys.modules
+assert "piper_kernels.fusions.convrot_int8_piper._output_compile" not in sys.modules
+assert "piper_kernels.fusions.convrot_int8_piper.output" not in sys.modules
+convrot_int8_piper.convrot_int8_piper_compile_options(fuse_output=True)
+assert "piper_kernels.fusions.convrot_int8_piper._compile" in sys.modules
+assert "piper_kernels.fusions.convrot_int8_piper._distributed_compile" in sys.modules
+assert "piper_kernels.fusions.convrot_int8_piper.distributed_output" in sys.modules
+assert "piper_kernels._distributed._peer_exchange" in sys.modules
+assert "piper_kernels.fusions.convrot_int8_piper._output_compile" in sys.modules
+assert "piper_kernels.fusions.convrot_int8_piper.output" in sys.modules
+assert "piper_kernels.linear.convrot.int8._compile" in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 def test_convrot_nvfp4_sparse_piper_compiler_integration_is_loaded_lazily() -> None:
     script = """
 import sys

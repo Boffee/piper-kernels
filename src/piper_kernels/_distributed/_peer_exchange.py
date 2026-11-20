@@ -1,0 +1,267 @@
+"""Shared bounded peer-exchange reduce-scatter helpers for distributed fusions."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+import torch
+import torch.distributed as dist
+
+from piper_kernels._residual import ResidualAdd
+from piper_kernels._residual.triton import apply_residual_add
+
+from . import _comm as distributed_comm
+
+
+def contiguous_chunk_view(
+    buffer: torch.Tensor,
+    batch: int,
+    rows: int,
+    features: int,
+) -> torch.Tensor:
+    """Slice a prefix of ``buffer`` as ``[batch, rows, features]``."""
+    return buffer.view(-1)[: batch * rows * features].view(batch, rows, features)
+
+
+def validate_distributed_sequence(
+    sequence_length: int,
+    comm_group_size: int,
+    comm_group_name: str,
+    *,
+    name: str = "distributed Piper",
+) -> int:
+    """Validate process-group metadata and return one rank's local sequence length."""
+    if (
+        isinstance(comm_group_size, bool)
+        or not isinstance(comm_group_size, int)
+        or comm_group_size < 2
+    ):
+        raise ValueError(f"{name} attention requires comm_group_size >= 2")
+    if not isinstance(comm_group_name, str):
+        raise TypeError(f"{name} attention requires string comm_group_name")
+    if not isinstance(sequence_length, torch.SymInt) and sequence_length % comm_group_size:
+        raise ValueError(f"{name} sequence length must divide evenly across ranks")
+    return sequence_length // comm_group_size
+
+
+def choose_distributed_chunk_rows(
+    local_sequence_length: int,
+    query_chunk_rows: int,
+    *,
+    tile_rows: int,
+    max_chunk_rows: int = 4096,
+) -> int:
+    """Choose a tile-aligned peer exchange window up to ``max_chunk_rows``."""
+    if local_sequence_length < tile_rows:
+        return local_sequence_length
+    target = min(local_sequence_length, query_chunk_rows, max_chunk_rows)
+    return max(tile_rows, (target // tile_rows) * tile_rows)
+
+
+def apply_received_chunk(
+    receive_tensor: torch.Tensor,
+    output: torch.Tensor,
+    local_offset: int,
+    rows: int,
+    *,
+    residual_add: ResidualAdd | None,
+    reuse_direct_receive: bool,
+) -> None:
+    """Copy or residual-add a peer-received chunk into ``output``."""
+    batch, local_sequence_length = output.shape[:2]
+    if residual_add is not None:
+        for batch_index in range(batch):
+            apply_residual_add(
+                receive_tensor[batch_index],
+                residual_add,
+                row_offset=batch_index * local_sequence_length + local_offset,
+            )
+    elif not reuse_direct_receive:
+        output[:, local_offset : local_offset + rows].copy_(receive_tensor)
+
+
+def run_distributed_fallback(
+    process_group: dist.ProcessGroup,
+    comm_group_size: int,
+    local_sequence_length: int,
+    output_features: int,
+    output_dtype: torch.dtype,
+    full_output: torch.Tensor,
+    residual_add: ResidualAdd | None,
+) -> torch.Tensor:
+    """Reduce-scatter a full-sequence output when aligned chunking cannot run."""
+    batch = full_output.shape[0]
+    reduced = torch.empty(
+        (batch, local_sequence_length, output_features),
+        device=full_output.device,
+        dtype=output_dtype,
+    )
+    reduce_scatter_input = (
+        full_output.view(comm_group_size, 1, local_sequence_length, output_features)
+        if batch == 1
+        else torch.cat(list(full_output.split(local_sequence_length, dim=1)), dim=0).contiguous()
+    )
+    work = dist.reduce_scatter_tensor(
+        reduced,
+        reduce_scatter_input,
+        op=dist.ReduceOp.SUM,
+        group=process_group,
+        async_op=False,
+    )
+    if work is not None:
+        work.wait()
+    if residual_add is not None:
+        apply_residual_add(reduced, residual_add, row_offset=0)
+        return residual_add.base
+    return reduced
+
+
+def allocate_peer_comm_slots(
+    world_size: int,
+    peer_ranks: tuple[int, ...],
+    batch: int,
+    capacity: int,
+    output_features: int,
+    *,
+    slots: int,
+    device: torch.device,
+    output_dtype: torch.dtype,
+    reuse_direct_receive: bool,
+) -> tuple[list[list[torch.Tensor]], list[torch.Tensor | None], torch.Tensor | None]:
+    """Allocate double-buffered send/receive scratch slots for bounded peer exchanges."""
+    send_slots: list[list[torch.Tensor]] = [
+        [
+            torch.empty((batch, capacity, output_features), device=device, dtype=output_dtype)
+            for _ in peer_ranks
+        ]
+        for _ in range(slots)
+    ]
+    receive_slots: list[torch.Tensor | None] = [
+        None
+        if reuse_direct_receive
+        else torch.empty((batch, capacity, output_features), device=device, dtype=output_dtype)
+        for _ in range(slots)
+    ]
+    zero_local_buffer = (
+        None
+        if world_size == 2
+        else torch.zeros((batch, capacity, output_features), device=device, dtype=output_dtype)
+    )
+    return send_slots, receive_slots, zero_local_buffer
+
+
+def run_peer_chunk_exchange(
+    process_group: dist.ProcessGroup,
+    output: torch.Tensor,
+    comm_chunk_rows: int,
+    run_peer_window: Callable[[int, int, torch.Tensor], None],
+    apply_received: Callable[[torch.Tensor, int, int], None],
+    *,
+    reuse_direct_receive: bool,
+) -> tuple[dist.Work, int, int, torch.Tensor, tuple[torch.Tensor, ...]]:
+    """Compute peer windows and ping-pong async exchanges, returning the final in-flight chunk."""
+    world_size = process_group.size()
+    batch, local_sequence_length, output_features = output.shape
+    capacity = min(local_sequence_length, comm_chunk_rows)
+    sub_ranges = [
+        (offset, min(comm_chunk_rows, local_sequence_length - offset))
+        for offset in range(0, local_sequence_length, comm_chunk_rows)
+    ]
+    slots = min(2, len(sub_ranges))
+    peer_ranks = tuple(peer for peer in range(world_size) if peer != process_group.rank())
+
+    send_slots, receive_slots, zero_local_buffer = allocate_peer_comm_slots(
+        world_size,
+        peer_ranks,
+        batch,
+        capacity,
+        output_features,
+        slots=slots,
+        device=output.device,
+        output_dtype=output.dtype,
+        reuse_direct_receive=reuse_direct_receive,
+    )
+
+    pending: tuple[dist.Work, int, int, int, torch.Tensor] | None = None
+    try:
+        for chunk_index, (local_offset, rows) in enumerate(sub_ranges):
+            slot = chunk_index % slots
+            send_views = [
+                contiguous_chunk_view(send_slots[slot][peer_index], batch, rows, output_features)
+                for peer_index in range(len(peer_ranks))
+            ]
+            for peer_rank, send_view in zip(peer_ranks, send_views, strict=True):
+                run_peer_window(peer_rank * local_sequence_length + local_offset, rows, send_view)
+
+            if pending is not None:
+                prev_work, _prev_slot, prev_offset, prev_rows, prev_receive = pending
+                prev_work.wait()
+                apply_received(prev_receive, prev_offset, prev_rows)
+                pending = None
+
+            if reuse_direct_receive:
+                receive_view = output[:, local_offset : local_offset + rows]
+            else:
+                receive_slot = receive_slots[slot]
+                assert receive_slot is not None
+                receive_view = contiguous_chunk_view(receive_slot, batch, rows, output_features)
+            zero_view = (
+                None
+                if zero_local_buffer is None
+                else contiguous_chunk_view(zero_local_buffer, batch, rows, output_features)
+            )
+            work = distributed_comm.start_peer_exchange(
+                process_group, send_views, receive_view, zero_view
+            )
+            pending = (work, slot, local_offset, rows, receive_view)
+    except BaseException:
+        if pending is not None:
+            pending[0].wait()
+        raise
+
+    assert pending is not None
+    last_work, last_slot, last_offset, last_rows, last_receive = pending
+    keepalive: tuple[torch.Tensor, ...] = (
+        *send_slots[last_slot],
+        *(() if zero_local_buffer is None else (zero_local_buffer,)),
+    )
+    return last_work, last_offset, last_rows, last_receive, keepalive
+
+
+def finish_overlapped_exchange(
+    last_exchange: tuple[dist.Work, int, int, torch.Tensor, tuple[torch.Tensor, ...]],
+    *,
+    run_own: Callable[[], torch.Tensor | None],
+    apply_received: Callable[[torch.Tensor, int, int], None],
+    output: torch.Tensor,
+    residual_add: ResidualAdd | None,
+) -> torch.Tensor:
+    """Run own-rank work behind the last in-flight collective, wait, and combine."""
+    last_work, last_offset, last_rows, last_receive, keepalive = last_exchange
+    del last_exchange
+    try:
+        own_partial = run_own()
+    except BaseException:
+        last_work.wait()
+        del keepalive, last_receive
+        raise
+    last_work.wait()
+    del keepalive
+    apply_received(last_receive, last_offset, last_rows)
+    if residual_add is not None:
+        return residual_add.base
+    assert own_partial is not None
+    output.add_(own_partial)
+    return output
+
+
+__all__ = [
+    "allocate_peer_comm_slots",
+    "apply_received_chunk",
+    "choose_distributed_chunk_rows",
+    "contiguous_chunk_view",
+    "finish_overlapped_exchange",
+    "run_distributed_fallback",
+    "run_peer_chunk_exchange",
+    "validate_distributed_sequence",
+]

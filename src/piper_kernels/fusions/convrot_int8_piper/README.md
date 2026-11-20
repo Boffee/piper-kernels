@@ -128,3 +128,23 @@ rounded across all heads, so each slice's add takes its position and covers its 
 share of the whole profile's budget. A coarse gate the fusion receives whole holds every
 head, so that add runs as one slice. Sparse windows keep their unsliced row cap: their Q,
 attention, and routing-score buffers then halve with the heads, at a small speed cost.
+
+## Sequence-parallel output collectives
+
+When `fuse_output=True`, `_OutputCompilePass` runs
+[`_distributed_compile.py`](_distributed_compile.py) via the shared
+[`_distributed_fold.py`](../attention/_distributed_fold.py) helper to rewrite
+`convrot_int8_piper_projected_query_attention_output -> reduce_scatter_tensor` (and an
+exclusive trailing in-place `residual_add_`) into
+`convrot_int8_piper_projected_query_attention_reduce_scatter` or
+`..._reduce_scatter_residual_add_`. Both custom operators live in
+[`distributed_output.py`](distributed_output.py) and delegate bounded peer chunk
+exchange behind own-rank attention to
+[`_peer_exchange.py`](../../_distributed/_peer_exchange.py).
+
+Rank-local sequences divisible by 128 tokens (matching dense query-tile alignment on SM89,
+SM120, and RDNA4) use bounded ping-pong peer chunks; shorter or unaligned local
+sequences fall back to whole-sequence reduce-scatter. On aligned sequences with a residual
+target, peer and local rank updates add into `base` in two rounded steps rather than
+materializing a full-sequence buffer; see
+[sequence-parallel weights](../../../../docs/weights.md#shard-a-quantized-weight).
