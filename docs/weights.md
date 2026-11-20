@@ -123,11 +123,9 @@ omitting it fixes unit global scaling (`1.0`, still computing 16-value block
 scales). The same scale contract applies to NVFP4/ConvRot FFN and sparse output
 fusions; see [compilation](#compile-a-model) for preparation sharing.
 
-Piper's portable weight builder, activation preparation, and updates round block
-scales directly to E4M3 down to `1/512` (FlashInfer semantics; passing
-`use_triton_kernel=True` to `from_hp` keeps TorchAO's `1/64` normal floor). Zero
-scales decode a block as zero without NaNs, and independent/fused rounding need
-not agree bitwise across backends.
+Zero scales decode a block as zero without NaNs, and independent vs fused backends need
+not agree bitwise (`use_triton_kernel=True` in `from_hp` selects TorchAO's `1/64` normal
+floor instead of Piper's `1/512` E4M3 floor).
 
 `PiperNVFP4Tensor.from_torchao(existing)` wraps TorchAO storage without copying;
 `ConvRotNVFP4Tensor.from_torchao(existing, group_size=...)` attaches rotation
@@ -226,17 +224,14 @@ compiled_layer = torch.compile(linear_layer, options=convrot_int8_compile_option
 
 - **Linears**: `convrot_int8_compile_options` (`piper_kernels.linear.convrot`),
   `nvfp4_compile_options` (`piper_kernels.linear.nvfp4`), and
-  `convrot_nvfp4_compile_options` (`piper_kernels.linear.convrot.nvfp4`) share
-  preparation across compatible linears (INT8 also fuses exclusive tanh-GELU
-  inputs). Static INT8 shares preparation only across the same scale graph node;
-  NVFP4 unit-scale metadata shares across transfers.
+  `convrot_nvfp4_compile_options` (`piper_kernels.linear.convrot.nvfp4`) share input
+  preparation across compatible linears (INT8 also fuses exclusive `tanh`-GELU inputs)
+  while preserving static/dynamic scales.
 - **FFNs**: `{convrot_int8,nvfp4,convrot_nvfp4}_{swiglu,gelu}_ffn_compile_options`
   under `piper_kernels.fusions` fuse FP16/BF16 SwiGLU and exclusive `tanh`-GELU
-  FFNs while preserving static/dynamic scales. When updating a residual stream, see
-  [in-place residual updates](attention.md#update-a-residual-stream-in-place) and
-  [residual epilogues](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md#residual-epilogues).
-- **Attention & specializations**: see [attention](attention.md#compile-and-fuse-projections)
-  and [`specializations/`](../src/piper_kernels/specializations).
+  FFNs while preserving scales. When updating a residual stream, see
+  [in-place residual updates](attention.md#update-a-residual-stream-in-place).
+- **Attention**: see [attention](attention.md#compile-and-fuse-projections).
 
 Static INT8 weights bypass AOTAutograd's persistent disk cache (Inductor caching
 and graph reuse remain enabled). There is no hidden prepared-weight cache.
@@ -262,11 +257,8 @@ with torch.no_grad():
     int8_weight.addmm_(lora_b, lora_a, alpha=0.1, rounding_seed=42)
 ```
 
-On NVIDIA SM80+/HIP with `in_features <= 16,384` (else `32 MiB` scratch cap on
-Triton; optimized NVFP4 also avoids dense buffers), Triton `addmm_` avoids a full
-dense update allocation, falling back to dense PyTorch elsewhere. Lower scratch
-does not guarantee higher speed, and HIP merge currently has compile-only
-coverage.
+Where supported on Triton, `addmm_` avoids a full dense update allocation, falling back
+to dense PyTorch elsewhere (lower scratch does not guarantee higher speed).
 
 Pass an unsigned 64-bit `rounding_seed` for stochastic code rounding without
 touching global RNG (reproducible per backend/device only; Dynamo compiles
@@ -362,21 +354,13 @@ distributed_layer = parallelize_module(distributed_layer, mesh, plan)
 ```
 
 Use `Shard(0)` bias for `dim=0` and `Replicate()` for `dim=1`. Sequence-sharded
-(`Shard(1)`) `PrepareModuleInput` boundaries whose shared activation feeds two
-or more sibling ConvRot INT8 linears (including dense Piper Q/K/V) fold into
-quantized INT8 all-gathers under `convrot_int8_compile_options`. Sparse Piper
-(`convrot_int8_sparse_piper_compile_options`) also folds `Shard(1)`
-`PrepareModuleInput` into overlapped K/V gathers and
-`RowwiseParallel(output_layouts=Shard(1))` into bounded peer-exchange
-reduce-scatters (64-token local alignment), while dense Piper
-(`convrot_int8_piper_compile_options(..., fuse_output=True)`) folds
-`RowwiseParallel(output_layouts=Shard(1))` into bounded peer-exchange
-reduce-scatters (128-token local alignment, falling back to whole-sequence
-reduce-scatter below that alignment). Pairing either attention fusion with
-`residual_updates_compile_options` folds reduce-scatters into in-place residual
-adds, rounding peer and local rank contributions into `base` in two steps on
-rank-aligned sequences. For other fused sharded blocks, keep full heads or FFN
-intermediate shards local, unwrap activations around fusions, keep collectives
+(`Shard(1)`) ConvRot INT8 linears and dense (`fuse_output=True`) or sparse Piper
+attention fusions fold `PrepareModuleInput`/`RowwiseParallel(output_layouts=Shard(1))`
+collectives automatically (and fold reduce-scatters into two-step in-place residual adds
+with `residual_updates_compile_options`); see
+[sequence-parallel output collectives](../src/piper_kernels/fusions/convrot_int8_piper/README.md#sequence-parallel-output-collectives)
+for alignment and fallback details. For other fused sharded blocks, keep full heads or
+FFN intermediate shards local, unwrap activations around fusions, keep collectives
 outside, and compare against the local **fused** output.
 
 ## Storage and checkpoint compatibility

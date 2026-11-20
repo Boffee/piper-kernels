@@ -9,72 +9,28 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - Sequence-sharded (`Shard(1)`) ConvRot INT8 linears and fused dense
   (`convrot_int8_piper_compile_options(..., fuse_output=True)`) or sparse Piper
-  attention blocks fold PyTorch TP+SP collective boundaries automatically
-  (rounding peer and local rank residual updates into `base` in two steps on
-  128-token dense or 64-token sparse rank-aligned sequences when paired with
-  `residual_updates_compile_options`). On 2x RX 9070 XT over `piper_relay` at
-  16K tokens, compiled 8-block MiniMax-H3 hybrid TP+SP runs 1.90x faster than
-  single-GPU streaming for sparse attention (41.07 vs 77.93 ms/block,
-  7-iteration median; peak 1587 vs 1644 MiB) and 1.78x faster non-causal /
-  1.74x causal for dense attention (67.52 vs 120.44 ms/block and 53.98 vs
-  93.81 ms/block, 5-iteration median; peak 1500 vs 1616 MiB).
+  attention blocks now fold PyTorch TP+SP collective boundaries automatically, including
+  two-step in-place residual add folding when paired with
+  `residual_updates_compile_options`. Measured faster with lower peak memory across 2×
+  RX 9070 XT dense and sparse attention blocks.
 
 ### Changed
 
-- On RX 9070 XT with Triton 3.9, ConvRot INT8 linears and fused FFNs run
-  faster with unchanged or lower peak allocation: fused GELU/SwiGLU and
-  residual FFNs take 6–13% less time, gated residual attention output
-  projections take 13–16% less time, 16,384-input down projections take
-  10–17% less time, and short batches up to 64 rows take 7–17% less time.
-  Outputs preserve existing rounding boundaries.
-- `piper_attention` now centers keys and values independently per `1024`-token
-  KV chunk (`K1024 + V1024`) for both non-causal and causal attention instead of
-  using sequence-wide reductions (and leaving causal V uncentered). Both causal
-  and non-causal numerical outputs differ from prior releases, so callers
-  upgrading should revalidate end-to-end quality.
-- `SparsePiperAttention` / `sparse_piper_attention` and the sparse-Piper
-  compiler fusions (`convrot_int8_sparse_piper_compile_options`,
-  `nvfp4_sparse_piper_compile_options`, `convrot_nvfp4_sparse_piper_compile_options`)
-  now center keys and values per independent `64`-token tile (`K64 + V64` — `K`
-  by its rotated midpoint and `V` by its mean) instead of using sequence-wide
-  global mean reductions. Numerical outputs differ from prior releases
-  (including full-keep configurations), so callers upgrading should revalidate
-  end-to-end quality.
-- Replaced sequence-wide K/V mean centering in `piper_attention` and `convrot_int8_piper` with independent `1024`-token chunk centering (`K1024 + V1024`) across both causal and non-causal paths, updating `piper_kernels::piper_attention_from_quantized` and its offline SM8x/SM120/RDNA4 compiler paths.
-- On RX 9070 XT, ConvRot INT8 linears run 1–5% faster (4–6% with Triton 3.9), fused
-  sparse Piper Q/K/V projections about 8% faster, and H3 VAE Conv3D about 1.5% faster,
-  with bitwise-identical outputs. ROCm Triton kernels recompile once after upgrading.
-- On RX 9070 XT (Triton 3.9), `sparse_piper_attention` runs 8–15% faster, `D=128`
-  `convrot_int8_sparse_piper` V projections run 4–18% faster, and `piper_attention` runs
-  4–13% faster standalone (~9% in compiled D=128 H3 blocks). Batched sparse `value_mean`
-  accumulation and per-row dense epilogue normalization slightly reassociate FP32
-  arithmetic within INT8 tolerances, while sparse V projection outputs are unchanged.
-- On RTX 5090 (SM120), `D=128` `sparse_piper_attention` runs 10–11% faster standalone
-  and 3–9% faster in compiled `1/8`-keep 20K–110K pipelines, with unchanged peak memory.
-  Batched BF16 tensor-core `value_mean` accumulation and reordered FP32 score reductions
-  slightly change `D=128` rounding within INT8 tolerances, while `D=64` and SM8x outputs
-  are unchanged.
-- On RTX 5090 (SM120), `D=128` `convrot_int8_sparse_piper` and `convrot_int8_piper`
-  Q/K/V projections use TMA operand loads across all `K64`-aligned input widths,
-  running 7–10% faster on standalone 110K-token sparse Q/K/V phases and up to 1.3%
-  faster end-to-end in compiled dense and sparse pipelines with unchanged peak memory.
-  Sparse Q/K/V and dense K/V outputs are bitwise-identical, while dense Q scales stay
-  within 1 ULP under Triton's default FP fusion with identical INT8 codes.
-- On RTX 5090 (SM120), `SparsePiperAttention` and sparse-Piper fusions now use
-  fused IEEE FP32 min/max routing scores alongside early-exit radix route
-  selection shared across native sparse targets, cutting routing time by about
-  1.7–2.5× at 110K–221K tokens (up to 5% faster standalone attention and 2.9%
-  faster compiled INT8 pipelines at 1/16 keep) with 80–127 MiB lower fused peak
-  scratch allocation and exact FP32 score (`<= 2e-5` vs FP64) and top-k parity.
-- On RTX 5090 (SM120), large ConvRot INT8 linear, paired, and fused 16-bit
-  residual projections run 2–8% faster standalone (`3–6%` across end-to-end
-  catalog linears, `3–9%` on GELU/SwiGLU FFNs, and `7–8%` on single- and
-  two-update fused residual projections) with unchanged peak memory and
-  bitwise-identical rounding boundaries.
-
-### Removed
-
-- Removed `convrot_int8_centered_projection` and `convrot_int8_sage_qk`; global key-mean centering helpers were superseded by chunk-centered KV projection, and the shared RMSNorm/RoPE Q/K helpers were folded into `convrot_int8_projection`.
+- **Breaking (numerical):** `piper_attention` (and `convrot_int8_piper_compile_options`)
+  now center keys and values independently per `1024`-token KV chunk (`K1024 + V1024`)
+  for both non-causal and causal attention instead of sequence-wide reductions. Outputs
+  differ from prior releases, so callers should revalidate end-to-end quality.
+- **Breaking (numerical):** `SparsePiperAttention` / `sparse_piper_attention` and
+  sparse-Piper compiler fusions now center keys and values independently per `64`-token
+  tile (`K64 + V64`) instead of using sequence-wide global mean reductions. Numerical
+  outputs differ across all keep ratios (including full keep), so callers should
+  revalidate end-to-end quality.
+- Improved RX 9070 XT (RDNA4) execution speed for ConvRot INT8 linears, FFNs, Conv3D,
+  and dense/sparse Piper attention (with minor FP32 reassociation within INT8 tolerances
+  and a one-time ROCm Triton kernel recompile).
+- Improved RTX 5090 (SM120) execution speed and reduced scratch memory across sparse Piper
+  routing/attention, D128 Q/K/V projections, and large ConvRot INT8 linear, FFN, and
+  fused residual projections (with minor rounding differences within INT8 tolerances).
 
 ## [0.8.0rc6] - 2026-11-12
 
