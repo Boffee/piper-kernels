@@ -1,8 +1,8 @@
 """Bounded-workspace standard and ConvRot NVFP4 FFN runner and custom ops.
 
-This module imports without Triton, TorchAO, or ConvRot. Standard NVFP4 calls
-(``group_size=None``) never import ConvRot packages or register ConvRot ops;
-ConvRot calls import rotation validation or kernels lazily.
+This module imports without Triton or ConvRot. Standard NVFP4 calls
+(``group_size=None``) never import ConvRot linear packages or register ConvRot
+ops; ConvRot calls import rotation validation or kernels lazily.
 """
 
 # Explicit custom-op schemas take flat tensor arguments required by torch.library.

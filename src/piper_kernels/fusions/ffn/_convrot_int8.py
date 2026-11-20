@@ -1,8 +1,8 @@
 """Bounded-workspace ConvRot INT8 feed-forward network runner and custom ops.
 
-This module imports without Triton, NVFP4, or TorchAO. Runtime dispatch selects
-the active ConvRot INT8 linear backend once per call and reuses chunk workspaces
-across both ``gelu_tanh`` and ``swiglu`` activations.
+This module imports without Triton or NVFP4. Runtime dispatch selects the active
+ConvRot INT8 linear backend once per call and reuses chunk workspaces across
+both ``gelu_tanh`` and ``swiglu`` activations.
 """
 
 # Explicit custom-op schemas take flat tensor arguments required by torch.library.
