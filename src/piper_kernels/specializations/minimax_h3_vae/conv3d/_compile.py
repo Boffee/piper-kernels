@@ -119,7 +119,7 @@ def _framewise_norm_silu(node: object) -> _NormSiluInput | None:  # noqa: PLR091
         return None
     try:
         _validation._validate_norm(source_value, weight_value, bias_value, groups, epsilon)
-    except (ValueError, RuntimeError):
+    except ValueError, RuntimeError:
         return None
     return source, weight, bias, groups, epsilon
 

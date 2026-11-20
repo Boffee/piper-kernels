@@ -511,7 +511,7 @@ def add_(
     high_first: bool,
     rounding_seed: int | None = None,
     # Last, so calls in existing compiled graphs stay valid. Not keyword-only:
-    # PyTorch 2.14 Inductor can pass it in another argument's position.
+    # PyTorch Inductor can pass it in another argument's position.
     beta: float = 1.0,
 ) -> None:
     """Fuse a dense update and optional rotation into in-place NVFP4 packing."""

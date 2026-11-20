@@ -43,7 +43,7 @@ def supports_device(device: torch.device) -> bool:
             return isinstance(backend, str) and (
                 backend != "cuda" or (isinstance(architecture, int) and architecture >= 70)
             )
-    except (RuntimeError, ImportError, AttributeError):
+    except RuntimeError, ImportError, AttributeError:
         # Only probing can fail closed. Never catch/retry a kernel failure after
         # an in-place operation may already have mutated its output.
         return False

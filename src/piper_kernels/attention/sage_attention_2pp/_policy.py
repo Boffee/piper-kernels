@@ -31,9 +31,8 @@ def _apply_sm89_policy(
     """Apply schedules measured on exact SM89 D128 shapes, plus causal LICM."""
     if is_causal:
         # Since Triton 3.9, disabling LICM keeps the Q tile's shared-memory copy
-        # inside the K loop. Timed on SM120 as a proxy, not on SM89: causal
-        # schedules without LICM were 20% (D128) and 3% (D64) slower on Triton 3.9
-        # than on 3.8, and within 2% of 3.8 with it. Non-causal D64 is unaffected.
+        # inside the K loop, regressing D128 and D64 causal schedules. Non-causal D64
+        # is unaffected.
         plan = replace(plan, loop_licm=True)
     if is_causal and head_dim == 128:
         return replace(
@@ -64,9 +63,7 @@ def _apply_sm120_policy(
         use_tensor_descriptors=use_tensor_descriptors,
         use_packed_probability_conversion=False,
         # Since Triton 3.9, disabling LICM also keeps the Q tile's shared-memory
-        # copy inside the K loop, so D128 spills and runs up to 36% slower.
-        # Enabling LICM brings Triton 3.9 within 2% of Triton 3.8, and changes
-        # Triton 3.8 by 1% slower (non-causal D128) to 4% faster (causal D128).
+        # copy inside the K loop, causing D128 spills and heavy slowdowns.
         loop_licm=True,
     )
 
