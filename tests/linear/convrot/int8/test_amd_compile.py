@@ -20,7 +20,7 @@ from piper_kernels.linear.convrot.int8._kernels import triton as kernels
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
 
 
-@pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"])
+@pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1201"])
 @pytest.mark.parametrize("aligned_nk", [False, True])
 def test_amd_paired_projection_compiles_to_matrix_instructions(architecture, aligned_nk):
     target = AcceleratorTarget("hip", architecture)
@@ -117,19 +117,32 @@ def _compile_rdna4_projection(architecture, plan, *, aligned_nk, group_m, option
     )
 
 
-@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("aligned_nk", [False, True])
-def test_rdna4_h3_projection_schedule_compiles(architecture, aligned_nk):
-    target = AcceleratorTarget("hip", architecture)
+def test_rdna4_h3_projection_schedule_compiles(aligned_nk):
+    target = AcceleratorTarget("hip", "gfx1201")
     plan = replace(
         policy.select_execution_plan(target, in_features=8_192),
         matmul_block_n=128,
     )
     compiled = _compile_rdna4_projection(
-        architecture,
+        "gfx1201",
         plan,
         aligned_nk=aligned_nk,
         group_m=0,
+        options=amd._amd_matmul_compiler_options(target),
+    )
+    assert "v_wmma_i32" in compiled.asm["amdgcn"]
+
+
+def test_gfx1200_projection_target_smoke_compiles():
+    """Keep lightweight offline gfx1200 target wiring without duplicating RDNA4 matrices."""
+    target = AcceleratorTarget("hip", "gfx1200")
+    plan = policy.select_execution_plan(target, in_features=8_192)
+    compiled = _compile_rdna4_projection(
+        "gfx1200",
+        plan,
+        aligned_nk=True,
+        group_m=policy.matmul_group_m(plan),
         options=amd._amd_matmul_compiler_options(target),
     )
     assert "v_wmma_i32" in compiled.asm["amdgcn"]
@@ -160,7 +173,7 @@ def test_rdna4_projection_barriers_fence_only_lds():
     assert "global_inv" not in compile_projection(options=options).asm["amdgcn"]
 
 
-@pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"])
+@pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1201"])
 @pytest.mark.parametrize("width", [5376, 9216, 12288, 14336, 16384])
 @pytest.mark.parametrize("static", [False, True])
 def test_amd_activated_preparation_compiles(architecture, width, static):

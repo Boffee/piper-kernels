@@ -229,10 +229,9 @@ def test_public_fused_preparation_matches_separate_and_graph(
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm compilation is Linux-only")
-def test_fused_preparation_compiles_for_rdna4(head_dim, architecture, padded):
+def test_fused_preparation_compiles_for_rdna4(head_dim, padded):
     triton = pytest.importorskip("triton")
     from triton.backends.compiler import GPUTarget  # noqa: PLC0415
     from triton.compiler import ASTSource  # noqa: PLC0415
@@ -273,7 +272,7 @@ def test_fused_preparation_compiles_for_rdna4(head_dim, architecture, padded):
             signature["query_ptr" if "query_ptr" in signature else "key_ptr"] = "*bf16"
         compiled = triton.compile(
             ASTSource(kernel, signature, constexprs=constants),
-            target=GPUTarget("hip", architecture, 32),
+            target=GPUTarget("hip", "gfx1201", 32),
             options={"num_warps": num_warps},
         )
         assert compiled.asm["hsaco"]
@@ -355,16 +354,13 @@ def test_fused_qk_compilation_is_reused_across_sequence_shapes(preparation, head
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize(
     ("query_summary", "mean_pool_summary"),
     [(True, False), (False, False), (True, True), (False, True)],
 )
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm compilation is Linux-only")
-def test_block_summary_compiles_for_rdna4(
-    head_dim, architecture, query_summary, mean_pool_summary, padded
-):
+def test_block_summary_compiles_for_rdna4(head_dim, query_summary, mean_pool_summary, padded):
     triton = pytest.importorskip("triton")
     from triton.backends.compiler import GPUTarget  # noqa: PLC0415
     from triton.compiler import ASTSource  # noqa: PLC0415
@@ -391,7 +387,7 @@ def test_block_summary_compiles_for_rdna4(
     )
     compiled = triton.compile(
         ASTSource(kernel, signature, constexprs=constants),
-        target=GPUTarget("hip", architecture, 32),
+        target=GPUTarget("hip", "gfx1201", 32),
         options={"num_warps": 4, "num_stages": 1},
     )
     assert compiled.asm["hsaco"]

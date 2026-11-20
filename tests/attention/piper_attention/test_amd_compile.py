@@ -70,13 +70,12 @@ def _compile_dense_kernel(
     )
 
 
-@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", ["fp16", "bf16"])
 @pytest.mark.parametrize("wide", [False, True])
-def test_dense_amd_compilation(architecture, head_dim, causal, dtype, wide):
-    compiled = _compile_dense_kernel(architecture, head_dim, causal, dtype, wide)
+def test_dense_amd_compilation(head_dim, causal, dtype, wide):
+    compiled = _compile_dense_kernel("gfx1201", head_dim, causal, dtype, wide)
     assert compiled.asm["hsaco"]
     instructions = [
         line.replace(" ", "")
@@ -93,6 +92,13 @@ def test_dense_amd_compilation(architecture, head_dim, causal, dtype, wide):
     if torch.version.hip is not None or not amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS:
         assert "global_load_b64" not in compiled.asm["amdgcn"]
     assert compiled.asm["amdgcn"].count("v_div_scale_f32") == 2
+
+
+def test_dense_amd_gfx1200_smoke_compilation():
+    """Keep lightweight Gluon gfx1200 target coverage without doubling the variant matrix."""
+    compiled = _compile_dense_kernel("gfx1200", head_dim=64)
+    assert compiled.asm["hsaco"]
+    assert "v_wmma_i32_16x16x16_iu8" in compiled.asm["amdgcn"]
 
 
 def _compile_llvm_ir_with_scalar_fma(scalar_fma: bool, head_dim: int = 128) -> str:
