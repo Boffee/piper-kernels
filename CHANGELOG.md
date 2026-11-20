@@ -21,6 +21,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- On RX 9070 XT (`Triton 3.9`), fused ConvRot INT8 sparse Piper Q/K/V
+  projections automatically use RDNA4 Gluon kernels across aligned `D=64` and
+  `D=128` operands (preserving partial K/V gather overlap and shared Triton
+  fallbacks), reducing combined QKV cache-flushed median latency by 1.11× on
+  20K video (`24.25 vs 26.92 ms`), 1.10× on 111K video (`132.35 vs
+  145.54 ms`), 1.11× on image (`9.87 vs 10.95 ms`), and 1.18× on VAE decoder
+  (`3.25 vs 3.84 ms`). Live NVIDIA and Windows were not validated on this
+  branch.
 - On RX 9070 XT (Triton 3.8), standalone `SparsePiperAttention` / `sparse_piper_attention`
   operand preparation runs 1.85–1.90× faster on `[B, S, H, D]` inputs (`H=56, D=128`,
   20K–110K tokens; unchanged head-major speed), route selection runs 1.25–1.28× faster

@@ -28,6 +28,11 @@ together.
 - Base performance decisions on hardware and workload properties, supported by
   representative measurements. Keep specialized assumptions explicit; see
   [performance tuning](docs/development.md#performance-tuning).
+- Optimize development iteration speed: batch kernel-tuning candidates into
+  multi-variant scripts on one anchor workload, inspect IR/ISA (vectorization,
+  VGPRs, spills, LDS) on a small canary set before running broad sweeps, and keep
+  CPU-bound compile checks parallelized rather than serializing them inside live
+  GPU runs; see [ROCm regressions](docs/environments.md#rocm-regressions).
 - Keep documentation clear, concise, and coherent with the current library.
   Rework the organization and examples when concepts change, consolidate
   overlap, and remove obsolete material. Prefer one authoritative explanation
@@ -63,6 +68,10 @@ an API documentation finding should show how the omission causes a caller to act
 wrongly or misinterpret the result.
 
 ## Checks
+
+Target **Triton 3.9** (PyTorch 2.15) only during development and validation:
+verify `triton.__version__` before running tests or benchmarks rather than using
+legacy Triton 3.8 environments; see [environments](docs/environments.md).
 
 Follow [writing tests](docs/development.md#writing-tests) when changing coverage.
 Use the [development checks](docs/development.md#checks) for tests, lint,
