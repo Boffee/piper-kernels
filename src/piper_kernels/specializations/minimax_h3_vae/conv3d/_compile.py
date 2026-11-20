@@ -20,7 +20,7 @@ from torch.nn import functional
 
 from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.conv3d.convrot.int8 import _compile as convolution_compile
-from piper_kernels.conv3d.convrot.int8 import _validation
+from piper_kernels.conv3d.convrot.int8 import _ops as convolution_ops
 from piper_kernels.conv3d.convrot.int8._compile import get_tensor_metadata
 
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
@@ -118,7 +118,7 @@ def _framewise_norm_silu(node: object) -> _NormSiluInput | None:  # noqa: PLR091
     if weight_value is None or bias_value is None:
         return None
     try:
-        _validation._validate_norm(source_value, weight_value, bias_value, groups, epsilon)
+        convolution_ops._validate_norm(source_value, weight_value, bias_value, groups, epsilon)
     except ValueError, RuntimeError:
         return None
     return source, weight, bias, groups, epsilon

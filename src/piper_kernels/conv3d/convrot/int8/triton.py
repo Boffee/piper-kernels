@@ -1,4 +1,23 @@
-"""Shared ConvRot INT8 convolution kernels and execution-plan launch mechanics."""
+"""Shared ConvRot INT8 convolution kernels and execution-plan launch mechanics.
+
+Arithmetic invariants:
+- GroupNorm statistics, affine transforms, SiLU, Hadamard rotation, rescaling,
+  bias, and residual addition use FP32 intermediates; INT8 products accumulate
+  in INT32 (the ``[64, 4096]`` power-of-two channel limit bounds the complete
+  ``27 * channels`` INT32 sum). Fused preparation avoids eliminated FP16
+  intermediate rounding and retains FP32 precision through normalization.
+- Padding uses six nonnegative ``F.pad``-order counts ``(W_l, W_r, H_t, H_b,
+  T_f, T_b)``: temporal borders supply zeros and spatial borders supply zeros
+  or reflection (each reflection amount strictly smaller than its dimension).
+  Kernel loads synthesize boundaries directly so preparation runs only on
+  original pixels without materializing padded activations.
+
+Target schedules (selected in ``_policy.py``):
+- NVIDIA SM120 uses optional 16-byte-aligned weight TMA descriptors; SM8x uses
+  pointer loads and narrower tiles to avoid SM120 register pressure; RDNA4
+  (``gfx1200``/``gfx1201``) uses HIP rounding, pointer loads, and LDS-only
+  barrier fences. Checkpoints move across targets without scale conversion.
+"""
 
 # pyright: reportCallIssue=false
 
@@ -14,8 +33,7 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.weights.convrot import triton as rotation_backend
 from piper_kernels.weights.convrot.int8 import triton as int8_kernels
 
-from ._plan import ConvolutionExecutionPlan, PreparationSchedule
-from ._validation import _output_shape
+from ._policy import ConvolutionExecutionPlan, PreparationSchedule, output_shape
 
 
 @triton.jit
@@ -508,14 +526,14 @@ def _conv3d_prepared(
 ):
     batch, input_frames, input_height, input_width, input_channels = input_qdata.shape
     output_channels = weight_qdata.shape[0]
-    output_shape = _output_shape(
+    shape = output_shape(
         (batch, input_channels, input_frames, input_height, input_width),
         output_channels,
         stride,
         padding,
     )
-    _, _, output_frames, output_height, output_width = output_shape
-    output = torch.empty(output_shape, device=input_qdata.device, dtype=torch.float16)
+    _, _, output_frames, output_height, output_width = shape
+    output = torch.empty(shape, device=input_qdata.device, dtype=torch.float16)
     bias_pointer = bias if bias is not None else output
     residual_pointer = residual if residual is not None else output
     residual_strides = residual.stride() if residual is not None else output.stride()

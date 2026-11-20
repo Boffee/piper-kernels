@@ -1,16 +1,33 @@
-"""Validated in-place updates for ConvRot INT8 weights."""
+"""Validated in-place updates and backend routing for ConvRot INT8 weights."""
 
 import torch
 
 from piper_kernels.weights._update import (
     narrow_rounding_seed,
+    validate_add_operands,
+    validate_addmm_operands,
     validate_real_scalar,
-    validate_update_operands,
 )
 from piper_kernels.weights.convrot.int8._quantization import validate_storage
 
-from . import _backend, _ops
 from . import _update_reference as reference
+
+try:
+    from . import triton as _triton_backend
+except ModuleNotFoundError as error:
+    if error.name != "triton":
+        raise
+    _triton_backend = None
+
+
+def _use_triton(value: torch.Tensor) -> bool:
+    """Route bounded accelerator rows to Triton; keep CPU and wide rows on PyTorch."""
+    return (
+        _triton_backend is not None
+        and value.device.type not in ("cpu", "meta")
+        and value.numel() != 0
+        and value.shape[-1] <= 16384
+    )
 
 
 def _validate_storage(
@@ -38,21 +55,10 @@ def _validate_addmm(
 ) -> None:
     operation = "ConvRot INT8 addmm_"
     _validate_storage(qdata, scale, dtype, group_size, operation=operation)
-    if mat1.ndim != 2 or mat2.ndim != 2:
-        raise ValueError(
-            "ConvRot INT8 addmm_ matrices must be 2-D, "
-            f"got shapes {tuple(mat1.shape)} and {tuple(mat2.shape)}"
-        )
-    expected_mat1 = (qdata.shape[0], mat2.shape[0])
-    expected_mat2 = (mat1.shape[1], qdata.shape[1])
-    if tuple(mat1.shape) != expected_mat1 or tuple(mat2.shape) != expected_mat2:
-        raise ValueError(
-            "ConvRot INT8 addmm_ shape mismatch: expected "
-            f"mat1 {expected_mat1} and mat2 {expected_mat2} for weight {tuple(qdata.shape)}, "
-            f"got {tuple(mat1.shape)} and {tuple(mat2.shape)}"
-        )
-    validate_update_operands(
-        (mat1, mat2),
+    validate_addmm_operands(
+        tuple(qdata.shape),
+        mat1,
+        mat2,
         device=qdata.device,
         dtype=dtype,
         differentiable_storage=(scale,),
@@ -69,13 +75,9 @@ def _validate_add(
 ) -> None:
     operation = "ConvRot INT8 add_"
     _validate_storage(qdata, scale, dtype, group_size, operation=operation)
-    if tuple(update.shape) != tuple(qdata.shape):
-        raise ValueError(
-            f"{operation} shape mismatch: expected update {tuple(qdata.shape)}, "
-            f"got {tuple(update.shape)}"
-        )
-    validate_update_operands(
-        (update,),
+    validate_add_operands(
+        tuple(qdata.shape),
+        update,
         device=qdata.device,
         dtype=dtype,
         differentiable_storage=(scale,),
@@ -100,10 +102,11 @@ def add_(
     beta_float = validate_real_scalar(beta, "beta", operation=operation)
     alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
     seed = narrow_rounding_seed(rounding_seed, operation=operation)
-    if beta_float == 1 and alpha_float == 0:
+    if (beta_float == 1 and alpha_float == 0) or qdata.numel() == 0:
         return
-    if _backend.select_add(qdata) is not None:
-        _ops.add_(
+    if _use_triton(qdata):
+        assert _triton_backend is not None
+        _triton_backend.add_(
             qdata,
             scale,
             update,
@@ -142,10 +145,11 @@ def addmm_(
     beta_float = validate_real_scalar(beta, "beta", operation=operation)
     alpha_float = validate_real_scalar(alpha, "alpha", operation=operation)
     seed = narrow_rounding_seed(rounding_seed, operation=operation)
-    if beta_float == 1 and alpha_float == 0:
+    if (beta_float == 1 and alpha_float == 0) or qdata.numel() == 0:
         return
-    if _backend.select_addmm(qdata) is not None:
-        _ops.addmm_(
+    if _use_triton(qdata):
+        assert _triton_backend is not None
+        _triton_backend.addmm_(
             qdata,
             scale,
             mat1,

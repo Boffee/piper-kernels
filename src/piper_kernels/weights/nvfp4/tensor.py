@@ -7,7 +7,6 @@ from typing import Any, ClassVar, Self, cast
 
 import torch
 from torch._prims_common import make_contiguous_strides_for
-from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.prototype.mx_formats.mx_tensor import tensor_size_fp4x2_to_hp
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -17,8 +16,13 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 from torchao.prototype.mx_formats.utils import from_blocked
 from torchao.utils import TorchAOBaseTensor
 
-from piper_kernels.weights._dispatch import _explicit_to_copy_args, register_inference_mode_dispatch
+from piper_kernels.weights._dispatch import (
+    register_conversion_ops,
+    register_inference_mode_dispatch,
+    to_quantized_weight,
+)
 from piper_kernels.weights._matmul import register_matrix_ops
+from piper_kernels.weights._update import register_update_ops, run_add_, run_addmm_
 from piper_kernels.weights._views import register_view_ops, require_untransposed
 from piper_kernels.weights.nvfp4 import _layout
 from piper_kernels.weights.nvfp4._quantization import quantize_nvfp4
@@ -232,13 +236,17 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
             )
         )
 
-    def _rebuild_with_orig_dtype(self, orig_dtype: torch.dtype) -> PiperNVFP4Tensor:
+    def _validate_memory_format(self, memory_format: object) -> None:
+        if memory_format not in (None, torch.preserve_format):
+            require_untransposed(self, "to with a different memory format")
+
+    def _rebuild_with_logical_dtype(self, dtype: torch.dtype) -> PiperNVFP4Tensor:
         """Rebuild the concrete semantic wrapper while preserving its storage."""
         return type(self)(
             self.qdata,
             self.scale,
             self.block_size,
-            orig_dtype,
+            dtype,
             self.per_tensor_scale,
             self.act_per_tensor_scale,
             self.is_swizzled_scales,
@@ -294,20 +302,21 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         """
         from piper_kernels.weights.nvfp4 import _update  # noqa: PLC0415
 
-        require_untransposed(self, "addmm_")
-        operation = _update._operation(self, "addmm_")
-        if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
-            raise TypeError(f"{operation} matrices must be tensors")
-        _update.addmm_(
+        return run_addmm_(
             self,
-            self._update_group_size(),
             mat1,
             mat2,
-            beta=beta,
-            alpha=alpha,
-            rounding_seed=rounding_seed,
+            operation=_update._operation(self, "addmm_"),
+            apply=lambda left, right: _update.addmm_(
+                self,
+                self._update_group_size(),
+                left,
+                right,
+                beta=beta,
+                alpha=alpha,
+                rounding_seed=rounding_seed,
+            ),
         )
-        return self
 
     # Tensor.add_ also types complex and None, which quantized updates reject.
     def add_(  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -326,131 +335,36 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         """
         from piper_kernels.weights.nvfp4 import _update  # noqa: PLC0415
 
-        require_untransposed(self, "add_")
-        operation = _update._operation(self, "add_")
-        if not isinstance(other, torch.Tensor):
-            raise TypeError(f"{operation} update must be a tensor")
-        _update.add_(
+        return run_add_(
             self,
-            self._update_group_size(),
             other,
-            beta=beta,
-            alpha=alpha,
-            rounding_seed=rounding_seed,
+            operation=_update._operation(self, "add_"),
+            apply=lambda update: _update.add_(
+                self,
+                self._update_group_size(),
+                update,
+                beta=beta,
+                alpha=alpha,
+                rounding_seed=rounding_seed,
+            ),
         )
-        return self
 
     def to(self, *args: object, **kwargs: object) -> Self:
         """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
-        if kwargs.get("memory_format") not in (None, torch.preserve_format):
-            require_untransposed(self, "to with a different memory format")
-        explicit_copy_args = _explicit_to_copy_args(args, kwargs)
-        if explicit_copy_args is None:
-            return cast(
-                Self,
-                super().to(*args, **kwargs),  # pyright: ignore[reportCallIssue, reportArgumentType]
-            )
-        to_args, to_kwargs = explicit_copy_args
-        options = self._get_to_kwargs(*to_args, **to_kwargs)
-        dtype = options["dtype"]
-        if dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise TypeError(f"NVFP4 logical dtype must be floating point, got {dtype}")
-        device = options["device"]
-        non_blocking = options["non_blocking"]
-        copied = cast(
-            Self,
-            self._apply_fn_to_data(
-                lambda value: value.to(
-                    device=device,
-                    non_blocking=non_blocking,
-                    copy=True,
-                )
-            ),
+        return to_quantized_weight(
+            self,
+            super().to,
+            args,
+            kwargs,
+            format_name="NVFP4",
         )
-        if dtype is not copied.orig_dtype:
-            copied = cast(Self, copied._rebuild_with_orig_dtype(dtype))
-        return copied
 
 
 register_inference_mode_dispatch(PiperNVFP4Tensor)
 register_view_ops(PiperNVFP4Tensor)
 register_matrix_ops(PiperNVFP4Tensor)
-
-
-@PiperNVFP4Tensor.implements(torch.ops.aten._to_copy.default)
-def _nvfp4_to_copy(
-    func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> PiperNVFP4Tensor:
-    """Preserve the semantic wrapper across autocast and device movement."""
-    tensor = args[0]
-    assert isinstance(tensor, PiperNVFP4Tensor)
-    arguments = dict(kwargs)
-    dtype = arguments.pop("dtype", tensor.orig_dtype)
-    device = arguments.pop("device", tensor.device)
-    non_blocking = arguments.pop("non_blocking", False)
-    copy = arguments.pop("copy", False)
-    memory_format = arguments.pop("memory_format", None)
-    if memory_format not in (None, torch.preserve_format):
-        require_untransposed(tensor, "to with a different memory format")
-    layout = arguments.pop("layout", None)
-    pin_memory = arguments.pop("pin_memory", None)
-    if arguments:
-        raise NotImplementedError(f"unsupported NVFP4 conversion arguments: {arguments}")
-    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError(f"NVFP4 logical dtype must be floating point, got {dtype}")
-    metadata_only = (
-        torch.device(device) == tensor.device
-        and dtype is not tensor.orig_dtype
-        and not copy
-        and memory_format in (None, torch.preserve_format)
-        and layout in (None, tensor.layout)
-        and pin_memory is None
-    )
-    moved = (
-        tensor
-        if metadata_only
-        else cast(
-            PiperNVFP4Tensor,
-            tensor._apply_fn_to_data(
-                lambda value: func(value, device=device, non_blocking=non_blocking)
-            ),
-        )
-    )
-    if dtype is not moved.orig_dtype:
-        moved = moved._rebuild_with_orig_dtype(dtype)
-    return cast(
-        PiperNVFP4Tensor,
-        return_and_correct_aliasing(func, args, kwargs, moved),
-    )
-
-
-@PiperNVFP4Tensor.implements(torch.ops.aten.addmm_.default)
-def _nvfp4_addmm_dispatch(
-    _func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> PiperNVFP4Tensor:
-    weight, mat1, mat2 = args
-    if not isinstance(weight, PiperNVFP4Tensor):
-        raise TypeError(f"NVFP4 addmm_ weight must be PiperNVFP4Tensor, got {type(weight)}")
-    return weight.addmm_(mat1, mat2, beta=kwargs.get("beta", 1), alpha=kwargs.get("alpha", 1))
-
-
-@PiperNVFP4Tensor.implements(torch.ops.aten.add_.Tensor)
-def _nvfp4_add_dispatch(
-    _func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> PiperNVFP4Tensor:
-    weight, update = args
-    if not isinstance(weight, PiperNVFP4Tensor):
-        raise TypeError(f"NVFP4 add_ weight must be PiperNVFP4Tensor, got {type(weight)}")
-    return weight.add_(update, alpha=kwargs.get("alpha", 1))
+register_conversion_ops(PiperNVFP4Tensor, format_name="NVFP4")
+register_update_ops(PiperNVFP4Tensor, format_name="NVFP4")
 
 
 __all__ = ["PiperNVFP4Tensor"]

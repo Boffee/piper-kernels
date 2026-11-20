@@ -13,8 +13,8 @@ from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispa
 from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-from piper_kernels.weights.convrot.int8 import _backend as int8_updates
 from piper_kernels.weights.convrot.int8 import _quantization as int8_quantization
+from piper_kernels.weights.convrot.int8 import _update as int8_updates
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 
 _DEVICES = [
@@ -31,14 +31,13 @@ _DEVICES = [
 
 @pytest.mark.parametrize("device", ["cuda", "xpu", "mps", "privateuseone"])
 def test_generic_update_selection_does_not_query_architecture(monkeypatch, device):
-    value = SimpleNamespace(device=torch.device(device))
+    value = SimpleNamespace(device=torch.device(device), shape=(2, 256), numel=lambda: 512)
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
     monkeypatch.setattr(_backend, "_amd_backend", None)
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("architecture queried"))
     )
-    assert int8_updates.select_add(value) is int8_updates.add_
-    assert int8_updates.select_addmm(value) is int8_updates.addmm_
+    assert int8_updates._use_triton(value)
     assert _backend.select_preparation_backend(value) is _generic
 
 

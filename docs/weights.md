@@ -205,8 +205,9 @@ causal zero frames automatically, accept `padding="none"|"reflect"|"reflect_righ
 optional FP16 residual.
 
 Both APIs work under `torch.compile`; `convrot_int8_conv3d_compile_options`
-additionally fuses explicit zero/spatial-reflection padding chains. See
-[Conv3D implementation notes](../src/piper_kernels/conv3d/convrot/int8/README.md)
+additionally fuses explicit zero/spatial-reflection padding chains. See the
+[Conv3D implementation](../src/piper_kernels/conv3d/convrot/int8/triton.py),
+[padding compiler pass](../src/piper_kernels/conv3d/convrot/int8/_compile.py),
 and the [MiniMax-H3 encoder specialization](../src/piper_kernels/specializations/minimax_h3_vae/conv3d/README.md).
 The sections below (updates, GGUF, trellis, sharding) cover 2-D weights only.
 

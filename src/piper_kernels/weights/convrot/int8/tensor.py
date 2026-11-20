@@ -1,14 +1,18 @@
 """Rotated INT8 W8A8 tensor subclass."""
 
 from collections.abc import Callable
-from typing import Any, ClassVar, Self, cast
+from typing import Any, ClassVar, Self
 
 import torch
-from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.utils import TorchAOBaseTensor
 
-from piper_kernels.weights._dispatch import _explicit_to_copy_args, register_inference_mode_dispatch
+from piper_kernels.weights._dispatch import (
+    register_conversion_ops,
+    register_inference_mode_dispatch,
+    to_quantized_weight,
+)
 from piper_kernels.weights._matmul import register_matrix_ops
+from piper_kernels.weights._update import register_update_ops, run_add_, run_addmm_
 from piper_kernels.weights._views import register_view_ops, require_untransposed
 from piper_kernels.weights.convrot.int8._quantization import (
     dequantize_weight,
@@ -280,23 +284,25 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         backend without consuming the process-global random-number generator.
         """
         self._require_matrix("addmm_")
-        require_untransposed(self, "addmm_")
-        if not isinstance(mat1, torch.Tensor) or not isinstance(mat2, torch.Tensor):
-            raise TypeError("ConvRot addmm_ matrices must be tensors")
         from piper_kernels.weights.convrot.int8 import _update  # noqa: PLC0415
 
-        _update.addmm_(
-            self.qdata,
-            self.scale,
-            self.dtype,
-            self.group_size,
+        return run_addmm_(
+            self,
             mat1,
             mat2,
-            beta=beta,
-            alpha=alpha,
-            rounding_seed=rounding_seed,
+            operation="ConvRot addmm_",
+            apply=lambda left, right: _update.addmm_(
+                self.qdata,
+                self.scale,
+                self.dtype,
+                self.group_size,
+                left,
+                right,
+                beta=beta,
+                alpha=alpha,
+                rounding_seed=rounding_seed,
+            ),
         )
-        return self
 
     # Tensor.add_ also types complex and None, which quantized updates reject.
     def add_(  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -314,22 +320,23 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         ordinary addition. Rounding follows the ``addmm_`` seed contract.
         """
         self._require_matrix("add_")
-        require_untransposed(self, "add_")
-        if not isinstance(other, torch.Tensor):
-            raise TypeError("ConvRot add_ update must be a tensor")
         from piper_kernels.weights.convrot.int8 import _update  # noqa: PLC0415
 
-        _update.add_(
-            self.qdata,
-            self.scale,
-            self.dtype,
-            self.group_size,
+        return run_add_(
+            self,
             other,
-            beta=beta,
-            alpha=alpha,
-            rounding_seed=rounding_seed,
+            operation="ConvRot add_",
+            apply=lambda update: _update.add_(
+                self.qdata,
+                self.scale,
+                self.dtype,
+                self.group_size,
+                update,
+                beta=beta,
+                alpha=alpha,
+                rounding_seed=rounding_seed,
+            ),
         )
-        return self
 
     def _stable_hash_for_caching(self) -> str:
         """Return a metadata fingerprint for AOTAutograd's cross-process cache."""
@@ -374,113 +381,20 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
 
     def to(self, *args: object, **kwargs: object) -> Self:
         """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
-        self._validate_memory_format(kwargs.get("memory_format"))
-        explicit_copy_args = _explicit_to_copy_args(args, kwargs)
-        if explicit_copy_args is None:
-            return cast(
-                Self,
-                super().to(*args, **kwargs),  # pyright: ignore[reportCallIssue, reportArgumentType]
-            )
-        to_args, to_kwargs = explicit_copy_args
-        options = self._get_to_kwargs(*to_args, **to_kwargs)
-        dtype = options["dtype"]
-        if dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise TypeError(f"ConvRot INT8 logical dtype must be floating point, got {dtype}")
-        device = options["device"]
-        non_blocking = options["non_blocking"]
-        copied = cast(
-            Self,
-            self._apply_fn_to_data(
-                lambda value: value.to(
-                    device=device,
-                    non_blocking=non_blocking,
-                    copy=True,
-                )
-            ),
+        return to_quantized_weight(
+            self,
+            super().to,
+            args,
+            kwargs,
+            format_name="ConvRot INT8",
         )
-        if dtype is not copied.dtype:
-            copied = copied._rebuild_with_logical_dtype(dtype)
-        return copied
 
 
 register_inference_mode_dispatch(ConvRotInt8Tensor)
 register_view_ops(ConvRotInt8Tensor)
 register_matrix_ops(ConvRotInt8Tensor)
-
-
-@ConvRotInt8Tensor.implements(torch.ops.aten._to_copy.default)
-def _convrot_int8_to_copy(
-    func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> ConvRotInt8Tensor:
-    """Preserve quantized storage across logical dtype and device conversion."""
-    tensor = args[0]
-    assert isinstance(tensor, ConvRotInt8Tensor)
-    arguments = dict(kwargs)
-    dtype = arguments.pop("dtype", tensor.dtype)
-    device = arguments.pop("device", tensor.device)
-    non_blocking = arguments.pop("non_blocking", False)
-    copy = arguments.pop("copy", False)
-    memory_format = arguments.pop("memory_format", None)
-    tensor._validate_memory_format(memory_format)
-    layout = arguments.pop("layout", None)
-    pin_memory = arguments.pop("pin_memory", None)
-    if arguments:
-        raise NotImplementedError(f"unsupported ConvRot INT8 conversion arguments: {arguments}")
-    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError(f"ConvRot INT8 logical dtype must be floating point, got {dtype}")
-    metadata_only = (
-        torch.device(device) == tensor.device
-        and dtype is not tensor.dtype
-        and not copy
-        and memory_format in (None, torch.preserve_format)
-        and layout in (None, tensor.layout)
-        and pin_memory is None
-    )
-    moved = (
-        tensor
-        if metadata_only
-        else cast(
-            ConvRotInt8Tensor,
-            tensor._apply_fn_to_data(
-                lambda value: func(value, device=device, non_blocking=non_blocking)
-            ),
-        )
-    )
-    if dtype is not moved.dtype:
-        moved = moved._rebuild_with_logical_dtype(dtype)
-    return cast(
-        ConvRotInt8Tensor,
-        return_and_correct_aliasing(func, args, kwargs, moved),
-    )
-
-
-@ConvRotInt8Tensor.implements(torch.ops.aten.addmm_.default)
-def _convrot_addmm_dispatch(
-    _func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> ConvRotInt8Tensor:
-    weight, mat1, mat2 = args
-    if not isinstance(weight, ConvRotInt8Tensor):
-        raise TypeError(f"ConvRot addmm_ weight must be ConvRotInt8Tensor, got {type(weight)}")
-    return weight.addmm_(mat1, mat2, beta=kwargs.get("beta", 1), alpha=kwargs.get("alpha", 1))
-
-
-@ConvRotInt8Tensor.implements(torch.ops.aten.add_.Tensor)
-def _convrot_add_dispatch(
-    _func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> ConvRotInt8Tensor:
-    weight, update = args
-    if not isinstance(weight, ConvRotInt8Tensor):
-        raise TypeError(f"ConvRot add_ weight must be ConvRotInt8Tensor, got {type(weight)}")
-    return weight.add_(update, alpha=kwargs.get("alpha", 1))
+register_conversion_ops(ConvRotInt8Tensor, format_name="ConvRot INT8")
+register_update_ops(ConvRotInt8Tensor, format_name="ConvRot")
 
 
 @ConvRotInt8Tensor.implements(torch.ops.aten.embedding.default)

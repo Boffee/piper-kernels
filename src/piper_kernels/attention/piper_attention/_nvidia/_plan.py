@@ -19,8 +19,6 @@ class PiperAttentionExecutionPlan:
 
     ``attention_kernel`` names the implementation independently of the target.
     ``max_registers`` and ``fuse_query_quantization`` apply only to ``gluon_async_copy``.
-    ``unspecialized_value_stride`` quantizes V without specializing on its
-    key-length-dependent row stride.
     """
 
     block_m: int
@@ -38,7 +36,6 @@ class PiperAttentionExecutionPlan:
     output_ctas_per_sm: int = 0
     strided_output_query_group: int = 0
     ragged_strided_output_maxnreg: int | None = None
-    unspecialized_value_stride: bool = False
     attention_kernel: Literal["triton", "gluon_async_copy"] = "triton"
     max_registers: int | None = None
     fuse_query_quantization: bool = False

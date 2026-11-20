@@ -12,7 +12,6 @@ from piper_kernels.linear.convrot.int8 import _backend, _generic
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
 from piper_kernels.linear.nvfp4 import triton as nvfp4
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-from piper_kernels.weights.convrot.int8 import _backend as int8_updates
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 from piper_kernels.weights.nvfp4 import triton as nvfp4_primitives
 
@@ -66,9 +65,9 @@ def test_operations_use_operand_device_and_its_current_stream(
                 if operation in ("add", "addmm"):
                     output, output_scale = qdata.clone(), scale.clone()
                     if operation == "add":
-                        int8_updates.add_(output, output_scale, update, 256, 1.0, 0.5)
+                        int8_weight_triton.add_(output, output_scale, update, 256, 0.5, beta=1.0)
                     else:
-                        int8_updates.addmm_(output, output_scale, mat1, mat2, 256, 1.0, 0.5)
+                        int8_weight_triton.addmm_(output, output_scale, mat1, mat2, 256, 1.0, 0.5)
                     return output, output_scale
                 assert backend is not None
                 prepared = backend.prepare_input(value, 256)

@@ -24,7 +24,7 @@ from piper_kernels.linear.convrot.int8.reference import linear, linear_prepared
 from piper_kernels.weights.convrot import triton as convrot_backend
 from piper_kernels.weights.convrot._rotation import build_hadamard, rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-from piper_kernels.weights.convrot.int8 import _ops as int8_update_ops
+from piper_kernels.weights.convrot.int8 import triton as int8_update_ops
 from piper_kernels.weights.convrot.int8._update_reference import add_ as reference_add_
 from piper_kernels.weights.convrot.int8._update_reference import addmm_
 

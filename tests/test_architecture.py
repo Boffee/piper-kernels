@@ -33,7 +33,7 @@ _TEST_AST_ALLOWLIST = frozenset(
 _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
     "benchmarks/benchmark_attention.py": 2,
     "benchmarks/benchmark_convrot_int8.py": 2,
-    "benchmarks/benchmark_convrot_int8_conv3d.py": 7,
+    "benchmarks/benchmark_convrot_int8_conv3d.py": 2,
     "benchmarks/benchmark_convrot_int8_preparation.py": 6,
     "benchmarks/benchmark_integer_pv_dot.py": 2,
     "benchmarks/benchmark_sparse_piper.py": 8,
@@ -46,15 +46,15 @@ _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
     "benchmarks/lib/sparse_piper.py": 1,
     "benchmarks/lib/suite_attention.py": 10,
     "benchmarks/lib/suite_pipeline.py": 12,
-    "benchmarks/lib/suite_weights.py": 8,
+    "benchmarks/lib/suite_weights.py": 7,
     "benchmarks/tune_convrot_int8_linear.py": 3,
     "benchmarks/tune_piper_attention.py": 4,
     "benchmarks/tune_sage_attention_2pp.py": 2,
 }
 
 # Legacy private piper_kernels import totals in tests/ (lower as tests decouple).
-_MAX_TEST_PRIVATE_IMPORT_FILES = 181
-_MAX_TEST_PRIVATE_IMPORTS = 786
+_MAX_TEST_PRIVATE_IMPORT_FILES = 180
+_MAX_TEST_PRIVATE_IMPORTS = 760
 
 _PASS_BASE_NAMES = frozenset(
     {
