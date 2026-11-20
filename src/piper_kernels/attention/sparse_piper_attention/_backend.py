@@ -195,7 +195,7 @@ def select_minmax_scores(
         return None
     target = AcceleratorTarget.from_device(query_summary.device)
     if amd_policy.supports_target(target):
-        schedule = amd_policy.select_minmax_score_schedule()
+        schedule = amd_policy.select_minmax_score_schedule(query_summary.shape[2])
     elif nvidia_policy.supports_minmax_scores(target):
         schedule = nvidia_policy.select_sm120_minmax_score_schedule(query_summary.shape[2])
     else:
@@ -246,9 +246,10 @@ def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> Sequenc
     """Select native Q/K summaries for a supported device, layout, and dtype."""
     if _summary_backend is None:
         return None
+    if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad):
+        return None
     if not (
-        nvidia_policy.supports_target(AcceleratorTarget.from_device(query.device))
-        and query.device == key.device
+        query.device == key.device
         and query.shape[-1] in SUPPORTED_HEAD_DIMS
         and key.shape[-1] == query.shape[-1]
         and query.stride(-1) == 1
@@ -256,6 +257,9 @@ def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> Sequenc
         and query.dtype in SUPPORTED_DTYPES
         and key.dtype == query.dtype
     ):
+        return None
+    target = AcceleratorTarget.from_device(query.device)
+    if not (nvidia_policy.supports_target(target) or amd_policy.supports_target(target)):
         return None
     return _summary_backend.sequence_block_summaries
 

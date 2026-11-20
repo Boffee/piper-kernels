@@ -21,6 +21,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- On RX 9070 XT (Triton 3.8), standalone `SparsePiperAttention` / `sparse_piper_attention`
+  operand preparation runs 1.85–1.90× faster on `[B, S, H, D]` inputs (`H=56, D=128`,
+  20K–110K tokens; unchanged head-major speed), route selection runs 1.25–1.28× faster
+  (up to `2048` sparse key blocks), FP32 minmax scoring runs up to 8% faster, and
+  standalone `sparse_piper_coarse_residual` runs 2.27× faster (`minmax`) and 1.07×
+  faster (`mean`) via native RDNA4 summaries. Outputs stay bitwise-identical across
+  preparation, minmax scoring, route selection, and 16-bit `minmax` coarse residuals,
+  while `mean` and `FP32` coarse residuals remain within `1e-6` tolerance.
 - On RX 9070 XT with Triton 3.9, ConvRot INT8 linears and fused FFNs run
   faster with unchanged or lower peak allocation: fused GELU/SwiGLU and
   residual FFNs take 6–13% less time, gated residual attention output
@@ -71,6 +79,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   catalog linears, `3–9%` on GELU/SwiGLU FFNs, and `7–8%` on single- and
   two-update fused residual projections) with unchanged peak memory and
   bitwise-identical rounding boundaries.
+
+### Fixed
+
+- Preserved autograd gradients and compact sequence support below 64 tokens for native GPU
+  `sparse_piper_coarse_residual` and `sequence_block_summaries` (`D64`/`D128`) calls.
 
 ### Removed
 

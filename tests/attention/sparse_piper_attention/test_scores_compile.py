@@ -5,10 +5,12 @@ import sys
 
 import pytest
 import triton
+from _accelerators import rocm_fences_only_lds
 from _nvidia_resources import stack_frame_bytes
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
+from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels.attention.sparse_piper_attention._amd.policy import (
     select_minmax_score_schedule as select_amd_minmax_score_schedule,
 )
@@ -29,6 +31,7 @@ def _compile_minmax_scores(
     has_score_scale: bool,
     specialization: str,
     query_heads_per_kv_head: int,
+    lds_only_fences: bool = False,
 ):
     constants = {
         "query_heads_per_kv_head": query_heads_per_kv_head,
@@ -54,7 +57,7 @@ def _compile_minmax_scores(
     compiled = triton.compile(
         ASTSource(_minmax_scores_kernel, signature, constexprs=constants, attrs=attrs),
         target=target,
-        options={"num_warps": 4, "num_stages": 1},
+        options={"num_warps": 4, "num_stages": 1, **lds_only_fence_options(lds_only_fences)},
     )
     assert "arith.truncf" not in compiled.asm["ttgir"]
     assert "tt.fp_to_fp" not in compiled.asm["ttgir"]
@@ -64,14 +67,15 @@ def _compile_minmax_scores(
     return compiled
 
 
+@pytest.mark.parametrize("query_blocks", [64, 128])
 @pytest.mark.parametrize("query_heads_per_kv_head", [1, 3])
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
 @pytest.mark.parametrize("has_score_scale", [False, True])
 @pytest.mark.parametrize("specialization", ["generic", "h3_full_chunk", "h3_tail_chunk"])
 def test_minmax_scoring_stays_fp32_without_spills(
-    architecture, has_score_scale, specialization, query_heads_per_kv_head
+    query_blocks, architecture, has_score_scale, specialization, query_heads_per_kv_head
 ):
-    schedule = select_amd_minmax_score_schedule()
+    schedule = select_amd_minmax_score_schedule(query_blocks)
     compiled = _compile_minmax_scores(
         GPUTarget("hip", architecture, 32),
         block_m=schedule.block_m,
@@ -80,8 +84,11 @@ def test_minmax_scoring_stays_fp32_without_spills(
         has_score_scale=has_score_scale,
         specialization=specialization,
         query_heads_per_kv_head=query_heads_per_kv_head,
+        lds_only_fences=schedule.lds_only_fences,
     )
     assert compiled.asm["hsaco"]
+    if rocm_fences_only_lds():
+        assert "global_inv" not in compiled.asm["amdgcn"]
     scratch = re.search(r"\.amdhsa_private_segment_fixed_size\s+(\d+)\b", compiled.asm["amdgcn"])
     assert scratch
     if specialization == "generic" and triton.__version__ == "3.9.0":

@@ -11,8 +11,9 @@ class AttentionSchedule(NamedTuple):
 
 
 class MinmaxScoreSchedule(NamedTuple):
-    """Tile dimensions selected for fused FP32 min/max summary scoring."""
+    """Tile dimensions and fence policy selected for fused FP32 min/max summary scoring."""
 
     block_m: int
     block_n: int
     block_k: int
+    lds_only_fences: bool = False
