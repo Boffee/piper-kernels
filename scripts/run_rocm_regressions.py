@@ -52,7 +52,7 @@ def _check_environment() -> None:
     from piper_kernels.attention.sparse_piper_attention import (  # noqa: PLC0415
         _backend as attention,
     )
-    from piper_kernels.conv3d.convrot.int8 import _backend as convolution  # noqa: PLC0415
+    from piper_kernels.conv3d.convrot.int8 import _ops as convolution  # noqa: PLC0415
     from piper_kernels.fusions.convrot_int8_sparse_piper import _backend as fusion  # noqa: PLC0415
     from piper_kernels.linear.convrot.int8 import _backend as linear  # noqa: PLC0415
 
@@ -76,7 +76,7 @@ def _check_environment() -> None:
     probe = torch.empty(0, device="cuda")
     if dense.select_backend(target) is None:
         raise SystemExit("ROCm regressions require a native dense Piper backend.")
-    if convolution.select_backend(probe) is None:
+    if convolution._select_native_backend(probe) is None:
         raise SystemExit("ROCm regressions require a native ConvRot INT8 Conv3D backend.")
     if linear.select_linear_backend(probe) is None or fusion.select_output_backend(probe) is None:
         raise SystemExit("ROCm regressions require native INT8 linear and sparse output backends.")
