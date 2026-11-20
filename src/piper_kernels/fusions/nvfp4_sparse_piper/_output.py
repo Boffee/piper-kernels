@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import cast
 
 import torch
 
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.sparse_piper import _output as output_common
+from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
 from piper_kernels.linear.nvfp4 import _projection, _validation
+from piper_kernels.linear.nvfp4 import triton as nvfp4_backend
+from piper_kernels.weights.convrot._rotation import validate_group_size
 from piper_kernels.weights.nvfp4 import _layout
+from piper_kernels.weights.nvfp4.triton import dynamic_scale as nvfp4_dynamic_scale
 
 from . import query as query_projection
 
@@ -23,21 +27,21 @@ def default_query_chunk_rows(dynamic_activation_scale: bool) -> int:
     return DYNAMIC_QUERY_CHUNK_ROWS if dynamic_activation_scale else DEFAULT_QUERY_CHUNK_ROWS
 
 
-class PreparationBackend(Protocol):
-    """Format-specific global scaling and attention-chunk packing."""
-
-    def dynamic_scale(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
-        """Compute one scale across all attention rows in the projection basis."""
-        ...
-
-    def prepare_static_out(
-        self,
-        input: torch.Tensor,  # noqa: A002 - match linear terminology
-        per_tensor_scale: torch.Tensor,
-        out: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Prepare an attention chunk into reusable standard NVFP4 storage."""
-        ...
+def validate_optional_group_size(
+    group_size: int | None,
+    input_features: int | torch.SymInt,
+) -> None:
+    """Validate optional ConvRot NVFP4 group size and feature divisibility."""
+    if group_size is None:
+        return
+    if isinstance(group_size, bool) or not isinstance(group_size, int):
+        raise ValueError(f"ConvRot group size must be an integer, got {group_size!r}")
+    validate_group_size(group_size)
+    if isinstance(input_features, int) and input_features % group_size:
+        raise ValueError(
+            f"ConvRot NVFP4 projection input features {input_features} must be divisible "
+            f"by group size {group_size}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +176,7 @@ def _validate_output_projection(
     logical_sequence_length: int,
     query_chunk_rows: int,
     dynamic_activation_scale: bool,
+    group_size: int | None = None,
 ) -> tuple[int, int]:
     """Validate the projection boundary and return its logical dimensions."""
     # The shared pipeline validates shapes, not NVFP4's accelerator requirements.
@@ -188,6 +193,7 @@ def _validate_output_projection(
         logical_sequence_length,
         query_chunk_rows,
     )
+    validate_optional_group_size(group_size, input_features)
     _validation.validate_activation_scale(
         activation_per_tensor_scale,
         dynamic_activation_scale,
@@ -218,7 +224,7 @@ def _validate_output_projection(
     return input_features, cast(int, output_features)
 
 
-def _prepare_output_projector(  # noqa: PLR0913, PLR0917
+def _prepare_output_projector(  # noqa: PLR0913
     attention_storage: torch.Tensor,
     sequence_length: int,
     weight_qdata: torch.Tensor,
@@ -228,7 +234,9 @@ def _prepare_output_projector(  # noqa: PLR0913, PLR0917
     bias: torch.Tensor | None,
     logical_sequence_length: int,
     query_chunk_rows: int,
-    preparation: PreparationBackend,
+    *,
+    high_first: bool,
+    group_size: int | None,
     dynamic_activation_scale: bool,
 ) -> tuple[
     int,
@@ -251,6 +259,7 @@ def _prepare_output_projector(  # noqa: PLR0913, PLR0917
         logical_sequence_length,
         query_chunk_rows,
         dynamic_activation_scale,
+        group_size,
     )
     capacity = min(sequence_length, query_chunk_rows)
     device = attention_storage.device
@@ -273,7 +282,21 @@ def _prepare_output_projector(  # noqa: PLR0913, PLR0917
         scale: torch.Tensor,
         storage: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
-        input_qdata, input_scale = preparation.prepare_static_out(attention_rows, scale, storage)
+        if group_size is None:
+            input_qdata, input_scale = nvfp4_backend.prepare_static_out(
+                attention_rows,
+                scale,
+                storage,
+                high_first=high_first,
+            )
+        else:
+            input_qdata, input_scale = convrot_nvfp4_backend.prepare_static_out(
+                attention_rows,
+                scale,
+                group_size,
+                storage,
+                high_first=high_first,
+            )
         _projection.matmul_prepared_chunk_affine_out(
             input_qdata,
             input_scale,
@@ -292,7 +315,11 @@ def _prepare_output_projector(  # noqa: PLR0913, PLR0917
         def project_attention(attention: torch.Tensor) -> torch.Tensor:
             batch, rows = attention.shape[:2]
             flat_attention = attention.view(batch * rows, input_features)
-            scale = preparation.dynamic_scale(flat_attention)
+            scale = (
+                nvfp4_dynamic_scale(flat_attention)
+                if group_size is None
+                else convrot_nvfp4_backend.dynamic_scale(flat_attention, group_size)
+            )
             # The global path needs packing storage only after attention finishes.
             storage = allocate_storage()
             if output_features <= input_features:
@@ -358,7 +385,6 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
     activation_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     query_chunk_rows: int | None,
-    preparation: PreparationBackend,
     block_lengths: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
@@ -366,12 +392,14 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
     sparse_query_blocks: int | None = None,
     gate_projection: PreparedGateProjection | None = None,
     *,
+    high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
     dynamic_activation_scale: bool = False,
+    group_size: int | None = None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Project bounded attention with unit, calibrated, or global dynamic scaling."""
+    """Project bounded attention with plain or ConvRot NVFP4 output preparation."""
     if query_chunk_rows is None:
         query_chunk_rows = default_query_chunk_rows(dynamic_activation_scale)
     prepared = output_common.prepare_attention(
@@ -411,8 +439,9 @@ def run_attention_output(  # noqa: PLR0913, PLR0917
             bias,
             logical_sequence_length,
             query_chunk_rows,
-            preparation,
-            dynamic_activation_scale,
+            high_first=high_first,
+            group_size=group_size,
+            dynamic_activation_scale=dynamic_activation_scale,
         )
     )
     return output_common.run_chunked_attention_output(
@@ -459,7 +488,6 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     activation_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     query_chunk_rows: int | None,
-    preparation: PreparationBackend,
     block_lengths: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     coarse_scale: float | None = None,
@@ -467,8 +495,10 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     sparse_query_blocks: int | None = None,
     gate_projection: PreparedGateProjection | None = None,
     *,
+    high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
     dynamic_activation_scale: bool = False,
+    group_size: int | None = None,
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -511,8 +541,9 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
             bias,
             logical_sequence_length,
             query_chunk_rows,
-            preparation,
-            dynamic_activation_scale,
+            high_first=high_first,
+            group_size=group_size,
+            dynamic_activation_scale=dynamic_activation_scale,
         )
     )
 
@@ -556,10 +587,10 @@ def run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
 
 __all__ = [
     "DEFAULT_QUERY_CHUNK_ROWS",
-    "PreparationBackend",
     "PreparedGateProjection",
     "prepare_gate_projection",
     "prepare_optional_gate_projection",
     "run_attention_output",
     "run_projected_query_attention_output",
+    "validate_optional_group_size",
 ]

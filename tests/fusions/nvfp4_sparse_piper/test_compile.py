@@ -1,4 +1,4 @@
-"""Tests for automatic NVFP4-to-sparse-Piper graph fusion."""
+"""Tests for automatic NVFP4 and ConvRot NVFP4 sparse-Piper graph fusion."""
 
 from __future__ import annotations
 
@@ -35,19 +35,46 @@ from piper_kernels.fusions.nvfp4_sparse_piper._compile import compile_pass
 from piper_kernels.fusions.nvfp4_sparse_piper._output_compile import (
     _fold_attention_output,
 )
+from piper_kernels.linear.convrot.nvfp4 import (
+    _ops as convrot_nvfp4_ops,
+)
+from piper_kernels.linear.convrot.nvfp4 import (
+    convrot_nvfp4_compile_options,
+)
+from piper_kernels.linear.convrot.nvfp4._compile import (
+    compile_pass as convrot_nvfp4_compile_pass,
+)
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.linear.nvfp4 import nvfp4_compile_options
 from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
+from piper_kernels.weights.convrot._rotation import rotate_groups
+from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 from .._accuracy import assert_fusion_output_close
 from .._nvfp4_sparse_piper_graphs import (
     build_attention_graph,
-    build_convrot_attention_graph,
+    build_mixed_quantized_attention_output_graph,
     build_quantized_attention_output_graph,
-    run_convrot_passes,
+    run_nvfp4_passes,
 )
 
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
+_GROUP_SIZES = [pytest.param(None, id="nvfp4"), pytest.param(64, id="convrot64")]
+
+
+def _convert_weight(weight: torch.Tensor, group_size: int) -> ConvRotNVFP4Tensor:
+    assert isinstance(weight, TorchAONVFP4Tensor)
+    dense = weight.dequantize(torch.bfloat16)
+    rotated = rotate_groups(dense, group_size)
+    converted = TorchAONVFP4Tensor.to_nvfp4(
+        rotated,
+        per_tensor_scale=per_tensor_amax_to_scale(rotated.abs().amax()),
+        act_per_tensor_scale=weight.act_per_tensor_scale,
+        is_swizzled_scales=True,
+        act_quant_kwargs=weight.act_quant_kwargs,
+    )
+    return ConvRotNVFP4Tensor.from_torchao(converted, group_size=group_size)
 
 
 class _SparseProjectionAttention(torch.nn.Module):
@@ -66,9 +93,11 @@ class _SparseProjectionAttention(torch.nn.Module):
         batch: int = 1,
         dynamic: bool = False,
         routing: str = "minmax",
+        group_size: int | None = None,
     ) -> None:
         super().__init__()
         self.batch = batch
+        self.group_size = group_size
         calibration = torch.full(
             (1, self.sequence_length, self.input_features),
             3.0,
@@ -103,10 +132,10 @@ class _SparseProjectionAttention(torch.nn.Module):
                 device="cuda",
                 dtype=torch.bfloat16,
             )
-            projection.weight = torch.nn.Parameter(
-                PiperNVFP4Tensor.from_torchao(torchao_weight),
-                requires_grad=False,
-            )
+            weight: torch.Tensor = PiperNVFP4Tensor.from_torchao(torchao_weight)
+            if group_size is not None:
+                weight = _convert_weight(weight, group_size)
+            projection.weight = torch.nn.Parameter(weight, requires_grad=False)
             projections.append(projection)
         self.query, self.key, self.value = projections
         self.query_norm = torch.nn.Parameter(
@@ -186,14 +215,19 @@ class _SparseProjectionAttention(torch.nn.Module):
 
 
 class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
-    """Canonical H3 attention with one NVFP4 output projection."""
+    """Canonical H3 attention with one NVFP4 or ConvRot NVFP4 output projection."""
 
     output_features = 320
 
     def __init__(
-        self, *, dynamic: bool = False, routing: str = "minmax", output_dynamic: bool = False
+        self,
+        *,
+        dynamic: bool = False,
+        routing: str = "minmax",
+        output_dynamic: bool = False,
+        group_size: int | None = None,
     ) -> None:
-        super().__init__(dynamic=dynamic, routing=routing)
+        super().__init__(dynamic=dynamic, routing=routing, group_size=group_size)
         calibration = torch.full(
             (1, self.sequence_length, self.heads * self.head_dim),
             3.0,
@@ -226,10 +260,10 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
             device="cuda",
             dtype=torch.bfloat16,
         )
-        self.output.weight = torch.nn.Parameter(
-            PiperNVFP4Tensor.from_torchao(torchao_weight),
-            requires_grad=False,
-        )
+        weight: torch.Tensor = PiperNVFP4Tensor.from_torchao(torchao_weight)
+        if group_size is not None:
+            weight = _convert_weight(weight, group_size)
+        self.output.weight = torch.nn.Parameter(weight, requires_grad=False)
 
     def forward(
         self,
@@ -247,8 +281,20 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
     coarse_scale = 0.125
     coarse_key_blocks = 3
 
-    def __init__(self, *, dynamic: bool, routing: str, output_dynamic: bool = False) -> None:
-        super().__init__(dynamic=dynamic, routing=routing, output_dynamic=output_dynamic)
+    def __init__(
+        self,
+        *,
+        dynamic: bool,
+        routing: str,
+        output_dynamic: bool = False,
+        group_size: int | None = None,
+    ) -> None:
+        super().__init__(
+            dynamic=dynamic,
+            routing=routing,
+            output_dynamic=output_dynamic,
+            group_size=group_size,
+        )
         self.routing = routing
 
     def forward(
@@ -290,10 +336,22 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
 class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentionOutput):
     """Bounded coarse attention whose gate is projected from hidden states."""
 
-    def __init__(self, *, dynamic: bool, routing: str, output_dynamic: bool = False) -> None:
-        super().__init__(dynamic=dynamic, routing=routing, output_dynamic=output_dynamic)
+    def __init__(
+        self,
+        *,
+        dynamic: bool,
+        routing: str,
+        output_dynamic: bool = False,
+        group_size: int | None = None,
+    ) -> None:
+        super().__init__(
+            dynamic=dynamic,
+            routing=routing,
+            output_dynamic=output_dynamic,
+            group_size=group_size,
+        )
         query_weight = self.query.weight
-        assert isinstance(query_weight, PiperNVFP4Tensor)
+        assert isinstance(query_weight, TorchAONVFP4Tensor)
         dense = torch.randn(
             (self.heads * self.head_dim, self.input_features),
             device="cuda",
@@ -313,10 +371,10 @@ class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentio
             device="cuda",
             dtype=torch.bfloat16,
         )
-        self.gate.weight = torch.nn.Parameter(
-            PiperNVFP4Tensor.from_torchao(torchao_weight),
-            requires_grad=False,
-        )
+        weight: torch.Tensor = PiperNVFP4Tensor.from_torchao(torchao_weight)
+        if group_size is not None:
+            weight = _convert_weight(weight, group_size)
+        self.gate.weight = torch.nn.Parameter(weight, requires_grad=False)
 
     def forward(
         self,
@@ -339,7 +397,7 @@ class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentio
 
 
 def _nvfp4_storage(weight: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    assert isinstance(weight, PiperNVFP4Tensor)
+    assert isinstance(weight, TorchAONVFP4Tensor)
     return weight.qdata, weight.scale, weight.per_tensor_scale
 
 
@@ -347,9 +405,19 @@ def _prepare_nvfp4_input(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
-    assert isinstance(weight, PiperNVFP4Tensor)
+    assert isinstance(weight, TorchAONVFP4Tensor)
     quantization = weight.act_quant_kwargs
     assert quantization is not None
+    if isinstance(weight, ConvRotNVFP4Tensor):
+        return convrot_nvfp4_ops.prepare_input(
+            hidden_states,
+            weight.act_per_tensor_scale,
+            quantization.use_dynamic_per_tensor_scale,
+            weight.group_size,
+            None,
+            weight.high_first,
+        )
+    assert isinstance(weight, PiperNVFP4Tensor)
     return nvfp4_ops.prepare_input(
         hidden_states,
         weight.act_per_tensor_scale,
@@ -446,6 +514,19 @@ def _run_explicit_attention_output(
             force_tile_counts=force_tile_counts,
         )
     output_weight = model.output.weight
+    if isinstance(output_weight, ConvRotNVFP4Tensor):
+        assert output_weight.act_quant_kwargs is not None
+        return convrot_nvfp4_ops.linear(
+            attention.flatten(2),
+            output_weight.qdata,
+            output_weight.scale,
+            output_weight.per_tensor_scale,
+            output_weight.act_per_tensor_scale,
+            model.output.bias,
+            output_weight.act_quant_kwargs.use_dynamic_per_tensor_scale,
+            output_weight.group_size,
+            output_weight.high_first,
+        )
     assert isinstance(output_weight, PiperNVFP4Tensor)
     quantization = output_weight.act_quant_kwargs
     assert quantization is not None
@@ -482,15 +563,35 @@ def test_compile_options_install_idempotent_passes() -> None:
     assert options["max_autotune"] is True
     passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(passes, tuple)
-    assert passes == (nvfp4_compile_pass, compile_pass)
+    assert passes == (nvfp4_compile_pass, convrot_nvfp4_compile_pass, compile_pass)
     assert nvfp4_sparse_piper_compile_options(options) == options
 
 
+@pytest.mark.parametrize("sparse_first", [False, True])
+def test_compile_options_compose_with_linear_options(sparse_first: bool) -> None:
+    if sparse_first:
+        options = convrot_nvfp4_compile_options(
+            nvfp4_compile_options(nvfp4_sparse_piper_compile_options())
+        )
+    else:
+        options = nvfp4_sparse_piper_compile_options(
+            convrot_nvfp4_compile_options(nvfp4_compile_options())
+        )
+
+    assert options[_POST_GRAD_PRE_PASS] == (
+        nvfp4_compile_pass,
+        convrot_nvfp4_compile_pass,
+        compile_pass,
+    )
+
+
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
 @pytest.mark.parametrize("q_affine", [True, False])
 @pytest.mark.parametrize("k_affine", [True, False])
 def test_prepared_projection_family_fuses_without_materializing_linears(
+    group_size: int | None,
     q_affine: bool,
     k_affine: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -499,7 +600,11 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
     routing_mode: int,
 ) -> None:
     graph = build_attention_graph(
-        dynamic=dynamic, routing_mode=routing_mode, q_affine=q_affine, k_affine=k_affine
+        dynamic=dynamic,
+        routing_mode=routing_mode,
+        q_affine=q_affine,
+        k_affine=k_affine,
+        group_size=group_size,
     )
     monkeypatch.setattr(
         AcceleratorTarget,
@@ -508,33 +613,39 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
     )
 
     nvfp4_compile_pass(graph, is_inference=True)
-    prepared_targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    assert (
-        prepared_targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default)
-        == preparation_count
+    convrot_nvfp4_compile_pass(graph, is_inference=True)
+    expected_prepare = (
+        torch.ops.piper_kernels.nvfp4_prepare_input.default
+        if group_size is None
+        else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
     )
+    prepared_targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    assert prepared_targets.count(expected_prepare) == preparation_count
     assert prepared_targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 3
 
     compile_pass(graph, is_inference=True)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == preparation_count
+    assert targets.count(expected_prepare) == preparation_count
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
     assert torch.ops.piper_kernels.nvfp4_linear_mean.default not in targets
     assert targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default) == 1
     assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
     assert torch.ops.piper_kernels.sparse_piper_attention.default not in targets
     graph.lint()
 
 
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("with_block_lengths", [False, True])
 @pytest.mark.parametrize("with_coarse", [False, True])
 @pytest.mark.parametrize("with_sparse_query_blocks", [False, True])
 def test_projection_fold_supports_every_bounded_attention_variant(
     monkeypatch: pytest.MonkeyPatch,
+    group_size: int | None,
     with_block_lengths: bool,
     with_coarse: bool,
     with_sparse_query_blocks: bool,
@@ -544,15 +655,9 @@ def test_projection_fold_supports_every_bounded_attention_variant(
         with_block_lengths=with_block_lengths,
         with_coarse=with_coarse,
         with_sparse_query_blocks=with_sparse_query_blocks,
+        group_size=group_size,
     )
-    monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
-    )
-
-    nvfp4_compile_pass(graph, is_inference=True)
-    compile_pass(graph, is_inference=True)
+    run_nvfp4_passes(graph, monkeypatch)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
@@ -569,11 +674,13 @@ def test_projection_fold_supports_every_bounded_attention_variant(
     graph.lint()
 
 
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
 @pytest.mark.parametrize("with_sparse_query_blocks", [False, True])
 def test_static_output_fuses_after_prepared_sparse_projection(
     monkeypatch: pytest.MonkeyPatch,
+    group_size: int | None,
     dynamic: bool,
     preparation_count: int,
     routing_mode: int,
@@ -584,36 +691,79 @@ def test_static_output_fuses_after_prepared_sparse_projection(
         output_dynamic=False,
         routing_mode=routing_mode,
         with_sparse_query_blocks=with_sparse_query_blocks,
+        group_size=group_size,
     )
-    monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
-    )
-
-    nvfp4_compile_pass(graph, is_inference=True)
-    compile_pass(graph, is_inference=True)
+    run_nvfp4_passes(graph, monkeypatch)
 
     call_nodes = [node for node in graph.nodes if node.op == "call_function"]
     targets = [node.target for node in call_nodes]
-    assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == preparation_count
+    expected_prepare = (
+        torch.ops.piper_kernels.nvfp4_prepare_input.default
+        if group_size is None
+        else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
+    )
+    assert targets.count(expected_prepare) == preparation_count
     projected_output = (
         torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
     )
     assert targets.count(projected_output) == 1
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
+    assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
     output_node = next(node for node in call_nodes if node.target is projected_output)
     assert output_node.args[30] == 8_192
     assert output_node.args[-1] == (2 if with_sparse_query_blocks else None)
+    assert output_node.kwargs["group_size"] == group_size
     graph.lint()
 
 
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+@pytest.mark.parametrize("with_block_lengths", [False, True])
+@pytest.mark.parametrize("with_coarse", [False, True])
+@pytest.mark.parametrize("with_sparse_query_blocks", [False, True])
+def test_complete_fold_supports_every_bounded_attention_variant(
+    monkeypatch: pytest.MonkeyPatch,
+    group_size: int | None,
+    with_block_lengths: bool,
+    with_coarse: bool,
+    with_sparse_query_blocks: bool,
+) -> None:
+    graph = build_attention_graph(
+        dynamic=False,
+        output_dynamic=False,
+        with_block_lengths=with_block_lengths,
+        with_coarse=with_coarse,
+        with_sparse_query_blocks=with_sparse_query_blocks,
+        group_size=group_size,
+    )
+    run_nvfp4_passes(graph, monkeypatch)
+
+    call_nodes = [node for node in graph.nodes if node.op == "call_function"]
+    targets = [node.target for node in call_nodes]
+    projected_output = (
+        torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
+    )
+    assert torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default not in targets
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
+    assert targets.count(projected_output) == 1
+    output_node = next(node for node in call_nodes if node.target is projected_output)
+    assert output_node.kwargs["group_size"] == group_size
+    assert torch.ops.piper_kernels.sparse_piper_attention.default not in targets
+    assert torch.ops.piper_kernels.sparse_piper_coarse_residual.default not in targets
+    assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
+    graph.lint()
+
+
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("with_block_lengths", [False, True])
 @pytest.mark.parametrize("with_coarse", [False, True])
 @pytest.mark.parametrize("with_sparse_query_blocks", [False, True])
 def test_output_fold_supports_every_bounded_attention_variant(
     monkeypatch: pytest.MonkeyPatch,
+    group_size: int | None,
     with_block_lengths: bool,
     with_coarse: bool,
     with_sparse_query_blocks: bool,
@@ -622,6 +772,7 @@ def test_output_fold_supports_every_bounded_attention_variant(
         with_block_lengths=with_block_lengths,
         with_coarse=with_coarse,
         with_sparse_query_blocks=with_sparse_query_blocks,
+        group_size=group_size,
     )
     monkeypatch.setattr(
         AcceleratorTarget,
@@ -631,25 +782,33 @@ def test_output_fold_supports_every_bounded_attention_variant(
 
     assert _fold_attention_output(graph)
 
-    targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default) == 1
+    call_nodes = [node for node in graph.nodes if node.op == "call_function"]
+    targets = [node.target for node in call_nodes]
+    fused = torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default
+    assert targets.count(fused) == 1
+    node = next(node for node in call_nodes if node.target is fused)
+    assert node.kwargs["group_size"] == group_size
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
     assert (
         torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
         not in targets
     )
     assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     graph.lint()
 
 
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
 def test_high_first_output_fold_preserves_order_metadata(
     monkeypatch: pytest.MonkeyPatch,
+    group_size: int | None,
 ) -> None:
     graph = build_quantized_attention_output_graph(
         with_block_lengths=False,
         with_coarse=False,
         with_sparse_query_blocks=False,
         high_first=True,
+        group_size=group_size,
     )
     monkeypatch.setattr(
         AcceleratorTarget,
@@ -665,42 +824,66 @@ def test_high_first_output_fold_preserves_order_metadata(
         "high_first": True,
         "output_dtype": torch.bfloat16,
         "dynamic_activation_scale": False,
+        "group_size": group_size,
     }
     graph.lint()
 
 
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
 def test_dynamic_output_fuses(
     monkeypatch: pytest.MonkeyPatch,
+    group_size: int | None,
 ) -> None:
-    graph = build_attention_graph(dynamic=False, output_dynamic=True)
-    monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
+    graph = build_attention_graph(
+        dynamic=False,
+        output_dynamic=True,
+        group_size=group_size,
     )
-
-    nvfp4_compile_pass(graph, is_inference=True)
-    compile_pass(graph, is_inference=True)
+    run_nvfp4_passes(graph, monkeypatch)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     fused = torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
     assert targets.count(fused) == 1
     node = next(node for node in graph.nodes if node.target is fused)
     assert node.kwargs["dynamic_activation_scale"] is True
+    assert node.kwargs["group_size"] == group_size
     assert node.args[28] is None
     assert node.args[30] == 32_768
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     graph.lint()
 
 
-def test_static_output_fails_closed_when_attention_escapes(
+def test_mixed_plain_and_convrot_output_blocks_fold_in_one_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph = build_attention_graph(
-        dynamic=False,
-        output_dynamic=False,
-        escape_attention=True,
+    graph = build_mixed_quantized_attention_output_graph(group_size=64)
+    run_nvfp4_passes(graph, monkeypatch)
+
+    fused = torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default
+    fused_nodes = [node for node in graph.nodes if node.target is fused]
+    assert len(fused_nodes) == 2
+    assert [node.kwargs["group_size"] for node in fused_nodes] == [None, 64]
+    assert all(
+        node.target
+        not in (
+            torch.ops.piper_kernels.nvfp4_linear.default,
+            torch.ops.piper_kernels.convrot_nvfp4_linear.default,
+        )
+        for node in graph.nodes
+    )
+    graph.lint()
+
+
+def test_output_fold_fails_closed_for_invalid_group_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = build_quantized_attention_output_graph(
+        with_block_lengths=False,
+        with_coarse=False,
+        with_sparse_query_blocks=False,
+        group_size=32,
     )
     monkeypatch.setattr(
         AcceleratorTarget,
@@ -708,13 +891,35 @@ def test_static_output_fails_closed_when_attention_escapes(
         classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
     )
 
-    nvfp4_compile_pass(graph, is_inference=True)
-    compile_pass(graph, is_inference=True)
-
+    assert not _fold_attention_output(graph)
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     assert torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default not in targets
+    assert targets.count(torch.ops.piper_kernels.convrot_nvfp4_linear.default) == 1
+    graph.lint()
+
+
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+def test_static_output_fails_closed_when_attention_escapes(
+    monkeypatch: pytest.MonkeyPatch,
+    group_size: int | None,
+) -> None:
+    graph = build_attention_graph(
+        dynamic=False,
+        output_dynamic=False,
+        escape_attention=True,
+        group_size=group_size,
+    )
+    run_nvfp4_passes(graph, monkeypatch)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    expected_linear = (
+        torch.ops.piper_kernels.nvfp4_linear.default
+        if group_size is None
+        else torch.ops.piper_kernels.convrot_nvfp4_linear.default
+    )
+    assert torch.ops.piper_kernels.nvfp4_sparse_piper_attention_output.default not in targets
     assert targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default) == 1
-    assert targets.count(torch.ops.piper_kernels.nvfp4_linear.default) == 1
+    assert targets.count(expected_linear) == 1
     graph.lint()
 
 
@@ -778,10 +983,14 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
-@pytest.mark.parametrize(("dynamic", "preparation_count"), [(False, 3), (True, 1)])
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+@pytest.mark.parametrize(
+    ("dynamic", "routing", "preparation_count"),
+    [(False, "minmax", 3), (True, "minmax", 1), (False, "mean", 3)],
+)
 # test_projection.py::test_chunked_qkv_epilogues_match_materialized_fp32_contract
 # covers the full head-size/affine arithmetic. Retain every pair
-# of dtype, head size, and affine mode here, across all input/output scale modes.
+# of dtype, head size, and affine mode here, across both formats and scale modes.
 @pytest.mark.parametrize(
     ("dtype", "head_dim", "affine"),
     [
@@ -795,20 +1004,27 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
 )
 @pytest.mark.parametrize("output_dynamic", [False, True])
 def test_cuda_compile_fuses_nvfp4_attention_output(
+    group_size: int | None,
     output_dynamic: bool,
     affine: bool,
     monkeypatch,
     dtype: torch.dtype,
     head_dim: int,
     dynamic: bool,
+    routing: str,
     preparation_count: int,
 ) -> None:
     monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
     monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
-    torch.manual_seed(829)
+    torch.manual_seed(829 + (0 if group_size is None else group_size) + dynamic)
     if output_dynamic:
         monkeypatch.setattr(_SparseProjectionAttentionOutput, "output_features", 128)
-    model = _SparseProjectionAttentionOutput(dynamic=dynamic, output_dynamic=output_dynamic).eval()
+    model = _SparseProjectionAttentionOutput(
+        dynamic=dynamic,
+        routing=routing,
+        output_dynamic=output_dynamic,
+        group_size=group_size,
+    ).eval()
     model.set_activation_dtype(dtype)
     if not affine:
         model.query_norm = None
@@ -828,12 +1044,14 @@ def test_cuda_compile_fuses_nvfp4_attention_output(
             options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
         )(hidden_states)
 
+    expected_prepare = (
+        torch.ops.piper_kernels.nvfp4_prepare_input.default
+        if group_size is None
+        else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
+    )
     assert actual.dtype is dtype
     assert_fusion_output_close(actual, expected)
-    assert (
-        capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default)
-        == preparation_count
-    )
+    assert capture.targets.count(expected_prepare) == preparation_count
     assert torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default not in capture.targets
     assert (
         capture.targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
@@ -851,6 +1069,7 @@ def test_cuda_compile_fuses_nvfp4_attention_output(
         capture.targets
     )
     assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in capture.targets
 
 
 @pytest.mark.gpu
@@ -929,38 +1148,46 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize(
     ("dynamic", "routing", "preparation_count"),
     [(False, "minmax", 4), (False, "mean", 4), (True, "minmax", 1)],
 )
 # test_prepared_projection_family_fuses_without_materializing_linears covers Q/K norms;
 # test_cuda_compile_fuses_nvfp4_attention_output covers their dtype/head-size pairs.
-# Retain both gate layouts, all dtypes, routing, preparation sharing, and chunk boundaries.
+# Retain both formats, gate layouts, all dtypes, routing, preparation sharing, and chunk boundaries.
 @pytest.mark.parametrize(
-    ("dtype", "key_affine", "query_chunk_rows"),
+    ("dtype", "key_affine", "query_chunk_rows", "output_dynamic"),
     [
-        (torch.float16, False, 128),
-        (torch.bfloat16, True, 128),
-        (torch.float32, False, 128),
-        (torch.bfloat16, True, 8_192),
+        (torch.float16, False, 128, False),
+        (torch.bfloat16, True, 128, False),
+        (torch.float32, False, 128, False),
+        (torch.bfloat16, True, 8_192, False),
+        (torch.bfloat16, False, 128, True),
     ],
 )
 def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
     monkeypatch: pytest.MonkeyPatch,
+    group_size: int | None,
     key_affine: bool,
     dtype: torch.dtype,
     dynamic: bool,
     routing: str,
     preparation_count: int,
     query_chunk_rows: int,
+    output_dynamic: bool,
 ) -> None:
     # Exercise eight windows with a short tail and the single-window path.
     monkeypatch.setattr(_output, "DEFAULT_QUERY_CHUNK_ROWS", query_chunk_rows)
+    if output_dynamic:
+        monkeypatch.setattr(_output, "DYNAMIC_QUERY_CHUNK_ROWS", query_chunk_rows)
     monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 960)
-    torch.manual_seed(839)
+    torch.manual_seed(839 + (0 if group_size is None else group_size) + dynamic)
     model = _ProjectedGateCoarseSparseAttentionOutput(
         dynamic=dynamic,
         routing=routing,
+        output_dynamic=output_dynamic,
+        group_size=group_size,
     ).eval()
     model.set_activation_dtype(dtype)
     if not key_affine:
@@ -1008,17 +1235,27 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
             options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
         )(hidden_states, block_lengths, 2)
 
+    expected_prepare = (
+        torch.ops.piper_kernels.nvfp4_prepare_input.default
+        if group_size is None
+        else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
+    )
     assert actual.dtype is dtype
-    assert_fusion_output_close(actual[:, valid_rows], expected[:, valid_rows])
+    # 1-ULP FP32 differences across chunked coarse_attention can flip one 4-bit
+    # NVFP4 block on dynamic outputs; static outputs retain the 1e-3 bound.
+    assert_fusion_output_close(
+        actual[:, valid_rows],
+        expected[:, valid_rows],
+        relative_l2=5e-3 if output_dynamic else 1e-3,
+    )
     assert [(start, rows) for start, rows, _ in gate_chunks] == [
         (start, min(query_chunk_rows, model.sequence_length - start))
         for start in range(0, model.sequence_length, query_chunk_rows)
     ]
-    assert len({pointer for _, _, pointer in gate_chunks}) == min(2, len(gate_chunks))
-    assert (
-        capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default)
-        == preparation_count
+    assert len({pointer for _, _, pointer in gate_chunks}) == (
+        1 if output_dynamic else min(2, len(gate_chunks))
     )
+    assert capture.targets.count(expected_prepare) == preparation_count
     assert (
         capture.targets.count(
             torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
@@ -1026,6 +1263,7 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
         == 1
     )
     assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in capture.targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in capture.targets
 
 
@@ -1052,37 +1290,29 @@ def test_cuda_compile_fails_closed_for_batch_two() -> None:
     assert capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention.default) == 1
 
 
-@pytest.mark.parametrize("rotated", [False, True])
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("bounded", [False, True])
 @pytest.mark.parametrize("output", [False, True])
 def test_forced_inputs_survive_projection_and_output_fusion(
-    monkeypatch: pytest.MonkeyPatch, rotated: bool, bounded: bool, output: bool
+    monkeypatch: pytest.MonkeyPatch,
+    group_size: int | None,
+    bounded: bool,
+    output: bool,
 ) -> None:
-    graph = (build_convrot_attention_graph if rotated else build_attention_graph)(
+    graph = build_attention_graph(
         dynamic=True,
         output_dynamic=False if output else None,
         with_block_lengths=bounded,
         with_coarse=bounded,
         with_sparse_query_blocks=bounded,
         with_force_tiles=True,
+        group_size=group_size,
     )
     ids = next(node for node in graph.nodes if node.target == "force_tile_ids")
     counts = next(node for node in graph.nodes if node.target == "force_tile_counts")
-    if rotated:
-        run_convrot_passes(graph, monkeypatch)
-    else:
-        monkeypatch.setattr(
-            AcceleratorTarget,
-            "from_device",
-            classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
-        )
-        nvfp4_compile_pass(graph, is_inference=True)
-        compile_pass(graph, is_inference=True)
+    run_nvfp4_passes(graph, monkeypatch)
     if output:
-        prefix = "convrot_nvfp4" if rotated else "nvfp4"
-        target = getattr(
-            torch.ops.piper_kernels, f"{prefix}_sparse_piper_projected_query_attention_output"
-        ).default
+        target = torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
     else:
         target = (
             torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
@@ -1092,6 +1322,7 @@ def test_forced_inputs_survive_projection_and_output_fusion(
     calls = [node for node in graph.nodes if node.target == target]
     assert len(calls) == 1
     if output:
+        assert calls[0].kwargs["group_size"] == group_size
         assert calls[0].kwargs["force_tile_ids"] is ids
         assert calls[0].kwargs["force_tile_counts"] is counts
     else:

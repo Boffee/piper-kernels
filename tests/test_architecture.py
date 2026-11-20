@@ -14,10 +14,10 @@ _TESTS_ROOT = _REPO_ROOT / "tests"
 _BENCHMARKS_ROOT = _REPO_ROOT / "benchmarks"
 
 # Legacy surface-area ceilings in src/piper_kernels (lower as refactors land).
-_MAX_FUSION_PACKAGES = 21
-_MAX_CUSTOM_OPS = 68
-_MAX_COMPILER_PASSES = 18
-_MAX_PATTERN_MATCHER_PASSES = 20
+_MAX_FUSION_PACKAGES = 20
+_MAX_CUSTOM_OPS = 66
+_MAX_COMPILER_PASSES = 17
+_MAX_PATTERN_MATCHER_PASSES = 18
 
 # Legacy tests that inspect src/ ASTs (shrink and remove entries over time).
 _TEST_AST_ALLOWLIST = frozenset(
@@ -53,8 +53,8 @@ _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
 }
 
 # Legacy private piper_kernels import totals in tests/ (lower as tests decouple).
-_MAX_TEST_PRIVATE_IMPORT_FILES = 180
-_MAX_TEST_PRIVATE_IMPORTS = 760
+_MAX_TEST_PRIVATE_IMPORT_FILES = 178
+_MAX_TEST_PRIVATE_IMPORTS = 751
 
 _PASS_BASE_NAMES = frozenset(
     {

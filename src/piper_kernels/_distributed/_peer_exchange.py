@@ -7,10 +7,13 @@ from collections.abc import Callable
 import torch
 import torch.distributed as dist
 
-from piper_kernels._residual import ResidualAdd
+from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels._residual.triton import apply_residual_add
 
 from . import _comm as distributed_comm
+
+type PeerExchangeHandle = tuple[dist.Work, int, int, torch.Tensor, tuple[torch.Tensor, ...]]
+type ApplyReceived = Callable[[torch.Tensor, int, int], None]
 
 
 def contiguous_chunk_view(
@@ -42,6 +45,38 @@ def validate_distributed_sequence(
     if not isinstance(sequence_length, torch.SymInt) and sequence_length % comm_group_size:
         raise ValueError(f"{name} sequence length must divide evenly across ranks")
     return sequence_length // comm_group_size
+
+
+def resolve_validated_process_group(
+    comm_group_name: str,
+    comm_group_size: int,
+    *,
+    name: str = "distributed Piper",
+) -> dist.ProcessGroup:
+    """Resolve ``comm_group_name`` and check that its world size matches."""
+    process_group = distributed_comm.resolve_process_group(comm_group_name)
+    if process_group.size() != comm_group_size:
+        raise ValueError(f"{name} comm_group_size must match resolved group")
+    return process_group
+
+
+def validate_distributed_residual_add(
+    residual_add: ResidualAdd,
+    *,
+    batch: int,
+    local_sequence_length: int,
+    output_features: int,
+    storage_device: torch.device,
+    name: str = "distributed Piper",
+    storage_label: str = "input",
+) -> None:
+    """Validate that a local residual base matches one rank's share and device."""
+    base = residual_add.base
+    if base.ndim != 3 or base.shape[:2] != (batch, local_sequence_length):
+        raise ValueError(f"{name} residual base must have one local rank share of rows")
+    if base.device != storage_device:
+        raise ValueError(f"{name} residual base must share the {storage_label} storage device")
+    validate_residual_add(base, residual_add, output_features)
 
 
 def choose_distributed_chunk_rows(
@@ -155,10 +190,10 @@ def run_peer_chunk_exchange(
     output: torch.Tensor,
     comm_chunk_rows: int,
     run_peer_window: Callable[[int, int, torch.Tensor], None],
-    apply_received: Callable[[torch.Tensor, int, int], None],
+    apply_received: ApplyReceived,
     *,
     reuse_direct_receive: bool,
-) -> tuple[dist.Work, int, int, torch.Tensor, tuple[torch.Tensor, ...]]:
+) -> PeerExchangeHandle:
     """Compute peer windows and ping-pong async exchanges, returning the final in-flight chunk."""
     world_size = process_group.size()
     batch, local_sequence_length, output_features = output.shape
@@ -228,11 +263,59 @@ def run_peer_chunk_exchange(
     return last_work, last_offset, last_rows, last_receive, keepalive
 
 
+def run_peer_attention_exchange(
+    process_group: dist.ProcessGroup,
+    output: torch.Tensor,
+    *,
+    heads: int,
+    head_dim: int,
+    comm_chunk_rows: int,
+    run_attention: Callable[[int, int, torch.Tensor], None],
+    peer_projector: Callable[[torch.Tensor, torch.Tensor, int, int], None],
+    apply_received: ApplyReceived,
+    reuse_direct_receive: bool,
+) -> PeerExchangeHandle:
+    """Run attention + output projection for each peer window and ping-pong exchange."""
+    batch, local_sequence_length, output_features = output.shape
+    capacity = min(local_sequence_length, comm_chunk_rows)
+    attention_scratch: torch.Tensor | None = (
+        None
+        if output_features >= heads * head_dim
+        else torch.empty(
+            (batch, capacity, heads, head_dim),
+            device=output.device,
+            dtype=output.dtype,
+        )
+    )
+
+    def run_peer_window(global_start: int, rows: int, output_buffer: torch.Tensor) -> None:
+        # Pack attention contiguously within each batch's own output slice so
+        # per-batch projection never overwrites later batches before reading them.
+        attention_chunk = (
+            output_buffer.view(batch, rows * output_features)[:, : rows * heads * head_dim].view(
+                batch, rows, heads, head_dim
+            )
+            if attention_scratch is None
+            else attention_scratch[:, :rows]
+        )
+        run_attention(global_start, rows, attention_chunk)
+        peer_projector(attention_chunk, output_buffer, 0, rows)
+
+    return run_peer_chunk_exchange(
+        process_group,
+        output,
+        comm_chunk_rows,
+        run_peer_window,
+        apply_received,
+        reuse_direct_receive=reuse_direct_receive,
+    )
+
+
 def finish_overlapped_exchange(
-    last_exchange: tuple[dist.Work, int, int, torch.Tensor, tuple[torch.Tensor, ...]],
+    last_exchange: PeerExchangeHandle,
     *,
     run_own: Callable[[], torch.Tensor | None],
-    apply_received: Callable[[torch.Tensor, int, int], None],
+    apply_received: ApplyReceived,
     output: torch.Tensor,
     residual_add: ResidualAdd | None,
 ) -> torch.Tensor:
@@ -255,13 +338,89 @@ def finish_overlapped_exchange(
     return output
 
 
+def run_overlapped_distributed_output(
+    process_group: dist.ProcessGroup,
+    *,
+    output_shape: tuple[int, int, int],
+    output_dtype: torch.dtype,
+    device: torch.device,
+    query_chunk_rows: int,
+    tile_rows: int,
+    residual_add: ResidualAdd | None,
+    run_fallback: Callable[[], torch.Tensor],
+    start_aligned: Callable[
+        [int, torch.Tensor, ApplyReceived, bool, int],
+        tuple[PeerExchangeHandle, Callable[[], torch.Tensor | None]],
+    ],
+) -> torch.Tensor:
+    """Run aligned overlapped peer exchange + own-rank output, or reduce-scatter fallback."""
+    batch, local_sequence_length, output_features = output_shape
+    if local_sequence_length < tile_rows or local_sequence_length % tile_rows:
+        return run_distributed_fallback(
+            process_group,
+            process_group.size(),
+            local_sequence_length,
+            output_features,
+            output_dtype,
+            run_fallback(),
+            residual_add,
+        )
+
+    comm_chunk_rows = choose_distributed_chunk_rows(
+        local_sequence_length,
+        query_chunk_rows,
+        tile_rows=tile_rows,
+    )
+    output = (
+        residual_add.base
+        if residual_add is not None
+        else torch.empty(output_shape, device=device, dtype=output_dtype)
+    )
+    reuse_direct_receive = residual_add is None and batch == 1
+
+    def apply_received(receive_tensor: torch.Tensor, local_offset: int, rows: int) -> None:
+        apply_received_chunk(
+            receive_tensor,
+            output,
+            local_offset,
+            rows,
+            residual_add=residual_add,
+            reuse_direct_receive=reuse_direct_receive,
+        )
+
+    own_base = process_group.rank() * local_sequence_length
+    last_exchange, run_own = start_aligned(
+        comm_chunk_rows,
+        output,
+        apply_received,
+        reuse_direct_receive,
+        own_base,
+    )
+    try:
+        return finish_overlapped_exchange(
+            last_exchange,
+            run_own=run_own,
+            apply_received=apply_received,
+            output=output,
+            residual_add=residual_add,
+        )
+    finally:
+        del last_exchange
+
+
 __all__ = [
+    "ApplyReceived",
+    "PeerExchangeHandle",
     "allocate_peer_comm_slots",
     "apply_received_chunk",
     "choose_distributed_chunk_rows",
     "contiguous_chunk_view",
     "finish_overlapped_exchange",
+    "resolve_validated_process_group",
     "run_distributed_fallback",
+    "run_overlapped_distributed_output",
+    "run_peer_attention_exchange",
     "run_peer_chunk_exchange",
+    "validate_distributed_residual_add",
     "validate_distributed_sequence",
 ]

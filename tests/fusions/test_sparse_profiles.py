@@ -9,14 +9,10 @@ from piper_kernels import SparsePiperAttention
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     convrot_int8_sparse_piper_compile_options,
 )
-from piper_kernels.fusions.convrot_nvfp4_sparse_piper import (
-    convrot_nvfp4_sparse_piper_compile_options,
-)
 from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_options
 
 from ._accuracy import assert_fusion_output_close
 from .convrot_int8_sparse_piper import test_compile as int8_cases
-from .convrot_nvfp4_sparse_piper import test_compile as convrot_cases
 from .nvfp4_sparse_piper import test_compile as nvfp4_cases
 
 
@@ -35,15 +31,16 @@ def test_sparse_projection_and_output_reuse_graph_across_profiles(
     if weight_format == "convrot_int8":
         model_type = int8_cases._SparseProjectionAttentionOutput
         options = convrot_int8_sparse_piper_compile_options()
-    elif weight_format == "nvfp4":
+    else:
         model_type = nvfp4_cases._SparseProjectionAttentionOutput
         options = nvfp4_sparse_piper_compile_options()
-    else:
-        model_type = convrot_cases._ConvRotSparseProjectionAttentionOutput
-        options = convrot_nvfp4_sparse_piper_compile_options()
     monkeypatch.setattr(model_type, "sequence_length", 1024)
     monkeypatch.setattr(model_type, "sparse_key_blocks", 12)
-    model = (model_type(dynamic=False) if weight_format == "convrot_nvfp4" else model_type()).eval()
+    if weight_format == "convrot_int8":
+        model = model_type().eval()
+    else:
+        group_size = None if weight_format == "nvfp4" else 64
+        model = model_type(dynamic=False, group_size=group_size).eval()
     inputs = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
@@ -67,10 +64,8 @@ def test_sparse_projection_and_output_reuse_graph_across_profiles(
                 expected, _attention = int8_cases._run_explicit_attention_output(
                     model, inputs, model.cos, model.sin, model.sparse_key_blocks
                 )
-            elif weight_format == "nvfp4":
-                expected = nvfp4_cases._run_explicit_attention_output(model, inputs)
             else:
-                expected = convrot_cases._run_explicit_attention_output(model, inputs)
+                expected = nvfp4_cases._run_explicit_attention_output(model, inputs)
             actual = compiled(inputs)
             assert_fusion_output_close(actual, expected)
             current_count = int8_cases._compiled_specialization_count(attention_kernel)
@@ -79,9 +74,10 @@ def test_sparse_projection_and_output_reuse_graph_across_profiles(
                 assert specialization_count > 0
             assert current_count == specialization_count
     assert capture.calls == 1
+    prefix = "convrot_int8" if weight_format == "convrot_int8" else "nvfp4"
     target = getattr(
         torch.ops.piper_kernels,
-        f"{weight_format}_sparse_piper_projected_query_attention_output",
+        f"{prefix}_sparse_piper_projected_query_attention_output",
     ).default
     assert capture.targets.count(target) == 1
     assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
