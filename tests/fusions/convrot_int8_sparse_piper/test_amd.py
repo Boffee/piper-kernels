@@ -11,8 +11,19 @@ from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._amd import gluon as amd_attention
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
+from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
+)
 from piper_kernels.fusions.convrot_int8_sparse_piper import _backend, key, output, query, value
+from piper_kernels.fusions.convrot_int8_sparse_piper import triton as shared_triton
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy
+from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
+from piper_kernels.fusions.convrot_int8_sparse_piper._layout import (
+    QUERY_SCALE_ROWS,
+    TILE_ROWS,
+    padded_sequence_length,
+)
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 
 from ._reference import (
@@ -38,14 +49,92 @@ def test_amd_projection_support_is_limited_to_linux_and_windows_rdna4(monkeypatc
     )
 
 
+def _assert_projection_matches(operation, actual, expected, *, allow_empty_nan=False):
+    assert_int8_codes_close(actual[0], expected[0])
+    if operation == "key":
+        torch.testing.assert_close(actual[1], expected[1], rtol=3e-5, atol=2e-5)
+        actual_center = reconstruct_key_center(actual[2], actual[3])
+        expected_center = reconstruct_key_center(expected[2], expected[3])
+        torch.testing.assert_close(actual_center, expected_center, rtol=2e-4, atol=2e-4)
+        tail = zip(actual[4:], expected[4:], strict=True)
+    else:
+        tail = zip(actual[1:], expected[1:], strict=True)
+    for actual_metadata, expected_metadata in tail:
+        rtol = 1.6e-2 if expected_metadata.dtype is torch.bfloat16 else 3e-5
+        if not allow_empty_nan and expected_metadata.numel() > 0:
+            assert not bool(actual_metadata.isnan().any())
+        torch.testing.assert_close(
+            actual_metadata,
+            expected_metadata,
+            rtol=rtol,
+            atol=2e-4,
+            equal_nan=allow_empty_nan,
+        )
+
+
+def _filled_outputs(
+    operation,
+    device,
+    *,
+    batch,
+    heads,
+    storage,
+    head_dim,
+    routing_mode=_MINMAX_ROUTING,
+    value_format=ValueFormat.AMD_WMMA,
+):
+    if operation == "query":
+        return (
+            torch.full((batch, heads, storage, head_dim), 99, device=device, dtype=torch.int8),
+            torch.full(
+                (batch, heads, storage // QUERY_SCALE_ROWS),
+                -7.0,
+                device=device,
+                dtype=torch.float32,
+            ),
+            torch.full(
+                (batch, heads, storage // TILE_ROWS, head_dim),
+                -7.0,
+                device=device,
+                dtype=torch.float32,
+            ),
+        )
+    tiles = storage // TILE_ROWS
+    if operation == "key":
+        return (
+            torch.full((batch, heads, storage, head_dim), 99, device=device, dtype=torch.int8),
+            torch.full((batch, heads, tiles), -7.0, device=device, dtype=torch.float32),
+            torch.full((batch, heads, tiles, 2, head_dim), 99, device=device, dtype=torch.int8),
+            torch.full((batch, heads, tiles, 2), -7.0, device=device, dtype=torch.float32),
+            torch.full((batch, heads, tiles, head_dim), -7.0, device=device, dtype=torch.float32),
+            torch.full(
+                (batch, heads, 0 if routing_mode == _MEAN_ROUTING else tiles, head_dim),
+                -7.0,
+                device=device,
+                dtype=torch.float32,
+            ),
+        )
+    return (
+        torch.full(
+            value_format.shape(batch, heads, storage, head_dim),
+            99,
+            device=device,
+            dtype=torch.int8,
+        ),
+        torch.full((batch, heads, tiles, 1), -7.0, device=device, dtype=torch.float32),
+        torch.full((batch, heads, tiles, head_dim), -7.0, device=device, dtype=torch.bfloat16),
+    )
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not _available(), reason="requires Linux RDNA4 ROCm")
 @pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(("width", "heads"), [(272, 3), (256, 4)])
 def test_grouped_order_preserves_complete_outputs_with_partial_groups_and_query_window(
-    monkeypatch, head_dim
+    monkeypatch, head_dim, width, heads
 ):
     torch.manual_seed(137)
-    batch, sequence, width, heads = 2, 1217, 272, 3
+    batch, sequence = 2, 1217
     qdata = torch.randint(-128, 128, (batch, sequence, width), device="cuda", dtype=torch.int8)
     scale = torch.rand((batch, sequence), device="cuda") * 0.01 + 0.001
     weight = torch.randint(-128, 128, (heads * head_dim, width), device="cuda", dtype=torch.int8)
@@ -86,24 +175,11 @@ def test_grouped_order_preserves_complete_outputs_with_partial_groups_and_query_
     monkeypatch.setattr(
         policy,
         "select_execution_plan",
-        lambda operation, *, head_dim: replace(
-            select_plan(operation, head_dim=head_dim), group_m=0
-        ),
+        lambda *args, **kwargs: replace(select_plan(*args, **kwargs), group_m=0),
     )
     expected = run()
-    for index, (left, right) in enumerate(zip(actual, expected, strict=True)):
-        assert_int8_codes_close(left[0], right[0])
-        if index == 1:
-            torch.testing.assert_close(left[1], right[1], rtol=3e-5, atol=2e-5)
-            actual_center = reconstruct_key_center(left[2], left[3])
-            expected_center = reconstruct_key_center(right[2], right[3])
-            torch.testing.assert_close(actual_center, expected_center, rtol=2e-4, atol=2e-4)
-            tail = zip(left[4:], right[4:], strict=True)
-        else:
-            tail = zip(left[1:], right[1:], strict=True)
-        for actual_metadata, expected_metadata in tail:
-            rtol = 1.6e-2 if expected_metadata.dtype is torch.bfloat16 else 3e-5
-            torch.testing.assert_close(actual_metadata, expected_metadata, rtol=rtol, atol=2e-4)
+    for operation, left, right in zip(("query", "key", "value"), actual, expected, strict=True):
+        _assert_projection_matches(operation, left, right)
 
 
 @pytest.mark.usefixtures("large_device_memory")
@@ -281,3 +357,445 @@ def test_h3_chunked_output_matches_materialized_boundary_with_bounded_workspace(
     if sequence == 100_000:
         # Only the final output grows with S; V is already in its final format.
         assert peak < actual.numel() * actual.element_size() + 512 * 1024**2
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _available(), reason="requires Linux RDNA4 ROCm")
+@pytest.mark.parametrize(
+    ("head_dim", "rotary_dim"),
+    [(hd, rd) for hd, dims in policy.GLUON_ROTARY_DIMS.items() for rd in dims],
+)
+@pytest.mark.parametrize("variant", ["full_minmax", "window_mean_block_lengths"])
+def test_amd_gluon_projections_match_triton_across_rotary_and_edge_modes(
+    head_dim, rotary_dim, variant
+):
+    torch.manual_seed(907)
+    batch, sequence = 2, 205
+    width = 192 if head_dim == 64 else 256
+    heads = 4 if head_dim == 64 else 3
+    qdata = torch.randint(-128, 128, (batch, sequence, width), device="cuda", dtype=torch.int8)
+    scale = torch.rand((batch, sequence), device="cuda") * 0.01 + 0.001
+    weights = [
+        torch.randint(-128, 128, (heads * head_dim, width), device="cuda", dtype=torch.int8)
+        for _ in range(3)
+    ]
+    scales = [torch.rand((heads * head_dim, 1), device="cuda") * 0.01 + 0.001 for _ in range(3)]
+    windowed = variant == "window_mean_block_lengths"
+    affine = not windowed
+    bias = (
+        torch.randn((heads * head_dim,), device="cuda", dtype=torch.bfloat16) if windowed else None
+    )
+    norm = torch.rand(head_dim, dtype=torch.bfloat16, device="cuda") + 0.5 if affine else None
+    routing_mode = _MEAN_ROUTING if windowed else _MINMAX_ROUTING
+    angles = torch.rand((sequence, rotary_dim), device="cuda") * (2 * torch.pi)
+    cos, sin = angles.cos(), angles.sin()
+    block_lengths = (
+        torch.tensor([64, 0, 17, 13], device="cuda", dtype=torch.int32) if windowed else None
+    )
+    chunk_start, chunk_rows = (64, 141) if windowed else (0, sequence)
+    storage_q = padded_sequence_length(chunk_rows)
+    storage_kv = padded_sequence_length(sequence)
+
+    triton_qk = policy.select_execution_plan("key", head_dim=head_dim)
+    triton_v = policy.select_execution_plan("value", head_dim=head_dim)
+    assert triton_qk.kernel == "triton"
+    assert triton_v.kernel == "triton"
+    assert (
+        amd.default_execution_plan(
+            qdata,
+            weights[0],
+            operation="query",
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            storage_sequence_length=storage_q,
+        ).kernel
+        == "gluon"
+    )
+    assert (
+        amd.default_execution_plan(
+            qdata,
+            weights[1],
+            operation="key",
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            storage_sequence_length=storage_kv,
+        ).kernel
+        == "gluon"
+    )
+    assert (
+        amd.default_execution_plan(
+            qdata,
+            weights[2],
+            operation="value",
+            head_dim=head_dim,
+            storage_sequence_length=storage_kv,
+            value_format=ValueFormat.AMD_WMMA,
+        ).kernel
+        == "gluon"
+    )
+
+    q_actual = _filled_outputs(
+        "query", "cuda", batch=batch, heads=heads, storage=storage_q, head_dim=head_dim
+    )
+    q_expected = _filled_outputs(
+        "query", "cuda", batch=batch, heads=heads, storage=storage_q, head_dim=head_dim
+    )
+    amd.project_query(
+        qdata,
+        scale,
+        weights[0],
+        scales[0],
+        norm,
+        cos,
+        sin,
+        1e-5,
+        head_dim**-0.5,
+        routing_mode,
+        block_lengths,
+        chunk_start=chunk_start,
+        chunk_rows=chunk_rows,
+        out=q_actual,
+        bias=bias,
+    )
+    shared_triton.project_query(
+        qdata,
+        scale,
+        weights[0],
+        scales[0],
+        norm,
+        cos,
+        sin,
+        1e-5,
+        head_dim**-0.5,
+        routing_mode,
+        block_lengths,
+        execution_plan=triton_qk,
+        chunk_start=chunk_start,
+        chunk_rows=chunk_rows,
+        out=q_expected,
+        bias=bias,
+    )
+    _assert_projection_matches("query", q_actual, q_expected, allow_empty_nan=windowed)
+
+    k_actual = _filled_outputs(
+        "key",
+        "cuda",
+        batch=batch,
+        heads=heads,
+        storage=storage_kv,
+        head_dim=head_dim,
+        routing_mode=routing_mode,
+    )
+    k_expected = _filled_outputs(
+        "key",
+        "cuda",
+        batch=batch,
+        heads=heads,
+        storage=storage_kv,
+        head_dim=head_dim,
+        routing_mode=routing_mode,
+    )
+    amd.project_key(
+        qdata,
+        scale,
+        weights[1],
+        scales[1],
+        norm,
+        cos,
+        sin,
+        1e-5,
+        routing_mode,
+        block_lengths,
+        out=k_actual,
+        bias=bias,
+    )
+    shared_triton.project_key(
+        qdata,
+        scale,
+        weights[1],
+        scales[1],
+        norm,
+        cos,
+        sin,
+        1e-5,
+        routing_mode,
+        block_lengths,
+        execution_plan=triton_qk,
+        out=k_expected,
+        bias=bias,
+    )
+    _assert_projection_matches("key", k_actual, k_expected, allow_empty_nan=windowed)
+
+    if rotary_dim == policy.GLUON_ROTARY_DIMS[head_dim][0]:
+        v_actual = _filled_outputs(
+            "value", "cuda", batch=batch, heads=heads, storage=storage_kv, head_dim=head_dim
+        )
+        v_expected = _filled_outputs(
+            "value", "cuda", batch=batch, heads=heads, storage=storage_kv, head_dim=head_dim
+        )
+        amd.project_value(
+            qdata,
+            scale,
+            weights[2],
+            scales[2],
+            block_lengths,
+            value_format=ValueFormat.AMD_WMMA,
+            out=v_actual,
+            bias=bias,
+        )
+        shared_triton.project_value(
+            qdata,
+            scale,
+            weights[2],
+            scales[2],
+            block_lengths,
+            execution_plan=triton_v,
+            value_format=ValueFormat.AMD_WMMA,
+            out=v_expected,
+            bias=bias,
+        )
+        _assert_projection_matches("value", v_actual, v_expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _available(), reason="requires Linux RDNA4 ROCm")
+@pytest.mark.parametrize(("head_dim", "heads", "rotary_dim"), [(64, 4, 48), (128, 3, 96)])
+def test_amd_gluon_public_window_bias_and_partial_kv_contracts(head_dim, heads, rotary_dim):
+    torch.manual_seed(911)
+    batch, sequence, width = 2, 256, 256
+    qdata = torch.randint(-128, 128, (batch, sequence, width), device="cuda", dtype=torch.int8)
+    scale = torch.rand((batch, sequence), device="cuda") * 0.01 + 0.001
+    weights = [
+        torch.randint(-128, 128, (heads * head_dim, width), device="cuda", dtype=torch.int8)
+        for _ in range(3)
+    ]
+    scales = [torch.rand((heads * head_dim, 1), device="cuda") * 0.01 + 0.001 for _ in range(3)]
+    norm = torch.rand(head_dim, dtype=torch.bfloat16, device="cuda") + 0.5
+    angles = torch.rand((sequence, rotary_dim), device="cuda") * (2 * torch.pi)
+    cos, sin = angles.cos(), angles.sin()
+    bias_f32 = torch.randn((heads * head_dim,), device="cuda", dtype=torch.float32)
+
+    # Empty-tile padding equivalence: chunk_rows=77 vs chunk_rows=128 with shortened block_lengths.
+    q_tail = query._launch_query_projection_range(
+        qdata,
+        scale,
+        weights[0],
+        scales[0],
+        norm,
+        cos,
+        sin,
+        1e-5,
+        head_dim**-0.5,
+        _MINMAX_ROUTING,
+        chunk_start=64,
+        chunk_rows=77,
+        bias=bias_f32,
+    )
+    short_lengths = torch.tensor([64, 64, 13, 0], device="cuda", dtype=torch.int32)
+    q_masked = query._launch_query_projection_range(
+        qdata,
+        scale,
+        weights[0],
+        scales[0],
+        norm,
+        cos,
+        sin,
+        1e-5,
+        head_dim**-0.5,
+        _MINMAX_ROUTING,
+        short_lengths,
+        chunk_start=64,
+        chunk_rows=128,
+        bias=bias_f32,
+    )
+    for left, right in zip(q_tail, q_masked, strict=True):
+        assert torch.equal(left, right)
+
+    # Partial K/V launches preserve block_m=128 overlap and match full launches bitwise.
+    seq_kv = 384
+    qk_data = torch.randint(-128, 128, (1, seq_kv, width), device="cuda", dtype=torch.int8)
+    kv_scale = torch.rand((1, seq_kv), device="cuda") * 0.01 + 0.001
+    kv_angles = torch.rand((seq_kv, rotary_dim), device="cuda") * (2 * torch.pi)
+    k_cos, k_sin = kv_angles.cos(), kv_angles.sin()
+    assert (
+        amd.partial_row_block_size(
+            qk_data, weights[1], operation="key", head_dim=head_dim, rotary_dim=rotary_dim
+        )
+        == 128
+    )
+    assert (
+        amd.partial_row_block_size(
+            qk_data,
+            weights[2],
+            operation="value",
+            head_dim=head_dim,
+            value_format=ValueFormat.AMD_WMMA,
+        )
+        == 128
+    )
+
+    k_full = _filled_outputs("key", "cuda", batch=1, heads=heads, storage=seq_kv, head_dim=head_dim)
+    k_split = _filled_outputs(
+        "key", "cuda", batch=1, heads=heads, storage=seq_kv, head_dim=head_dim
+    )
+    amd.project_key(
+        qk_data, kv_scale, weights[1], scales[1], norm, k_cos, k_sin, 1e-5, 0, None, out=k_full
+    )
+    amd.project_key(
+        qk_data,
+        kv_scale,
+        weights[1],
+        scales[1],
+        norm,
+        k_cos,
+        k_sin,
+        1e-5,
+        0,
+        None,
+        out=k_split,
+        start_row_block=0,
+        num_row_blocks=1,
+    )
+    amd.project_key(
+        qk_data,
+        kv_scale,
+        weights[1],
+        scales[1],
+        norm,
+        k_cos,
+        k_sin,
+        1e-5,
+        0,
+        None,
+        out=k_split,
+        start_row_block=1,
+        num_row_blocks=None,
+    )
+    for left, right in zip(k_full, k_split, strict=True):
+        assert torch.equal(left, right)
+
+    v_full = _filled_outputs(
+        "value", "cuda", batch=1, heads=heads, storage=seq_kv, head_dim=head_dim
+    )
+    v_split = _filled_outputs(
+        "value", "cuda", batch=1, heads=heads, storage=seq_kv, head_dim=head_dim
+    )
+    amd.project_value(
+        qk_data,
+        kv_scale,
+        weights[2],
+        scales[2],
+        None,
+        value_format=ValueFormat.AMD_WMMA,
+        out=v_full,
+        bias=bias_f32,
+    )
+    amd.project_value(
+        qk_data,
+        kv_scale,
+        weights[2],
+        scales[2],
+        None,
+        value_format=ValueFormat.AMD_WMMA,
+        out=v_split,
+        bias=bias_f32,
+        start_row_block=1,
+        num_row_blocks=2,
+    )
+    amd.project_value(
+        qk_data,
+        kv_scale,
+        weights[2],
+        scales[2],
+        None,
+        value_format=ValueFormat.AMD_WMMA,
+        out=v_split,
+        bias=bias_f32,
+        start_row_block=0,
+        num_row_blocks=1,
+    )
+    for left, right in zip(v_full, v_split, strict=True):
+        assert torch.equal(left, right)
+
+    seq_oversized = 192
+    oversized_storage = seq_oversized + 128
+    active_tiles = seq_oversized // TILE_ROWS
+    v_in = qk_data[:, :seq_oversized].contiguous()
+    v_in_scale = kv_scale[:, :seq_oversized].contiguous()
+    v_exact = _filled_outputs(
+        "value", "cuda", batch=1, heads=heads, storage=seq_oversized, head_dim=head_dim
+    )
+    v_oversized = _filled_outputs(
+        "value", "cuda", batch=1, heads=heads, storage=oversized_storage, head_dim=head_dim
+    )
+    amd.project_value(
+        v_in,
+        v_in_scale,
+        weights[2],
+        scales[2],
+        None,
+        value_format=ValueFormat.AMD_WMMA,
+        out=v_exact,
+        bias=bias_f32,
+    )
+    amd.project_value(
+        v_in,
+        v_in_scale,
+        weights[2],
+        scales[2],
+        None,
+        value_format=ValueFormat.AMD_WMMA,
+        out=v_oversized,
+        bias=bias_f32,
+    )
+    for actual_tensor, expected_tensor in zip(v_oversized, v_exact, strict=True):
+        assert torch.equal(actual_tensor[:, :, :active_tiles], expected_tensor)
+        sentinel = 99 if actual_tensor.dtype is torch.int8 else -7.0
+        assert torch.all(actual_tensor[:, :, active_tiles:] == sentinel)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _available(), reason="requires Linux RDNA4 ROCm")
+def test_amd_triton_fallbacks_cover_odd_d64_heads_unaligned_width_rotary_and_transposed_v():
+    torch.manual_seed(919)
+    cases = [
+        # Sequence length, width, head count, head width, rotary width, and value storage layout.
+        (137, 256, 3, 64, 48, ValueFormat.AMD_WMMA),
+        (137, 272, 4, 64, 48, ValueFormat.AMD_WMMA),
+        (137, 256, 4, 64, 16, ValueFormat.AMD_WMMA),
+        (137, 256, 3, 128, 96, ValueFormat.TRANSPOSED),
+    ]
+    for sequence, width, heads, head_dim, rotary_dim, value_format in cases:
+        qdata = torch.randint(-128, 128, (1, sequence, width), device="cuda", dtype=torch.int8)
+        scale = torch.rand((1, sequence), device="cuda") * 0.01 + 0.001
+        w = torch.randint(-128, 128, (heads * head_dim, width), device="cuda", dtype=torch.int8)
+        ws = torch.rand((heads * head_dim, 1), device="cuda") * 0.01 + 0.001
+        norm = torch.rand(head_dim, dtype=torch.bfloat16, device="cuda") + 0.5
+        angles = torch.rand((sequence, rotary_dim), device="cuda")
+        cos, sin = angles.cos(), angles.sin()
+        expect_v_gluon = (
+            value_format is ValueFormat.AMD_WMMA
+            and width % 64 == 0
+            and (head_dim == 128 or heads % 2 == 0)
+        )
+        expect_k_gluon = (
+            width % 64 == 0
+            and (head_dim == 128 or heads % 2 == 0)
+            and rotary_dim in policy.GLUON_ROTARY_DIMS[head_dim]
+        )
+        assert amd.default_execution_plan(
+            qdata, w, operation="key", head_dim=head_dim, rotary_dim=rotary_dim
+        ).kernel == ("gluon" if expect_k_gluon else "triton")
+        assert amd.default_execution_plan(
+            qdata, w, operation="value", head_dim=head_dim, value_format=value_format
+        ).kernel == ("gluon" if expect_v_gluon else "triton")
+        q_out = query._project_query_op(
+            qdata, scale, w, ws, norm, cos, sin, 1e-5, head_dim**-0.5, 0
+        )
+        k_out = key._project_key_op(qdata, scale, w, ws, norm, cos, sin, 1e-5, 0)
+        v_out = value._project_value_op(
+            qdata, scale, w, ws, head_dim=head_dim, value_format=int(value_format)
+        )
+        assert torch.isfinite(q_out[1]).all()
+        assert torch.isfinite(k_out[1]).all()
+        assert torch.isfinite(v_out[1]).all()

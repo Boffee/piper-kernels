@@ -26,22 +26,24 @@ For ROCm development, create an isolated environment with matching ROCm PyTorch,
 Triton, package extras, and the `test` group dependencies from
 [`pyproject.toml`](../pyproject.toml). Do not use `uv sync` to provision it.
 
-Validated Linux RX 9070 XT (`gfx1201`) setup with stable ROCm 10.1.0, PyTorch
-2.14, and matching Triton:
+Validated Linux RX 9070 XT (`gfx1201`) setup with stable ROCm 10.2.0, PyTorch
+2.15, and matching Triton 3.9 (Triton 3.8 is unsupported; on Windows, pair the
+same AMD index with `triton-windows>=3.9,<3.10`):
 
 ```shell
-uv --no-config venv --python 3.13 .venv-rocm
+uv --no-config venv --python 3.14 .venv-rocm
 uv --no-config pip install --python .venv-rocm/bin/python \
   --index-url https://stable.repo.amd.com/rocm/whl-next/ \
-  "torch[device-gfx1201]==2.14.0+rocm10.1.0"
+  "torch[device-gfx1201]==2.15.0+rocm10.2.0"
 uv --no-config pip install --python .venv-rocm/bin/python --group test \
   "torchao==0.18.0" "numpy>=2"
 ```
 
-PyTorch 2.15 for ROCm 10.0 (`torch==2.15.0+rocm10.0` from PyTorch's `rocm10.0`
-index) with Triton 3.9 also passes the regressions. Attention uses RDNA4 codegen
-workarounds there ([dense implementation guide](../src/piper_kernels/attention/piper_attention/README.md#rdna4-behavior)).
-ConvRot INT8 linear and FFN kernels run within about 3% of Triton 3.8.
+Do not use PyTorch's `download.pytorch.org/whl/rocm*` wheels: they are
+Linux-only (no Windows wheels) and their older ROCm runtimes can crash with a
+GPU fault (`HSA_STATUS_ERROR_EXCEPTION`) on out-of-memory instead of raising a
+recoverable OOM error. Attention uses RDNA4 codegen workarounds on Triton 3.9
+([dense implementation guide](../src/piper_kernels/attention/piper_attention/README.md#rdna4-behavior)).
 
 AMD dispatch accepts Linux and Windows within the same architecture limits,
 though on-device INT8 validation currently covers Linux RX 9070 XT (`gfx1201`)
@@ -59,11 +61,14 @@ Windows, use `Scripts/python.exe`):
 ```
 
 The [runner](../scripts/run_rocm_regressions.py) verifies environment metadata
-and requires native RDNA4 attention, INT8 linear/Conv3D, and sparse
-projection/output backends, failing rather than skipping when absent. Pass pytest
+and requires Triton 3.9 or newer plus native RDNA4 attention, INT8 linear/Conv3D,
+and sparse projection/output backends, failing fast rather than skipping when an
+older Triton or missing backend is active. Pass pytest
 selectors such as `-k sparse_gqa` to narrow a run. The opt-in
 [ROCm workflow](../.github/workflows/rocm.yml) runs this script on a provisioned
-RDNA4 runner.
+RDNA4 runner. During local iteration, keep CPU-bound offline compile tests in
+parallel `xdist` runs with accelerators hidden rather than passing `-o addopts=`
+or `-n0` across mixed offline/GPU file lists.
 
 ## Compiler caches
 

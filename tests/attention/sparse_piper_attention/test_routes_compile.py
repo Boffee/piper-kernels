@@ -11,28 +11,16 @@ from triton.compiler import ASTSource
 
 from piper_kernels.attention.sparse_piper_attention._routes_triton import (
     _SELECTOR_TILE,
+    _SINGLE_LOAD_BLOCK_SIZES,
+    _single_load_radix_select_packed_routes_kernel,
     _tiled_radix_select_packed_routes_kernel,
 )
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="requires Linux compiler tooling")
 
 
-@pytest.mark.parametrize("has_force", [False, True])
-@pytest.mark.parametrize(
-    "target",
-    [
-        GPUTarget("cuda", 120, 32),
-        GPUTarget("cuda", 89, 32),
-        GPUTarget("hip", "gfx1201", 32),
-    ],
-)
-def test_radix_route_selection_compiles_for_supported_targets(target, has_force):
-    constants = {"selector_tile": _SELECTOR_TILE, "has_force": has_force}
-    signature = {
-        name: "i32"
-        for name in _tiled_radix_select_packed_routes_kernel.arg_names
-        if name not in constants
-    }
+def _compile_route_kernel(kernel, target: GPUTarget, constants: dict[str, object]) -> None:
+    signature = {name: "i32" for name in kernel.arg_names if name not in constants}
     signature.update(
         scores_ptr="*fp32",
         routes_ptr="*u16",
@@ -41,7 +29,7 @@ def test_radix_route_selection_compiles_for_supported_targets(target, has_force)
         force_mask_ptr="*i32",
     )
     compiled = triton.compile(
-        ASTSource(_tiled_radix_select_packed_routes_kernel, signature, constexprs=constants),
+        ASTSource(kernel, signature, constexprs=constants),
         target=target,
         options={"num_warps": 4, "num_stages": 1},
     )
@@ -55,3 +43,40 @@ def test_radix_route_selection_compiles_for_supported_targets(target, has_force)
         )
         assert scratch is not None
         assert int(scratch.group(1)) == 0
+
+
+@pytest.mark.parametrize("has_force", [False, True])
+@pytest.mark.parametrize(
+    "target",
+    [
+        GPUTarget("cuda", 120, 32),
+        GPUTarget("cuda", 89, 32),
+        GPUTarget("hip", "gfx1201", 32),
+    ],
+)
+def test_radix_route_selection_compiles_for_supported_targets(target, has_force):
+    _compile_route_kernel(
+        _tiled_radix_select_packed_routes_kernel,
+        target,
+        {"selector_tile": _SELECTOR_TILE, "has_force": has_force},
+    )
+
+
+@pytest.mark.parametrize("block_k", _SINGLE_LOAD_BLOCK_SIZES)
+@pytest.mark.parametrize("has_force", [False, True])
+@pytest.mark.parametrize(
+    "target",
+    [
+        GPUTarget("cuda", 120, 32),
+        GPUTarget("cuda", 89, 32),
+        GPUTarget("hip", "gfx1201", 32),
+    ],
+)
+def test_single_load_radix_route_selection_compiles_for_supported_targets(
+    target, block_k, has_force
+):
+    _compile_route_kernel(
+        _single_load_radix_select_packed_routes_kernel,
+        target,
+        {"block_k": block_k, "has_force": has_force},
+    )

@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels._grid import select_block_grid
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
@@ -36,12 +37,22 @@ _FUSED_DO_NOT_SPECIALIZE = (
     "stride_kh",
     "stride_kn",
     "heads",
+    "heads_inner",
 )
 # Measured warps per K64 tile. Head width is already a specialization key.
 _FUSED_QK_WARPS = {64: 1, 128: 2}
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=(
+        "key_length",
+        "stride_vb",
+        "stride_vh",
+        "stride_vn",
+        "heads",
+        "heads_inner",
+    )
+)
 def _quantize_value_per_tile_kernel(
     value_ptr,
     value_mean_ptr,
@@ -52,17 +63,20 @@ def _quantize_value_per_tile_kernel(
     stride_vb,
     stride_vh,
     stride_vn,
+    heads,
+    heads_inner,
     value_format: tl.constexpr,
-    heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
     mask_block_lengths: tl.constexpr,
 ):
     """Per-K64 tile-center and quantize one storage tile while masking the tail."""
-    key_block = tl.program_id(0).to(tl.int64)
-    batch_head = tl.program_id(1).to(tl.int64)
-    batch = batch_head // heads
-    head = batch_head % heads
+    pid0 = tl.program_id(0)
+    pid1 = tl.program_id(1)
+    key_block = tl.where(heads_inner != 0, pid1, pid0).to(tl.int64)
+    head = tl.where(heads_inner != 0, pid0, pid1).to(tl.int64)
+    batch = tl.program_id(2).to(tl.int64)
+    batch_head = batch * heads + head
     value, valid_rows, offsets_n, offsets_d = _load_row_tile(
         value_ptr,
         key_block,
@@ -159,6 +173,7 @@ def _quantize_query_with_summary_kernel(
     stride_qh,
     stride_qn,
     heads,
+    heads_inner,
     softmax_scale: tl.constexpr,
     mask_block_lengths: tl.constexpr,
     head_dim: tl.constexpr,
@@ -166,8 +181,10 @@ def _quantize_query_with_summary_kernel(
     scale_rows: tl.constexpr,
 ):
     """Quantize one Q64 tile and emit its min/max routing summary from the same load."""
-    query_block = tl.program_id(0)
-    head = tl.program_id(1)
+    pid0 = tl.program_id(0)
+    pid1 = tl.program_id(1)
+    query_block = tl.where(heads_inner != 0, pid1, pid0).to(tl.int64)
+    head = tl.where(heads_inner != 0, pid0, pid1)
     batch = tl.program_id(2)
     values, valid_rows, sequence_offsets, features = _load_row_tile(
         query_ptr,
@@ -243,13 +260,16 @@ def _quantize_key_with_summary_kernel(
     stride_kh,
     stride_kn,
     heads,
+    heads_inner,
     mask_block_lengths: tl.constexpr,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
 ):
     """Quantize one K64-centered tile and emit min/max routing summaries of the raw tile."""
-    key_block = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1)
+    pid0 = tl.program_id(0)
+    pid1 = tl.program_id(1)
+    key_block = tl.where(heads_inner != 0, pid1, pid0).to(tl.int64)
+    head = tl.where(heads_inner != 0, pid0, pid1)
     batch = tl.program_id(2)
     values, valid_rows, sequence_offsets, features = _load_row_tile(
         key_ptr,
@@ -362,8 +382,10 @@ def _prepare_query_key_with_summaries(
     )
     key_aux = torch.empty_like(key_primary)
     lengths_or_placeholder = block_lengths if block_lengths is not None else key_scale
+    query_grid, query_heads_inner = select_block_grid(query, blocks)
+    key_grid, key_heads_inner = select_block_grid(key, blocks)
     with device_context(query.device):
-        _quantize_query_with_summary_kernel[(blocks, heads, batch)](
+        _quantize_query_with_summary_kernel[query_grid](
             query,
             query_int8,
             query_scale,
@@ -375,6 +397,7 @@ def _prepare_query_key_with_summaries(
             query.stride(1),
             query.stride(2),
             heads,
+            query_heads_inner,
             scale,
             mask_block_lengths=block_lengths is not None,
             head_dim=head_dim,
@@ -382,7 +405,7 @@ def _prepare_query_key_with_summaries(
             scale_rows=QUERY_SCALE_ROWS,
             num_warps=_FUSED_QK_WARPS[head_dim],
         )
-        _quantize_key_with_summary_kernel[(blocks, kv_heads, batch)](
+        _quantize_key_with_summary_kernel[key_grid](
             key,
             key_int8,
             key_scale,
@@ -398,6 +421,7 @@ def _prepare_query_key_with_summaries(
             key.stride(1),
             key.stride(2),
             kv_heads,
+            key_heads_inner,
             mask_block_lengths=block_lengths is not None,
             head_dim=head_dim,
             block_n=_BLOCK_N,
@@ -511,8 +535,9 @@ def _prepare_sparse_piper_operands(
         dtype=torch.bfloat16,
     )
 
+    value_grid, value_heads_inner = select_block_grid(combined_value, tile_count)
     with device_context(query.device):
-        _quantize_value_per_tile_kernel[(tile_count, batch * kv_heads)](
+        _quantize_value_per_tile_kernel[value_grid](
             combined_value,
             value_mean,
             value_scale_multiplier,
@@ -522,8 +547,9 @@ def _prepare_sparse_piper_operands(
             combined_value.stride(0),
             combined_value.stride(1),
             combined_value.stride(2),
+            kv_heads,
+            value_heads_inner,
             value_format=int(value_format),
-            heads=kv_heads,
             head_dim=head_dim,
             block_n=_BLOCK_N,
             mask_block_lengths=block_lengths is not None,

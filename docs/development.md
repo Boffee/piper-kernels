@@ -31,7 +31,7 @@ separates Triton-free math from `triton.py`. Existing `specializations/` and off
 
 ## Code conventions
 
-Target Python 3.13 and the Ruff/Pyright settings in [`pyproject.toml`](../pyproject.toml).
+Target Python 3.14 and the Ruff/Pyright settings in [`pyproject.toml`](../pyproject.toml).
 Contain `Any` at dynamic boundaries and explain why. Use canonical names with explicit
 units (`bytes`, `elements`, `tokens`, `blocks`) in kernels rather than prototype
 shorthand, prefix internal names with `_`, and export public surfaces via `__all__`
@@ -88,9 +88,15 @@ Use real workload shapes as anchors, base dispatch on general hardware and workl
 properties verified across nearby shapes, and validate on-device speed and quality with
 the [benchmark guide](../benchmarks/README.md) rather than compile coverage alone.
 
+During kernel prototyping, batch multiple candidate variants into one script on a
+single anchor workload, and inspect generated IR/ISA (vector loads/stores, VGPRs,
+scratch spills, LDS) on a small canary set before sweeping.
+
 ## Checks
 
-In the default CUDA environment:
+Target **Triton 3.9** (PyTorch 2.15) during development and validation (verify
+`triton.__version__` before running tests or benchmarks). In the default CUDA
+environment:
 
 ```shell
 uv sync --dev
@@ -124,6 +130,11 @@ for NVIDIA SM120. [`tests/test_architecture.py`](../tests/test_architecture.py) 
 non-increasing ratchets on surface area and private imports in `tests/` and
 `benchmarks/`.
 
+Include `[["tt.divisibility", 16]]` on pointer `attrs` in offline `GluonASTSource`
+compile tests to match contiguous PyTorch tensors. Gate broad compile sweeps on a small
+canary subset parallelized across CPU workers, and avoid multiplying identical-ISA
+targets (such as `gfx1200` and `gfx1201`) across every option flag when one covers
+variant codegen.
 ## Commits and pull requests
 
 Use standard Git commits (imperative subject `<= 72` chars without `feat:` prefixes,

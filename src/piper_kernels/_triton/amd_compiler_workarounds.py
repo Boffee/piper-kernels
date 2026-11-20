@@ -4,15 +4,15 @@ Each workaround below applies to a range of Triton releases. The first two are
 Triton 3.9 changes that made dense Piper attention 12-17% slower on RX 9070 XT,
 and sparse Piper attention about 3% slower.
 
-1. Triton 3.8.0 disabled LLVM's ``slp-copyable-elements`` for that release only.
-   With it enabled, the SLP vectorizer bundles scalar FMAs into vector FMAs.
-   RDNA4 has no packed FP32 FMA, so the vectors only add register pressure: dense
-   D128 attention grows from 188 to 208 VGPRs and drops from eight waves to
-   seven. Kernels that read :data:`USE_SCALAR_FMA` issue those FMAs as opaque
-   scalar instructions instead. Remove this once Triton disables that
-   vectorization for AMD again or offers a per-kernel opt-out. Uses:
-   ``_SCALAR_FMA``, ``scalar_fma``, and ``qk_tiles(scalar_score_recovery=...)``
-   in the shared RDNA4 fragments, and their dense Piper callers.
+1. With LLVM's ``slp-copyable-elements`` enabled in Triton 3.9+, the SLP
+   vectorizer bundles scalar FMAs into vector FMAs. RDNA4 has no packed FP32
+   FMA, so the vectors only add register pressure: dense D128 attention grows
+   from 188 to 208 VGPRs and drops from eight waves to seven. Kernels that
+   read :data:`USE_SCALAR_FMA` issue those FMAs as opaque scalar instructions
+   instead. Remove this once Triton disables that vectorization for AMD again
+   or offers a per-kernel opt-out. Uses: ``_SCALAR_FMA``, ``scalar_fma``, and
+   ``qk_tiles(scalar_score_recovery=...)`` in the shared RDNA4 fragments, and
+   their dense Piper callers.
 2. triton-lang/triton#10840 adds a scheduling barrier after every memory
    operation in a warp-pipeline stage. That keeps CDNA GEMM prefetches in order,
    but it pins Piper's K/V loads beside their WMMAs, so LLVM can no longer hoist
@@ -31,9 +31,10 @@ and sparse Piper attention about 3% slower.
    only LDS pass :data:`LDS_ONLY_FENCE_ATTRS`; their workgroup fences are tagged
    as LDS-only, which keeps the LDS waits and drops the global ones. Remove this
    once Triton emits LDS-only fences for its shared-memory barriers. Uses:
-   :data:`LDS_ONLY_FENCE_ATTRS` at the RDNA4 ConvRot INT8 GEMM, dense Piper
-   attention, and sparse Piper attention launches; :func:`lds_only_fence_options`
-   at the shared Conv3D and dense/sparse Piper projection launches, which RDNA4
+   :data:`LDS_ONLY_FENCE_ATTRS` at the RDNA4 ConvRot INT8 GEMM, sparse Piper
+   projection, dense Piper attention, and sparse Piper attention launches;
+   :func:`lds_only_fence_options` at the shared Conv3D, sparse Piper minmax
+   routing-score, and dense/sparse Piper projection launches, which RDNA4
    policies enable through their plans' ``lds_only_fences``; and the stage hook
    below.
 
@@ -66,11 +67,7 @@ def _applies_to_installed_triton(first: tuple[int, int], fixed: tuple[int, int] 
 
 
 USE_SCALAR_FMA = _applies_to_installed_triton(first=(3, 9), fixed=None)
-"""Whether RDNA4 kernels issue FMAs that LLVM must not vectorize as scalar assembly.
-
-On Triton 3.8 plain FMAs stay scalar, and inline assembly would cost 1-3% because
-the compiler cannot dual-issue it.
-"""
+"""Whether RDNA4 kernels issue FMAs that LLVM must not vectorize as scalar assembly."""
 
 _UNPINNED_WARP_PIPELINE_MARKER = "piper-unpinned-warp-pipeline"
 _PINS_WARP_PIPELINE_MEMORY = _applies_to_installed_triton(first=(3, 9), fixed=None)
@@ -84,8 +81,7 @@ such barriers, so those kernels compile unchanged.
 """
 
 _LDS_ONLY_FENCE_MARKER = "piper-lds-only-fences"
-# Triton 3.8 is the oldest release Piper's ROCm environments use, not where the fences began.
-_FENCES_GLOBAL_MEMORY = _applies_to_installed_triton(first=(3, 8), fixed=None)
+_FENCES_GLOBAL_MEMORY = _applies_to_installed_triton(first=(3, 9), fixed=None)
 LDS_ONLY_FENCE_ATTRS: tuple[tuple[str, str], ...] = (
     ((_LDS_ONLY_FENCE_MARKER, ""),) if _FENCES_GLOBAL_MEMORY else ()
 )

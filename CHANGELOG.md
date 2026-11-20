@@ -16,6 +16,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- **Breaking:** Require Python 3.14+, PyTorch 2.15+, and Triton 3.9+ across all
+  platforms, dropping Python 3.13, PyTorch 2.14, and Triton 3.8 support.
 - **Breaking (numerical):** `piper_attention` (and `convrot_int8_piper_compile_options`)
   now center keys and values independently per `1024`-token KV chunk (`K1024 + V1024`)
   for both non-causal and causal attention instead of sequence-wide reductions. Outputs
@@ -25,12 +27,19 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   tile (`K64 + V64`) instead of using sequence-wide global mean reductions. Numerical
   outputs differ across all keep ratios (including full keep), so callers should
   revalidate end-to-end quality.
-- Improved RX 9070 XT (RDNA4) execution speed for ConvRot INT8 linears, FFNs, Conv3D,
-  and dense/sparse Piper attention (with minor FP32 reassociation within INT8 tolerances
+- Improved RX 9070 XT (RDNA4) execution speed across ConvRot INT8 linears, FFNs, Conv3D,
+  dense/sparse Piper attention, standalone `SparsePiperAttention`
+  preparation/routing/scoring/coarse residuals, and RDNA4 Gluon fused ConvRot INT8
+  sparse Q/K/V projections (with minor FP32 differences within `1e-6` / INT8 tolerances
   and a one-time ROCm Triton kernel recompile).
 - Improved RTX 5090 (SM120) execution speed and reduced scratch memory across sparse Piper
   routing/attention, D128 Q/K/V projections, and large ConvRot INT8 linear, FFN, and
   fused residual projections (with minor rounding differences within INT8 tolerances).
+
+### Fixed
+
+- Preserved autograd gradients and compact sequence support below 64 tokens for native GPU
+  `sparse_piper_coarse_residual` and `sequence_block_summaries` (`D64`/`D128`) calls.
 
 ## [0.8.0rc6] - 2026-11-12
 

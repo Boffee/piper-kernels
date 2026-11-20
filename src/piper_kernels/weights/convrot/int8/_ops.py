@@ -52,7 +52,7 @@ def add_(
     alpha: float,
     rounding_seed: int | None = None,
     # Last, so calls in existing compiled graphs stay valid. Not keyword-only:
-    # PyTorch 2.14 Inductor passes it in alpha's position.
+    # PyTorch Inductor passes it in alpha's position.
     beta: float = 1.0,
 ) -> None:
     """Dispatch the stable add_ operation to a supported implementation."""

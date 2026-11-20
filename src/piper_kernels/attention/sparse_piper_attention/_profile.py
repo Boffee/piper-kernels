@@ -31,7 +31,7 @@ def _profile_guards(profile: _SparsePiperRatioProfile) -> list[int]:
     return [profile.num_heads]
 
 
-# Torch 2.14's custom-class boundary lifts this object as a graph input. Its
+# PyTorch's custom-class boundary lifts this object as a graph input. Its
 # fake counterpart exposes only the guarded head count to tracing and fusions.
 register_custom_class(
     _SparsePiperRatioProfile,

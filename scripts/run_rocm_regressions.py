@@ -3,11 +3,13 @@
 import json
 import os
 import platform
+import re
 import sys
 from importlib.metadata import version
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
+_MIN_TRITON_VERSION = (3, 9)
 
 # Use this checkout even when the environment has another Piper wheel installed.
 sys.path.insert(0, str(_ROOT / "src"))
@@ -65,6 +67,12 @@ def _check_environment() -> None:
     target = AcceleratorTarget.from_device(torch.device("cuda"))
     if not target.is_amd_hip or not target.is_architecture("gfx1200", "gfx1201"):
         raise SystemExit(f"ROCm regressions require RDNA4 (gfx1200/gfx1201), got {target}.")
+    triton_version = tuple(int(part) for part in re.findall(r"\d+", triton.__version__)[:2])
+    if triton_version < _MIN_TRITON_VERSION:
+        raise SystemExit(
+            f"ROCm regressions require Triton 3.9 or newer, got {triton.__version__}. "
+            "See docs/environments.md."
+        )
     probe = torch.empty(0, device="cuda")
     if dense.select_backend(target) is None:
         raise SystemExit("ROCm regressions require a native dense Piper backend.")

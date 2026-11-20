@@ -40,6 +40,8 @@ for architecture, validation, and tests.
 
 ## Contracts & checks
 
+- Target Python 3.14, PyTorch 2.15, and **Triton 3.9** during development and
+  validation (verify `triton.__version__`; see [environments](docs/environments.md)).
 - Check [attention](docs/attention.md) and [weights](docs/weights.md) before changing
   operators or rewrites; follow [development guide](docs/development.md) for
   architecture, backend/compiler contracts, tests, checks, commits/PRs, and

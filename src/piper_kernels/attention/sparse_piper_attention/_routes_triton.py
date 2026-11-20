@@ -14,6 +14,26 @@ from piper_kernels._triton.runtime import device_context
 
 _RADIX_BINS = tl.constexpr(256)
 _SELECTOR_TILE = 512
+_SINGLE_LOAD_BLOCK_SIZES = (512, 1024, 2048)
+_RADIX_DO_NOT_SPECIALIZE = (
+    "sparse_key_blocks",
+    "query_block_offset",
+    "score_batch_stride",
+    "score_head_stride",
+    "score_query_stride",
+    "route_batch_stride",
+    "route_query_stride",
+    "route_route_stride",
+    "force_mask_stride",
+)
+
+
+def _select_single_load_block_k(sparse_key_blocks: int) -> int | None:
+    """Choose a power-of-two single-load radix width when rows fit without spilling."""
+    for block_k in _SINGLE_LOAD_BLOCK_SIZES:
+        if sparse_key_blocks <= block_k:
+            return block_k
+    return None
 
 
 @triton.jit(do_not_specialize=["capacity", "mask_words", "query_blocks"])
@@ -114,6 +134,57 @@ def _ordered_float_bits(scores):  # noqa: ANN001, ANN202
 
 
 @triton.jit
+def _select_radix_digit(histogram, prefix, rank):  # noqa: ANN001, ANN202
+    """Resolve the winning descending radix digit and remaining rank."""
+    bins = tl.arange(0, _RADIX_BINS)
+    descending_counts = tl.flip(histogram, dim=0)
+    cumulative = tl.cumsum(descending_counts, axis=0)
+    descending_bin = tl.min(tl.where(cumulative >= rank, bins, _RADIX_BINS), axis=0)
+    preceding = tl.sum(
+        tl.where(bins < descending_bin, descending_counts, 0),
+        axis=0,
+    )
+    bin_count = tl.sum(
+        tl.where(bins == descending_bin, descending_counts, 0),
+        axis=0,
+    )
+    chosen_digit = (_RADIX_BINS - 1 - descending_bin).to(tl.uint32)  # pyright: ignore[reportAttributeAccessIssue]
+    return (prefix << 8) | chosen_digit, rank - preceding, bin_count
+
+
+@triton.jit
+def _resolve_route_row(  # noqa: PLR0913, PLR0917, ANN202
+    head_keep_blocks_ptr,  # noqa: ANN001
+    route_head_offsets_ptr,  # noqa: ANN001
+    force_mask_ptr,  # noqa: ANN001
+    query_block_offset,  # noqa: ANN001
+    score_batch_stride,  # noqa: ANN001
+    score_head_stride,  # noqa: ANN001
+    score_query_stride,  # noqa: ANN001
+    route_batch_stride,  # noqa: ANN001
+    route_query_stride,  # noqa: ANN001
+    route_route_stride,  # noqa: ANN001
+    force_mask_stride,  # noqa: ANN001
+):
+    """Compute score/output row bases, head keep count, and force row pointer."""
+    query_block = tl.program_id(0)
+    head = tl.program_id(1)
+    batch = tl.program_id(2)
+    score_base = (
+        batch * score_batch_stride + head * score_head_stride + query_block * score_query_stride
+    )
+    route_head_offset = tl.load(route_head_offsets_ptr + head)
+    output_base = (
+        batch * route_batch_stride
+        + (query_block_offset + query_block) * route_query_stride
+        + route_head_offset * route_route_stride
+    )
+    rank = tl.load(head_keep_blocks_ptr + head)
+    force_row = force_mask_ptr + (query_block_offset + query_block) * force_mask_stride
+    return score_base, output_base, rank, force_row
+
+
+@triton.jit
 def _tiled_radix_select_pass(  # noqa: ANN202
     scores_ptr,  # noqa: ANN001
     score_base,  # noqa: ANN001
@@ -138,35 +209,27 @@ def _tiled_radix_select_pass(  # noqa: ANN202
         digits = (ordered_bits >> shift) & 0xFF
         histogram += tl.histogram(digits.to(tl.int32), _RADIX_BINS, mask=active)
 
-    bins = tl.arange(0, _RADIX_BINS)
-    descending_counts = tl.flip(histogram, dim=0)
-    cumulative = tl.cumsum(descending_counts, axis=0)
-    descending_bin = tl.min(tl.where(cumulative >= rank, bins, _RADIX_BINS), axis=0)
-    preceding = tl.sum(
-        tl.where(bins < descending_bin, descending_counts, 0),
-        axis=0,
-    )
-    bin_count = tl.sum(
-        tl.where(bins == descending_bin, descending_counts, 0),
-        axis=0,
-    )
-    chosen_digit = (_RADIX_BINS - 1 - descending_bin).to(tl.uint32)  # pyright: ignore[reportAttributeAccessIssue]
-    return (prefix << 8) | chosen_digit, rank - preceding, bin_count
+    return _select_radix_digit(histogram, prefix, rank)
 
 
-@triton.jit(
-    do_not_specialize=[
-        "sparse_key_blocks",
-        "query_block_offset",
-        "score_batch_stride",
-        "score_head_stride",
-        "score_query_stride",
-        "route_batch_stride",
-        "route_query_stride",
-        "route_route_stride",
-        "force_mask_stride",
-    ]
-)
+@triton.jit
+def _in_register_radix_select_pass(  # noqa: ANN202
+    ordered_bits,  # noqa: ANN001
+    valid,  # noqa: ANN001
+    prefix,  # noqa: ANN001
+    rank,  # noqa: ANN001
+    shift: tl.constexpr,
+):
+    """Select one radix byte from score priorities already loaded in registers."""
+    active = valid
+    if shift < 24:
+        active &= (ordered_bits >> (shift + 8)) == prefix
+    digits = (ordered_bits >> shift) & 0xFF
+    histogram = tl.histogram(digits.to(tl.int32), _RADIX_BINS, mask=active)
+    return _select_radix_digit(histogram, prefix, rank)
+
+
+@triton.jit(do_not_specialize=_RADIX_DO_NOT_SPECIALIZE)
 def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     scores_ptr: torch.Tensor,
     routes_ptr: torch.Tensor,
@@ -186,20 +249,19 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
     has_force: tl.constexpr,
 ) -> None:
     """Select exact stable FP32 top-k routes with runtime row dimensions."""
-    query_block = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
-    score_base = (
-        batch * score_batch_stride + head * score_head_stride + query_block * score_query_stride
+    score_base, output_base, rank, force_row = _resolve_route_row(
+        head_keep_blocks_ptr,
+        route_head_offsets_ptr,
+        force_mask_ptr,
+        query_block_offset,
+        score_batch_stride,
+        score_head_stride,
+        score_query_stride,
+        route_batch_stride,
+        route_query_stride,
+        route_route_stride,
+        force_mask_stride,
     )
-    route_head_offset = tl.load(route_head_offsets_ptr + head)
-    output_base = (
-        batch * route_batch_stride
-        + (query_block_offset + query_block) * route_query_stride
-        + route_head_offset * route_route_stride
-    )
-    rank = tl.load(head_keep_blocks_ptr + head)
-    force_row = force_mask_ptr + (query_block_offset + query_block) * force_mask_stride
 
     prefix = tl.full((), 0, tl.uint32)
     resolved_shift = tl.full((), 24, tl.uint32)
@@ -280,6 +342,97 @@ def _tiled_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
         output_offset += tl.sum(selected.to(tl.int32), axis=0)  # pyright: ignore[reportOperatorIssue]
 
 
+@triton.jit(do_not_specialize=_RADIX_DO_NOT_SPECIALIZE)
+def _single_load_radix_select_packed_routes_kernel(  # noqa: PLR0913, PLR0917
+    scores_ptr: torch.Tensor,
+    routes_ptr: torch.Tensor,
+    head_keep_blocks_ptr: torch.Tensor,
+    route_head_offsets_ptr: torch.Tensor,
+    force_mask_ptr: torch.Tensor,
+    sparse_key_blocks: int,
+    query_block_offset: int,
+    score_batch_stride: int,
+    score_head_stride: int,
+    score_query_stride: int,
+    route_batch_stride: int,
+    route_query_stride: int,
+    route_route_stride: int,
+    force_mask_stride: int,
+    block_k: tl.constexpr,
+    has_force: tl.constexpr,
+) -> None:
+    """Select exact stable FP32 top-k routes from one register-resident score load."""
+    score_base, output_base, rank, force_row = _resolve_route_row(
+        head_keep_blocks_ptr,
+        route_head_offsets_ptr,
+        force_mask_ptr,
+        query_block_offset,
+        score_batch_stride,
+        score_head_stride,
+        score_query_stride,
+        route_batch_stride,
+        route_query_stride,
+        route_route_stride,
+        force_mask_stride,
+    )
+
+    key_offsets = tl.arange(0, block_k)
+    valid = key_offsets < sparse_key_blocks
+    scores = tl.load(scores_ptr + score_base + key_offsets, mask=valid, other=0.0)
+    ordered_bits = _route_priority_bits(scores, key_offsets, valid, force_row, has_force)
+
+    prefix = tl.full((), 0, tl.uint32)
+    resolved_shift = tl.full((), 24, tl.uint32)
+    prefix, rank, bin_count = _in_register_radix_select_pass(
+        ordered_bits,
+        valid,
+        prefix,
+        rank,
+        tl.constexpr(24),
+    )
+    if bin_count != rank:
+        prefix, rank, bin_count = _in_register_radix_select_pass(
+            ordered_bits,
+            valid,
+            prefix,
+            rank,
+            tl.constexpr(16),
+        )
+        resolved_shift = tl.full((), 16, tl.uint32)
+        if bin_count != rank:
+            prefix, rank, bin_count = _in_register_radix_select_pass(
+                ordered_bits,
+                valid,
+                prefix,
+                rank,
+                tl.constexpr(8),
+            )
+            resolved_shift = tl.full((), 8, tl.uint32)
+            if bin_count != rank:
+                prefix, rank, bin_count = _in_register_radix_select_pass(
+                    ordered_bits,
+                    valid,
+                    prefix,
+                    rank,
+                    tl.constexpr(0),
+                )
+                resolved_shift = tl.full((), 0, tl.uint32)
+
+    shifted = ordered_bits >> resolved_shift
+    if resolved_shift == 0:
+        equal = valid & (shifted == prefix)
+        equal_rank = tl.cumsum(equal.to(tl.int32), axis=0)
+        selected = valid & ((shifted > prefix) | (equal & (equal_rank <= rank)))
+    else:
+        selected = valid & (shifted >= prefix)
+    local_output_rank = tl.cumsum(selected.to(tl.int32), axis=0) - 1
+    tl.store(
+        routes_ptr + output_base + local_output_rank * route_route_stride,
+        key_offsets,
+        mask=selected,
+    )
+
+
 def tiled_radix_select_packed_routes(
     scores: torch.Tensor,
     routes: torch.Tensor,
@@ -325,27 +478,41 @@ def tiled_radix_select_packed_routes(
         or not force_tile_mask.is_contiguous()
     ):
         raise ValueError("forced membership must use contiguous INT32 [query_blocks,key_words]")
+    common_args = (
+        scores,
+        routes,
+        head_keep_blocks,
+        route_head_offsets,
+        head_keep_blocks if force_tile_mask is None else force_tile_mask,
+        sparse_key_blocks,
+        query_block_offset,
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        routes.stride(0),
+        routes.stride(1),
+        routes.stride(2),
+        0 if force_tile_mask is None else force_tile_mask.stride(0),
+    )
+    has_force = force_tile_mask is not None
+    single_load_block_k = _select_single_load_block_k(sparse_key_blocks)
     with device_context(scores.device):
-        _tiled_radix_select_packed_routes_kernel[(query_blocks, heads, batch)](
-            scores,
-            routes,
-            head_keep_blocks,
-            route_head_offsets,
-            head_keep_blocks if force_tile_mask is None else force_tile_mask,
-            sparse_key_blocks,
-            query_block_offset,
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            routes.stride(0),
-            routes.stride(1),
-            routes.stride(2),
-            0 if force_tile_mask is None else force_tile_mask.stride(0),
-            selector_tile=_SELECTOR_TILE,
-            has_force=force_tile_mask is not None,
-            num_warps=4,
-            num_stages=1,
-        )
+        if single_load_block_k is not None:
+            _single_load_radix_select_packed_routes_kernel[(query_blocks, heads, batch)](
+                *common_args,
+                block_k=single_load_block_k,
+                has_force=has_force,
+                num_warps=4,
+                num_stages=1,
+            )
+        else:
+            _tiled_radix_select_packed_routes_kernel[(query_blocks, heads, batch)](
+                *common_args,
+                selector_tile=_SELECTOR_TILE,
+                has_force=has_force,
+                num_warps=4,
+                num_stages=1,
+            )
 
 
 __all__ = ["tiled_radix_select_packed_routes"]

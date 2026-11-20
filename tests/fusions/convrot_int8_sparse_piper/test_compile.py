@@ -1805,7 +1805,7 @@ def test_sparse_piper_projection_fails_closed_for_strided_rope() -> None:
 def test_forced_output_fusion_reuses_dynamic_shapes_and_runtime_contents(monkeypatch) -> None:
     from piper_kernels.attention.sparse_piper_attention._routes_triton import (  # noqa: PLC0415
         _scatter_force_tile_bits,
-        _tiled_radix_select_packed_routes_kernel,
+        _single_load_radix_select_packed_routes_kernel,
     )
 
     torch.manual_seed(739)
@@ -1824,7 +1824,11 @@ def test_forced_output_fusion_reuses_dynamic_shapes_and_runtime_contents(monkeyp
         options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
     )
     attention_kernel = _reset_attention_kernel_cache()
-    kernels = (_scatter_force_tile_bits, _tiled_radix_select_packed_routes_kernel, attention_kernel)
+    kernels = (
+        _scatter_force_tile_bits,
+        _single_load_radix_select_packed_routes_kernel,
+        attention_kernel,
+    )
     for kernel in kernels:
         kernel.device_caches.clear()
     specializations = None

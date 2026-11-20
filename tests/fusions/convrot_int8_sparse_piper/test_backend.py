@@ -17,6 +17,7 @@ from _accelerators import rocm_fences_only_lds
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
+from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
@@ -38,7 +39,10 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
     value,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
+from piper_kernels.fusions.convrot_int8_sparse_piper._amd import gluon as amd_gluon
+from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy as amd_policy
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
+from piper_kernels.fusions.convrot_int8_sparse_piper._layout import resolve_row_block_launches
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import dispatch as nvidia
 from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
 from piper_kernels.fusions.sparse_piper import _output as output_common
@@ -800,6 +804,7 @@ def test_amd_aligned_value_projection_compiles_without_vgpr_spills(
 ):
     if sys.platform != "linux":
         pytest.skip("ROCm support is Linux-only")
+    monkeypatch.setattr(amd.policy, "supports_gluon", lambda *args, **kwargs: False)
     function, kernel = _capture_projection(
         monkeypatch,
         "value",
@@ -816,6 +821,280 @@ def test_amd_aligned_value_projection_compiles_without_vgpr_spills(
     assert calls[0].kwargs["aligned_projection"] is True
     compiled = _compile_projection_call(function, calls[0], target, operation="value")
     assert ".vgpr_spill_count: 0" in compiled.asm["amdgcn"]
+
+
+_AMD_GLUON_POINTER_TYPES = {
+    "input_ptr": "*i8",
+    "weight_ptr": "*i8",
+    "query_ptr": "*i8",
+    "key_ptr": "*i8",
+    "key_center_ptr": "*i8",
+    "value_ptr": "*i8",
+    "value_mean_ptr": "*bf16",
+    "block_lengths_ptr": "*i32",
+    "norm_weight_ptr": "*bf16",
+    "bias_ptr": "*bf16",
+}
+
+
+def _compile_amd_gluon_kernel(
+    architecture: str,
+    operation: str,
+    *,
+    head_dim: int,
+    rotary_dim: int,
+    affine: bool,
+    with_bias: bool,
+    mean_pool_summary: bool,
+    mask_rows: bool,
+    mask_block_lengths: bool,
+    input_features: int = 5376,
+):
+    function = getattr(amd_gluon, f"_{operation}_kernel")
+    heads = 56 if head_dim == 128 else 32
+    constants = {
+        "input_features": input_features,
+        "heads": heads,
+        "head_dim": head_dim,
+        "rotary_dim": rotary_dim,
+        "norm_epsilon": 1e-5,
+        "softmax_scale": head_dim**-0.5,
+        "mean_pool_summary": mean_pool_summary,
+        "mask_block_lengths": mask_block_lengths,
+        "mask_rows": mask_rows,
+        "group_m": amd_policy.GLUON_GROUP_M,
+    }
+    constants = {name: item for name, item in constants.items() if name in function.arg_names}
+    signature, attributes = {}, {}
+    for index, name in enumerate(function.arg_names):
+        if name in constants:
+            continue
+        if (name == "bias_ptr" and not with_bias) or (name == "norm_weight_ptr" and not affine):
+            constants[name], signature[name] = None, "constexpr"
+        elif name.endswith("_ptr"):
+            signature[name] = _AMD_GLUON_POINTER_TYPES.get(name, "*fp32")
+            attributes[(index,)] = [["tt.divisibility", 16]]
+        else:
+            signature[name] = "i32"
+    extra = (
+        amd_gluon._build_key_kernel_options(
+            head_dim,
+            rotary_dim,
+            mask_rows=mask_rows,
+            mask_block_lengths=mask_block_lengths,
+            mean_pool_summary=mean_pool_summary,
+        )
+        if operation == "key"
+        else amd_gluon._build_kernel_options()
+    )
+    compiled = triton.compile(
+        GluonASTSource(function, signature, constexprs=constants, attrs=attributes),
+        target=GPUTarget("hip", architecture, 32),
+        options={"num_warps": amd_policy.GLUON_NUM_WARPS, **extra},
+    )
+    amdgcn = compiled.asm["amdgcn"]
+    assert "v_wmma_i32_16x16x16_iu8" in amdgcn
+    if operation != "value":
+        assert "v_permlanex16_b32" in amdgcn
+    assert "buffer_load_b64" in amdgcn
+    assert "buffer_store_b64" in amdgcn
+    assert compiled.metadata.shared <= 16384
+    assert ".vgpr_spill_count: 0" in amdgcn
+    if rocm_fences_only_lds():
+        assert "global_inv" not in amdgcn
+    truncations = [line for line in compiled.asm["ttgir"].splitlines() if "arith.truncf" in line]
+    assert bool(truncations) is (operation == "value")
+    assert all("f32" in line and "bf16" in line for line in truncations)
+    return compiled
+
+
+def test_amd_policy_and_gluon_eligibility_contracts():
+    assert amd_policy.supports_gluon(
+        "query", head_dim=64, input_features=192, heads=2, rotary_dim=48
+    )
+    assert amd_policy.supports_gluon(
+        "key", head_dim=128, input_features=256, heads=1, rotary_dim=96
+    )
+    assert amd_policy.supports_gluon(
+        "value", head_dim=64, input_features=64, heads=2, value_format=ValueFormat.AMD_WMMA
+    )
+    # Unsupported shapes, counts, rotary widths, alignment, or value layout fall back to Triton.
+    assert not amd_policy.supports_gluon("query", head_dim=64, input_features=192, heads=3)
+    assert not amd_policy.supports_gluon("query", head_dim=64, input_features=272, heads=4)
+    assert not amd_policy.supports_gluon("key", head_dim=64, input_features=32, heads=2)
+    assert not amd_policy.supports_gluon(
+        "query", head_dim=64, input_features=256, heads=4, rotary_dim=16
+    )
+    assert not amd_policy.supports_gluon(
+        "key", head_dim=128, input_features=256, heads=3, rotary_dim=48
+    )
+    assert not amd_policy.supports_gluon("query", head_dim=32, input_features=256, heads=4)
+    assert not amd_policy.supports_gluon(
+        "value", head_dim=128, input_features=256, heads=4, value_format=ValueFormat.TRANSPOSED
+    )
+    assert not amd_policy.supports_gluon(
+        "query", head_dim=128, input_features=256, heads=4, operands_aligned=False
+    )
+
+    with FakeTensorMode():
+        q_in = torch.empty((1, 256, 256), device="cuda:1", dtype=torch.int8)
+        w_d64_even = torch.empty((4 * 64, 256), device="cuda:1", dtype=torch.int8)
+        w_d64_odd = torch.empty((3 * 64, 256), device="cuda:1", dtype=torch.int8)
+        w_d128 = torch.empty((3 * 128, 256), device="cuda:1", dtype=torch.int8)
+
+        assert amd_gluon.operands_aligned(
+            q_in, w_d64_even, storage_sequence_length=256, rotary_dim=48, head_dim=64
+        )
+        assert not amd_gluon.operands_aligned(
+            q_in[:, ::2], w_d64_even, storage_sequence_length=128, rotary_dim=48, head_dim=64
+        )
+        assert not amd_gluon.operands_aligned(
+            q_in, w_d64_even[:, ::2], storage_sequence_length=256, rotary_dim=48, head_dim=64
+        )
+        # Signed 32-bit FP32 byte-offset check: 8_388_608 * 64 * 4 exceeds 2**31 bytes.
+        q_large_fp32 = torch.empty((1, 8_388_608, 64), device="cuda:1", dtype=torch.int8)
+        w_small = torch.empty((4 * 64, 64), device="cuda:1", dtype=torch.int8)
+        assert not amd_gluon.operands_aligned(
+            q_large_fp32, w_small, storage_sequence_length=8_388_608, rotary_dim=64, head_dim=64
+        )
+
+        q_plan = amd.default_execution_plan(
+            q_in, w_d64_even, operation="query", head_dim=64, rotary_dim=48
+        )
+        assert q_plan == amd_policy._D64_GLUON_EXECUTION_PLAN
+        assert q_plan.kernel == "gluon"
+        assert q_plan.block_m == 128
+        assert q_plan.heads_per_program == 2
+
+        d128_plan = amd.default_execution_plan(
+            q_in, w_d128, operation="key", head_dim=128, rotary_dim=96
+        )
+        assert d128_plan == amd_policy._D128_GLUON_EXECUTION_PLAN
+        assert (
+            amd.partial_row_block_size(
+                q_in, w_d64_even, operation="key", head_dim=64, rotary_dim=48
+            )
+            == 128
+        )
+        assert (
+            amd.partial_row_block_size(
+                q_in, w_d128, operation="value", head_dim=128, value_format=ValueFormat.AMD_WMMA
+            )
+            == 128
+        )
+        assert amd.partial_row_block_size(q_in, w_d64_odd, operation="key", head_dim=64) == 64
+        assert (
+            amd.partial_row_block_size(
+                q_in, w_d128, operation="value", head_dim=128, value_format=ValueFormat.TRANSPOSED
+            )
+            == 128
+        )
+
+
+def test_resolve_row_block_launches_covers_full_tail_and_partial_ranges():
+    assert resolve_row_block_launches(0, 128) == ()
+    assert resolve_row_block_launches(256, 128) == ((2, 0, True),)
+    assert resolve_row_block_launches(205, 128) == ((1, 0, True), (1, 1, False))
+    assert resolve_row_block_launches(384, 128, start_row_block=1, num_row_blocks=None) == (
+        (2, 1, True),
+    )
+    assert resolve_row_block_launches(384, 128, start_row_block=1, num_row_blocks=0) == ()
+    with pytest.raises(ValueError, match="non-negative"):
+        resolve_row_block_launches(256, 128, start_row_block=-1)
+    with pytest.raises(ValueError, match="alignment"):
+        resolve_row_block_launches(205, 128, start_row_block=1, num_row_blocks=None)
+    with pytest.raises(ValueError, match="full block_m"):
+        resolve_row_block_launches(256, 128, start_row_block=1, num_row_blocks=2)
+
+
+_AMD_QK_COMPILE_VARIANTS = [
+    ("full_tiles_mean_routing", True, False, True, False, False, False),
+    ("ragged_tail", True, False, False, True, False, False),
+    ("block_lengths", True, False, True, True, True, False),
+    ("bias_without_norm", False, True, False, True, False, False),
+    ("full_rotary", True, True, False, False, False, True),
+]
+_AMD_V_COMPILE_VARIANTS = [
+    ("ragged_tail", False, True, False),
+    ("bias_block_lengths", True, True, True),
+]
+
+
+@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
+@pytest.mark.parametrize("operation", ["query", "key", "value"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_amd_gluon_kernels_compile_offline_across_rdna4_targets(architecture, operation, head_dim):
+    if sys.platform != "linux":
+        pytest.skip("ROCm support is Linux-only")
+    rotary_dim = 0 if operation == "value" else (48 if head_dim == 64 else 96)
+    _compile_amd_gluon_kernel(
+        architecture,
+        operation,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        affine=True,
+        with_bias=False,
+        mean_pool_summary=False,
+        mask_rows=False,
+        mask_block_lengths=False,
+    )
+
+
+@pytest.mark.parametrize("operation", ["query", "key"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    ("variant", "affine", "with_bias", "mean_pool_summary", "mask_rows", "mask_bl", "full_rotary"),
+    _AMD_QK_COMPILE_VARIANTS,
+)
+def test_amd_gluon_qk_compile_variants_keep_zero_spills(
+    operation,
+    head_dim,
+    variant,
+    affine,
+    with_bias,
+    mean_pool_summary,
+    mask_rows,
+    mask_bl,
+    full_rotary,
+):
+    if sys.platform != "linux":
+        pytest.skip("ROCm support is Linux-only")
+    rotary_dim = head_dim if full_rotary else (48 if head_dim == 64 else 96)
+    _compile_amd_gluon_kernel(
+        "gfx1201",
+        operation,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        affine=affine,
+        with_bias=with_bias,
+        mean_pool_summary=mean_pool_summary,
+        mask_rows=mask_rows,
+        mask_block_lengths=mask_bl,
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(("variant", "with_bias", "mask_rows", "mask_bl"), _AMD_V_COMPILE_VARIANTS)
+def test_amd_gluon_value_compile_variants_keep_zero_spills(
+    head_dim,
+    variant,
+    with_bias,
+    mask_rows,
+    mask_bl,
+):
+    if sys.platform != "linux":
+        pytest.skip("ROCm support is Linux-only")
+    _compile_amd_gluon_kernel(
+        "gfx1201",
+        "value",
+        head_dim=head_dim,
+        rotary_dim=0,
+        affine=True,
+        with_bias=with_bias,
+        mean_pool_summary=False,
+        mask_rows=mask_rows,
+        mask_block_lengths=mask_bl,
+    )
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
