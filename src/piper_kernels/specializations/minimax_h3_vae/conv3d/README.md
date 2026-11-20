@@ -2,8 +2,8 @@
 
 This opt-in specialization fuses framewise normalization around prequantized H3
 encoder convolutions. See [Conv3D usage](../../../../../docs/weights.md#run-a-conv3d)
-for weight construction and the [shared implementation](../../../conv3d/convrot/int8/README.md)
-for convolution storage, arithmetic, and backend support.
+for weight construction and the [shared implementation](../../../conv3d/convrot/int8/triton.py)
+for convolution arithmetic and backend support.
 
 ## Calibration and installation
 

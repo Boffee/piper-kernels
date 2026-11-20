@@ -4,9 +4,8 @@ import torch
 
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
-from ._functional import _weight_storage, conv3d
-from ._padding import SpatialPadding, causal_padding
-from ._validation import _validate_config, _validate_weight
+from ._functional import SpatialPadding, _weight_storage, causal_padding, conv3d
+from ._ops import _validate_config, _validate_weight
 
 
 class ConvRotInt8Conv3d(torch.nn.Module):

@@ -13,22 +13,32 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from piper_kernels._triton import runtime
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import triton as gguf_backend
 from piper_kernels.stochastic_quantization.triton import stochastic_round_to_int
 from piper_kernels.weights.convrot import triton as convrot_backend
 
+from . import _update_reference as reference
 from ._gguf_policy import select_conversion_chunks
-from ._plan import AddmmExecutionPlan
-from ._policy import select_addmm_plan
 
 _GGUF_TILE_SIZE = 1024
 _GGUF_MAXIMA_BYTES = 1024 * 1024
 # Amortize GEMM/launch overhead while bounding scratch independently of output rows.
 _UPDATE_WORKSPACE_BYTES = 32 * 1024 * 1024
+# Shared conservative schedule for fused addmm_; only block_n varies with group_size.
+_ADDMM_BLOCK_M = 16
+_ADDMM_BLOCK_K = 32
+_ADDMM_NUM_WARPS = 4
+_ADDMM_NUM_STAGES = 1
 # PyTorch's metadata-only alias predicate is missing from its type stubs.
 _shares_storage: Callable[[torch.Tensor, torch.Tensor], bool] = torch._C._is_alias_of  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def _supports_fused_addmm(target: AcceleratorTarget) -> bool:
+    """NVIDIA SM80+ (BF16/TF32x3 dots) and HIP (IEEE FP32 dots) share one fused merge."""
+    return target.cuda_capability_at_least(8) or target.is_amd_hip
 
 
 @triton.jit
@@ -84,47 +94,6 @@ def _store_quantized_chunk(
 
 
 @triton.jit
-def _load_weight_chunk(
-    x_ptr,
-    input_row_offset,
-    packed_row_offset,
-    row_width,
-    chunk_start: tl.constexpr,
-    chunk_offsets,
-    chunk_size: tl.constexpr,
-    group_size: tl.constexpr,
-    inverse_sqrt_group: tl.constexpr,
-    activation_fn: tl.constexpr,
-    accelerator_backend: tl.constexpr,
-    gguf_quant_type: tl.constexpr,
-):
-    if gguf_quant_type >= 0:
-        return convrot_backend.load_gguf_rotated_chunk(
-            x_ptr,
-            packed_row_offset,
-            row_width,
-            chunk_start,
-            chunk_offsets,
-            chunk_size,
-            group_size,
-            inverse_sqrt_group,
-            gguf_quant_type,
-        )
-    return convrot_backend.load_activated_rotated_chunk(
-        x_ptr,
-        input_row_offset,
-        row_width,
-        chunk_start,
-        chunk_offsets,
-        chunk_size,
-        group_size,
-        inverse_sqrt_group,
-        activation_fn,
-        accelerator_backend,
-    )
-
-
-@triton.jit
 def rotate_quantize_rows_kernel(
     x_ptr,
     q_ptr,
@@ -160,7 +129,7 @@ def rotate_quantize_rows_kernel(
     if static_scale_ptr is not None:
         scale = tl.load(static_scale_ptr)
         for chunk in tl.static_range(chunk_count):  # pyright: ignore[reportGeneralTypeIssues]
-            values = _load_weight_chunk(
+            values = convrot_backend.load_rotated_chunk(
                 x_ptr,
                 input_row_offset,
                 packed_row_offset,
@@ -187,7 +156,7 @@ def rotate_quantize_rows_kernel(
         tl.store(scale_ptr + row_i64, scale)
         return
 
-    values0 = _load_weight_chunk(
+    values0 = convrot_backend.load_rotated_chunk(
         x_ptr,
         input_row_offset,
         packed_row_offset,
@@ -203,7 +172,7 @@ def rotate_quantize_rows_kernel(
     )
     row_max = tl.max(tl.abs(values0).to(tl.float32), axis=0)
     if chunk_count >= 2:
-        values1 = _load_weight_chunk(
+        values1 = convrot_backend.load_rotated_chunk(
             x_ptr,
             input_row_offset,
             packed_row_offset,
@@ -222,7 +191,7 @@ def rotate_quantize_rows_kernel(
             tl.max(tl.abs(values1).to(tl.float32), axis=0),
         )
     if chunk_count >= 3:
-        values2 = _load_weight_chunk(
+        values2 = convrot_backend.load_rotated_chunk(
             x_ptr,
             input_row_offset,
             packed_row_offset,
@@ -539,8 +508,6 @@ def _addmm_fused_(
     beta: float,
     alpha: float,
     rounding_seed: int | None = None,
-    *,
-    execution_plan: AddmmExecutionPlan,
 ) -> None:
     """Merge contiguous INT8 rows with group-aligned tiles.
 
@@ -554,8 +521,8 @@ def _addmm_fused_(
         _requantize_update_(qdata, scale, qdata, beta, alpha, rounding_seed, has_update=False)
         return
     rows, width = qdata.shape
-    plan = execution_plan
-    tiles = triton.cdiv(width, plan.block_n)
+    block_n = max(128, group_size)
+    tiles = triton.cdiv(width, block_n)
     maxima = (
         torch.empty((rows, tiles), device=qdata.device, dtype=torch.float32) if tiles > 1 else None
     )
@@ -572,7 +539,7 @@ def _addmm_fused_(
     }[dtype]
     with device_context(qdata.device):
         for write_maxima in (True, False) if tiles > 1 else (False,):
-            merge_lora_tiles_kernel[(triton.cdiv(rows, plan.block_m), tiles)](
+            merge_lora_tiles_kernel[(triton.cdiv(rows, _ADDMM_BLOCK_M), tiles)](
                 qdata,
                 scale,
                 new_scale,
@@ -594,11 +561,11 @@ def _addmm_fused_(
                 write_maxima=write_maxima,
                 single_tile=tiles == 1,
                 accelerator_backend="hip" if _reciprocal_scale(qdata) else qdata.device.type,
-                block_m=plan.block_m,
-                block_n=plan.block_n,
-                block_k=plan.block_k,
-                num_warps=plan.num_warps,
-                num_stages=plan.num_stages,
+                block_m=_ADDMM_BLOCK_M,
+                block_n=block_n,
+                block_k=_ADDMM_BLOCK_K,
+                num_warps=_ADDMM_NUM_WARPS,
+                num_stages=_ADDMM_NUM_STAGES,
             )
             if write_maxima:
                 reduce_row_scales_kernel[(rows,)](
@@ -683,7 +650,7 @@ def _convert_gguf_tiled_out(data, quant_type, group_size, qdata, scale):
                     )
 
 
-def addmm_(
+def _addmm_(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     mat1: torch.Tensor,
@@ -701,22 +668,8 @@ def addmm_(
             mat1 = mat1.clone()
         if _shares_storage(mat2, qdata) or _shares_storage(mat2, scale):
             mat2 = mat2.clone()
-    plan = select_addmm_plan(
-        AcceleratorTarget.from_device(qdata.device),
-        group_size,
-    )
-    if plan is not None:
-        _addmm_fused_(
-            qdata,
-            scale,
-            mat1,
-            mat2,
-            group_size,
-            beta,
-            alpha,
-            rounding_seed,
-            execution_plan=plan,
-        )
+    if _supports_fused_addmm(AcceleratorTarget.from_device(qdata.device)):
+        _addmm_fused_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed)
     else:
         _addmm_batched_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed)
 
@@ -784,7 +737,7 @@ def _requantize_update_(
         )
 
 
-def add_(qdata, scale, update, group_size, beta, alpha, rounding_seed=None):
+def _add_(qdata, scale, update, group_size, beta, alpha, rounding_seed=None):
     """Rotate a dense update and merge it into existing rowwise storage."""
     has_update = alpha != 0
     if has_update:
@@ -802,3 +755,77 @@ def add_(qdata, scale, update, group_size, beta, alpha, rounding_seed=None):
         rounding_seed,
         has_update=has_update,
     )
+
+
+@torch.library.custom_op(
+    "piper_kernels::convrot_int8_addmm_",
+    mutates_args=("qdata", "scale"),
+)
+def addmm_(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    group_size: int,
+    beta: float,
+    alpha: float,
+    rounding_seed: int | None = None,
+) -> None:
+    """Apply an in-place ConvRot INT8 matrix-product update on Triton or reference."""
+    if (beta == 1 and alpha == 0) or qdata.numel() == 0:
+        return
+    if runtime.supports_device(qdata.device):
+        _addmm_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed)
+    else:
+        reference.addmm_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed)
+
+
+@addmm_.register_fake
+def _addmm_fake(
+    _qdata: torch.Tensor,
+    _scale: torch.Tensor,
+    _mat1: torch.Tensor,
+    _mat2: torch.Tensor,
+    _group_size: int,
+    _beta: float,
+    _alpha: float,
+    _rounding_seed: int | None = None,
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "piper_kernels::convrot_int8_add_",
+    mutates_args=("qdata", "scale"),
+)
+def add_(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    update: torch.Tensor,
+    group_size: int,
+    alpha: float,
+    rounding_seed: int | None = None,
+    # Last, so calls in existing compiled graphs stay valid. Not keyword-only:
+    # PyTorch Inductor passes it in alpha's position.
+    beta: float = 1.0,
+) -> None:
+    """Apply an in-place ConvRot INT8 dense update on Triton or reference."""
+    if (beta == 1 and alpha == 0) or qdata.numel() == 0:
+        return
+    if runtime.supports_device(qdata.device):
+        _add_(qdata, scale, update, group_size, beta, alpha, rounding_seed)
+    else:
+        reference.add_(qdata, scale, update, group_size, beta, alpha, rounding_seed)
+
+
+@add_.register_fake
+def _add_fake(
+    _qdata: torch.Tensor,
+    _scale: torch.Tensor,
+    _update: torch.Tensor,
+    _group_size: int,
+    _alpha: float,
+    _rounding_seed: int | None = None,
+    _beta: float = 1.0,
+) -> None:
+    return None

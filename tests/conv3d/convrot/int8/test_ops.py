@@ -1,18 +1,26 @@
 """Static-scale ConvRot INT8 convolution contracts and kernel correctness."""
 
+import importlib.util
+
 import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.conv3d.convrot.int8 import _backend, conv3d, group_norm_silu_conv3d, reference
-from piper_kernels.conv3d.convrot.int8._padding import causal_padding
+from piper_kernels.conv3d.convrot.int8 import _policy, conv3d, group_norm_silu_conv3d, reference
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+
+_CAUSAL_PADDING = {
+    "none": (0, 0, 0, 0, 2, 0),
+    "reflect": (1, 1, 1, 1, 2, 0),
+    "reflect_right": (0, 1, 0, 1, 2, 0),
+}
 
 
 def _native_available() -> bool:
     return (
         torch.cuda.is_available()
-        and _backend.select_backend(torch.empty(0, device="cuda")) is not None
+        and importlib.util.find_spec("triton") is not None
+        and _policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda")))
     )
 
 
@@ -253,7 +261,7 @@ def test_triton_conv3d_matches_reference(
             group_size,
             weight.act_per_tensor_scale,
             stride,
-            padding=causal_padding(padding)[0],
+            padding=_CAUSAL_PADDING[padding],
             spatial_reflection=symmetric or right,
             residual=residual,
         )
@@ -313,15 +321,22 @@ def test_triton_group_norm_silu_conv3d_matches_reference(channels, height, width
 @pytest.mark.skipif(not _native_available(), reason="requires a native Conv3D backend")
 def test_group_norm_preserves_small_variance_at_large_frame_offsets():
     from piper_kernels.conv3d.convrot.int8 import triton as backend  # noqa: PLC0415
-    from piper_kernels.conv3d.convrot.int8._amd import policy as amd_policy  # noqa: PLC0415
-    from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy  # noqa: PLC0415
 
     torch.manual_seed(31415)
     offsets = torch.tensor([1000.0, -1000.0], device="cuda").view(1, 1, 2, 1, 1)
     activation = (offsets + 0.5 * torch.randn(1, 128, 2, 33, 35, device="cuda")).half()
     weight, bias = torch.ones(128, device="cuda"), torch.zeros(128, device="cuda")
     target = AcceleratorTarget.from_device(activation.device)
-    policy = amd_policy if target.is_amd_hip else nvidia_policy
+    plan = _policy.select_execution_plan(
+        target,
+        channels=128,
+        outputs=128,
+        input_rows=2 * 33 * 35,
+        output_rows=2 * 33 * 35,
+        output_height=33,
+        weight_aligned=True,
+        group_norm=True,
+    )
     actual = backend._prepare_group_norm_silu_input(
         activation,
         weight,
@@ -330,7 +345,7 @@ def test_group_norm_preserves_small_variance_at_large_frame_offsets():
         1e-6,
         64,
         torch.tensor(0.02, device="cuda"),
-        schedule=policy._preparation_schedule(128, 2 * 33 * 35, group_norm=True),
+        schedule=plan.preparation,
         accelerator_backend=target.backend,
     )
     expected = reference._prepare_group_norm_silu_input(
@@ -380,10 +395,6 @@ def test_sm8x_tiles_match_reference_and_production_on_any_nvidia_gpu(
     shape, outputs, padding, stride, fused, tile
 ):
     from piper_kernels.conv3d.convrot.int8 import triton as backend  # noqa: PLC0415
-    from piper_kernels.conv3d.convrot.int8._dispatch import (  # noqa: PLC0415
-        default_execution_plan,
-    )
-    from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy  # noqa: PLC0415
 
     torch.manual_seed(2718)
     channels = shape[1]
@@ -395,13 +406,12 @@ def test_sm8x_tiles_match_reference_and_production_on_any_nvidia_gpu(
     group_size = 64 if channels <= 128 else 256
     symmetric, right = padding == "reflect", padding == "reflect_right"
     operands = (weight.qdata, weight.scale, bias, group_size, weight.act_per_tensor_scale, stride)
-    flags = {"padding": causal_padding(padding)[0], "spatial_reflection": symmetric or right}
+    flags = {"padding": _CAUSAL_PADDING[padding], "spatial_reflection": symmetric or right}
     norm = (activation, norm_weight, norm_bias, 32, 1e-6)
-    sm8x = default_execution_plan(
+    sm8x = _policy.default_execution_plan(
         activation,
         weight.qdata,
         stride,
-        policy=nvidia_policy,
         target=AcceleratorTarget("cuda", "sm89"),
         group_norm=fused,
         padding=flags["padding"],

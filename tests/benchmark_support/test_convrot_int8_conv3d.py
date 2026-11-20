@@ -113,21 +113,18 @@ def test_incorrect_outputs_fail_before_timing(monkeypatch, skip_reference_timing
     timer.assert_not_called()
 
 
-@pytest.mark.parametrize("arch", ["sm120", "sm89"])
-def test_convolution_selects_the_production_nvidia_policy(arch):
-    target = AcceleratorTarget("cuda", arch)
-    assert benchmark._convolution_policy(target) is benchmark.nvidia_policy
-
-
-@pytest.mark.parametrize("arch", ["gfx1200", "gfx1201"])
-def test_convolution_selects_the_production_amd_policy(arch):
-    assert benchmark._convolution_policy(AcceleratorTarget("hip", arch)) is benchmark.amd_policy
+@pytest.mark.parametrize(
+    ("backend", "arch"),
+    [("cuda", "sm120"), ("cuda", "sm89"), ("hip", "gfx1200"), ("hip", "gfx1201")],
+)
+def test_convolution_accepts_supported_native_targets(backend, arch):
+    benchmark._require_supported_target(AcceleratorTarget(backend, arch))
 
 
 @pytest.mark.parametrize(("backend", "arch"), [("cuda", "sm90"), ("hip", "gfx9999"), ("cpu", None)])
 def test_unsupported_targets_cannot_benchmark_a_portable_fallback(backend, arch):
     with pytest.raises(ValueError, match="no optimized backend"):
-        benchmark._convolution_policy(AcceleratorTarget(backend, arch))
+        benchmark._require_supported_target(AcceleratorTarget(backend, arch))
 
 
 @pytest.mark.parametrize("memory_format", [torch.contiguous_format, torch.channels_last_3d])

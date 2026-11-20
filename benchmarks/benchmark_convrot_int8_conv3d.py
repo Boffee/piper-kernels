@@ -24,17 +24,13 @@ from torch.nn import functional
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import (
+    _policy,
     conv3d,
     convrot_int8_conv3d_compile_options,
     group_norm_silu_conv3d,
     reference,
 )
 from piper_kernels.conv3d.convrot.int8 import triton as shared
-from piper_kernels.conv3d.convrot.int8._amd import policy as amd_policy
-from piper_kernels.conv3d.convrot.int8._dispatch import default_execution_plan
-from piper_kernels.conv3d.convrot.int8._interfaces import ConvolutionPolicy
-from piper_kernels.conv3d.convrot.int8._nvidia import policy as nvidia_policy
-from piper_kernels.conv3d.convrot.int8._plan import ConvolutionExecutionPlan, ConvolutionSchedule
 from piper_kernels.specializations.minimax_h3_vae import (
     minimax_h3_vae_convrot_int8_conv3d_compile_options,
 )
@@ -105,12 +101,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _convolution_policy(target: AcceleratorTarget) -> ConvolutionPolicy:
-    if nvidia_policy.supports_target(target):
-        return cast(ConvolutionPolicy, nvidia_policy)
-    if amd_policy.supports_target(target):
-        return cast(ConvolutionPolicy, amd_policy)
-    raise ValueError(f"ConvRot INT8 convolution benchmarking has no optimized backend for {target}")
+def _require_supported_target(target: AcceleratorTarget) -> None:
+    if not _policy.supports_target(target):
+        raise ValueError(
+            f"ConvRot INT8 convolution benchmarking has no optimized backend for {target}"
+        )
 
 
 def _standard_conv3d(activation: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -196,7 +191,7 @@ def _benchmark_shape(
     target: AcceleratorTarget,
 ) -> list[BenchmarkRecord[DeviceTimings]]:
     batch, channels, frames, height, width, outputs = shape
-    policy = _convolution_policy(target)
+    _require_supported_target(target)
     activation = normal_tensor(
         (batch, channels, frames, height, width),
         device=torch.device("cuda"),
@@ -351,11 +346,10 @@ def _benchmark_shape(
     if not args.tune:
         return records
     execution_plan_for = partial(
-        default_execution_plan,
+        _policy.default_execution_plan,
         activation,
         weight.qdata,
         (1, 1, 1),
-        policy=policy,
         target=target,
         group_norm=bool(args.group_norm_silu),
         padding=(1, 1, 1, 1, 2, 0),
@@ -382,7 +376,7 @@ def _benchmark_shape(
             accelerator_backend=target.backend,
         )
     candidates = (
-        ConvolutionSchedule(m, n, k, warps, stages)
+        _policy.ConvolutionSchedule(m, n, k, warps, stages)
         for m, n, k, warps in (
             (32, 64, 64, 4),
             (32, 64, 128, 4),
@@ -411,7 +405,7 @@ def _benchmark_shape(
     for schedule in candidates:
         candidate = execution_plan_for(convolution_schedule=schedule)
 
-        def run(candidate: ConvolutionExecutionPlan = candidate) -> torch.Tensor:
+        def run(candidate: _policy.ConvolutionExecutionPlan = candidate) -> torch.Tensor:
             return shared._conv3d_prepared(
                 prepared,
                 weight.qdata,
@@ -456,7 +450,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("ConvRot INT8 convolution benchmarking requires a CUDA or ROCm GPU")
     torch.cuda.set_device(args.device)
     target = AcceleratorTarget.from_device(torch.device("cuda"))
-    _convolution_policy(target)
+    _require_supported_target(target)
     environment = capture_environment(Path(__file__).resolve().parents[1])
     print(
         f"GPU: {environment.gpu_name}; backend: {target.backend}; "

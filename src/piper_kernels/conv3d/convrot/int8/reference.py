@@ -7,7 +7,7 @@ from torch.nn import functional
 
 from piper_kernels.weights.convrot._rotation import rotate_groups
 
-from ._padding import Padding
+from ._policy import Padding
 
 
 def _prepare_input(

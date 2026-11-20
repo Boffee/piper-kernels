@@ -236,17 +236,6 @@ def _quantize_value_k1024_kernel(
             )
 
 
-_quantize_value_k1024_unspecialized_kernel = triton.jit(
-    do_not_specialize=[
-        "key_length",
-        "storage_key_length",
-        "meta_storage_length",
-        "heads",
-        "stride_od",
-    ],
-)(_quantize_value_k1024_kernel.fn)
-
-
 def prepare_chunk_centered_key(
     key: torch.Tensor,
     *,
@@ -308,7 +297,6 @@ def prepare_chunk_centered_value(
     storage_key_length: int,
     store_log_scale: bool,
     scale_storage_length: int | None = None,
-    unspecialized_value_stride: bool = False,
     pack_wmma: bool = False,
     log_scale_dtype: torch.dtype = torch.float16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -333,15 +321,10 @@ def prepare_chunk_centered_value(
     value_mean = torch.empty(
         (batch, heads, chunk_count, head_dim), device=value.device, dtype=torch.float32
     )
-    kernel = (
-        _quantize_value_k1024_unspecialized_kernel
-        if unspecialized_value_stride
-        else _quantize_value_k1024_kernel
-    )
     stride_od = head_dim * _BLOCK_N if pack_wmma else value_int8.stride(2)
     stride_ok = 1 if pack_wmma else value_int8.stride(3)
     with device_context(value.device):
-        kernel[(chunk_count, heads, batch)](
+        _quantize_value_k1024_kernel[(chunk_count, heads, batch)](
             value,
             value_int8,
             value_scale_multiplier,

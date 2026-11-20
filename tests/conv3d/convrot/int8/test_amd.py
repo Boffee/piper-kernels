@@ -5,19 +5,21 @@ import torch
 from torch.nn import functional
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.conv3d.convrot.int8 import _backend, conv3d, group_norm_silu_conv3d, reference
+from piper_kernels.conv3d.convrot.int8 import _policy, conv3d, group_norm_silu_conv3d, reference
 from piper_kernels.conv3d.convrot.int8 import triton as shared
-from piper_kernels.conv3d.convrot.int8._amd import dispatch as amd
-from piper_kernels.conv3d.convrot.int8._amd import policy
-from piper_kernels.conv3d.convrot.int8._dispatch import default_execution_plan
-from piper_kernels.conv3d.convrot.int8._padding import causal_padding
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+
+_CAUSAL_PADDING = {
+    "none": (0, 0, 0, 0, 2, 0),
+    "reflect": (1, 1, 1, 1, 2, 0),
+    "reflect_right": (0, 1, 0, 1, 2, 0),
+}
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
         not torch.cuda.is_available()
-        or not policy.supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
+        or not _policy._supports_amd(AcceleratorTarget.from_device(torch.device("cuda"))),
         reason="requires RDNA4 ROCm",
     ),
 ]
@@ -41,7 +43,7 @@ def test_preparation_matches_reference(channels, group_size, dtype):
     activation[:, :, 0, 0, 1] = -32
     activation = activation.transpose(3, 4)
     scale = torch.tensor(0.125, device="cuda")
-    schedule = policy._preparation_schedule(channels, 2 * 3 * 5 * 7, group_norm=False)
+    schedule = _policy._amd_preparation_schedule(channels)
     actual = shared._prepare_input(
         activation, group_size, scale, schedule=schedule, accelerator_backend="hip"
     )
@@ -71,6 +73,7 @@ def test_prepared_convolution_matches_exact_integer_accumulation(channels, paddi
     input_scale = torch.tensor(0.003, device="cuda")
     weight_scale = torch.full((outputs, 1), 0.004, device="cuda")
     stride = (2, 2, 1)
+    pads = _CAUSAL_PADDING[padding]
     actual = shared._conv3d_prepared(
         prepared,
         weight,
@@ -78,22 +81,21 @@ def test_prepared_convolution_matches_exact_integer_accumulation(channels, paddi
         None,
         input_scale,
         stride,
-        execution_plan=default_execution_plan(
+        execution_plan=_policy.default_execution_plan(
             prepared.permute(0, 4, 1, 2, 3),
             weight,
             stride,
-            policy=policy,
             group_norm=False,
-            padding=causal_padding(padding)[0],
+            padding=pads,
         ),
-        padding=causal_padding(padding)[0],
+        padding=pads,
         spatial_reflection=padding != "none",
         residual=None,
     )
     padded = prepared.permute(0, 4, 1, 2, 3).float()
     if padding != "none":
-        pads = (1, 1, 1, 1, 0, 0) if padding == "reflect" else (0, 1, 0, 1, 0, 0)
-        padded = functional.pad(padded, pads, mode="reflect")
+        spatial_pads = (1, 1, 1, 1, 0, 0) if padding == "reflect" else (0, 1, 0, 1, 0, 0)
+        padded = functional.pad(padded, spatial_pads, mode="reflect")
     padded = functional.pad(padded, (0, 0, 0, 0, 2, 0)).to(torch.int8)
     windows = padded.unfold(2, 3, stride[0]).unfold(3, 3, stride[1]).unfold(4, 3, stride[2])
     matrix = windows.permute(0, 2, 3, 4, 5, 6, 7, 1).reshape(-1, 27 * channels)
@@ -121,7 +123,7 @@ def test_native_dispatch_and_graph_capture_use_live_scale(monkeypatch, fused, ch
     )
     norm_weight = torch.randn(channels, device="cuda")
     norm_bias = torch.randn(channels, device="cuda")
-    assert _backend.select_backend(activation) is amd
+    assert _policy._supports_amd(AcceleratorTarget.from_device(activation.device))
 
     def run():
         if fused:

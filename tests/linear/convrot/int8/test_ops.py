@@ -7,10 +7,9 @@ from _compile_capture import TargetCapturePass
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8 import _backend, _ops, dispatch, reference
-from piper_kernels.weights.convrot.int8 import _backend as int8_updates
-from piper_kernels.weights.convrot.int8 import _ops as int8_update_ops
 from piper_kernels.weights.convrot.int8 import _update
 from piper_kernels.weights.convrot.int8 import _update_reference as int8_update_reference
+from piper_kernels.weights.convrot.int8 import triton as int8_update_ops
 
 
 class _RecordingBackend:
@@ -154,8 +153,7 @@ def test_fake_schemas_need_no_implementation(monkeypatch, static):
 
     monkeypatch.setattr(_backend, "select_linear_backend", unexpected_selection)
     monkeypatch.setattr(_backend, "select_preparation_backend", unexpected_selection)
-    monkeypatch.setattr(int8_updates, "select_add", unexpected_selection)
-    monkeypatch.setattr(int8_updates, "select_addmm", unexpected_selection)
+    monkeypatch.setattr(_update, "_use_triton", unexpected_selection)
     value = torch.empty(2, 3, 64, device="meta", dtype=torch.bfloat16)
     weight = torch.empty(7, 32, device="meta", dtype=torch.int8)
     scale = torch.empty(7, 1, device="meta")
@@ -193,11 +191,11 @@ def test_linear_only_implementation_preserves_weight_update_fallback(monkeypatch
     expected_weight, expected_scale = weight.clone(), scale.clone()
     delta = torch.ones_like(weight, dtype=torch.float32)
     if operation == "add":
-        assert int8_updates.select_add(weight) is None
+        assert not _update._use_triton(weight)
         _update.add_(weight, scale, torch.float32, 16, delta)
         int8_update_reference.add_(expected_weight, expected_scale, delta, 16, 1.0, 1.0)
     else:
-        assert int8_updates.select_addmm(weight) is None
+        assert not _update._use_triton(weight)
         mat1, mat2 = torch.ones(7, 2), torch.ones(2, 32)
         _update.addmm_(weight, scale, torch.float32, 16, mat1, mat2)
         int8_update_reference.addmm_(expected_weight, expected_scale, mat1, mat2, 16, 1.0, 1.0)
