@@ -1,1 +1,1 @@
-"""Shared machinery for attention projection fusions."""
+"""Shared runtime, Triton, and compiler helpers for attention fusions."""

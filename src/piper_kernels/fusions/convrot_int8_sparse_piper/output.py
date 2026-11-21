@@ -9,9 +9,9 @@ import torch
 from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
+from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.convrot_int8_projection._validation import validate_qk_transform_inputs
-from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8._backend import LinearBackend

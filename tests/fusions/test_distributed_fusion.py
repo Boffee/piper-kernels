@@ -50,7 +50,7 @@ from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePip
 from piper_kernels.fusions.convrot_int8_piper import _backend as dense_fusion_backend
 from piper_kernels.fusions.convrot_int8_piper import _distributed_compile as dense_dist_compile
 from piper_kernels.fusions.convrot_int8_piper import distributed_output as dense_distributed_output
-from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import NvidiaExecutionPlan
+from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import NvidiaExecutionPlan
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend as fusion_backend,
 )

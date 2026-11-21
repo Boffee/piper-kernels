@@ -5,18 +5,29 @@ loads when targeting exact SM120. SM8x plans follow measurements on SM89, which
 represents the family.
 """
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from typing import Literal
 
 from piper_kernels._triton.targets import AcceleratorTarget
-
-from ._plan import (
-    GLUON_BLOCK_K,
-    GLUON_BLOCK_M,
-    GLUON_NUM_STAGES,
-    GLUON_NUM_WARPS,
-    NvidiaExecutionPlan,
-    ProjectionOperation,
+from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
+from piper_kernels.fusions.convrot_int8_projection._plan import (
+    ProjectionOperation as ProjectionOperation,  # noqa: PLC0414
 )
+
+# The Gluon feature layout and register epilogues require this fixed tile. The shared
+# policy builds the one Gluon plan from these constants, which the fragments compile with.
+GLUON_BLOCK_M = 128
+GLUON_BLOCK_K = 64
+GLUON_NUM_WARPS = 4
+GLUON_NUM_STAGES = 3
+
+
+@dataclass(frozen=True, slots=True)
+class NvidiaExecutionPlan(ProjectionExecutionPlan):
+    """Complete implementation and launch choices for one NVIDIA projection."""
+
+    kernel: Literal["gluon_async_copy", "gluon_tma", "triton"] = "triton"
+
 
 # SM120's two-head tiles exceed the 99 KiB of shared memory on SM86 and SM89, and its V
 # accumulator spills there. One head per 64-row tile keeps four warps within SM8x's

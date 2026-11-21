@@ -40,7 +40,7 @@ from piper_kernels.linear.convrot.int8._nvidia.gluon_async_copy import (
 )
 
 from .._plan import resolve_row_block_launches
-from ._plan import (
+from .policy import (
     GLUON_BLOCK_K,
     GLUON_BLOCK_M,
     GLUON_NUM_STAGES,

@@ -19,7 +19,7 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
     QUERY_SCALE_ROWS,
     TILE_ROWS,
 )
-from piper_kernels.fusions.projected_qk import triton as projected_qk
+from piper_kernels.fusions.attention import triton as projected_qk
 
 _QUERY_BLOCK_M = TILE_ROWS
 _KEY_VALUE_BLOCK_M = 2 * TILE_ROWS

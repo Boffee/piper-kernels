@@ -14,7 +14,8 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     _SparsePiperRatioProfile,
     validate_output_dtype,
 )
-from piper_kernels.fusions.attention import _output as output_pipeline
+
+from . import _output as output_pipeline
 
 if TYPE_CHECKING:
     from piper_kernels.attention.sparse_piper_attention._prepared import (

@@ -14,7 +14,7 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
 )
 from piper_kernels.fusions.attention import _head_slices as head_slices
 from piper_kernels.fusions.attention import _residual_fold as residual_fold
-from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
+from piper_kernels.fusions.attention import _sparse_compile as sparse_piper_compile
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing

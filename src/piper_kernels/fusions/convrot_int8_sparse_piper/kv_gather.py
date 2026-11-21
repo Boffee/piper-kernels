@@ -9,7 +9,7 @@ import torch
 from piper_kernels._distributed import _comm as distributed_comm
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat, padded_sequence_length
 from piper_kernels.attention.sparse_piper_attention._contracts import validate_routing_mode
-from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
+from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.linear.convrot.int8 import _backend as convrot_linear_backend
 from piper_kernels.linear.convrot.int8._backend import LinearBackend
 

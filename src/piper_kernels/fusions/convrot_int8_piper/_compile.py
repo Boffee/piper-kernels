@@ -18,8 +18,8 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 )
 from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.fusions.attention import _head_slices as head_slices
+from piper_kernels.fusions.attention import _projected_qk_compile as projected_compile
 from piper_kernels.fusions.attention import _residual_fold as residual_fold
-from piper_kernels.fusions.projected_qk import _compile as projected_compile
 from piper_kernels.linear import _bias, _projection_views
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing

@@ -12,7 +12,7 @@ from piper_kernels.attention.sparse_piper_attention._contracts import SUPPORTED_
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     validate_block_lengths as validate_k64_block_lengths,
 )
-from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
+from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
 

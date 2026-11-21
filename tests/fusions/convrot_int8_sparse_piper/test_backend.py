@@ -24,6 +24,7 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MINMAX_ROUTING,
     _SparsePiperRatioProfile,
 )
+from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend,
     _compile,
@@ -41,7 +42,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import resolve_row_block_launches
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import dispatch as nvidia
 from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
-from piper_kernels.fusions.sparse_piper import _output as output_common
 
 
 def _operands(sequence=193, heads=3, head_dim=128, input_features=272, device="cuda:1"):

@@ -33,7 +33,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 from piper_kernels.fusions.convrot_int8_projection import triton as shared_projection
 from piper_kernels.fusions.convrot_int8_projection._nvidia import fragments
-from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import NvidiaExecutionPlan
+from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import NvidiaExecutionPlan
 
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 
