@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
-from piper_kernels._input_activations import (
-    InputActivation,
-    input_activation_width,
-)
-from piper_kernels.weights.convrot._rotation import SUPPORTED_GROUP_SIZES
+from piper_kernels.weights.convrot import SUPPORTED_GROUP_SIZES
 
 from .inputs import normal_tensor
 
+type InputActivation = Literal["gelu_tanh", "swiglu"]
 type ConvRotInputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
 
+_INPUT_ACTIVATION_WIDTHS: dict[str | None, int] = {
+    None: 1,
+    "gelu_tanh": 1,
+    "swiglu": 2,
+}
 _DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
@@ -25,6 +28,13 @@ CONVROT_DTYPE_NAMES = tuple(_DTYPES)
 DENSE_LINEAR_ANCHOR_ROWS = (8192, 32768)
 DENSE_LINEAR_ANCHOR_OUT_FEATURES = (4096, 16384)
 DENSE_LINEAR_ANCHOR_IN_FEATURES = (6144, 14336)
+
+
+def _input_activation_width(activation: str | None) -> int:
+    try:
+        return _INPUT_ACTIVATION_WIDTHS[activation]
+    except KeyError as error:
+        raise ValueError(f"unsupported input activation {activation!r}") from error
 
 
 @dataclass(slots=True, frozen=True)
@@ -43,7 +53,7 @@ class ConvRotShape:
             raise ValueError("ConvRot shape name cannot be empty")
         if any(value <= 0 for value in (self.rows, self.out_features, self.in_features)):
             raise ValueError("ConvRot rows, out_features, and in_features must be positive")
-        input_activation_width(self.input_activation)
+        _input_activation_width(self.input_activation)
 
     def as_dict(self) -> dict[str, int | str]:
         """Return stable machine-readable case and dimension fields."""
@@ -100,18 +110,7 @@ def convrot_dtype(name: str) -> torch.dtype:
 
 def raw_input_features(in_features: int, input_activation: str | None) -> int:
     """Return the source width before applying an optional input activation."""
-    return in_features * input_activation_width(input_activation)
-
-
-def comfy_convrot_input(
-    activation: torch.Tensor,
-    input_activation: str | None,
-) -> torch.Tensor:
-    """Adapt Piper's ``[up | gate]`` input to Comfy Kitchen's ``[gate | up]``."""
-    if input_activation != "swiglu":
-        return activation
-    up, gate = activation.chunk(2, dim=-1)
-    return torch.cat((gate, up), dim=-1)
+    return in_features * _input_activation_width(input_activation)
 
 
 def make_convrot_inputs(

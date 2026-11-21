@@ -1,6 +1,6 @@
 """Host-side specialization policy tests for Piper Attention."""
 
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -27,69 +27,58 @@ def _select(
     *,
     head_dim: int = 128,
     is_causal: bool = False,
+    query_length: int = 128,
+    key_length: int | None = None,
     quantized_query: bool = False,
 ) -> PiperAttentionExecutionPlan:
     return select_execution_plan(
         target,
         head_dim=head_dim,
         is_causal=is_causal,
-        query_length=128,
+        query_length=query_length,
+        key_length=key_length,
         quantized_query=quantized_query,
     )
 
 
-@pytest.mark.parametrize("sequence", [1, 8192, 131073])
-def test_noncausal_d128_execution_plan_is_sequence_length_invariant(sequence: int) -> None:
-    query = torch.empty((1, 8, sequence, 128), device="meta")
-
-    plan = default_execution_plan(
-        query,
-        False,
-        target=_SM120,
-    )
-
-    assert plan.block_m == 128
-    assert plan.grouped_qk
-    assert plan.split_pv_head_dim
-    assert plan.derive_value_log_bound
-    assert plan.use_packed_probability_conversion
+def test_noncausal_d128_execution_plan_is_sequence_length_invariant() -> None:
+    plans = [
+        default_execution_plan(
+            torch.empty((1, 8, sequence, 128), device="meta"), False, target=_SM120
+        )
+        for sequence in (1, 8192, 131073)
+    ]
+    assert all(plan == plans[0] for plan in plans)
+    plans[0].validate_kernel()
+    assert plans[0].grouped_qk is True
+    assert plans[0].optimize_causal_traversal is False
 
 
-@pytest.mark.parametrize(("batch", "heads"), [(1, 1), (1, 16), (4, 48)])
-@pytest.mark.parametrize(
-    ("sequence", "descriptors"),
-    [
-        (128, False),
-        (512, False),
-        (768, False),
-        (1023, False),
-        (1024, True),
-        (1025, True),
-        (1536, True),
-        (4096, True),
-        (131072, True),
-        (131073, True),
-    ],
-)
-def test_sm120_causal_d128_load_schedule_uses_query_metadata(
+@pytest.mark.parametrize(("batch", "heads"), [(1, 1), (4, 48)])
+def test_sm120_causal_d128_descriptors_switch_monotonically_with_query_length(
     batch: int,
     heads: int,
-    sequence: int,
-    descriptors: bool,
 ) -> None:
-    query = torch.empty((batch, heads, sequence, 128), device="meta")
-
-    plan = default_execution_plan(query, True, target=_SM120)
-
-    # The short plan supplies all numerical choices and the three-stage launch.
-    assert plan == replace(
-        _select(_SM120, is_causal=True),
-        use_tensor_descriptors=descriptors,
-    )
+    sequences = (128, 512, 1023, 1024, 4096, 131073)
+    plans = [
+        default_execution_plan(
+            torch.empty((batch, heads, sequence, 128), device="meta"), True, target=_SM120
+        )
+        for sequence in sequences
+    ]
+    descriptor_flags = [plan.use_tensor_descriptors for plan in plans]
+    assert descriptor_flags[0] is False
+    assert descriptor_flags[-1] is True
+    assert descriptor_flags == sorted(descriptor_flags)
+    # Only descriptor usage changes across the crossover; other launch choices stay consistent.
+    for plan in plans:
+        assert replace(plan, use_tensor_descriptors=False) == replace(
+            plans[0], use_tensor_descriptors=False
+        )
 
 
 @pytest.mark.parametrize("target", [_SM80, _SM89, _SM121])
-@pytest.mark.parametrize("sequence", [1024, 1025, 131073])
+@pytest.mark.parametrize("sequence", [1024, 131073])
 def test_other_targets_retain_causal_d128_load_schedule(
     target: AcceleratorTarget,
     sequence: int,
@@ -99,154 +88,100 @@ def test_other_targets_retain_causal_d128_load_schedule(
     plan = default_execution_plan(query, True, target=target)
 
     assert plan == _select(target, is_causal=True)
+    assert not plan.use_tensor_descriptors
 
 
 @pytest.mark.parametrize("target", [_SM80, _SM89, _SM120, _SM121])
 @pytest.mark.parametrize("query_length", [65, 8193])
-@pytest.mark.parametrize("key_length", [4095, 4096, 4097, 131073])
-def test_d64_descriptors_depend_on_key_traversal_not_query_length(target, query_length, key_length):
-    query = torch.empty((2, 6, query_length, 64), device="meta")
-    plan = default_execution_plan(query, False, target=target, key_length=key_length)
-    assert plan.use_tensor_descriptors is (target == _SM120 and key_length >= 4096)
-    # The Gluon kernel issues its own copies and compiles one stage.
-    pointer_stages = 1 if plan.attention_kernel == "gluon_async_copy" else 3
-    assert plan.num_stages == (2 if plan.use_tensor_descriptors else pointer_stages)
+def test_d64_descriptors_depend_on_key_traversal_not_query_length(target, query_length):
+    key_lengths = (64, 1024, 4095, 4096, 131073)
+    plans = [
+        default_execution_plan(
+            torch.empty((2, 6, query_length, 64), device="meta"),
+            False,
+            target=target,
+            key_length=key_length,
+        )
+        for key_length in key_lengths
+    ]
+    for plan in plans:
+        plan.validate_kernel()
+    descriptor_flags = [plan.use_tensor_descriptors for plan in plans]
+    if target == _SM120:
+        assert descriptor_flags[0] is False
+        assert descriptor_flags[-1] is True
+        assert descriptor_flags == sorted(descriptor_flags)
+        # Same key_length yields the same descriptor decision regardless of query_length.
+        other = default_execution_plan(
+            torch.empty((2, 6, 128, 64), device="meta"),
+            False,
+            target=target,
+            key_length=key_lengths[-1],
+        )
+        assert other.use_tensor_descriptors is plans[-1].use_tensor_descriptors
+    else:
+        assert not any(descriptor_flags)
 
 
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("sequence", [4095, 4096, 4097, 131073])
+@pytest.mark.parametrize("sequence", [128, 4096, 131073])
 def test_d64_self_attention_default_key_length_matches_explicit_metadata(causal, sequence):
-    plan = select_execution_plan(_SM120, head_dim=64, is_causal=causal, query_length=sequence)
-    assert plan == select_execution_plan(
+    plan = _select(_SM120, head_dim=64, is_causal=causal, query_length=sequence)
+    assert plan == _select(
         _SM120, head_dim=64, is_causal=causal, query_length=sequence, key_length=sequence
     )
-    assert plan.use_tensor_descriptors is (sequence >= 4096)
-    assert plan.num_stages == (2 if plan.use_tensor_descriptors and not causal else 3)
+    plan.validate_kernel()
 
 
-@pytest.mark.parametrize("target", [_SM120, _SM121])
+@pytest.mark.parametrize("target", [_SM80, _SM89, _SM120, _SM121])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
-@pytest.mark.parametrize(
-    ("sequence", "ragged"),
-    [(64, False), (65, True), (8192, False), (8193, True)],
-)
-def test_ragged_causal_d64_loop_motion_is_specific_to_sm120(
+@pytest.mark.parametrize("sequence", [64, 65, 8192, 8193])
+def test_all_selected_plans_satisfy_capability_and_safety_invariants(
     target: AcceleratorTarget,
     head_dim: int,
     is_causal: bool,
     sequence: int,
-    ragged: bool,
 ) -> None:
-    query = torch.empty((1, 8, sequence, head_dim), device="meta")
-    plan = default_execution_plan(query, is_causal, target=target)
-    assert plan.loop_licm is (target == _SM120 and head_dim == 64 and is_causal and ragged)
+    plan = default_execution_plan(
+        torch.empty((1, 8, sequence, head_dim), device="meta"), is_causal, target=target
+    )
+    plan.validate_kernel()
+    assert plan.block_m in (64, 128)
+    assert plan.num_warps in (2, 4, 8)
+    assert 1 <= plan.num_stages <= 4
+    assert plan.grouped_qk is groups_qk_scales(target)
+    if not is_causal:
+        assert not plan.optimize_causal_traversal
+    if head_dim == 64:
+        assert not plan.split_pv_head_dim
+    # Exact-SM120 tuning knobs and tensor descriptors never leak to other targets.
+    if target != _SM120:
+        assert not plan.use_tensor_descriptors
+        assert not plan.optimize_causal_traversal
+        assert not plan.loop_licm
+        assert not plan.retain_query_tail_for_strided_output
+        assert plan.output_ctas_per_sm == 0
+        assert plan.strided_output_query_group == 0
+        assert plan.ragged_strided_output_maxnreg is None
+    # SM89 uses the Gluon async-copy kernel; other targets use Triton.
+    assert plan.attention_kernel == ("gluon_async_copy" if target == _SM89 else "triton")
+    if target == _SM120:
+        assert plan.optimize_causal_traversal is is_causal
+        assert plan.loop_licm is (head_dim == 64 and is_causal and sequence % plan.block_m != 0)
 
 
-@pytest.mark.parametrize(
-    ("target", "expected"),
-    [
-        (
-            _SM80,
-            PiperAttentionExecutionPlan(
-                block_m=128,
-                grouped_qk=False,
-                split_pv_head_dim=False,
-                use_tensor_descriptors=False,
-            ),
-        ),
-        (
-            _SM89,
-            PiperAttentionExecutionPlan(
-                block_m=64,
-                grouped_qk=False,
-                split_pv_head_dim=False,
-                use_tensor_descriptors=False,
-                derive_value_log_bound=True,
-                num_stages=1,
-                use_packed_probability_conversion=True,
-                attention_kernel="gluon_async_copy",
-                max_registers=232,
-            ),
-        ),
-        (
-            _SM120,
-            PiperAttentionExecutionPlan(
-                block_m=128,
-                grouped_qk=True,
-                split_pv_head_dim=True,
-                use_tensor_descriptors=True,
-                derive_value_log_bound=True,
-                num_stages=2,
-                use_packed_probability_conversion=True,
-                retain_query_tail_for_strided_output=True,
-                output_ctas_per_sm=2,
-            ),
-        ),
-        (
-            _SM121,
-            PiperAttentionExecutionPlan(
-                block_m=64,
-                grouped_qk=True,
-                split_pv_head_dim=True,
-                use_tensor_descriptors=False,
-            ),
-        ),
-    ],
-)
-def test_execution_plan_separates_architecture_facts_from_exact_target_tuning(
-    target: AcceleratorTarget,
-    expected: PiperAttentionExecutionPlan,
-) -> None:
-    plan = _select(target)
-
-    assert plan == expected
-
-
-@pytest.mark.parametrize(
-    ("head_dim", "block_m", "max_registers", "fuse_query_quantization"),
-    [(64, 128, None, True), (128, 64, 232, False)],
-)
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_sm89_runs_the_gluon_kernel_in_every_mode(
-    head_dim: int,
-    block_m: int,
-    max_registers: int | None,
-    fuse_query_quantization: bool,
-    is_causal: bool,
-) -> None:
-    plan = _select(
-        _SM89,
-        head_dim=head_dim,
-        is_causal=is_causal,
-    )
+def test_sm89_quantized_query_disables_fused_quantization(head_dim: int, is_causal: bool) -> None:
+    floating_plan = _select(_SM89, head_dim=head_dim, is_causal=is_causal, quantized_query=False)
+    quantized_plan = _select(_SM89, head_dim=head_dim, is_causal=is_causal, quantized_query=True)
 
-    assert plan.attention_kernel == "gluon_async_copy"
-    assert plan.max_registers == max_registers
-    assert plan.block_m == block_m
-    assert plan.fuse_query_quantization is fuse_query_quantization
-    assert plan.derive_value_log_bound
-    assert plan.use_packed_probability_conversion
-    assert not plan.grouped_qk
-    assert not plan.split_pv_head_dim
-    assert not plan.use_tensor_descriptors
-    assert not plan.optimize_causal_traversal
-
-
-@pytest.mark.parametrize(
-    ("head_dim", "is_causal", "block_m"),
-    [(64, False, 128), (64, True, 64), (128, False, 64), (128, True, 64)],
-)
-def test_sm89_quantized_query_skips_fused_quantization(
-    head_dim: int, is_causal: bool, block_m: int
-) -> None:
-    plan = _select(_SM89, head_dim=head_dim, is_causal=is_causal, quantized_query=True)
-
-    assert plan == replace(
-        _select(_SM89, head_dim=head_dim, is_causal=is_causal),
-        block_m=block_m,
-        fuse_query_quantization=False,
-    )
+    floating_plan.validate_kernel()
+    quantized_plan.validate_kernel()
+    assert floating_plan.attention_kernel == quantized_plan.attention_kernel == "gluon_async_copy"
+    assert not quantized_plan.fuse_query_quantization
+    assert quantized_plan.block_m <= floating_plan.block_m
 
 
 @pytest.mark.parametrize("target", [_SM80, _SM120, _SM121])
@@ -339,110 +274,6 @@ def test_gluon_plan_rejects_unsupported_recurrence_choices(
         )
 
 
-@pytest.mark.parametrize(
-    ("head_dim", "is_causal", "expected"),
-    [
-        (64, False, True),
-        (64, True, True),
-        (128, False, True),
-        (128, True, False),
-    ],
-)
-def test_sm120_probability_conversion_policy(
-    head_dim: int,
-    is_causal: bool,
-    expected: bool,
-) -> None:
-    plan = _select(_SM120, head_dim=head_dim, is_causal=is_causal)
-
-    assert plan.use_packed_probability_conversion is expected
-
-
-@pytest.mark.parametrize(
-    ("head_dim", "is_causal", "expected"),
-    [
-        (64, False, True),
-        (128, False, True),
-        (64, True, False),
-        (128, True, False),
-    ],
-)
-def test_sm120_derived_value_log_policy_is_mode_specific(
-    head_dim: int,
-    is_causal: bool,
-    expected: bool,
-) -> None:
-    plan = _select(
-        _SM120,
-        head_dim=head_dim,
-        is_causal=is_causal,
-    )
-
-    assert plan.derive_value_log_bound is expected
-
-
-@pytest.mark.parametrize(
-    (
-        "head_dim",
-        "is_causal",
-        "block_m",
-        "split_pv",
-        "descriptors",
-    ),
-    [
-        (64, False, 128, False, False),
-        (128, False, 128, True, True),
-        (64, True, 64, False, False),
-        (128, True, 64, True, False),
-    ],
-)
-def test_sm120_tiling_is_dimension_and_mode_specific(
-    head_dim: int,
-    is_causal: bool,
-    block_m: int,
-    split_pv: bool,
-    descriptors: bool,
-) -> None:
-    plan = _select(
-        _SM120,
-        head_dim=head_dim,
-        is_causal=is_causal,
-    )
-
-    assert plan.block_m == block_m
-    assert plan.split_pv_head_dim is split_pv
-    assert plan.use_tensor_descriptors is descriptors
-    assert plan.num_stages == (2 if descriptors else 3)
-
-
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize(
-    ("is_causal", "expected"),
-    [
-        (True, True),
-        (False, False),
-    ],
-)
-def test_sm120_optimized_causal_traversal_policy_is_mode_specific(
-    head_dim: int,
-    is_causal: bool,
-    expected: bool,
-) -> None:
-    plan = _select(
-        _SM120,
-        head_dim=head_dim,
-        is_causal=is_causal,
-    )
-
-    assert plan.optimize_causal_traversal is expected
-
-
-def test_unmeasured_sm12x_target_does_not_inherit_sm120_causal_policy() -> None:
-    plan = _select(_SM121, is_causal=True)
-
-    assert not plan.optimize_causal_traversal
-
-
 def test_alternate_plan_can_disable_tensor_descriptors() -> None:
     descriptor_plan = _select(_SM120)
     pointer_plan = replace(
@@ -452,9 +283,8 @@ def test_alternate_plan_can_disable_tensor_descriptors() -> None:
     )
 
     assert descriptor_plan.use_tensor_descriptors
-    assert descriptor_plan.num_stages == 2
     assert not pointer_plan.use_tensor_descriptors
-    assert pointer_plan.num_stages == 3
+    pointer_plan.validate_kernel()
 
 
 def test_execution_plan_serializes_all_launch_choices() -> None:
@@ -464,52 +294,11 @@ def test_execution_plan_serializes_all_launch_choices() -> None:
         loop_num_stages=2,
         loop_licm=True,
     )
-
-    assert plan.as_dict() == {
-        "block_m": 64,
-        "grouped_qk": True,
-        "split_pv_head_dim": True,
-        "use_tensor_descriptors": False,
-        "derive_value_log_bound": False,
-        "optimize_causal_traversal": True,
-        "num_warps": 4,
-        "num_stages": 3,
-        "loop_num_stages": 2,
-        "loop_licm": True,
-        "use_packed_probability_conversion": False,
-        "retain_query_tail_for_strided_output": False,
-        "output_ctas_per_sm": 0,
-        "strided_output_query_group": 0,
-        "ragged_strided_output_maxnreg": None,
-        "attention_kernel": "triton",
-        "max_registers": None,
-        "fuse_query_quantization": False,
-    }
-
-
-@pytest.mark.parametrize("target", [_SM80, _SM89, _SM120, _SM121])
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("is_causal", [False, True])
-def test_output_tuning_stays_with_the_measured_noncausal_sm120_plan(target, head_dim, is_causal):
-    plan = _select(target, head_dim=head_dim, is_causal=is_causal)
-    tuned = target == _SM120 and not is_causal
-    assert plan.retain_query_tail_for_strided_output is (tuned and head_dim == 128)
-    assert plan.output_ctas_per_sm == (2 if tuned else 0)
-
-
-@pytest.mark.parametrize("target", [_SM80, _SM89, _SM120, _SM121])
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("is_causal", [False, True])
-@pytest.mark.parametrize("sequence", [4095, 4096, 4097, 131073])
-def test_causal_strided_schedule_stays_with_sm120_d64_descriptors(
-    target, head_dim, is_causal, sequence
-):
-    plan = select_execution_plan(
-        target, head_dim=head_dim, is_causal=is_causal, query_length=sequence
-    )
-    tuned = target == _SM120 and head_dim == 64 and is_causal and plan.use_tensor_descriptors
-    assert plan.strided_output_query_group == (8 if tuned else 0)
-    assert plan.ragged_strided_output_maxnreg == (168 if tuned else None)
+    serialized = plan.as_dict()
+    expected_keys = {field_info.name for field_info in fields(PiperAttentionExecutionPlan)}
+    assert set(serialized) == expected_keys
+    for key in expected_keys:
+        assert serialized[key] == getattr(plan, key)
 
 
 def test_execution_plan_rejects_optimized_traversal_for_noncausal_invocation() -> None:

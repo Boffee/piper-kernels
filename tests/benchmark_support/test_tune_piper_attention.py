@@ -3,9 +3,9 @@ from dataclasses import replace
 import pytest
 import torch
 from lib.attention import AttentionConfig
-from lib.providers import ProviderPhase
-from lib.tuning import UnsupportedTuningCandidateError
+from lib.tuning import TuningPhase, UnsupportedTuningCandidateError
 from tune_piper_attention import (
+    _AttentionBackend,
     _candidate_plans,
     _make_candidate,
     _parse_args,
@@ -42,7 +42,7 @@ def test_tuner_defaults_to_production_plan() -> None:
 
     assert arguments.heads == 16
     assert arguments.use_tensor_descriptors is None
-    assert arguments.phase is ProviderPhase.PREPARED_EXECUTION
+    assert arguments.phase is TuningPhase.PREPARED_EXECUTION
     assert arguments.minimum_sqnr_db == 20.0
     assert arguments.block_m is None
     assert arguments.num_warps is None
@@ -263,3 +263,47 @@ def test_tuner_rejects_nonfinite_minimum_sqnr(value: str) -> None:
 
     with pytest.raises(SystemExit, match="minimum SQNR must be finite"):
         _validate_args(arguments)
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_prepares"),
+    [
+        (TuningPhase.PREPARED_EXECUTION, 1),
+        (TuningPhase.OPERATOR_END_TO_END, 2),
+    ],
+)
+def test_candidate_phase_controls_preparation_frequency(
+    phase: TuningPhase,
+    expected_prepares: int,
+) -> None:
+    prepare_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    launch_calls: list[int] = []
+    plan = _production_plan()
+    tensor = torch.empty((1, 1, 8, 128), device="meta")
+    expected_output = torch.empty_like(tensor)
+
+    def fake_prepare(*args, **kwargs) -> int:
+        prepare_calls.append((args, kwargs))
+        return len(prepare_calls)
+
+    def fake_launch(prepared: int) -> torch.Tensor:
+        launch_calls.append(prepared)
+        return expected_output
+
+    operation = _make_candidate(
+        plan,
+        (tensor, tensor, tensor),
+        config=AttentionConfig(dtype=torch.float16, scale=128**-0.5, seed=7),
+        target=_SM120,
+        phase=phase,
+        backend=_AttentionBackend(prepare=fake_prepare, launch=fake_launch),
+    ).build()
+    first = operation.run()
+    second = operation.run()
+
+    assert first is expected_output
+    assert second is expected_output
+    assert len(prepare_calls) == expected_prepares
+    assert launch_calls == ([1, 1] if phase is TuningPhase.PREPARED_EXECUTION else [1, 2])
+    assert prepare_calls[0][0][3:] == (128**-0.5, False)
+    assert prepare_calls[0][1] == {"execution_plan": plan}

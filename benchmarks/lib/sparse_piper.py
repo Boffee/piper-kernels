@@ -1,9 +1,61 @@
-"""Bounded-memory checks and useful-operation accounting for sparse Piper."""
+"""Bounded-memory reference checks for sparse Piper attention."""
+
+from __future__ import annotations
+
+from typing import Protocol
 
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
-from piper_kernels.attention.sparse_piper_attention._prepared import _PreparedSparsePiperAttention
+
+
+class _PreparedQuery(Protocol):
+    @property
+    def data(self) -> torch.Tensor: ...
+    @property
+    def scale(self) -> torch.Tensor: ...
+    @property
+    def routes(self) -> torch.Tensor: ...
+    @property
+    def global_block_offset(self) -> int: ...
+
+
+class _PreparedContext(Protocol):
+    @property
+    def key(self) -> torch.Tensor: ...
+    @property
+    def value(self) -> torch.Tensor: ...
+    @property
+    def value_format(self) -> ValueFormat: ...
+    @property
+    def key_scale(self) -> torch.Tensor: ...
+    @property
+    def key_center(self) -> torch.Tensor: ...
+    @property
+    def key_center_scale(self) -> torch.Tensor: ...
+    @property
+    def value_scale_multiplier(self) -> torch.Tensor: ...
+    @property
+    def value_mean(self) -> torch.Tensor: ...
+    @property
+    def route_head_offsets(self) -> torch.Tensor: ...
+    @property
+    def routes_per_query(self) -> int: ...
+    @property
+    def block_lengths(self) -> torch.Tensor | None: ...
+    @property
+    def sparse_key_blocks(self) -> int: ...
+    @property
+    def sparse_query_blocks(self) -> int | None: ...
+    @property
+    def logical_sequence_length(self) -> int: ...
+
+
+class _PreparedSparseAttention(Protocol):
+    @property
+    def query(self) -> _PreparedQuery: ...
+    @property
+    def context(self) -> _PreparedContext: ...
 
 
 def reference_value_storage(value: torch.Tensor, value_format: ValueFormat) -> torch.Tensor:
@@ -20,26 +72,8 @@ def reference_value_storage(value: torch.Tensor, value_format: ValueFormat) -> t
     )
 
 
-def useful_integer_operations(
-    sequence: int, keep_blocks: list[int], batch: int = 1, head_dim: int = 128
-) -> int:
-    """Count selected QK/PV work, including the valid dense ragged suffix."""
-    selected_rows = 64 * sum(keep_blocks) + len(keep_blocks) * (sequence % 64)
-    return 4 * batch * sequence * head_dim * selected_rows
-
-
-def assert_equal_finite(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    """Compare complete outputs without allocating full-sized FP32 temporaries."""
-    assert actual.shape == expected.shape
-    for left, right in zip(
-        actual.flatten().split(1 << 20), expected.flatten().split(1 << 20), strict=True
-    ):
-        assert torch.isfinite(left).all()
-        torch.testing.assert_close(left, right, rtol=0, atol=0)
-
-
 def _selected_tiles_and_validity(
-    prepared: _PreparedSparsePiperAttention,
+    prepared: _PreparedSparseAttention,
     batch: int,
     head: int,
     query_block: int,
@@ -74,7 +108,7 @@ def _selected_tiles_and_validity(
 
 
 def reference_prepared_query(
-    prepared: _PreparedSparsePiperAttention,
+    prepared: _PreparedSparseAttention,
     batch: int,
     head: int,
     query_block: int,
@@ -140,29 +174,3 @@ def reference_prepared_query(
     denominator = (probabilities.sum(dim=-1) * weights).sum(dim=0)
     output = numerator / (denominator.clamp_min(1e-30)[:, None] * 255)
     return output.to(output_dtype)
-
-
-def check_query_samples(
-    prepared: _PreparedSparsePiperAttention, output: torch.Tensor
-) -> list[dict[str, int | float]]:
-    """Check first/middle/last query blocks and heads against bounded FP64 math."""
-    batch, sequence, heads, _ = output.shape
-    blocks = (sequence + 63) // 64
-    checks = []
-    for b in range(batch):
-        for head in sorted({0, heads // 2, heads - 1}):
-            for block in sorted({0, blocks // 2, blocks - 1}):
-                expected = reference_prepared_query(
-                    prepared, b, head, block, output_dtype=output.dtype
-                )
-                actual = output[b, block * 64 : block * 64 + expected.shape[0], head]
-                error = float(
-                    (actual.float() - expected.float()).norm()
-                    / expected.float().norm().clamp_min(1e-30)
-                )
-                assert torch.isfinite(actual).all()
-                assert error < 0.015, (b, head, block, error)
-                checks.append(
-                    {"batch": b, "head": head, "query_block": block, "relative_l2": error}
-                )
-    return checks

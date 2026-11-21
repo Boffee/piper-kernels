@@ -45,10 +45,11 @@ def _support(
 
             supported = _policy.supports_target(target)
         else:
-            from piper_kernels.linear.convrot.int8._amd import policy as amd
-            from piper_kernels.linear.convrot.int8._nvidia import policy as nvidia
+            from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 
-            supported = amd.supports_target(target) or nvidia.supports_target(target)
+            supported = (
+                linear_backend.select_linear_backend(torch.empty(0, device=device)) is not None
+            )
         if not supported:
             return "no native ConvRot INT8 backend for this accelerator"
     elif not target.is_cuda_capability(12, 0):

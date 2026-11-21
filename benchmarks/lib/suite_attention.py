@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import partial
+from typing import Protocol
 
 import torch
 
@@ -19,7 +20,6 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _resolve_route_layout,
 )
 from piper_kernels.attention.sparse_piper_attention._contracts import routing_mode_from_name
-from piper_kernels.attention.sparse_piper_attention._routes import PackedRoutes
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
 
 from .attention import (
@@ -99,8 +99,15 @@ def _dense_operation(case: AttentionCase, device: torch.device, name: str) -> Op
     return Operation(run=run, check=check, configuration={"layout": "BHSD"})
 
 
+class _PackedRoutes(Protocol):
+    @property
+    def indices(self) -> torch.Tensor: ...
+    @property
+    def route_head_offsets(self) -> torch.Tensor: ...
+
+
 def _selected_key_rows(
-    routes: PackedRoutes, *, head: int, batch: int, block: int, sequence: int
+    routes: _PackedRoutes, *, head: int, batch: int, block: int, sequence: int
 ) -> torch.Tensor:
     """Resolve the actual sparse support, including a dense ragged suffix."""
     device = routes.indices.device

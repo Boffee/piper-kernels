@@ -2,13 +2,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from benchmark_sparse_piper import _parse_args
-from lib.sparse_piper import (
-    assert_equal_finite,
-    reference_prepared_query,
-    reference_value_storage,
-    useful_integer_operations,
-)
+from lib.sparse_piper import reference_prepared_query, reference_value_storage
 
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._prepared import (
@@ -16,43 +10,6 @@ from piper_kernels.attention.sparse_piper_attention._prepared import (
     _PreparedSparsePiperContext,
     _PreparedSparsePiperQuery,
 )
-
-
-@pytest.mark.parametrize("option", ["--sequence", "--batch", "--heads", "--rep-ms", "--samples"])
-def test_nonpositive_counts_are_rejected(option):
-    with pytest.raises(SystemExit):
-        _parse_args([option, "0"])
-
-
-@pytest.mark.parametrize("ratio", ["0", "-1", "1.1", "nan", "inf"])
-def test_invalid_ratios_are_rejected(ratio):
-    with pytest.raises(SystemExit):
-        _parse_args(["--ratios", ratio])
-
-
-def test_ragged_benchmark_counts_only_valid_selected_work():
-    assert _parse_args(["--sequence", "100000"]).sequence == [100000]
-    assert useful_integer_operations(65, [1, 1]) == 4 * 65 * 128 * 2 * 65
-    assert useful_integer_operations(4096, [16] * 8) == 17179869184
-    assert useful_integer_operations(4096, [16] * 8, head_dim=64) == 8589934592
-
-
-def test_defaults_include_sparse_and_dense_multiple_sample_measurements():
-    args = _parse_args([])
-    assert args.ratios == [0.25, 1.0]
-    assert args.sequence == [1024, 4096]
-    assert args.samples == 3
-
-
-def test_catalog_case_preserves_sparse_workload_and_rejects_overrides():
-    args = _parse_args(["--case", "sparse-attention-video-high-eighth"])
-    assert args.sequence == [110592]
-    assert (args.heads, args.kv_heads, args.head_dim) == (56, 56, 128)
-    assert args.ratios == [0.125]
-    with pytest.raises(SystemExit):
-        _parse_args(["--case", "sparse-attention-video-high-eighth", "--ratios", "1"])
-    with pytest.raises(SystemExit):
-        _parse_args(["--case", "attention-small"])
 
 
 @pytest.mark.parametrize("value_format", list(ValueFormat))
@@ -114,15 +71,3 @@ def test_bounded_reference_selects_routes_dense_queries_and_valid_rows(
                 torch.testing.assert_close(
                     reference_prepared_query(prepared, batch, head, block), expected, rtol=0, atol=0
                 )
-
-
-def test_complete_output_check_rejects_nonfinite_and_late_mismatches():
-    expected = torch.zeros((1 << 20) + 1)
-    actual = expected.clone()
-    assert_equal_finite(actual, expected)
-    actual[-1] = 1
-    with pytest.raises(AssertionError):
-        assert_equal_finite(actual, expected)
-    actual[-1] = torch.nan
-    with pytest.raises(AssertionError):
-        assert_equal_finite(actual, actual)

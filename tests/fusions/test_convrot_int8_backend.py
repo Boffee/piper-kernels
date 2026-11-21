@@ -1,7 +1,5 @@
 """Shared fusion orchestration needs operations, not vendor launch plans."""
 
-import ast
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -168,6 +166,9 @@ def _semantic_ffn_graph(device, output_features=20):
 def test_ffn_compiler_uses_backend_support_not_device_family(monkeypatch, device, supported):
     select = Mock(return_value=object() if supported else None)
     monkeypatch.setattr(_backend, "select_linear_backend", select)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", Mock(side_effect=AssertionError("device probe"))
+    )
     with FakeTensorMode():
         module, value = _semantic_ffn_graph(device)
         ffn_compile.fold_ffns(module.graph)
@@ -249,30 +250,6 @@ def test_sparse_gate_uses_selected_projection_operation(operations):
     select.assert_called_once_with(qdata)
     assert backend.prepare_input.call_count == 0
     assert backend.linear_prepared.call_count == 2
-
-
-@pytest.mark.parametrize("module", [ffn, ffn_compile, sparse_output])
-def test_shared_orchestration_does_not_depend_on_vendor_launch_interfaces(module):
-    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
-    forbidden = tuple(
-        f"piper_kernels.linear.convrot.int8.{name}"
-        for name in ("_nvidia", "_amd", "_plan", "_policy", "triton")
-    )
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                assert not f"{node.module}.{alias.name}".startswith(forbidden)
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                assert not alias.name.startswith(forbidden)
-        if isinstance(node, ast.Attribute):
-            assert node.attr not in {
-                "default_execution_plan",
-                "prepare_input_with_plan",
-                "execute_prepared_linear",
-            }
-            if module in (ffn, ffn_compile):
-                assert node.attr not in {"from_device", "cuda_capability_at_least"}
 
 
 @pytest.mark.parametrize("static", [False, True])

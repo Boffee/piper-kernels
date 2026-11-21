@@ -17,12 +17,11 @@ from lib.reporting import (
     output_target,
     write_records,
 )
-from lib.timing import ClockDomain, PhaseTimings, SampleTimings, Timing
+from lib.timing import ClockDomain, Timing
 
 
 def _record(environment) -> BenchmarkRecord:
-    wall_timing = Timing(1.0, 0.8, 1.2, ClockDomain.SYNCHRONIZED_WALL)
-    device_timing = Timing(1.0, 0.8, 1.2, ClockDomain.DEVICE_EVENT)
+    wall_timing = Timing(1.0, 0.8, 1.2, ClockDomain.SYNCHRONIZED_WALL, sample_count=3)
     quality = QualityMetrics(
         mean_absolute_error=0.0,
         max_absolute_error=0.0,
@@ -39,14 +38,7 @@ def _record(environment) -> BenchmarkRecord:
         provider="test",
         shape={"sequence": 128},
         configuration={"dtype": "float16"},
-        timings=PhaseTimings(
-            warmup_ms=100,
-            measurement_time_ms=500,
-            first_call_ms=12.0,
-            preparation=wall_timing,
-            prepared_execution=device_timing,
-            operator_end_to_end=wall_timing,
-        ),
+        timings=wall_timing,
         quality=quality,
         environment=environment,
     )
@@ -74,32 +66,11 @@ def test_output_is_versioned_strict_and_preserves_catalog_identity(
     for value in values:
         assert value["schema_version"] == 1
         assert value["provider"] == "test"
-        assert value["timings"]["warmup_ms"] == 100
-        assert value["timings"]["measurement_time_ms"] == 500
-        assert value["timings"]["first_call_clock"] == "synchronized_wall"
-        assert value["timings"]["prepared_execution"]["median_ms"] == 1.0
-        assert value["timings"]["prepared_execution"]["clock"] == "device_event"
-        assert value["timings"]["operator_end_to_end"]["clock"] == "synchronized_wall"
+        assert value["timings"]["median_ms"] == 1.0
+        assert value["timings"]["clock"] == "synchronized_wall"
+        assert value["timings"]["sample_count"] == 3
         assert value["quality"]["sqnr_db"] is None
         assert value["environment"]["gpu_architecture"] == "SM120"
-
-
-def test_fixed_count_records_use_the_shared_schema_without_fake_phases(environment, tmp_path):
-    path = tmp_path / "samples.jsonl"
-    record = replace(
-        _record(environment), timings=SampleTimings(warmup_calls=1, samples_ms=(3.0, 1.0, 2.0))
-    )
-    write_records([record], OutputTarget(path, OutputFormat.JSONL))
-    value = json.loads(path.read_text())
-    assert value["schema_version"] == 1
-    assert value["environment"]["gpu_architecture"] == "SM120"
-    assert value["timings"]["samples_ms"] == [3.0, 1.0, 2.0]
-    assert value["timings"]["sample_count"] == 3
-    assert value["timings"]["operator_end_to_end"]["clock"] == "synchronized_wall"
-    assert value["timings"]["operator_end_to_end"]["median_ms"] == 2.0
-    assert "prepared_execution" not in value["timings"]
-    assert "warmup_ms" not in value["timings"]
-    assert "measurement_time_ms" not in value["timings"]
 
 
 def test_output_arguments_are_optional_and_mutually_exclusive(tmp_path: Path) -> None:

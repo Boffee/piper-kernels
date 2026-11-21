@@ -20,7 +20,14 @@ sys.meta_path.insert(0, WithoutTorchAO())
 import pytest
 
 raise SystemExit(pytest.main([
-    "tests/attention", "tests/triton", "-m", "not gpu", "--collect-only", "-q", "-n0",
+    "tests/attention",
+    "tests/triton",
+    "tests/test_architecture.py",
+    "-m",
+    "not gpu",
+    "--collect-only",
+    "-q",
+    "-n0",
 ]))
 """
     result = subprocess.run(

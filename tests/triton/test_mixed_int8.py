@@ -9,7 +9,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from lib.triton_inspection import compiled_artifact
+from _triton_inspection import compiled_artifact
 
 from piper_kernels._triton import mixed_int8
 from piper_kernels._triton.mixed_int8 import (

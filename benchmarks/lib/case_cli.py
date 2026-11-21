@@ -48,7 +48,6 @@ def apply_case(
     argv: Sequence[str] | None,
     *,
     attention: bool = False,
-    preparation: bool = False,
 ) -> argparse.Namespace:
     """Use a catalog case unchanged; custom shape flags describe separate experiments."""
     if args.case is None:
@@ -71,11 +70,11 @@ def apply_case(
         case = require_case(args.case, LinearCase)
         values = {
             "rows": case.rows,
-            "in_features": [case.in_features] if preparation else case.in_features,
+            "in_features": case.in_features,
+            "out_features": case.out_features,
+            "bias": case.bias,
             "input_activation": None,
         }
-        if not preparation:
-            values.update(out_features=case.out_features, bias=case.bias)
     values.update(dtype=case.dtype, seed=case.seed)
     set_case_arguments(args, argv, values)
     return args

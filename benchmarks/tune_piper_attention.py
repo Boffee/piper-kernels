@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
-from dataclasses import replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
-from typing import cast
 
 import torch
 from lib.attention import (
@@ -24,13 +23,15 @@ from lib.attention_tuning import (
 )
 from lib.case_cli import apply_case
 from lib.environment import capture_environment
-from lib.providers import BenchmarkProvider, Implementation
+from lib.providers import Implementation, Operation
 from lib.quality import measure_quality
 from lib.reporting import output_target
 from lib.tuning import (
+    TuningPhase,
     UnsupportedTuningCandidateError,
     boolean_tuning_axis,
     meets_minimum_sqnr,
+    phase_operation,
     report_tuning_run,
     tune_candidates,
     tuning_axis,
@@ -106,7 +107,7 @@ def _candidate_plans(
         tuning_axis(args.attention_kernel, production_plan.attention_kernel),
     )
     validate_tuning_candidate_count(axes, args.max_candidates)
-    plans = tuple(
+    return tuple(
         replace(
             production_plan,
             block_m=block_m,
@@ -140,7 +141,6 @@ def _candidate_plans(
             attention_kernel,
         ) in product(*axes)
     )
-    return plans
 
 
 def _plan_name(plan: PiperAttentionExecutionPlan) -> str:
@@ -160,18 +160,34 @@ def _plan_name(plan: PiperAttentionExecutionPlan) -> str:
     )
 
 
-def _make_candidate(
+@dataclass(frozen=True, slots=True)
+class _AttentionBackend[PreparedT]:
+    """Explicit prepare/launch pair bound by the Piper Attention tuner."""
+
+    prepare: Callable[..., PreparedT]
+    launch: Callable[[PreparedT], torch.Tensor]
+
+
+_DEFAULT_BACKEND = _AttentionBackend(
+    prepare=piper_attention_backend._prepare_piper_attention,
+    launch=piper_attention_backend._launch_piper_attention,
+)
+
+
+def _make_candidate[PreparedT](
     plan: PiperAttentionExecutionPlan,
     inputs: AttentionInputs,
     *,
     config: AttentionConfig,
     target: AcceleratorTarget,
-) -> Implementation[BenchmarkProvider[object, torch.Tensor]]:
+    phase: TuningPhase = TuningPhase.PREPARED_EXECUTION,
+    backend: _AttentionBackend[PreparedT] | None = None,
+) -> Implementation[Operation[torch.Tensor]]:
     name = _plan_name(plan)
     query, key, value = inputs
     scale = config.scale if config.scale is not None else query.shape[-1] ** -0.5
 
-    def make_provider() -> BenchmarkProvider[object, torch.Tensor]:
+    def build_operation() -> Operation[torch.Tensor]:
         if plan.use_tensor_descriptors and not target.is_cuda_capability(12):
             raise UnsupportedTuningCandidateError(
                 "the tensor-descriptor candidate currently targets SM12x"
@@ -181,27 +197,22 @@ def _make_candidate(
         except ValueError as error:
             raise UnsupportedTuningCandidateError(str(error)) from error
 
-        def prepare() -> object:
-            return piper_attention_backend._prepare_piper_attention(
-                query,
-                key,
-                value,
-                scale,
-                config.is_causal,
-                execution_plan=plan,
+        def bind[T](selected: _AttentionBackend[T]) -> Operation[torch.Tensor]:
+            return phase_operation(
+                lambda: selected.prepare(
+                    query,
+                    key,
+                    value,
+                    scale,
+                    config.is_causal,
+                    execution_plan=plan,
+                ),
+                selected.launch,
+                phase=phase,
+                synchronize=torch.cuda.synchronize,
             )
 
-        def run(prepared: object) -> torch.Tensor:
-            return piper_attention_backend._launch_piper_attention(
-                cast(piper_attention_backend._PreparedPiperAttention, prepared)
-            )
-
-        return BenchmarkProvider(
-            name=f"piper_attention_{name.replace('-', '_')}",
-            prepare=prepare,
-            run=run,
-            synchronize=torch.cuda.synchronize,
-        )
+        return bind(_DEFAULT_BACKEND) if backend is None else bind(backend)
 
     return Implementation(
         name=name,
@@ -210,7 +221,7 @@ def _make_candidate(
             "algorithm": "piper_attention",
             **plan.as_dict(),
         },
-        build=make_provider,
+        build=build_operation,
     )
 
 
@@ -255,6 +266,7 @@ def _main(argv: Sequence[str] | None = None) -> None:
             inputs,
             config=config,
             target=target,
+            phase=args.phase,
         )
         for plan in _candidate_plans(args, production_plan)
     )

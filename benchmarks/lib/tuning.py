@@ -1,4 +1,4 @@
-"""Offline configuration search for development benchmarks."""
+"""Offline configuration search over unified Operation implementations."""
 
 from __future__ import annotations
 
@@ -8,19 +8,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from functools import partial
-from typing import Any, TypeVar
+from typing import Any, Protocol
 
 from triton.runtime.errors import OutOfResources
 
 from .cases import catalog_metadata
 from .environment import EnvironmentInfo
-from .providers import (
-    BenchmarkProvider,
-    DistributionTimer,
-    Implementation,
-    ProviderPhase,
-    provider_phase_launch,
-)
+from .providers import Implementation, Operation, _no_sync
 from .quality import QualityMetrics
 from .reporting import (
     SCHEMA_VERSION,
@@ -30,8 +24,49 @@ from .reporting import (
 )
 from .timing import Timing, synchronized_wall_benchmark, triton_benchmark
 
-PreparedT = TypeVar("PreparedT")
-OutputT = TypeVar("OutputT")
+
+class TuningPhase(StrEnum):
+    """Execution boundary timed by offline schedule search."""
+
+    PREPARED_EXECUTION = "prepared_execution"
+    OPERATOR_END_TO_END = "operator_end_to_end"
+
+
+def phase_operation[PreparedT, OutputT](
+    prepare: Callable[[], PreparedT],
+    launch: Callable[[PreparedT], OutputT],
+    *,
+    phase: TuningPhase,
+    synchronize: Callable[[], None] = _no_sync,
+    configuration: Mapping[str, Any] | None = None,
+) -> Operation[OutputT]:
+    """Bind prepare/launch callables into one Operation for the selected tuning phase."""
+    if phase is TuningPhase.PREPARED_EXECUTION:
+        prepared = prepare()
+
+        def run() -> OutputT:
+            return launch(prepared)
+    else:
+
+        def run() -> OutputT:
+            return launch(prepare())
+
+    return Operation(
+        run=run,
+        synchronize=synchronize,
+        configuration=dict(configuration) if configuration else {},
+    )
+
+
+class DistributionTimer(Protocol):
+    """A timing adapter for one tuning measurement."""
+
+    def __call__(
+        self,
+        function: Callable[[], Any],
+        warmup_ms: int,
+        measurement_time_ms: int,
+    ) -> Timing: ...
 
 
 class TuningStatus(StrEnum):
@@ -54,7 +89,7 @@ class TuningRecord:
     candidate: str
     shape: Mapping[str, Any]
     configuration: Mapping[str, Any]
-    phase: ProviderPhase
+    phase: TuningPhase
     status: TuningStatus
     selected: bool
     warmup_ms: int
@@ -104,9 +139,9 @@ def add_tuning_arguments(parser: argparse.ArgumentParser) -> None:
     """Add controls shared by every offline tuning CLI."""
     parser.add_argument(
         "--phase",
-        type=ProviderPhase,
-        choices=tuple(ProviderPhase),
-        default=ProviderPhase.PREPARED_EXECUTION,
+        type=TuningPhase,
+        choices=tuple(TuningPhase),
+        default=TuningPhase.PREPARED_EXECUTION,
     )
     parser.add_argument("--warmup-ms", type=int, default=50)
     parser.add_argument("--measurement-time-ms", type=int, default=200)
@@ -187,21 +222,21 @@ def _reason(error: Exception) -> str:
 
 
 def _phase_timer(
-    provider: BenchmarkProvider[Any, Any],
-    phase: ProviderPhase,
+    operation: Operation[Any],
+    phase: TuningPhase,
     device_timer: DistributionTimer,
 ) -> DistributionTimer:
-    """Select the timer matching a provider execution boundary."""
-    if phase is ProviderPhase.PREPARED_EXECUTION:
+    """Select the timer matching a tuning execution boundary."""
+    if phase is TuningPhase.PREPARED_EXECUTION:
         return device_timer
     return partial(
         synchronized_wall_benchmark,
-        synchronize=provider.synchronize,
+        synchronize=operation.synchronize,
     )
 
 
-def _validate_tuning_run[PreparedT, OutputT](
-    candidates: Sequence[Implementation[BenchmarkProvider[PreparedT, OutputT]]],
+def _validate_tuning_run[OutputT](
+    candidates: Sequence[Implementation[Operation[OutputT]]],
     *,
     tuning: str,
     warmup_ms: int,
@@ -225,13 +260,13 @@ def _validate_tuning_run[PreparedT, OutputT](
         raise ValueError("tuning candidate names must be unique")
 
 
-def tune_candidates(  # noqa: PLR0913 - independent protocol, timing, and quality controls
-    candidates: Sequence[Implementation[BenchmarkProvider[PreparedT, OutputT]]],
+def tune_candidates[OutputT](  # noqa: PLR0913 - independent protocol, timing, and quality controls
+    candidates: Sequence[Implementation[Operation[OutputT]]],
     *,
     tuning: str,
     shape: Mapping[str, Any],
     environment: EnvironmentInfo,
-    phase: ProviderPhase = ProviderPhase.PREPARED_EXECUTION,
+    phase: TuningPhase = TuningPhase.PREPARED_EXECUTION,
     warmup_ms: int = 50,
     measurement_time_ms: int = 200,
     measure_candidate_quality: Callable[[OutputT], QualityMetrics] | None = None,
@@ -274,14 +309,13 @@ def tune_candidates(  # noqa: PLR0913 - independent protocol, timing, and qualit
         try:
             if candidate.unsupported_reason is not None:
                 raise UnsupportedTuningCandidateError(candidate.unsupported_reason)
-            provider = candidate.build()
+            operation = candidate.build()
             record = replace(
-                record, configuration={**candidate.configuration, **provider.configuration}
+                record, configuration={**candidate.configuration, **operation.configuration}
             )
-            launch = provider_phase_launch(provider, phase)
-            output = launch()
-            provider.synchronize()
-            timer = _phase_timer(provider, phase, device_timer)
+            output = operation.run()
+            operation.synchronize()
+            timer = _phase_timer(operation, phase, device_timer)
 
             quality = (
                 measure_candidate_quality(output) if measure_candidate_quality is not None else None
@@ -297,7 +331,7 @@ def tune_candidates(  # noqa: PLR0913 - independent protocol, timing, and qualit
                 )
                 continue
 
-            timing = timer(launch, warmup_ms, measurement_time_ms)
+            timing = timer(operation.run, warmup_ms, measurement_time_ms)
             records.append(
                 replace(
                     record,
