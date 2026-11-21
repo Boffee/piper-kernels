@@ -511,6 +511,7 @@ def _fuse_context(graph: torch.fx.Graph) -> bool:
 def fold_attention_projections(graph: torch.fx.Graph) -> bool:
     """Fold ConvRot INT8 Q/K/V projections into dense Piper operand preparation."""
     changed = _projection_views.normalize_projection_views(graph)
+    changed = linear_compile_fx.coalesce_input_casts(graph) or changed
     changed = _fold_query_projections(graph) or changed
     changed = _fuse_context(graph) or changed
     if changed:

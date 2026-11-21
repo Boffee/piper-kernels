@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import torch
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 
+from ._compile_fx import SEMANTIC_LINEAR_NAMES
 from ._preparation_sharing import tensor_metadata
 
 _RESHAPE_OPS = (
@@ -14,11 +15,6 @@ _RESHAPE_OPS = (
     torch.ops.aten.view.default,
     torch.ops.aten._unsafe_view.default,
 )
-_PROJECTION_NAMES = {
-    "piper_kernels::convrot_int8_linear",
-    "piper_kernels::nvfp4_linear",
-    "piper_kernels::convrot_nvfp4_linear",
-}
 
 
 def _reshape_input(node: torch.fx.Node) -> torch.fx.Node | None:
@@ -76,7 +72,7 @@ def _normalize_projection_view(restore: torch.fx.Node) -> bool:
         linear is None
         or linear.op != "call_function"
         or not isinstance(linear.target, torch._ops.OpOverload)
-        or linear.target._schema.name not in _PROJECTION_NAMES
+        or linear.target._schema.name not in SEMANTIC_LINEAR_NAMES
         or linear.kwargs
         or not linear.args
         or not isinstance(linear.args[0], torch.fx.Node)

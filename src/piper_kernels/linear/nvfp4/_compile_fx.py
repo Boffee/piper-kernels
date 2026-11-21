@@ -14,39 +14,6 @@ from piper_kernels.weights.nvfp4 import _layout
 
 from . import _validation
 
-
-def coalesce_input_casts(graph: torch.fx.Graph) -> bool:
-    """Share identical autocasts consumed exclusively by ordinary NVFP4 linears.
-
-    Post-AOT graphs represent input mutations as distinct values. Match exact
-    source/dtype identity and keep casts with external consumers independent,
-    so this does not change externally visible storage aliasing.
-    """
-    casts: dict[tuple[torch.fx.Node, torch.dtype], torch.fx.Node] = {}
-    changed = False
-    for node in list(graph.nodes):
-        converted = linear_fx.convert_dtype(node)
-        if converted is None or not node.users:
-            continue
-        source, dtype = converted
-        if any(
-            (user_bound := linear_fx.bind_call(user, torch.ops.piper_kernels.nvfp4_linear.default))
-            is None
-            or user_bound["input"] is not node
-            for user in node.users
-        ):
-            continue
-        key = (source, dtype)
-        previous = casts.get(key)
-        if previous is None:
-            casts[key] = node
-        else:
-            node.replace_all_uses_with(previous)
-            graph.erase_node(node)
-            changed = True
-    return changed
-
-
 type PreparedInputNodes = tuple[
     torch.fx.Node,
     torch.fx.Node,
@@ -356,7 +323,6 @@ __all__ = [
     "PreparedInputNodes",
     "PreparedLinearNodes",
     "SemanticLinearNodes",
-    "coalesce_input_casts",
     "emit_prepared_input",
     "emit_prepared_linear",
     "validated_prepared_linear",

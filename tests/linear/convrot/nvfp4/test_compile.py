@@ -226,6 +226,46 @@ def test_pass_does_not_rewrite_training_graph() -> None:
     assert str(graph) == original
 
 
+@pytest.mark.parametrize("external_consumer", [False, True])
+def test_pass_coalesces_duplicate_input_casts_and_shares_preparation(
+    external_consumer: bool,
+) -> None:
+    graph = torch.fx.Graph()
+    raw = _placeholder(graph, "raw", torch.empty(17, 256, device="meta", dtype=torch.float32))
+    cast_0 = graph.call_function(
+        torch.ops.prims.convert_element_type.default, (raw, torch.bfloat16)
+    )
+    cast_0.meta["val"] = torch.empty(17, 256, device="meta", dtype=torch.bfloat16)
+    cast_1 = graph.call_function(
+        torch.ops.prims.convert_element_type.default, (raw, torch.bfloat16)
+    )
+    cast_1.meta["val"] = torch.empty(17, 256, device="meta", dtype=torch.bfloat16)
+    _, qdata, scale, global_scale, activation_scale = _operands(
+        graph,
+        torch.empty(17, 256, device="meta", dtype=torch.bfloat16),
+    )
+    first = _linear(graph, cast_0, qdata, scale, global_scale, activation_scale)
+    second = _linear(graph, cast_1, qdata, scale, global_scale, activation_scale)
+    graph.output((first, second, cast_0) if external_consumer else (first, second))
+
+    _run_compile_pass(graph)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    assert targets.count(torch.ops.prims.convert_element_type.default) == (
+        2 if external_consumer else 1
+    )
+    assert targets.count(torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default) == (
+        0 if external_consumer else 1
+    )
+    assert targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == (
+        0 if external_consumer else 2
+    )
+    assert targets.count(torch.ops.piper_kernels.convrot_nvfp4_linear.default) == (
+        2 if external_consumer else 0
+    )
+    graph.lint()
+
+
 def test_compile_options_install_idempotent_pass() -> None:
     options = compile_options({"max_autotune": True})
 

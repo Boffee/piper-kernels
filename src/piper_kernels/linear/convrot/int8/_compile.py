@@ -198,8 +198,9 @@ def _fold_gelu_tanh_inputs(graph: torch.fx.Graph) -> bool:
 
 
 def fold_linear(graph: torch.fx.Graph) -> bool:
-    """Fold GELU-tanh inputs, share ConvRot INT8 preparation, and hoist all-gathers."""
+    """Coalesce input casts, fold GELU-tanh inputs, share preparation, and hoist all-gathers."""
     changed = projection_views.normalize_projection_views(graph)
+    changed = linear_fx.coalesce_input_casts(graph) or changed
     changed = _fold_gelu_tanh_inputs(graph) or changed
     changed = preparation_sharing.share_preparation(graph, _PREPARATION_RULES) or changed
     changed = _distributed_compile.fold_quantized_all_gather(graph) or changed

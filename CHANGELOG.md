@@ -54,6 +54,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Improved RTX 5090 (SM120) execution speed and reduced scratch memory across sparse Piper
   routing/attention, D128 Q/K/V projections, and large ConvRot INT8 linear, FFN, and
   fused residual projections (with minor rounding differences within INT8 tolerances).
+- `minimax_h3_vae_convrot_int8_compile_options` now defers to SM120's default Gluon TMA
+  plan while preserving its measured RDNA4 schedules.
 
 ### Fixed
 
@@ -62,6 +64,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Made runtime float-scalar validation (`scale`, `coarse_scale`, `norm_epsilon`,
   `softmax_scale`, and quantized weight update coefficients) safe for `SymFloat` inputs
   under `torch.compile(..., dynamic=True)` and automatic-dynamic compilation.
+- Coalesced identical input dtype casts (such as `torch.autocast` conversions) across
+  ConvRot INT8, NVFP4, and ConvRot NVFP4 semantic linears so mixed-precision autocast
+  graphs still share input preparation and fold SwiGLU/QKV fusions.
 
 ## [0.8.0rc6] - 2026-11-12
 

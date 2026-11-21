@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
@@ -76,8 +77,9 @@ _PREPARATION_RULES = (_PreparationRule(),)
 
 
 def fold_linear(graph: torch.fx.Graph) -> bool:
-    """Normalize projection views and share compatible ConvRot NVFP4 preparation."""
+    """Normalize projection views, coalesce input casts, and share ConvRot NVFP4 preparation."""
     changed = projection_views.normalize_projection_views(graph)
+    changed = linear_fx.coalesce_input_casts(graph) or changed
     return preparation_sharing.share_preparation(graph, _PREPARATION_RULES) or changed
 
 

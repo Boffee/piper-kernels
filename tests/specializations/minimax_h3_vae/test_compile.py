@@ -14,28 +14,21 @@ from piper_kernels.specializations.minimax_h3_vae._compile import (
 from piper_kernels.specializations.minimax_h3_vae._ops import _execution_plan
 
 _SM120 = AcceleratorTarget("cuda", "sm120")
+_GFX1200 = AcceleratorTarget("hip", "gfx1200")
 _GFX1201 = AcceleratorTarget("hip", "gfx1201")
 
 
+@pytest.mark.parametrize("rows", [1_797, 3_594, 7_188])
 @pytest.mark.parametrize(
-    ("shape", "expected"),
-    [
-        ((1_797, 2_048, 2_048), (128, 128, 128, 4, 2)),
-        ((1_797, 16_384, 2_048), (128, 128, 64, 8, 3)),
-        ((1_797, 2_048, 8_192), (128, 128, 128, 4, 2)),
-        ((3_594, 2_048, 2_048), (128, 128, 64, 8, 3)),
-        ((3_594, 16_384, 2_048), (128, 128, 64, 8, 3)),
-        ((3_594, 2_048, 8_192), (128, 128, 64, 8, 3)),
-        ((7_188, 2_048, 2_048), (128, 128, 128, 4, 2)),
-        ((7_188, 16_384, 2_048), (128, 128, 64, 8, 3)),
-        ((7_188, 2_048, 8_192), (128, 128, 128, 4, 2)),
-    ],
+    ("out_features", "in_features"),
+    [(2_048, 2_048), (6_144, 2_048), (8_192, 2_048), (16_384, 2_048), (2_048, 8_192)],
 )
-def test_sm120_schedule_covers_supported_batch_shapes(
-    shape: tuple[int, int, int],
-    expected: tuple[int, int, int, int, int],
+def test_sm120_defers_to_default_plan(
+    rows: int,
+    out_features: int,
+    in_features: int,
 ) -> None:
-    assert _schedule_for(shape, target=_SM120) == expected
+    assert _schedule_for((rows, out_features, in_features), target=_SM120) is None
 
 
 @pytest.mark.parametrize(
@@ -98,7 +91,7 @@ def _run_passes(
     graph: torch.fx.Graph,
     *,
     is_inference: bool = True,
-    target: AcceleratorTarget = _SM120,
+    target: AcceleratorTarget = _GFX1200,
 ) -> None:
     torch.fx.GraphModule({}, graph)
     if not is_inference:
@@ -113,8 +106,12 @@ def _run_passes(
     _specialize_linears(graph, target=target)
 
 
+@pytest.mark.parametrize("target", [_GFX1200, _SM120])
 @pytest.mark.parametrize("static", [False, True])
-def test_pass_specializes_h3_linears_after_generic_preparation_sharing(static) -> None:
+def test_pass_specializes_h3_linears_after_generic_preparation_sharing(
+    target: AcceleratorTarget,
+    static: bool,
+) -> None:
     graph = torch.fx.Graph()
     activation = _placeholder(
         graph,
@@ -142,15 +139,15 @@ def test_pass_specializes_h3_linears_after_generic_preparation_sharing(static) -
     ffn_activation = _placeholder(
         graph,
         "ffn_activation",
-        torch.empty(1_797, 2_048, dtype=torch.float16, device="meta"),
+        torch.empty(1_797, 8_192, dtype=torch.float16, device="meta"),
     )
-    w1_qdata = _placeholder(
+    down_qdata = _placeholder(
         graph,
-        "w1_qdata",
-        torch.empty(16_384, 2_048, dtype=torch.int8, device="meta"),
+        "down_qdata",
+        torch.empty(2_048, 8_192, dtype=torch.int8, device="meta"),
     )
-    w1_scale = _placeholder(graph, "w1_scale", torch.empty(16_384, 1, device="meta"))
-    ffn = _linear(graph, ffn_activation, w1_qdata, w1_scale)
+    down_scale = _placeholder(graph, "down_scale", torch.empty(2_048, 1, device="meta"))
+    ffn = _linear(graph, ffn_activation, down_qdata, down_scale)
     if static:
         with graph.inserting_before(query):
             input_scale = _placeholder(graph, "input_scale", torch.empty((), device="meta"))
@@ -158,7 +155,7 @@ def test_pass_specializes_h3_linears_after_generic_preparation_sharing(static) -
             node.args = (*node.args, None, input_scale)
     graph.output((attention, ffn))
 
-    _run_passes(graph)
+    _run_passes(graph, target=target)
     if static:
         assert all(
             node.args[-1] is input_scale
@@ -167,22 +164,31 @@ def test_pass_specializes_h3_linears_after_generic_preparation_sharing(static) -
         )
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    assert targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 2
-    assert (
-        targets.count(torch.ops.piper_kernels.minimax_h3_vae_convrot_int8_linear_prepared.default)
-        == 4
-    )
     assert targets.count(torch.ops.aten.scaled_dot_product_attention.default) == 1
-    assert torch.ops.piper_kernels.convrot_int8_linear_prepared.default not in targets
-    specialized_nodes = [
-        node
-        for node in graph.nodes
-        if node.target
-        == torch.ops.piper_kernels.minimax_h3_vae_convrot_int8_linear_prepared.default
-    ]
-    schedules = [node.args[-1] for node in specialized_nodes]
-    assert schedules.count([128, 128, 128, 4, 2]) == 3
-    assert schedules.count([128, 128, 64, 8, 3]) == 1
+    if target == _GFX1200:
+        assert targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 2
+        assert (
+            targets.count(
+                torch.ops.piper_kernels.minimax_h3_vae_convrot_int8_linear_prepared.default
+            )
+            == 4
+        )
+        assert torch.ops.piper_kernels.convrot_int8_linear_prepared.default not in targets
+        specialized_nodes = [
+            node
+            for node in graph.nodes
+            if node.target
+            == torch.ops.piper_kernels.minimax_h3_vae_convrot_int8_linear_prepared.default
+        ]
+        assert [node.args[-1] for node in specialized_nodes] == [[128, 128, 64, 8, 2]] * 4
+    else:
+        assert targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
+        assert targets.count(torch.ops.piper_kernels.convrot_int8_linear_prepared.default) == 3
+        assert targets.count(torch.ops.piper_kernels.convrot_int8_linear.default) == 1
+        assert (
+            torch.ops.piper_kernels.minimax_h3_vae_convrot_int8_linear_prepared.default
+            not in targets
+        )
     graph.lint()
 
 
@@ -195,7 +201,7 @@ def test_pass_leaves_unrecognized_shapes_and_training_graphs_unchanged() -> None
     graph.output(output)
     original = str(graph)
 
-    _run_passes(graph)
+    _run_passes(graph, target=_GFX1200)
 
     assert str(graph) == original
 
@@ -208,9 +214,9 @@ def test_pass_leaves_unrecognized_shapes_and_training_graphs_unchanged() -> None
     qdata = _placeholder(
         training_graph,
         "qdata",
-        torch.empty(16_384, 2_048, dtype=torch.int8, device="meta"),
+        torch.empty(2_048, 2_048, dtype=torch.int8, device="meta"),
     )
-    scale = _placeholder(training_graph, "scale", torch.empty(16_384, 1, device="meta"))
+    scale = _placeholder(training_graph, "scale", torch.empty(2_048, 1, device="meta"))
     output = _linear(training_graph, activation, qdata, scale)
     training_graph.output(output)
     original = str(training_graph)
@@ -226,9 +232,9 @@ def test_pass_leaves_exact_h3_shape_unchanged_on_unsupported_target() -> None:
     qdata = _placeholder(
         graph,
         "qdata",
-        torch.empty(16_384, 2_048, dtype=torch.int8, device="meta"),
+        torch.empty(2_048, 2_048, dtype=torch.int8, device="meta"),
     )
-    scale = _placeholder(graph, "scale", torch.empty(16_384, 1, device="meta"))
+    scale = _placeholder(graph, "scale", torch.empty(2_048, 1, device="meta"))
     output = _linear(graph, activation, qdata, scale)
     graph.output(output)
     original = str(graph)
