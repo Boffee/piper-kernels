@@ -212,6 +212,9 @@ def test_amd_activated_preparation_compiles(architecture, width, static):
     # BF16 inputs are widened on load; rotated/activated values stay FP32
     # until the terminal integer conversion, on every supported AMD target.
     assert "arith.truncf" not in compiled.asm["ttir"]
+    if not chunked:
+        assert "ocml_tanh" not in compiled.asm["llir"]
+        assert "v_exp_f32" in compiled.asm["amdgcn"]
 
     if static:
         assert "tt.reduce" not in compiled.asm["ttir"]

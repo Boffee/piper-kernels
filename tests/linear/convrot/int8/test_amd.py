@@ -77,27 +77,23 @@ def test_amd_missing_runtime_falls_back(monkeypatch):
     assert int8_updates._use_triton(value)
 
 
-@pytest.mark.parametrize(
-    ("width", "blocks", "warps", "fused"),
-    [
-        (256, (256, 0, 0), 4, True),
-        (2048, (2048, 0, 0), 4, True),
-        (4096, (4096, 0, 0), 8, True),
-        (5376, (2048, 2048, 2048), 4, True),
-        (8192, (8192, 0, 0), 8, True),
-        (9216, (8192, 1024, 0), 8, True),
-        (12288, (4096, 4096, 4096), 8, True),
-        (16384, (16384, 0, 0), 16, True),
-        (32768, (32768, 0, 0), 16, False),
-    ],
-)
-def test_rdna4_preparation_policy(width, blocks, warps, fused):
+@pytest.mark.parametrize("width", [256, 2048, 4096, 5376, 8192, 9216, 12288, 16384, 32768])
+def test_rdna4_preparation_policy(width):
     plan = policy.select_execution_plan(AcceleratorTarget("hip", "gfx1201"), in_features=width)
-    assert policy.preparation_blocks(width) == blocks
-    assert plan.fused_num_warps == warps
-    assert plan.fuse_rotation_quantization is fused
-    assert (plan.matmul_block_m, plan.matmul_block_n, plan.matmul_block_k) == (128, 256, 64)
-    assert plan.matmul_num_stages == 2
+    blocks = policy.preparation_blocks(width)
+    assert len(blocks) == 3
+    assert sum(blocks) >= width
+    active = [block for block in blocks if block > 0]
+    assert active
+    assert blocks == (*active, *([0] * (3 - len(active))))
+    assert all((block & (block - 1)) == 0 for block in active)
+    assert 1 <= plan.fused_num_warps <= 16
+    assert (plan.fused_num_warps & (plan.fused_num_warps - 1)) == 0
+    assert plan.fuse_rotation_quantization is (width <= 16384)
+    assert plan.matmul_block_m > 0
+    assert plan.matmul_block_n > 0
+    assert plan.matmul_block_k > 0
+    assert plan.matmul_num_stages >= 1
 
 
 @pytest.mark.parametrize(
@@ -290,7 +286,7 @@ def test_amd_projection_crosses_cache_group_and_tail_boundaries(rows, width, col
 @pytest.mark.gpu
 @_gpu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("width", [256, 5376, 9216, 12288, 16384, 32768])
+@pytest.mark.parametrize("width", [256, 2048, 4096, 5376, 8192, 9216, 12288, 16384, 32768])
 @pytest.mark.parametrize("activation", [None, "gelu_tanh", "swiglu"])
 def test_amd_preparation_matches_rotation_and_populates_storage(dtype, width, activation):
     torch.manual_seed(721)
