@@ -161,3 +161,47 @@ def test_long_context_local_query_matches_fp64(global_query_block, head_dim):
         assert error < 0.015, (head, error.item())
     assert (guarded[:8] == -123).all()
     assert (guarded[-8:] == -123).all()
+
+
+@pytest.mark.parametrize("kept", [1, 8, 9, 24, 25])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fused_amd_partial_chunk_bias_boundary_matches_reference(kept, head_dim):
+    sequence, blocks, heads = 1600, 25, 2
+    generator = torch.Generator(device="cuda").manual_seed(1703 + kept + head_dim)
+    q, k, v = [
+        torch.randn(
+            (1, sequence, heads, head_dim), dtype=torch.bfloat16, device="cuda", generator=generator
+        )
+        for _ in range(3)
+    ]
+    layout = _resolve_route_layout(
+        _normalize_head_keep_ratios((kept / blocks,) * heads), blocks, q.device
+    )
+    assert layout.head_keep_blocks.tolist() == [kept] * heads
+    routes = packed_routes_from_sequences(
+        q.transpose(1, 2), k.transpose(1, 2), layout, _MINMAX_ROUTING
+    )
+    backend = require_attention_backend(q.transpose(1, 2))
+    prepared = backend.prepare(
+        q.transpose(1, 2),
+        head_dim**-0.5,
+        sparse_key_blocks=blocks,
+        combined_key=k.transpose(1, 2),
+        combined_value=v.transpose(1, 2),
+    ).with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
+    expected = reference_sparse_piper_attention(
+        q, k, v, routes, sparse_key_blocks=blocks, scale=head_dim**-0.5
+    )
+    storage = torch.full((q.numel() + 16,), -123, device=q.device, dtype=q.dtype)
+    actual = storage[8:-8].view(q.shape)
+    prepared.launch(prepared.query, actual.transpose(1, 2))
+    error = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert torch.isfinite(actual).all()
+    assert error < 0.015, error.item()
+    assert (storage[:8] == -123).all()
+    assert (storage[-8:] == -123).all()

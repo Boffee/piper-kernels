@@ -315,7 +315,9 @@ def test_bound_context_owns_final_value_buffer_and_reuses_parameters(monkeypatch
     bound = bind_context(prepared.context)
     torch.cuda.synchronize()
     extra = torch.cuda.memory_allocated() - before
-    assert extra <= bound.parameters.numel() * bound.parameters.element_size() + 512
+    expected_parameters_bytes = prepared.context.key_scale.numel() * 4 * torch.float32.itemsize
+    assert expected_parameters_bytes < prepared.context.value.nbytes
+    assert extra <= expected_parameters_bytes + 512
     assert bound.context.value is prepared.context.value
     parameters = Mock(side_effect=AssertionError("parameters rebuilt during a query launch"))
     monkeypatch.setattr(backend, "prepare_parameters", parameters)

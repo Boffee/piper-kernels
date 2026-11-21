@@ -103,6 +103,7 @@ def test_fused_amd_compilation(
     if rocm_fences_only_lds():
         assert "global_inv" not in compiled.asm["amdgcn"]
     assert "ds_bpermute" not in compiled.asm["amdgcn"]
+    assert re.search(r"amdhsa_private_segment_fixed_size\s+0\b", compiled.asm["amdgcn"])
     assert compiled.metadata.shared <= 6208
 
 
@@ -122,6 +123,7 @@ def test_output_dtype_amd_compilation(dtype, head_dim, apply_coarse_residual):
     assert f'!tt.ptr<{dtype.replace("fp", "f")}> loc("output_ptr"' in compiled.asm["ttgir"]
     assert "tt.fp_to_fp" not in compiled.asm["ttgir"]
     assert compiled.asm["ttgir"].count("arith.truncf") == (1 if dtype == "fp16" else 0)
+    assert re.search(r"amdhsa_private_segment_fixed_size\s+0\b", compiled.asm["amdgcn"])
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
