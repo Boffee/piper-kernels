@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 
+from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     validate_routing_mode,
 )
@@ -51,8 +50,10 @@ def _validate_inputs(  # noqa: PLR0913
         head_dim=head_dim,
         bias=bias,
     )
-    if not math.isfinite(softmax_scale) or softmax_scale <= 0:
-        raise ValueError("Q projection softmax scale must be finite and positive")
+    validate_positive_finite_float(
+        softmax_scale,
+        "Q projection softmax scale must be finite and positive",
+    )
     return result
 
 

@@ -1,9 +1,10 @@
 """Shared validation for full-attention operators."""
 
-import math
 from collections.abc import Mapping
 
 import torch
+
+from piper_kernels._validation import validate_positive_finite_float
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_HEAD_DIMS = (64, 128)
@@ -112,7 +113,9 @@ def validate_attention_inputs(
             f"{operator} is an inference-only operator and does not support autograd"
         )
 
-    converted_scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
-    if not math.isfinite(converted_scale) or converted_scale <= 0:
-        raise ValueError(f"{operator} scale must be finite and positive, got {scale}")
-    return converted_scale
+    if scale is None:
+        return query.shape[-1] ** -0.5
+    return validate_positive_finite_float(
+        scale,
+        f"{operator} scale must be finite and positive",
+    )

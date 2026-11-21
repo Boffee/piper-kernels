@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
 from torchao.utils import TorchAOBaseTensor
 
+from piper_kernels._validation import validate_finite_float
 from piper_kernels.stochastic_quantization import signed_seed
 from piper_kernels.weights._views import require_untransposed
 
@@ -25,12 +25,11 @@ def validate_real_scalar(
     operation: str,
 ) -> float:
     """Normalize a real coefficient and reject invalid runtime inputs at the boundary."""
-    if value is None or isinstance(value, complex):
-        raise TypeError(f"{operation} {name} must be a real number, got {value}")
-    converted = float(value)
-    if not math.isfinite(converted):
-        raise ValueError(f"{operation} {name} must be finite, got {value}")
-    return converted
+    return validate_finite_float(
+        value,
+        f"{operation} {name} must be finite",
+        type_message=f"{operation} {name} must be a real number",
+    )
 
 
 def validate_rounding_seed(
