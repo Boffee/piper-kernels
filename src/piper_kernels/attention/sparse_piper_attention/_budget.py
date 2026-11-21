@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
+
+from piper_kernels._validation import validate_positive_finite_float
 
 _RATIO_SCALE = 1_000_000
 _UINT16_ROUTE_CAPACITY = 1 << 16
@@ -42,8 +43,15 @@ def _normalize_head_keep_ratios(
         if not ratios:
             raise ValueError("sparse Piper head keep ratios must be a nonempty vector")
 
-    if any(not math.isfinite(ratio) or not 0 < ratio <= 1 for ratio in ratios):
-        raise ValueError("sparse Piper head keep ratios must be finite and lie in (0, 1]")
+    for ratio in ratios:
+        if (
+            validate_positive_finite_float(
+                ratio,
+                "sparse Piper head keep ratios must be finite and lie in (0, 1]",
+            )
+            > 1
+        ):
+            raise ValueError("sparse Piper head keep ratios must be finite and lie in (0, 1]")
     units = tuple(round(ratio * _RATIO_SCALE) for ratio in ratios)
     if any(not 1 <= value <= _RATIO_SCALE for value in units):
         raise ValueError("sparse Piper head keep ratios exceed supported precision")

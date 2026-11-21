@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
 
 from piper_kernels._residual import ResidualAdd, validate_residual_add
+from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.convrot_int8_projection._validation import validate_qk_transform_inputs
@@ -431,8 +431,10 @@ def validate_projected_query_input(  # noqa: PLR0913
         norm_epsilon=query_norm_epsilon,
         name="Q",
     )
-    if not math.isfinite(softmax_scale) or softmax_scale <= 0:
-        raise ValueError("Q projection softmax scale must be finite and positive")
+    validate_positive_finite_float(
+        softmax_scale,
+        "Q projection softmax scale must be finite and positive",
+    )
 
 
 def build_query_chunk_projector(  # noqa: PLR0913, PLR0917

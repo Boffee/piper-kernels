@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 
+from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.attention.kernels.sparse_piper.layout import (
     QUERY_SCALE_ROWS,
     TILE_ROWS,
@@ -79,8 +78,10 @@ def _launch_query_range(  # noqa: PLR0913, PLR0917
         input_qdata.device,
         "Q projection",
     )
-    if not math.isfinite(softmax_scale) or softmax_scale <= 0:
-        raise ValueError("Q projection softmax scale must be finite and positive")
+    validate_positive_finite_float(
+        softmax_scale,
+        "Q projection softmax scale must be finite and positive",
+    )
     if chunk_rows is None:
         chunk_rows = sequence_length
     if (

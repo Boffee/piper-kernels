@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import math
 from typing import cast
 
 import torch
 
+from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._contracts import SUPPORTED_DTYPES
 from piper_kernels.attention.sparse_piper_attention._contracts import (
@@ -81,8 +81,10 @@ def validate_qk_epilogue(
         or any(not operand.is_contiguous() for operand in operands)
     ):
         raise ValueError(f"{name} requires contiguous FP16/BF16/FP32 norm and FP32 split-half RoPE")
-    if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
-        raise ValueError(f"{name} norm epsilon must be finite and positive")
+    validate_positive_finite_float(
+        norm_epsilon,
+        f"{name} norm epsilon must be finite and positive",
+    )
 
 
 def validate_block_lengths(

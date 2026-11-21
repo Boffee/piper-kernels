@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 
 import torch
 
+from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
@@ -230,10 +230,12 @@ def _validate_inputs(
         query_blocks=(sequence + _BLOCK_ROWS - 1) // _BLOCK_ROWS,
         context="sparse Piper",
     )
-    converted_scale = head_dim**-0.5 if scale is None else float(scale)
-    if not math.isfinite(converted_scale) or converted_scale <= 0:
-        raise ValueError("sparse Piper scale must be finite and positive")
-    return converted_scale
+    if scale is None:
+        return head_dim**-0.5
+    return validate_positive_finite_float(
+        scale,
+        "sparse Piper scale must be finite and positive",
+    )
 
 
 def _run_sparse_piper_attention(  # noqa: PLR0913
