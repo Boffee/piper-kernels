@@ -419,6 +419,7 @@ def _build(case: PipelineCase, device: torch.device, *, fused: bool) -> Operatio
         assert isinstance(passes, tuple)
         options["post_grad_custom_pre_pass"] = (*passes, capture)
         # Compiler options contain graph-pass objects outside Torch's public type annotation.
+        torch.compiler.reset()
         compiled = torch.compile(model, fullgraph=True, options=cast(Any, options))
         run = partial(compiled, hidden, cos, sin)
         run()
@@ -454,9 +455,15 @@ def implementations(case: PipelineCase, device: torch.device) -> list[Implementa
         fused_reason = "sparse projection/output compiler fusion requires equal Q/KV heads"
     return [
         Implementation(
-            "convrot_int8_materialized", partial(_build, case, device, fused=False), reason
+            "convrot_int8_materialized",
+            partial(_build, case, device, fused=False),
+            reason,
+            configuration={"compiled": False},
         ),
         Implementation(
-            "convrot_int8_fused", partial(_build, case, device, fused=True), fused_reason
+            "convrot_int8_fused",
+            partial(_build, case, device, fused=True),
+            fused_reason,
+            configuration={"compiled": True},
         ),
     ]

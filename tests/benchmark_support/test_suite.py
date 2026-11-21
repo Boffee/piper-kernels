@@ -216,3 +216,55 @@ def test_case_list_does_not_import_native_implementations(monkeypatch, capsys):
     monkeypatch.setattr(benchmark, "implementations", lambda *_args: pytest.fail("native import"))
     assert benchmark.main(["--list", "--case", "*video-high*", "--family", "attention"]) == 0
     assert "110592" in capsys.readouterr().out
+
+
+def test_compiled_implementation_resets_compiler_cache_on_exit(monkeypatch, environment):
+    resets = 0
+
+    def count_reset():
+        nonlocal resets
+        resets += 1
+
+    monkeypatch.setattr(torch.compiler, "reset", count_reset)
+    monkeypatch.setattr(
+        suite,
+        "synchronized_wall_benchmark",
+        lambda *_a, **_k: Timing.from_samples([1], ClockDomain.SYNCHRONIZED_WALL),
+    )
+
+    non_compiled = run_implementation(
+        named_case("linear-small"),
+        Implementation("non-compiled", lambda: Operation(lambda: torch.ones(4), _quality)),
+        device=torch.device("cpu"),
+        environment=environment,
+        measurement=Measurement(0, 1),
+    )
+    assert non_compiled.status == "ok"
+    assert resets == 0
+
+    compiled = run_implementation(
+        named_case("linear-small"),
+        Implementation(
+            "compiled",
+            lambda: Operation(lambda: torch.ones(4), _quality),
+            configuration={"compiled": True},
+        ),
+        device=torch.device("cpu"),
+        environment=environment,
+        measurement=Measurement(0, 1),
+    )
+    assert compiled.status == "ok"
+    assert resets == 1
+
+    def fail_build():
+        raise RuntimeError("compile failure")
+
+    failed = run_implementation(
+        named_case("linear-small"),
+        Implementation("compiled-fail", fail_build, configuration={"compiled": True}),
+        device=torch.device("cpu"),
+        environment=environment,
+        measurement=Measurement(0, 1),
+    )
+    assert failed.status == "failed"
+    assert resets == 2
