@@ -165,6 +165,8 @@ def run_implementation(
         )
     finally:
         del output, operation
+        if record.configuration.get("compiled"):
+            torch.compiler.reset()
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()

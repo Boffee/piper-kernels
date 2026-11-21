@@ -253,3 +253,24 @@ def test_build_samples_reference_then_releases_full_output(monkeypatch):
     assert operation.check(actual).metrics.relative_l2_error > 0
     actual[:, -1] = float("nan")
     assert operation.check(actual).metrics.actual_nonfinite_count == case.width
+
+
+def test_fused_pipeline_build_resets_dynamo_across_cases(monkeypatch):
+    original_compile = torch.compile
+
+    def compile_eager(model, *, fullgraph=False, options=None, **_kwargs):
+        return original_compile(model, fullgraph=fullgraph, backend="eager")
+
+    monkeypatch.setattr(
+        pipeline.Pipeline, "materialized", lambda self, hidden, cos, sin: torch.zeros_like(hidden)
+    )
+    monkeypatch.setattr(torch, "compile", compile_eager)
+    monkeypatch.setattr(pipeline.CaptureFusion, "check", lambda self: None)
+
+    torch.compiler.reset()
+    try:
+        with torch._dynamo.config.patch(recompile_limit=1):
+            pipeline._build(_case(id="rotary-32", rotary_dim=32), torch.device("cpu"), fused=True)
+            pipeline._build(_case(id="rotary-64", rotary_dim=64), torch.device("cpu"), fused=True)
+    finally:
+        torch.compiler.reset()
