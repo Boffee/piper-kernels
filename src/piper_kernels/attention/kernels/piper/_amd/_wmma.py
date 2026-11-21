@@ -9,11 +9,11 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 _INIT_ASM = gl.constexpr(
-    (
-        "v_wmma_i32_16x16x16_iu8 v[0:7], $9, $8, 0 neg_lo:[1,0,0]",
-        "v_wmma_i32_16x16x16_iu8 v[8:15], $9, $8, 0 neg_lo:[1,0,0]",
-        "v_wmma_i32_16x16x16_iu8 v[0:7], $9, $8, 0x3e22f983 neg_lo:[1,1,0]",
-        "v_wmma_i32_16x16x16_iu8 v[8:15], $9, $8, 0x3e22f983 neg_lo:[1,1,0]",
+    tuple(
+        f"v_wmma_i32_16x16x16_iu8 {dst}, $9, $8, {seed} neg_lo:[1,{signed},0]"
+        for signed in (0, 1)
+        for seed in ("0", "0x3e22f983")
+        for dst in ("v[0:7]", "v[8:15]")
     )
 )
 _ACCUMULATE_ASM = gl.constexpr(
@@ -39,13 +39,20 @@ _ACCUMULATE_CONSTRAINTS = gl.constexpr(
 
 
 @gluon.jit
-def _wmma_iu8(lhs_bits, rhs_bits, acc, bank: gl.constexpr, signed_rhs: gl.constexpr):
+def _wmma_iu8(
+    lhs_bits,
+    rhs_bits,
+    acc,
+    bank: gl.constexpr,
+    signed_rhs: gl.constexpr,
+    biased_init: gl.constexpr,
+):
     gl.static_assert(bank >= 0)
     gl.static_assert(bank <= 1)
-    variant: gl.constexpr = signed_rhs * 2 + bank
     if acc is None:
+        init_variant: gl.constexpr = (signed_rhs * 2 + biased_init) * 2 + bank
         return gl.inline_asm_elementwise(
-            _INIT_ASM[variant],
+            _INIT_ASM[init_variant],
             constraints=_INIT_CONSTRAINTS[bank],
             args=(lhs_bits, rhs_bits),
             dtype=(gl.int32,) * 8,
@@ -53,6 +60,7 @@ def _wmma_iu8(lhs_bits, rhs_bits, acc, bank: gl.constexpr, signed_rhs: gl.conste
             pack=1,
         )
     else:
+        variant: gl.constexpr = signed_rhs * 2 + bank
         return gl.inline_asm_elementwise(
             _ACCUMULATE_ASM[variant],
             constraints=_ACCUMULATE_CONSTRAINTS[bank],
@@ -75,14 +83,15 @@ def _wmma_iu8(lhs_bits, rhs_bits, acc, bank: gl.constexpr, signed_rhs: gl.conste
 
 
 @gluon.jit
-def uint8_int8_wmma(lhs_bits, rhs_bits, acc, bank: gl.constexpr):
+def uint8_int8_wmma(lhs_bits, rhs_bits, acc, bank: gl.constexpr, biased_init: gl.constexpr = False):
     """Unsigned P times signed V, physically transposed for wave-local fragments.
 
-    Pass ``acc=None`` on the first K step to seed the accumulator inline with 0
-    without materializing an eight-VGPR zero splat. Each explicit contiguous
-    bank describes the eight-VGPR tuple to the compiler without hidden clobbers.
+    Pass ``acc=None`` on the first K step to seed inline (``0`` by default;
+    ``biased_init=True`` uses ``0x3e22f983`` for single-K64 sums in
+    ``[-2,088,960, +2,072,640]`` without ``i32 -> f32``, whereas K128 must keep
+    ``False``). Contiguous explicit banks avoid eight-VGPR splats and hidden clobbers.
     """
-    return _wmma_iu8(lhs_bits, rhs_bits, acc, bank, 0)
+    return _wmma_iu8(lhs_bits, rhs_bits, acc, bank, 0, 1 if biased_init else 0)
 
 
 @gluon.jit
@@ -94,4 +103,4 @@ def int8_wmma(lhs_bits, rhs_bits, acc, bank: gl.constexpr):
     binade for ``_recover_scores`` without an ``i32 -> f32`` conversion or an
     eight-VGPR bias splat.
     """
-    return _wmma_iu8(lhs_bits, rhs_bits, acc, bank, 1)
+    return _wmma_iu8(lhs_bits, rhs_bits, acc, bank, 1, 1)

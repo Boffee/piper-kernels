@@ -208,7 +208,6 @@ def _dense_piper_kernel(  # noqa: PLR0915
                 wide_context_offsets,
                 head_dim,
                 two_tiles=False,
-                scalar_score_recovery=True,
             )
             scale = query_scale * gl.load(
                 key_scale_ptr + kv_batch_head * (key_storage // 64) + tile

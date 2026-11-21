@@ -95,7 +95,8 @@ def test_fused_amd_compilation(
         if "v_wmma_i32_16x16x16_iu8" in line
     ]
     assert any("neg_lo:[1,1,0]" in line for line in matrix_instructions)  # signed QK
-    assert any("neg_lo:[1,0,0]" in line for line in matrix_instructions)  # unsigned P, signed V
+    assert any(",0neg_lo:[1,0,0]" in line for line in matrix_instructions)  # zero-init K128 PV
+    assert all("0x3e22f983neg_lo:[1,0,0]" not in line for line in matrix_instructions)
     assert all("clamp" not in line for line in matrix_instructions)
     # Keep rotated QK, online softmax, and the optional coarse epilogue in FP32.
     assert "tt.fp_to_fp" not in compiled.asm["ttgir"]
