@@ -10,9 +10,8 @@ and sparse Piper attention about 3% slower.
    from 188 to 208 VGPRs and drops from eight waves to seven. Kernels that
    read :data:`USE_SCALAR_FMA` issue those FMAs as opaque scalar instructions
    instead. Remove this once Triton disables that vectorization for AMD again
-   or offers a per-kernel opt-out. Uses: ``_SCALAR_FMA``, ``scalar_fma``, and
-   ``qk_tiles(scalar_score_recovery=...)`` in the shared RDNA4 fragments, and
-   their dense Piper callers.
+   or offers a per-kernel opt-out. Uses: ``_SCALAR_FMA`` and ``scalar_fma`` in
+   the shared RDNA4 fragments, and their dense Piper caller.
 2. triton-lang/triton#10840 adds a scheduling barrier after every memory
    operation in a warp-pipeline stage. That keeps CDNA GEMM prefetches in order,
    but it pins Piper's K/V loads beside their WMMAs, so LLVM can no longer hoist

@@ -1,5 +1,6 @@
 """Offline coverage of dense RDNA4 signed QK and mixed-sign PV lowering."""
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -82,8 +83,9 @@ def test_dense_amd_compilation(head_dim, causal, dtype, wide):
         for line in compiled.asm["amdgcn"].splitlines()
         if "v_wmma_i32_16x16x16_iu8" in line
     ]
-    assert any("neg_lo:[1,1,0]" in line for line in instructions)
-    assert any("neg_lo:[1,0,0]" in line for line in instructions)
+    assert any("0x3e22f983neg_lo:[1,1,0]" in line for line in instructions)
+    assert any("0x3e22f983neg_lo:[1,0,0]" in line for line in instructions)
+    assert all(",0neg_lo:[1,0,0]" not in line for line in instructions)
     assert all("clamp" not in line for line in instructions)
     assert compiled.asm["ttgir"].count("arith.truncf") == 1  # final output only
     if rocm_fences_only_lds():
@@ -92,6 +94,7 @@ def test_dense_amd_compilation(head_dim, causal, dtype, wide):
     if torch.version.hip is not None or not amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS:
         assert "global_load_b64" not in compiled.asm["amdgcn"]
     assert compiled.asm["amdgcn"].count("v_div_scale_f32") == 2
+    assert re.search(r"amdhsa_private_segment_fixed_size\s+0\b", compiled.asm["amdgcn"])
 
 
 def test_dense_amd_gfx1200_smoke_compilation():
@@ -127,7 +130,7 @@ def test_dense_amd_scalar_fma_emits_no_vector_fma(head_dim):
     llvm_ir = _compile_llvm_ir_with_scalar_fma(True, head_dim)
     # RDNA4 has no packed FP32 FMA, so vector FMAs would only add register pressure.
     assert "@llvm.fma.v" not in llvm_ir
-    assert "v_fma_f32 $0, $1, 0x4c800000, $2" in llvm_ir  # QK score recovery
+    assert "v_fma_f32 $0, $1, $2, $3" in llvm_ir  # block_max score scaling
 
 
 @pytest.mark.skipif(

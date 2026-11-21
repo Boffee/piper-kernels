@@ -68,20 +68,8 @@ def scalar_fma(a, b, c):
 
 
 @gluon.jit
-def _recover_scores(biased, scalar: gl.constexpr):
-    """Recover exact integer QK sums from the binade the accumulator bias selects."""
-    if scalar and _SCALAR_FMA:
-        # A literal 2^26 and an SGPR offset keep this FMA scalar without
-        # spending VGPRs on splat constants; see scalar_fma.
-        offset = gl.full(biased.shape, -10680707.0, gl.float32, biased.type.layout)
-        return gl.inline_asm_elementwise(
-            "v_fma_f32 $0, $1, 0x4c800000, $2",
-            constraints="=v,v,s",
-            args=(biased, offset),
-            dtype=gl.float32,
-            is_pure=True,
-            pack=1,
-        )
+def _recover_scores(biased):
+    """Recover exact bounded integer dot sums seeded with ``0x3e22f983``."""
     return gl.fma(biased, 67108864.0, -10680707.0)
 
 
@@ -183,14 +171,11 @@ def qk_tiles(
     use_64bit_context_offsets: gl.constexpr,
     head_dim: gl.constexpr,
     two_tiles: gl.constexpr = True,
-    scalar_score_recovery: gl.constexpr = False,
 ):
     """Return Q64 scores for one K64 tile or two independently selected K64 tiles.
 
     Paired mode preserves sparse Piper's K128 layout. Single-tile mode ignores
     ``tile_1`` and returns K64 scores for dense Piper's per-tile recurrence.
-    ``scalar_score_recovery`` uses :func:`scalar_fma`'s form for score recovery,
-    which dense Piper needs; sparse Piper keeps plain FMAs, about 1% faster there.
     Warp-pipeline ``"qk"`` stages run at ``priority=3`` above ``"softmax"``
     (``priority=0``).
     """
@@ -211,9 +196,7 @@ def qk_tiles(
                 acc = int8_wmma(query[2 * k_pair], gl.load(pair_words), acc, column % 2)
                 acc = int8_wmma(query[2 * k_pair + 1], gl.load(pair_words + 1), acc, column % 2)
             result: gl.tensor = _matrix_fragment(acc)
-            results += (
-                _recover_scores(result.to(gl.float32, bitcast=True), scalar_score_recovery),
-            )
+            results += (_recover_scores(result.to(gl.float32, bitcast=True)),)
         with gl.amd.warp_pipeline_stage("qk", priority=3):
             pass
     return _join_matrix(results)
@@ -255,7 +238,7 @@ def compute_chunk_key_biases(
                 pair_words = (key_center_ptr + offset).to(gl.pointer_type(gl.uint64))
                 acc = int8_wmma(query[2 * k_pair], gl.load(pair_words), acc, 0)
                 acc = int8_wmma(query[2 * k_pair + 1], gl.load(pair_words + 1), acc, 0)
-            recovered = _recover_scores(_matrix_fragment(acc).to(gl.float32, bitcast=True), False)
+            recovered = _recover_scores(_matrix_fragment(acc).to(gl.float32, bitcast=True))
             column = gl.arange(0, 16, scale_layout)
             column_tile_index = tiles_shared.gather(half * 8 + column // 2, 0).to(offset_type)
             center_scales = gl.load(
@@ -443,9 +426,12 @@ def pv_tiles(
     """Accumulate D16 products into the already-rescaled numerator.
 
     Probability words follow the single-K64 or paired-K128 order from ``qk_tiles``;
-    V uses the packed WMMA layout. Single-tile mode ignores ``tile_1``.
+    V uses packed WMMA layout. Single-tile K64 ignores ``tile_1``, seeds ``0x3e22f983``
+    via ``biased_init``, and recovers FP32 via ``_recover_scores``; paired-K128 keeps
+    zero-init and ``i32 -> f32`` since sums can exceed that binade's negative bound.
     """
     head_dim: gl.constexpr = numerator.shape[2]
+    use_biased_init: gl.constexpr = not two_tiles
     packed = eight_fragments(probability) if two_tiles else four_fragments(probability)
     fragments = ()
     for k in gl.static_range(8 if two_tiles else 4):
@@ -472,15 +458,24 @@ def pv_tiles(
                 offset = (start[:, None] * head_dim + column[None, :] * 64 + token).to(offset_type)
                 pair_words = (value_ptr + offset).to(gl.pointer_type(gl.uint64))
                 acc = uint8_int8_wmma(
-                    fragments[2 * k_pair], gl.load(pair_words), acc, column_tile % 2
+                    fragments[2 * k_pair],
+                    gl.load(pair_words),
+                    acc,
+                    column_tile % 2,
+                    biased_init=use_biased_init,
                 )
                 acc = uint8_int8_wmma(
                     fragments[2 * k_pair + 1], gl.load(pair_words + 1), acc, column_tile % 2
                 )
             result: gl.tensor = _matrix_fragment(acc)
+            recovered = (
+                _recover_scores(result.to(gl.float32, bitcast=True))
+                if use_biased_init
+                else result.to(gl.float32)
+            )
             results += (
                 gl.fma(
-                    result.to(gl.float32),
+                    recovered,
                     current_weight[:, :, None],
                     gl.convert_layout(numerators[column_tile], MMA_LAYOUT),
                 ),
