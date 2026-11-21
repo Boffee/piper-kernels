@@ -23,8 +23,8 @@ from lib.timing import ClockDomain, PhaseTimings, Timing, triton_benchmark
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.sparse_piper_attention import _backend
+from piper_kernels.attention.sparse_piper_attention._contracts import _MINMAX_ROUTING
 from piper_kernels.attention.sparse_piper_attention._routing import routing_scores
-from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
 from piper_kernels.fusions.sparse_piper._output import DEFAULT_QUERY_CHUNK_ROWS
 
 _WARMUP_MS = 20

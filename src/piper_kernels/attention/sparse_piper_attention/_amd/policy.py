@@ -2,7 +2,7 @@
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-from .._plan import MinmaxScoreSchedule
+from .._contracts import MinmaxScoreSchedule
 
 _RDNA4_MINMAX_SMALL_QUERY_SCHEDULE = MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True)
 _RDNA4_MINMAX_LARGE_QUERY_SCHEDULE = MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True)

@@ -17,10 +17,10 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import (
     _backend,
+    _contracts,
     _quantized_dispatch,
     _routes,
     _routing,
-    _routing_modes,
     _summaries,
     dispatch,
 )
@@ -28,14 +28,16 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention._interfaces import AttentionBackend
-from piper_kernels.attention.sparse_piper_attention._plan import MinmaxScoreSchedule
+from piper_kernels.attention.sparse_piper_attention._contracts import (
+    AttentionBackend,
+    MinmaxScoreSchedule,
+    _SparsePiperRatioProfile,
+)
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_context_from_quantized,
     _prepare_sparse_piper_query_from_quantized,
     _PreparedSparsePiperAttention,
 )
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -76,13 +78,14 @@ def test_attention_selection_uses_operand_target(monkeypatch, target, kernel, he
     probe.assert_called_once_with(query.device)
 
 
-@pytest.mark.skipif(_backend.nvidia_async_copy_gluon is None, reason="requires Triton import")
+@pytest.mark.skipif(_backend.nvidia_gluon is None, reason="requires Triton import")
 def test_sm8x_attention_uses_its_own_launcher_and_shared_preparation():
     sm8x = _backend._nvidia_async_copy_attention
     sm120 = _backend._nvidia_tma_attention
     assert sm8x is not None
     assert sm120 is not None
-    assert sm8x.bind is _backend.nvidia_async_copy_gluon.bind_context
+    assert sm8x.bind is _backend.nvidia_gluon.bind_async_copy_context
+    assert sm120.bind is _backend.nvidia_gluon.bind_tma_context
     assert sm8x.bind is not sm120.bind
     assert sm8x.prepare is sm120.prepare
 
@@ -312,14 +315,14 @@ def test_scoring_orchestration_selects_minmax_only_and_forwards_scale(monkeypatc
     monkeypatch.setattr(_backend, "select_minmax_scores", select)
     assert (
         _routing.routing_scores(
-            query, primary, auxiliary, _routing_modes._MINMAX_ROUTING, score_scale=0.125
+            query, primary, auxiliary, _contracts._MINMAX_ROUTING, score_scale=0.125
         )
         is expected
     )
     select.assert_called_once_with(query, primary, auxiliary)
     score.assert_called_once_with(query, primary, auxiliary, score_scale=0.125)
     mean_scores = _routing.routing_scores(
-        query, primary, auxiliary[:, :, :0], _routing_modes._MEAN_ROUTING
+        query, primary, auxiliary[:, :, :0], _contracts._MEAN_ROUTING
     )
     torch.testing.assert_close(mean_scores, query @ primary.transpose(-1, -2))
     select.assert_called_once()
@@ -337,7 +340,7 @@ def test_score_fallback_keeps_autograd(monkeypatch, query_blocks):
         torch.randn(1, 2, blocks, 128, generator=generator, requires_grad=True)
         for blocks in (query_blocks, 3, 3)
     ]
-    result = _routing.routing_scores(*tensors, _routing_modes._MINMAX_ROUTING, score_scale=0.125)
+    result = _routing.routing_scores(*tensors, _contracts._MINMAX_ROUTING, score_scale=0.125)
     expected = torch.maximum(
         tensors[0] @ tensors[1].transpose(-1, -2) * 0.125,
         tensors[0] @ tensors[2].transpose(-1, -2) * 0.125,
@@ -403,13 +406,11 @@ def test_fused_operand_preparation_follows_summary_support(monkeypatch):
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("cuda", "sm89")
     )
     query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
-    selected = _backend.use_fused_operand_preparation(query, query, _routing_modes._MINMAX_ROUTING)
+    selected = _backend.use_fused_operand_preparation(query, query, _contracts._MINMAX_ROUTING)
     assert selected is (_backend.select_sequence_summaries(query, query) is not None)
     unsupported = torch.empty(1, 1, 128, 32, dtype=torch.bfloat16)
     assert (
-        _backend.use_fused_operand_preparation(
-            unsupported, unsupported, _routing_modes._MINMAX_ROUTING
-        )
+        _backend.use_fused_operand_preparation(unsupported, unsupported, _contracts._MINMAX_ROUTING)
         is False
     )
 
@@ -420,22 +421,15 @@ def test_mean_pool_routing_keeps_the_separate_summary_pass(monkeypatch):
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("cuda", "sm89")
     )
     query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
-    assert (
-        _backend.use_fused_operand_preparation(query, query, _routing_modes._MEAN_ROUTING) is False
-    )
-    assert (
-        _backend.use_fused_operand_preparation(query, query, _routing_modes._MINMAX_ROUTING) is True
-    )
+    assert _backend.use_fused_operand_preparation(query, query, _contracts._MEAN_ROUTING) is False
+    assert _backend.use_fused_operand_preparation(query, query, _contracts._MINMAX_ROUTING) is True
 
 
 def test_fused_operand_preparation_requires_native_preparation(monkeypatch):
     monkeypatch.setattr(_backend, "preparation", None)
     monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
     query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
-    assert (
-        _backend.use_fused_operand_preparation(query, query, _routing_modes._MINMAX_ROUTING)
-        is False
-    )
+    assert _backend.use_fused_operand_preparation(query, query, _contracts._MINMAX_ROUTING) is False
 
 
 @pytest.mark.parametrize("invalid", ["dtype", "width", "stride", "key_dtype", "device"])
@@ -563,13 +557,13 @@ def test_dense_orchestration_uses_selected_operations(
     # Both policy paths must use the backend already selected for this call.
     monkeypatch.setattr(
         dispatch,
-        "packed_routes_from_summaries",
+        "_packed_routes_from_validated_summaries",
         Mock(
             return_value=_routing.packed_routes_from_sequences(
                 query.transpose(1, 2),
                 key.transpose(1, 2),
                 _resolve_route_layout(_normalize_head_keep_ratios((keep_ratio,)), 2, query.device),
-                _routing_modes._MINMAX_ROUTING,
+                _contracts._MINMAX_ROUTING,
                 skip_dense_routing=backend.skip_dense_routing,
             )
         ),
@@ -640,14 +634,11 @@ def test_summaries_use_selected_operation_after_validation(monkeypatch):
     summarize = Mock(return_value=expected)
     select = Mock(return_value=summarize)
     monkeypatch.setattr(_backend, "select_sequence_summaries", select)
-    assert (
-        _summaries.sequence_block_summaries(query, query, _routing_modes._MINMAX_ROUTING)
-        is expected
-    )
+    assert _summaries.sequence_block_summaries(query, query, _contracts._MINMAX_ROUTING) is expected
     select.assert_called_once_with(query, query)
-    summarize.assert_called_once_with(query, query, _routing_modes._MINMAX_ROUTING, None)
+    summarize.assert_called_once_with(query, query, _contracts._MINMAX_ROUTING, None)
     with pytest.raises(ValueError, match="rank-four"):
-        _summaries.sequence_block_summaries(query[0], query, _routing_modes._MINMAX_ROUTING)
+        _summaries.sequence_block_summaries(query[0], query, _contracts._MINMAX_ROUTING)
     select.assert_called_once()
 
 
@@ -670,7 +661,7 @@ def _quantized_context_arguments(head_dim=128):
         "ratio_profile": _SparsePiperRatioProfile(_normalize_head_keep_ratios((0.5,))),
         "sparse_key_blocks": 2,
         "logical_sequence_length": 128,
-        "routing_mode": _routing_modes._MINMAX_ROUTING,
+        "routing_mode": _contracts._MINMAX_ROUTING,
     }
 
 
@@ -856,21 +847,28 @@ def test_context_rejects_invalid_storage_before_binding(monkeypatch, defect, mes
     bind.assert_not_called()
 
 
-@pytest.mark.skipif(_backend.nvidia_tma_gluon is None, reason="requires Triton import")
+@pytest.mark.skipif(_backend.nvidia_gluon is None, reason="requires Triton import")
 def test_tma_reuses_context_descriptors_across_query_windows(monkeypatch):
-    native = _backend.nvidia_tma_gluon
+    native = _backend.nvidia_gluon
     prepared = _prepared_attention(128, 2)
-    describe = Mock(side_effect=lambda *args: object())
+    descriptors = []
+
+    def make_descriptor(*args):
+        descriptor = object()
+        descriptors.append(descriptor)
+        return descriptor
+
+    describe = Mock(side_effect=make_descriptor)
     kernel = MagicMock()
     monkeypatch.setattr(native, "_descriptor", describe)
     monkeypatch.setattr(native, "_sparse_piper_attention_kernel", kernel)
     monkeypatch.setattr(native, "device_context", lambda device: nullcontext())
     monkeypatch.setattr(native, "install_uint8_int8_dot_hook", lambda: None)
-    launch = native.bind_context(prepared.context)
+    launch = native.bind_tma_context(prepared.context)
     assert describe.call_count == 2
     assert describe.call_args_list[0].args[0] is prepared.context.key
     assert describe.call_args_list[1].args[0] is prepared.context.value
-    key_descriptor, value_descriptor = launch.key_descriptor, launch.value_descriptor
+    key_descriptor, value_descriptor = descriptors[0], descriptors[1]
     for offset in (0, 1):
         local = _prepare_sparse_piper_query_from_quantized(
             prepared.query.data[:, :, offset * 64 : (offset + 1) * 64].contiguous(),
@@ -930,27 +928,27 @@ def test_shared_preparation_accepts_empty_routes_and_rejects_negative_counts(hea
         _prepared_attention(head_dim, -1)
 
 
-@pytest.mark.skipif(_backend.nvidia_tma_gluon is None, reason="requires Triton import")
-@pytest.mark.parametrize("module", ["nvidia_tma_gluon", "nvidia_async_copy_gluon"])
-def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch, module):
-    native = getattr(_backend, module)
+@pytest.mark.skipif(_backend.nvidia_gluon is None, reason="requires Triton import")
+@pytest.mark.parametrize("binder", ["bind_tma_context", "bind_async_copy_context"])
+def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch, binder):
+    native = _backend.nvidia_gluon
     prepared = _prepared_attention(128, 0)
     enter_device = Mock(side_effect=AssertionError("unsupported mode reached device execution"))
     monkeypatch.setattr(native, "device_context", enter_device)
     with pytest.raises(ValueError, match="skip_dense_routing requires NVIDIA D64"):
-        native.bind_context(prepared.context)(
+        getattr(native, binder)(prepared.context)(
             prepared.query, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
         )
     enter_device.assert_not_called()
 
 
-@pytest.mark.skipif(_backend.nvidia_async_copy_gluon is None, reason="requires Triton import")
+@pytest.mark.skipif(_backend.nvidia_gluon is None, reason="requires Triton import")
 @pytest.mark.parametrize("operand", ["query", "key", "value"])
 @pytest.mark.parametrize("defect", ["noncontiguous", "misaligned"])
 def test_async_copy_rejects_uncopyable_storage_before_device_execution(
     monkeypatch, operand, defect
 ):
-    native = _backend.nvidia_async_copy_gluon
+    native = _backend.nvidia_gluon
     prepared = _prepared_attention(128, 2)
     tensor = {
         "query": prepared.query.data,
@@ -970,7 +968,7 @@ def test_async_copy_rejects_uncopyable_storage_before_device_execution(
     enter_device = Mock(side_effect=AssertionError("unsupported storage reached device execution"))
     monkeypatch.setattr(native, "device_context", enter_device)
     with pytest.raises(ValueError, match="16-byte-aligned"):
-        native.bind_context(prepared.context)(
+        native.bind_async_copy_context(prepared.context)(
             prepared.query, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
         )
     enter_device.assert_not_called()
@@ -1007,7 +1005,7 @@ def test_sparse_orchestration_has_no_vendor_or_runtime_layout_knowledge():
         "_routing.py",
         "_summaries.py",
         "_prepared.py",
-        "_routing_modes.py",
+        "_contracts.py",
     ):
         source = (directory / name).read_text(encoding="utf-8")
         assert "sm120" not in source.lower()
@@ -1037,7 +1035,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 query = torch.zeros(1, 128, 1, 128, dtype=torch.bfloat16)
 assert _backend.select_attention_backend(query) is None
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
-from piper_kernels.attention.sparse_piper_attention._plan import AttentionSchedule
+from piper_kernels.attention.sparse_piper_attention._contracts import AttentionSchedule
 assert policy.skip_dense_routing(64)
 schedule = policy.select_sm120_attention_schedule(
     64, 32768, 32768, skip_dense_routing=True,

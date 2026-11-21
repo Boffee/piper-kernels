@@ -13,7 +13,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 
 from piper_kernels import SparsePiperAttention
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
+from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,

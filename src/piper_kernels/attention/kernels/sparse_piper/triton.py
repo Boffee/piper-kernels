@@ -8,6 +8,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from piper_kernels.attention.kernels.piper.triton import pack_amd_wmma_token
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
@@ -291,8 +292,7 @@ def value_storage_offsets(
     head = head.to(tl.int64)
     row = row.to(tl.int64)
     if value_format == _AMD_VALUE_FORMAT:
-        token = row % 64
-        token = (token & ~24) | ((token & 8) << 1) | ((token & 16) >> 1)
+        token = pack_amd_wmma_token(row % 64)
         return (
             (head * (storage_sequence_length // 64) + row // 64) * head_dim + feature
         ) * 64 + token

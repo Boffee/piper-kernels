@@ -100,7 +100,7 @@ def round_to_int8(values):
 def quantize_query_tile(
     values,
     group_valid,
-    softmax_scale: tl.constexpr,
+    softmax_scale,
     heads_per_program: tl.constexpr,
     head_dim: tl.constexpr,
     block_m: tl.constexpr,
@@ -267,14 +267,13 @@ def quantize_tile_centered_key_tile(
     )
 
 
-@triton.jit
-def quantize_query_per_thread_group(
+# Per-row scale strides follow the sequence length; specializing on their
+# divisibility would compile a new variant per length class for no benefit.
+@triton.jit(do_not_specialize=["query_length", "stride_sb", "stride_sh"])
+def quantize_query_per_thread_kernel(
     query_ptr,
     output_ptr,
     scale_ptr,
-    scale_group,
-    head,
-    batch,
     query_length,
     softmax_scale,
     stride_qb,
@@ -287,11 +286,11 @@ def quantize_query_per_thread_group(
     stride_sh,
     head_dim: tl.constexpr,
 ):
-    """Quantize one per-thread Q scale group for standalone or fused launchers."""
+    """Quantize one per-thread Q scale group (4 rows per thread, stride 8)."""
     # A head or sequence stride can fit INT32 while its row offset does not.
-    scale_group = scale_group.to(tl.int64)
-    head = head.to(tl.int64)
-    batch = batch.to(tl.int64)
+    scale_group = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    batch = tl.program_id(2).to(tl.int64)
     query_block = scale_group // 8
     thread = scale_group % 8
     offsets_n = query_block * 32 + tl.arange(0, 4) * 8 + thread
@@ -323,47 +322,6 @@ def quantize_query_per_thread_group(
         scale_ptr + batch * stride_sb + head * stride_sh + offsets_n,
         scale * (softmax_scale * _LOG2_E),
         mask=offsets_n < query_length,
-    )
-
-
-# Per-row scale strides follow the sequence length; specializing on their
-# divisibility would compile a new variant per length class for no benefit.
-@triton.jit(do_not_specialize=["query_length", "stride_sb", "stride_sh"])
-def quantize_query_per_thread_kernel(
-    query_ptr,
-    output_ptr,
-    scale_ptr,
-    query_length,
-    softmax_scale,
-    stride_qb,
-    stride_qh,
-    stride_qn,
-    stride_ob,
-    stride_oh,
-    stride_on,
-    stride_sb,
-    stride_sh,
-    head_dim: tl.constexpr,
-):
-    """Standalone launcher for the shared per-thread Q component."""
-    quantize_query_per_thread_group(
-        query_ptr,
-        output_ptr,
-        scale_ptr,
-        tl.program_id(0),
-        tl.program_id(1),
-        tl.program_id(2),
-        query_length,
-        softmax_scale,
-        stride_qb,
-        stride_qh,
-        stride_qn,
-        stride_ob,
-        stride_oh,
-        stride_on,
-        stride_sb,
-        stride_sh,
-        head_dim,
     )
 
 
@@ -402,180 +360,27 @@ def quantize_query_per_warp_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    values = rotate_signed_hadamard_heads(values, head_dim)
-    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
-    quantized = round_to_int8(values / scale)
-    tl.store(
-        output_ptr
-        + batch * stride_ob
-        + head * stride_oh
-        + offsets_n[:, None] * stride_on
-        + offsets_d[None, :],
-        quantized,
-        mask=mask,
-    )
-    tl.store(
-        scale_ptr + batch * stride_sb + head * stride_sh + scale_group,
-        scale * (softmax_scale * _LOG2_E),
-    )
-
-
-@triton.jit
-def quantize_key_per_thread_group(
-    key_ptr,
-    mean_ptr,
-    output_ptr,
-    scale_ptr,
-    scale_group,
-    head,
-    batch,
-    key_length,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_ob,
-    stride_oh,
-    stride_on,
-    stride_sb,
-    stride_sh,
-    heads,
-    head_dim: tl.constexpr,
-):
-    """Quantize one per-thread K scale group for standalone or fused launchers."""
-    scale_group = scale_group.to(tl.int64)
-    head = head.to(tl.int64)
-    batch = batch.to(tl.int64)
-    key_block = scale_group // 4
-    thread = scale_group % 4
-    group_offsets = tl.arange(0, 16)
-    offsets_n = key_block * 64 + (group_offsets // 2) * 8 + (group_offsets % 2) + thread * 2
-    offsets_d = tl.arange(0, head_dim)
-    mask = offsets_n[:, None] < key_length
-    mean = tl.load(mean_ptr + (batch * heads + head) * head_dim + offsets_d)
-    values = tl.load(
-        key_ptr
-        + batch * stride_kb
-        + head * stride_kh
-        + offsets_n[:, None] * stride_kn
-        + offsets_d[None, :],
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    values = tl.where(mask, values - mean[None, :], 0.0)
-    values = rotate_signed_hadamard_heads(values, head_dim)
-    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
-    quantized = round_to_int8(values / scale)
-    tl.store(
-        output_ptr
-        + batch * stride_ob
-        + head * stride_oh
-        + offsets_n[:, None] * stride_on
-        + offsets_d[None, :],
-        quantized,
-        mask=mask,
-    )
-    tl.store(
-        scale_ptr + batch * stride_sb + head * stride_sh + offsets_n,
-        scale,
-        mask=offsets_n < key_length,
-    )
-
-
-@triton.jit(do_not_specialize=["key_length", "heads", "stride_sb", "stride_sh"])
-def quantize_key_per_thread_kernel(
-    key_ptr,
-    mean_ptr,
-    output_ptr,
-    scale_ptr,
-    key_length,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_ob,
-    stride_oh,
-    stride_on,
-    stride_sb,
-    stride_sh,
-    heads,
-    head_dim: tl.constexpr,
-):
-    """Standalone launcher for the shared per-thread K component."""
-    quantize_key_per_thread_group(
-        key_ptr,
-        mean_ptr,
-        output_ptr,
-        scale_ptr,
-        tl.program_id(0),
-        tl.program_id(1),
-        tl.program_id(2),
-        key_length,
-        stride_kb,
-        stride_kh,
-        stride_kn,
-        stride_ob,
-        stride_oh,
-        stride_on,
-        stride_sb,
-        stride_sh,
-        heads,
+    quantized, stored_scale = quantize_query_tile(
+        tl.reshape(values, (32, 1, head_dim)),
+        tl.full((1, 1), True, dtype=tl.int1),
+        softmax_scale,
+        tl.constexpr(1),
         head_dim,
+        tl.constexpr(32),
+        tl.constexpr(32),
     )
-
-
-@triton.jit(do_not_specialize=["key_length", "heads"])
-def quantize_key_per_block_kernel(
-    key_ptr,
-    mean_ptr,
-    output_ptr,
-    scale_ptr,
-    key_length,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_ob,
-    stride_oh,
-    stride_on,
-    stride_sb,
-    stride_sh,
-    heads,
-    head_dim: tl.constexpr,
-    block_n: tl.constexpr,
-):
-    scale_group = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
-    batch = tl.program_id(2).to(tl.int64)
-    offsets_n = scale_group * block_n + tl.arange(0, block_n)
-    offsets_d = tl.arange(0, head_dim)
-    mask = offsets_n[:, None] < key_length
-    mean = tl.load(mean_ptr + (batch * heads + head) * head_dim + offsets_d)
-    values = tl.load(
-        key_ptr
-        + batch * stride_kb
-        + head * stride_kh
-        + offsets_n[:, None] * stride_kn
-        + offsets_d[None, :],
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    values = tl.where(mask, values - mean[None, :], 0.0)
-    values = rotate_signed_hadamard_heads(values, head_dim)
-    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
-    quantized = round_to_int8(values / scale)
     tl.store(
         output_ptr
         + batch * stride_ob
         + head * stride_oh
         + offsets_n[:, None] * stride_on
         + offsets_d[None, :],
-        quantized,
+        tl.reshape(quantized, (32, head_dim)),
         mask=mask,
     )
     tl.store(
         scale_ptr + batch * stride_sb + head * stride_sh + scale_group,
-        scale,
+        tl.reshape(stored_scale, ()),
     )
 
 
@@ -805,119 +610,3 @@ def prepare_query(
                 num_warps=4,
             )
         return query_int8, query_scale
-
-
-def prepare_key(
-    key: torch.Tensor,
-    key_mean: torch.Tensor,
-    *,
-    grouped: bool,
-    storage_key_length: int,
-    out: tuple[torch.Tensor, torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize centered K, optionally filling validated caller-owned storage."""
-    batch, heads, key_length, head_dim = key.shape
-    key_shape = (batch, heads, storage_key_length, head_dim)
-    key_int8 = (
-        out[0]
-        if out is not None
-        else (
-            torch.zeros(key_shape, device=key.device, dtype=torch.int8)
-            if storage_key_length != key_length
-            else torch.empty(key_shape, device=key.device, dtype=torch.int8)
-        )
-    )
-    if out is not None and storage_key_length != key_length:
-        key_int8.zero_()
-    with device_context(key.device):
-        if grouped:
-            scale_groups = int(triton.cdiv(key_length, _KEY_BLOCK))
-            key_scale = (
-                out[1]
-                if out is not None
-                else torch.empty(
-                    (batch, heads, scale_groups),
-                    device=key.device,
-                    dtype=torch.float32,
-                )
-            )
-            quantize_key_per_block_kernel[(scale_groups, heads, batch)](
-                key,
-                key_mean,
-                key_int8,
-                key_scale,
-                key_length,
-                key.stride(0),
-                key.stride(1),
-                key.stride(2),
-                key_int8.stride(0),
-                key_int8.stride(1),
-                key_int8.stride(2),
-                key_scale.stride(0),
-                key_scale.stride(1),
-                heads=heads,
-                head_dim=head_dim,
-                block_n=_KEY_BLOCK,
-                num_warps=4,
-            )
-        else:
-            key_scale = (
-                out[1]
-                if out is not None
-                else torch.empty(key.shape[:3], device=key.device, dtype=torch.float32)
-            )
-            quantize_key_per_thread_kernel[(triton.cdiv(key_length, _KEY_BLOCK) * 4, heads, batch)](
-                key,
-                key_mean,
-                key_int8,
-                key_scale,
-                key_length,
-                key.stride(0),
-                key.stride(1),
-                key.stride(2),
-                key_int8.stride(0),
-                key_int8.stride(1),
-                key_int8.stride(2),
-                key_scale.stride(0),
-                key_scale.stride(1),
-                heads=heads,
-                head_dim=head_dim,
-                num_warps=4,
-            )
-        return key_int8, key_scale
-
-
-def prepare_query_key(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    key_mean: torch.Tensor,
-    softmax_scale: float,
-    *,
-    grouped: bool,
-    storage_key_length: int,
-    storage_query_length: int | None = None,
-) -> PreparedInt8QueryKey:
-    """Prepare the shared INT8 Q/K contract consumed by quantized attention.
-
-    Attention-specific V encoding, routing summaries, descriptors, and output
-    storage deliberately remain outside this function. A fused projection
-    frontend can produce the same contract without materializing BF16 Q/K.
-    """
-    query_int8, query_scale = prepare_query(
-        query,
-        softmax_scale,
-        grouped=grouped,
-        storage_query_length=storage_query_length,
-    )
-    key_int8, key_scale = prepare_key(
-        key,
-        key_mean,
-        grouped=grouped,
-        storage_key_length=storage_key_length,
-    )
-    return PreparedInt8QueryKey(
-        query=query_int8,
-        key=key_int8,
-        query_scale=query_scale,
-        key_scale=key_scale,
-    )

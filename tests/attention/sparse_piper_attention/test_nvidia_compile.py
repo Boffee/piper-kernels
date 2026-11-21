@@ -16,8 +16,7 @@ from triton.experimental.gluon._runtime import GluonASTSource
 from piper_kernels._triton.mixed_int8 import _MixedInt8StageHook
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._nvidia import (
-    gluon_async_copy,
-    gluon_tma,
+    gluon,
     policy,
 )
 
@@ -89,7 +88,7 @@ def test_sm120_d128_recurrence_keeps_two_cta_smem_and_low_spills(
     query_heads_per_kv_head,
     max_spill_bytes,
 ):
-    kernel = gluon_tma._sparse_piper_attention_kernel
+    kernel = gluon._sparse_piper_attention_kernel
     constants = {
         "query_heads_per_kv_head": query_heads_per_kv_head,
         "head_dim": 128,
@@ -101,12 +100,13 @@ def test_sm120_d128_recurrence_keeps_two_cta_smem_and_low_spills(
         "mma_warps": 4,
         "skip_dense_routing": False,
         "mask_output_tail": mask_output_tail,
+        "use_tma": True,
     }
     signature = {name: "i32" for name in kernel.arg_names if name not in constants}
     signature.update(
-        query_desc=_tensor_descriptor_type(TILE_ROWS, 128),
-        key_desc=_tensor_descriptor_type(TILE_ROWS, 128),
-        value_desc=_tensor_descriptor_type(128, TILE_ROWS),
+        query_operand=_tensor_descriptor_type(TILE_ROWS, 128),
+        key_operand=_tensor_descriptor_type(TILE_ROWS, 128),
+        value_operand=_tensor_descriptor_type(128, TILE_ROWS),
         **_common_pointer_signature(),
     )
     source = GluonASTSource(
@@ -137,7 +137,7 @@ def test_sm120_d128_recurrence_keeps_two_cta_smem_and_low_spills(
 def test_sm120_d64_schedules_compile_within_budgets(
     monkeypatch, block_m, mma_warps, skip_dense_routing
 ):
-    kernel = gluon_tma._sparse_piper_attention_kernel
+    kernel = gluon._sparse_piper_attention_kernel
     constants = {
         "query_heads_per_kv_head": 1,
         "head_dim": 64,
@@ -149,12 +149,13 @@ def test_sm120_d64_schedules_compile_within_budgets(
         "mma_warps": mma_warps,
         "skip_dense_routing": skip_dense_routing,
         "mask_output_tail": False,
+        "use_tma": True,
     }
     signature = {name: "i32" for name in kernel.arg_names if name not in constants}
     signature.update(
-        query_desc=_tensor_descriptor_type(block_m, 64),
-        key_desc=_tensor_descriptor_type(TILE_ROWS, 64),
-        value_desc=_tensor_descriptor_type(64, TILE_ROWS),
+        query_operand=_tensor_descriptor_type(block_m, 64),
+        key_operand=_tensor_descriptor_type(TILE_ROWS, 64),
+        value_operand=_tensor_descriptor_type(64, TILE_ROWS),
         **_common_pointer_signature(),
     )
     source = GluonASTSource(
@@ -181,7 +182,7 @@ def test_sm120_d64_schedules_compile_within_budgets(
 @pytest.mark.parametrize("architecture", [80, 89])
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_sm8x_async_copy_kernels_compile_within_stack_budget(monkeypatch, architecture, head_dim):
-    kernel = gluon_async_copy._sparse_piper_attention_kernel
+    kernel = gluon._sparse_piper_attention_kernel
     constants = {
         "query_heads_per_kv_head": 3,
         "head_dim": head_dim,
@@ -189,14 +190,17 @@ def test_sm8x_async_copy_kernels_compile_within_stack_budget(monkeypatch, archit
         "mask_ragged_tail": False,
         "has_dense_query_suffix": True,
         "apply_coarse_residual": True,
+        "block_m": TILE_ROWS,
+        "mma_warps": 4,
         "skip_dense_routing": False,
         "mask_output_tail": True,
+        "use_tma": False,
     }
     signature = {name: "i32" for name in kernel.arg_names if name not in constants}
     signature.update(
-        query_ptr="*i8",
-        key_ptr="*i8",
-        value_ptr="*i8",
+        query_operand="*i8",
+        key_operand="*i8",
+        value_operand="*i8",
         **_common_pointer_signature(),
     )
     source = GluonASTSource(

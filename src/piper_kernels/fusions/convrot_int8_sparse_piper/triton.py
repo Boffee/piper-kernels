@@ -11,7 +11,7 @@ import triton
 from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
-from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
+from piper_kernels.attention.sparse_piper_attention._contracts import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 
 from . import _kernels

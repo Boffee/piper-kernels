@@ -8,7 +8,7 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
     TILE_ROWS,
     padded_sequence_length,
 )
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
     validate_routing_mode,

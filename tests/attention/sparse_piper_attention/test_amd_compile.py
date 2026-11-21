@@ -9,12 +9,7 @@ from _accelerators import rocm_fences_only_lds
 from triton.backends.compiler import GPUTarget
 from triton.experimental.gluon._runtime import GluonASTSource
 
-from piper_kernels.attention.sparse_piper_attention._amd.gluon import (
-    _LLVM_FN_ATTRS,
-    _requires_64bit_context_offsets,
-    _requires_64bit_query_offsets,
-    _sparse_piper_attention_kernel,
-)
+from piper_kernels.attention.sparse_piper_attention._amd import gluon as amd_gluon
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
 
@@ -29,14 +24,15 @@ def _compile_attention(
     output_dtype="bf16",
     query_heads_per_kv_head=1,
 ):
+    kernel = amd_gluon._sparse_piper_attention_kernel
     constants = {
         "head_dim": head_dim,
         "query_heads_per_kv_head": query_heads_per_kv_head,
-        "use_64bit_query_offsets": _requires_64bit_query_offsets(
+        "use_64bit_query_offsets": amd_gluon._requires_64bit_query_offsets(
             storage_sequence_length,
             head_dim,
         ),
-        "use_64bit_context_offsets": _requires_64bit_context_offsets(
+        "use_64bit_context_offsets": amd_gluon._requires_64bit_context_offsets(
             storage_sequence_length,
             head_dim,
         ),
@@ -44,9 +40,7 @@ def _compile_attention(
         "has_dense_query_suffix": has_dense_query_suffix,
         "apply_coarse_residual": apply_coarse_residual,
     }
-    signature = {
-        name: "i32" for name in _sparse_piper_attention_kernel.arg_names if name not in constants
-    }
+    signature = {name: "i32" for name in kernel.arg_names if name not in constants}
     signature.update(
         {
             "query_ptr": "*i8",
@@ -67,12 +61,12 @@ def _compile_attention(
         }
     )
     return triton.compile(
-        GluonASTSource(_sparse_piper_attention_kernel, signature, constexprs=constants),
+        GluonASTSource(kernel, signature, constexprs=constants),
         target=GPUTarget("hip", architecture, 32),
         options={
             "num_warps": 4,
             "num_stages": 1,
-            "llvm_fn_attrs": _LLVM_FN_ATTRS,
+            "llvm_fn_attrs": amd_gluon._LLVM_FN_ATTRS,
         },
     )
 
@@ -151,5 +145,23 @@ def test_runtime_lengths_support_wide_query_and_context_offsets(head_dim):
 def test_gqa_amd_compilation(query_heads_per_kv_head):
     compiled = _compile_attention(
         "gfx1201", False, True, False, query_heads_per_kv_head=query_heads_per_kv_head
+    )
+    assert compiled.asm["hsaco"]
+
+
+def test_prepare_parameters_compiles_with_runtime_count():
+    """Keep count non-constexpr so parameter folding does not recompile per shape."""
+    kernel = amd_gluon._prepare_parameters
+    assert "count" in kernel.do_not_specialize
+    signature = {
+        "key_scale_ptr": "*fp32",
+        "multiplier_ptr": "*fp32",
+        "table_ptr": "*fp32",
+        "count": "i32",
+    }
+    compiled = triton.compile(
+        GluonASTSource(kernel, signature, constexprs={}),
+        target=GPUTarget("hip", "gfx1201", 32),
+        options={"num_warps": 4},
     )
     assert compiled.asm["hsaco"]

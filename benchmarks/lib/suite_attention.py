@@ -18,9 +18,9 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
+from piper_kernels.attention.sparse_piper_attention._contracts import routing_mode_from_name
 from piper_kernels.attention.sparse_piper_attention._routes import PackedRoutes
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
-from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
 
 from .attention import (
     AttentionConfig,

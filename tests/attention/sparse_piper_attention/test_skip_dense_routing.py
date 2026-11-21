@@ -8,7 +8,7 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )

@@ -7,8 +7,8 @@ from dataclasses import dataclass
 import torch
 
 from . import _backend
-from ._budget import _UINT16_ROUTE_CAPACITY, _ResolvedRouteLayout
-from .coarse import coarse_attention
+from ._budget import _ResolvedRouteLayout
+from .coarse import _coarse_attention_unchecked
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +48,8 @@ class PackedRouteBuilder:
         skip_dense_routing: bool = False,
         force_tile_mask: torch.Tensor | None = None,
     ) -> None:
-        _validate_route_layout(layout, heads, sparse_key_blocks, device)
+        if layout.head_keep_blocks.shape != (heads,):
+            raise ValueError("sparse route layout does not match the attention head count")
         self._layout = layout
         self._full_keep = layout.keeps_all_blocks(sparse_key_blocks)
         skip_dense_routing = self._full_keep and skip_dense_routing
@@ -125,17 +126,6 @@ class PackedRouteAndCoarseBuilder:
         skip_dense_routing: bool = False,
         force_tile_mask: torch.Tensor | None = None,
     ) -> None:
-        if pooled_value.ndim != 4 or pooled_value.shape[-1] < 1:
-            raise ValueError("pooled V must use [batch,heads,key blocks,features]")
-        if pooled_value.shape[:2] != (batch, heads):
-            raise ValueError("pooled V must match the routing batch and heads")
-        coarse_key_blocks = pooled_value.shape[2]
-        if not sparse_key_blocks <= coarse_key_blocks:
-            raise ValueError("coarse attention must include every sparse key block")
-        if pooled_value.dtype is not torch.float32:
-            raise ValueError("pooled V must use FP32")
-        if pooled_value.device != device:
-            raise ValueError("pooled V and routing scores must share a device")
         self._route_builder = PackedRouteBuilder(
             layout,
             batch=batch,
@@ -151,7 +141,7 @@ class PackedRouteAndCoarseBuilder:
         self._coarse_output = pooled_value.new_empty(
             (batch, heads, query_blocks, pooled_value.shape[-1])
         )
-        self._written_query_ranges: list[tuple[int, int]] = []
+        self._written_query_blocks = 0
 
     def write(
         self,
@@ -160,57 +150,25 @@ class PackedRouteAndCoarseBuilder:
         query_block_offset: int,
     ) -> None:
         """Route over each score prefix without retaining the full coarse matrix."""
-        if scores.ndim != 4:
-            raise ValueError("coarse route scores must use rank-four block tensors")
-        if isinstance(query_block_offset, bool) or not isinstance(query_block_offset, int):
-            raise TypeError("coarse score query-block offset must be an integer")
         query_block_count = scores.shape[2]
         query_block_stop = query_block_offset + query_block_count
-        if not 0 <= query_block_offset < query_block_stop <= self._coarse_output.shape[2]:
-            raise ValueError("coarse score query-block range must fit the output")
-        if any(
-            query_block_offset < written_stop and written_start < query_block_stop
-            for written_start, written_stop in self._written_query_ranges
-        ):
-            raise ValueError("coarse score query-block ranges must not overlap")
         self._route_builder.write(
             scores[..., : self._sparse_key_blocks],
             query_block_offset=query_block_offset,
         )
-        self._coarse_output[:, :, query_block_offset:query_block_stop] = coarse_attention(
-            scores,
-            self._pooled_value,
+        self._coarse_output[:, :, query_block_offset:query_block_stop] = (
+            _coarse_attention_unchecked(scores, self._pooled_value)
         )
-        self._written_query_ranges.append((query_block_offset, query_block_stop))
+        self._written_query_blocks += query_block_count
 
     def finish(self) -> PackedRoutesAndCoarseOutput:
         """Return packed routes and their query-block-aligned coarse output."""
-        next_query_block = 0
-        for written_start, written_stop in sorted(self._written_query_ranges):
-            if written_start != next_query_block:
-                raise RuntimeError("coarse score chunks must cover every query block")
-            next_query_block = written_stop
-        if next_query_block != self._coarse_output.shape[2]:
+        if self._written_query_blocks != self._coarse_output.shape[2]:
             raise RuntimeError("coarse score chunks must cover every query block")
         return PackedRoutesAndCoarseOutput(
             routes=self._route_builder.routes,
             coarse_output=self._coarse_output,
         )
-
-
-def _validate_route_layout(
-    layout: _ResolvedRouteLayout,
-    heads: int,
-    sparse_key_blocks: int,
-    device: torch.device,
-) -> None:
-    """Validate metadata shared by every packed block-routing policy."""
-    if not 1 <= sparse_key_blocks <= _UINT16_ROUTE_CAPACITY:
-        raise ValueError("sparse routing requires between 1 and 65,536 sparse key blocks")
-    if layout.head_keep_blocks.shape != (heads,) or layout.route_head_offsets.shape != (heads + 1,):
-        raise ValueError("sparse route layout does not match the attention head count")
-    if layout.head_keep_blocks.device != device or layout.route_head_offsets.device != device:
-        raise ValueError("sparse route layout must share the attention device")
 
 
 def _select_portable_routes(

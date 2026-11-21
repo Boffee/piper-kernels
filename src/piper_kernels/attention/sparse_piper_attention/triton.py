@@ -19,7 +19,7 @@ from piper_kernels.attention.kernels.sparse_piper import (
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, ValueFormat
 
-from ._block_layout import valid_block_rows, validate_sparse_query_blocks
+from ._contracts import valid_block_rows
 from ._prepared import _PreparedSparsePiperOperands
 
 _BLOCK_N = 64
@@ -448,43 +448,18 @@ def _prepare_sparse_piper_operands(
     emit_summaries: bool = False,
     value_format: ValueFormat = ValueFormat.TRANSPOSED,
 ) -> _PreparedSparsePiperOperands:
-    """Quantize Q/K/V, optionally emitting min/max summaries from the Q/K pass.
+    """Quantize validated Q/K/V, optionally emitting min/max summaries from the Q/K pass.
 
     Mask padded rows in the mean and V kernels. The fused Q/K pass also masks
     padding, while the separate Q/K quantizer still needs zeroed copies.
     """
-    if (
-        combined_key.shape[0] != query.shape[0]
-        or combined_key.shape[2:] != query.shape[2:]
-        or combined_key.shape[1] < 1
-        or query.shape[1] % combined_key.shape[1]
-        or combined_value.shape != combined_key.shape
-        or not 1 <= sparse_key_blocks <= query.shape[2] // _BLOCK_N
-    ):
-        raise ValueError("combined Q/K/V and the sparse-prefix K64 count must agree")
-    if combined_key.stride(-1) != 1 or combined_value.stride(-1) != 1:
-        raise ValueError("combined K/V feature dimensions must be contiguous")
-
     batch, kv_heads, logical_sequence_length, head_dim = combined_key.shape
-    if block_lengths is not None and (
-        logical_sequence_length % _BLOCK_N
-        or block_lengths.shape != (logical_sequence_length // _BLOCK_N,)
-        or block_lengths.dtype is not torch.int32
-        or block_lengths.device != query.device
-        or not block_lengths.is_contiguous()
-    ):
-        raise ValueError("padded sparse Piper requires one contiguous device INT32 length per K64")
     if block_lengths is not None and not emit_summaries:
         valid_rows = valid_block_rows(block_lengths).reshape(-1)
         valid_rows = valid_rows[None, None, :, None]
         query = torch.where(valid_rows, query, 0)
     tile_count = (logical_sequence_length + _BLOCK_N - 1) // _BLOCK_N
     storage_sequence_length = tile_count * _BLOCK_N
-    validate_sparse_query_blocks(
-        sparse_query_blocks,
-        query_blocks=tile_count,
-        context="sparse Piper",
-    )
 
     query_summary = key_summary = key_aux = None
     if emit_summaries:

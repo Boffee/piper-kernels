@@ -9,16 +9,16 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, ValueFormat
 
 from ._amd import policy as amd_policy
-from ._dtype import SUPPORTED_DTYPES
-from ._force_tiles import build_portable_force_tile_bitmask
-from ._interfaces import (
+from ._contracts import (
+    _MEAN_ROUTING,
+    SUPPORTED_DTYPES,
     AttentionBackend,
     MinmaxScores,
     SelectRoutes,
     SequenceSummaries,
+    build_portable_force_tile_bitmask,
 )
 from ._nvidia import policy as nvidia_policy
-from ._routing_modes import _MEAN_ROUTING
 
 try:
     from . import triton as preparation
@@ -28,18 +28,11 @@ except ModuleNotFoundError as error:
     preparation = None
 
 try:
-    from ._nvidia import gluon_tma as nvidia_tma_gluon
+    from ._nvidia import gluon as nvidia_gluon
 except ModuleNotFoundError as error:
     if error.name is None or not error.name.startswith("triton"):
         raise
-    nvidia_tma_gluon = None
-
-try:
-    from ._nvidia import gluon_async_copy as nvidia_async_copy_gluon
-except ModuleNotFoundError as error:
-    if error.name is None or not error.name.startswith("triton"):
-        raise
-    nvidia_async_copy_gluon = None
+    nvidia_gluon = None
 
 try:
     from ._amd import gluon as amd_gluon
@@ -52,9 +45,9 @@ _nvidia_tma_attention = (
     AttentionBackend(
         prepare=preparation._prepare_sparse_piper_operands,
         value_format=ValueFormat.TRANSPOSED,
-        bind=nvidia_tma_gluon.bind_context,
+        bind=nvidia_gluon.bind_tma_context,
     )
-    if preparation is not None and nvidia_tma_gluon is not None
+    if preparation is not None and nvidia_gluon is not None
     else None
 )
 _nvidia_tma_attention_skip_dense_routing = (
@@ -66,9 +59,9 @@ _nvidia_async_copy_attention = (
     AttentionBackend(
         prepare=preparation._prepare_sparse_piper_operands,
         value_format=ValueFormat.TRANSPOSED,
-        bind=nvidia_async_copy_gluon.bind_context,
+        bind=nvidia_gluon.bind_async_copy_context,
     )
-    if preparation is not None and nvidia_async_copy_gluon is not None
+    if preparation is not None and nvidia_gluon is not None
     else None
 )
 _nvidia_async_copy_attention_skip_dense_routing = (

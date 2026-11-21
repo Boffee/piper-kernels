@@ -16,6 +16,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.piper.triton import conservative_value_log_scale_bound
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
@@ -25,7 +26,6 @@ from piper_kernels.attention.piper_attention._nvidia import policy as _policy
 from piper_kernels.attention.piper_attention._nvidia import triton as _backend
 from piper_kernels.attention.piper_attention._nvidia._plan import PiperAttentionExecutionPlan
 from piper_kernels.attention.piper_attention._nvidia.triton import (
-    _conservative_value_log_scale_bound,
     _launch_piper_attention,
     _prepare_piper_attention,
     _ptx_float32_to_uint8x4,
@@ -95,7 +95,7 @@ def _value_log_scale_bound_kernel(input_ptr, output_ptr, elements: tl.constexpr)
     offsets = tl.program_id(0) * 256 + tl.arange(0, 256)
     mask = offsets < elements
     multipliers = tl.load(input_ptr + offsets, mask=mask)
-    bounds = _conservative_value_log_scale_bound(multipliers)
+    bounds = conservative_value_log_scale_bound(multipliers)
     tl.store(output_ptr + offsets, bounds, mask=mask)
 
 

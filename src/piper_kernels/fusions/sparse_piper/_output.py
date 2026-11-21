@@ -10,8 +10,10 @@ import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
-from piper_kernels.attention.sparse_piper_attention._dtype import validate_output_dtype
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
+from piper_kernels.attention.sparse_piper_attention._contracts import (
+    _SparsePiperRatioProfile,
+    validate_output_dtype,
+)
 from piper_kernels.fusions.attention import _output as output_pipeline
 
 if TYPE_CHECKING:

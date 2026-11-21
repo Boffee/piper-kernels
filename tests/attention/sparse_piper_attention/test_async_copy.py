@@ -14,6 +14,10 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
+from piper_kernels.attention.sparse_piper_attention._contracts import (
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
+)
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_context_from_quantized,
@@ -21,10 +25,6 @@ from piper_kernels.attention.sparse_piper_attention._prepared import (
     _PreparedSparsePiperAttention,
 )
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
-    _MEAN_ROUTING,
-    _MINMAX_ROUTING,
-)
 
 pytestmark = [
     pytest.mark.gpu,
@@ -35,9 +35,8 @@ pytestmark = [
     ),
 ]
 
-if _backend.nvidia_async_copy_gluon is not None:
-    from piper_kernels.attention.sparse_piper_attention._nvidia import gluon_async_copy as native
-    from piper_kernels.attention.sparse_piper_attention._nvidia import gluon_tma as sm120
+if _backend.nvidia_gluon is not None:
+    from piper_kernels.attention.sparse_piper_attention._nvidia import gluon as native
 
 
 def _prepare(
@@ -369,7 +368,7 @@ def test_query_ranges_local_storage_and_graph_replay(skip_dense_routing):
     torch.testing.assert_close(replayed, expected, atol=0, rtol=0)
 
 
-def _jit_arguments(module, prepared, output, **kwargs):
+def _jit_arguments(bind, prepared, output, **kwargs):
     """Return a launcher's grid, kernel arguments, and options without launching."""
     captured = {}
 
@@ -380,12 +379,12 @@ def _jit_arguments(module, prepared, output, **kwargs):
 
             return run
 
-    kernel = module._sparse_piper_attention_kernel
-    module._sparse_piper_attention_kernel = _Capture()
+    kernel = native._sparse_piper_attention_kernel
+    native._sparse_piper_attention_kernel = _Capture()
     try:
-        module.bind_context(prepared.context)(prepared.query, output, **kwargs)
+        bind(prepared.context)(prepared.query, output, **kwargs)
     finally:
-        module._sparse_piper_attention_kernel = kernel
+        native._sparse_piper_attention_kernel = kernel
     return captured
 
 
@@ -431,28 +430,31 @@ def test_launch_specializes_no_more_finely_than_sm120(
         kwargs["coarse_gate"] = torch.randn(
             1, rows, heads, head_dim, device="cuda", dtype=torch.bfloat16
         )
-    sm8x = _jit_arguments(native, prepared, output, **kwargs)
-    reference = _jit_arguments(sm120, prepared, output, **kwargs)
-    sm8x_names = native._sparse_piper_attention_kernel.arg_names
-    sm120_arguments = dict(
-        zip(sm120._sparse_piper_attention_kernel.arg_names, reference["args"], strict=True)
-    )
-    assert set(sm120_arguments) - set(sm8x_names) == {
-        "query_desc",
-        "key_desc",
-        "value_desc",
-        "block_m",
-        "mma_warps",
-    }
+    sm8x = _jit_arguments(native.bind_async_copy_context, prepared, output, **kwargs)
+    reference = _jit_arguments(native.bind_tma_context, prepared, output, **kwargs)
+    arg_names = native._sparse_piper_attention_kernel.arg_names
+    sm120_arguments = dict(zip(arg_names, reference["args"], strict=True))
     assert sm8x["grid"] == ((rows + 63) // 64, *reference["grid"][1:])
     options = {**reference["options"], "num_warps": 4}
     if head_dim == 64:
         options["maxnreg"] = 168
     assert sm8x["options"] == options
-    sm8x_arguments = dict(zip(sm8x_names, sm8x["args"], strict=True))
+    sm8x_arguments = dict(zip(arg_names, sm8x["args"], strict=True))
+    assert sm8x_arguments["use_tma"] is False
+    assert sm120_arguments["use_tma"] is True
+    assert sm8x_arguments["block_m"] == 64
+    assert sm8x_arguments["mma_warps"] == 4
     assert sm8x_arguments["mask_output_tail"] is (rows % 64 != 0)
     for name, actual in sm8x_arguments.items():
-        if name in ("query_ptr", "key_ptr", "value_ptr", "mask_output_tail"):
+        if name in (
+            "query_operand",
+            "key_operand",
+            "value_operand",
+            "block_m",
+            "mma_warps",
+            "mask_output_tail",
+            "use_tma",
+        ):
             continue
         expected = sm120_arguments[name]
         if isinstance(expected, torch.Tensor):

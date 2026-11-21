@@ -7,13 +7,16 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 
 from . import _backend
 from ._budget import _resolve_route_layout, _ResolvedRouteLayout
-from ._dtype import validate_output_dtype
-from ._force_tiles import validate_force_tiles
-from ._interfaces import LaunchAttention
+from ._contracts import (
+    LaunchAttention,
+    _SparsePiperRatioProfile,
+    validate_force_tiles,
+    validate_output_dtype,
+    validate_routing_mode,
+)
 from ._prepared import (
     _prepare_sparse_piper_context_from_quantized,
     _prepare_sparse_piper_query_from_quantized,
@@ -23,9 +26,6 @@ from ._prepared import (
 from ._routing import (
     packed_routes_and_coarse_from_summaries,
     packed_routes_from_summaries,
-)
-from ._routing_modes import (
-    validate_routing_mode,
 )
 from .coarse import _validate_coarse_key_blocks
 

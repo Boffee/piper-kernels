@@ -1,11 +1,30 @@
-"""RDNA4 dense Piper: per-token V scaling, K1024+V1024 centering, and Q64/K64 recurrence."""
+"""RDNA4 dense Piper: per-token V scaling, K1024+V1024 centering, and Q64/K64 recurrence.
+
+Architecture and codegen behavior:
+- Uses four wave32 warps and Q64/K64 tiles with Q32/K64 scale groups. Supports
+  causal attention (traversing longest query prefixes first), rectangular
+  non-causal attention, ragged tails, outer strides, and GQA/MQA. V preparation
+  writes initialized padding directly into packed WMMA storage, avoiding a
+  full-size transpose/repacking allocation.
+- Softmax processes 16-column fragments, combining score scaling with FP32 maxima
+  and exponential arguments while warp-pipeline stages prioritize QK/PV matrix
+  work over softmax. Probability rounding uses the logical K64 tile's maximum and
+  each token's V scale with round-to-nearest-even packing; the epilogue multiplies
+  by the per-row reciprocal of ``max(denominator, 1e-30) * 255.0``. Interior tiles
+  omit elementwise masks; key tails and causal diagonals retain them.
+- Launches in WGP mode (``-cumode``) with ``amd_compiler_workarounds.LDS_ONLY_FENCE_ATTRS``
+  so workgroup fences synchronize without invalidating shared L0/L1 caches across
+  CUs. On affected Triton 3.9 builds, ``amd_compiler_workarounds`` also enables
+  scalar ``v_fma_f32`` score FMAs (avoiding LLVM SLP vectorization register bloat)
+  and unpinned warp-pipeline loads (preserving K/V load hoisting and pairing).
+- ``gfx1201`` has hardware coverage on RX 9070 XT; ``gfx1200`` has offline
+  compilation coverage only.
+"""
 
 # Gluon device types and layouts are not Python runtime values.
 # ruff: noqa: ANN001, ANN202, PLR0913, PLR0917
 # pyright: reportArgumentType=false, reportAssignmentType=false, reportCallIssue=false
 # pyright: reportGeneralTypeIssues=false, reportIndexIssue=false, reportAttributeAccessIssue=false
-
-from dataclasses import dataclass
 
 import torch
 import triton
@@ -26,10 +45,14 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
     rescale_numerator,
     scalar_fma,
 )
+from piper_kernels.attention.kernels.piper.gluon import advance_tile_max
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 
 from .. import _quantization
 from .._validation import (
+    PreparedAttention,
+    PreparedContext,
+    PreparedQuery,
     resolve_query_window,
     validate_output_buffer,
     validate_query_offset,
@@ -79,26 +102,6 @@ def _softmax_tile(scores, block_max, scale, multiplier):
         concat_columns(packed_fragments[2], packed_fragments[3]),
     )
     return packed, (sums[0] + sums[1]) + (sums[2] + sums[3])
-
-
-@gluon.jit
-def _advance_tile_max(running_max, running_bias, block_max, k_bias):
-    """Update winner-frame running maximum across chunks without round-tripping."""
-    has_block = block_max != -float("inf")
-    has_running = running_max != -float("inf")
-    raw_delta = (block_max - running_max) + (k_bias - running_bias)
-    delta = gl.where(
-        has_block,
-        gl.where(has_running, raw_delta, float("inf")),
-        -float("inf"),
-    )
-    tile_wins = delta > 0.0
-    next_max = gl.where(tile_wins, block_max, running_max)
-    next_bias = gl.where(tile_wins, k_bias, running_bias)
-    decay = gl.exp2(-gl.abs(delta))
-    old_weight = gl.where(tile_wins, decay, 1.0)
-    current_weight = gl.where(tile_wins, 1.0, decay)
-    return next_max, next_bias, old_weight, current_weight
 
 
 @gluon.jit(
@@ -229,7 +232,7 @@ def _dense_piper_kernel(  # noqa: PLR0915
                 scalar_fma(scores, scale[:, :, None], log_scale[:, None, :]),
                 2,
             )
-            next_max, next_bias, old_weight, current_weight = _advance_tile_max(
+            next_max, next_bias, old_weight, current_weight = advance_tile_max(
                 running_max,
                 running_bias,
                 block_max,
@@ -265,41 +268,6 @@ def _dense_piper_kernel(  # noqa: PLR0915
     )
 
 
-@dataclass(frozen=True, slots=True)
-class PreparedContext:
-    """Reusable K/V operands whose storage scales with KV heads."""
-
-    key: torch.Tensor
-    value: torch.Tensor
-    key_scale: torch.Tensor
-    key_center: torch.Tensor
-    multiplier: torch.Tensor
-    log_scale: torch.Tensor
-    value_mean: torch.Tensor
-    key_length: int
-    is_causal: bool
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedQuery:
-    """Quantized Q with its unpadded logical shape and original floating dtype."""
-
-    data: torch.Tensor
-    scale: torch.Tensor
-    shape: tuple[int, int, int, int]
-    dtype: torch.dtype
-    global_row_offset: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedAttention:
-    """Prepared K/V and Q with one reusable output for full attention."""
-
-    context: PreparedContext
-    query: PreparedQuery
-    output: torch.Tensor
-
-
 def prepare_context(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -323,8 +291,8 @@ def prepare_context(
         value=packed_value,
         key_scale=key_scale,
         key_center=key_center,
-        multiplier=multiplier,
-        log_scale=log_scale,
+        value_scale_multiplier=multiplier,
+        value_log_scale=log_scale,
         value_mean=value_mean,
         key_length=key.shape[2],
         is_causal=is_causal,
@@ -391,8 +359,8 @@ def _launch_window_into(
             query.scale,
             context.key_scale,
             context.key_center,
-            context.multiplier,
-            context.log_scale,
+            context.value_scale_multiplier,
+            context.value_log_scale,
             context.value_mean,
             output,
             query_start,

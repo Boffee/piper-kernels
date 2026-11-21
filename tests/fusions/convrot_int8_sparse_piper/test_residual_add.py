@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from piper_kernels import SparsePiperAttention
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
+from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 
 from ._helpers import output_available
