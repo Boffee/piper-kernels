@@ -13,16 +13,10 @@ from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_D
 from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
 from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
+from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-from piper_kernels.linear.convrot.nvfp4 import (
-    _ops as convrot_nvfp4_ops,  # noqa: F401 - registers convrot_nvfp4_linear
-)
-from piper_kernels.linear.nvfp4 import (
-    _compile_fx,
-)
-from piper_kernels.linear.nvfp4 import (
-    _ops as nvfp4_ops,  # noqa: F401 - registers nvfp4_linear
-)
+from piper_kernels.linear.nvfp4 import _compile_fx
+from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops  # noqa: F401 - registers nvfp4_linear
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
 from . import (
@@ -41,24 +35,8 @@ type _PreparedGateProjectionNodes = tuple[
 ]
 type _PreparedQueryProjectionNodes = tuple[Argument, ...]
 
-_QUANTIZED_ATTENTION_ARGUMENT_NAMES = (
-    "query",
-    "query_scale",
-    "query_summary",
-    "key",
-    "key_scale",
-    "key_center",
-    "key_center_scale",
-    "key_summary",
-    "key_aux",
-    "value",
-    "value_scale_multiplier",
-    "value_mean",
-    "ratio_profile",
-    "sparse_key_blocks",
-    "logical_sequence_length",
-    "routing_mode",
-)
+_NVFP4_LINEAR = "piper_kernels::nvfp4_linear"
+_CONVROT_NVFP4_LINEAR = "piper_kernels::convrot_nvfp4_linear"
 _QUERY_PROJECTION_ARGUMENT_NAMES = (
     "input_qdata",
     "input_scale",
@@ -92,39 +70,6 @@ class _MatchedAttentionOutput:
     output_dtype: torch.dtype
 
 
-def _bind_schema_arguments(node: torch.fx.Node) -> dict[str, Argument] | None:
-    """Bind a custom-op call's provided positional and keyword arguments by schema name."""
-    if node.op != "call_function" or not isinstance(node.target, torch._ops.OpOverload):
-        return None
-    schema = node.target._schema
-    if len(node.args) > len(schema.arguments):
-        return None
-    values: dict[str, Argument] = {}
-    allowed_names: set[str] = set()
-    for index, argument in enumerate(schema.arguments):
-        allowed_names.add(argument.name)
-        if index < len(node.args):
-            if argument.kwarg_only:
-                return None
-            values[argument.name] = node.args[index]
-        elif argument.name in node.kwargs:
-            values[argument.name] = node.kwargs[argument.name]
-        elif not argument.has_default_value():
-            return None
-    if not set(node.kwargs).issubset(allowed_names):
-        return None
-    return values
-
-
-def _optional_tensor_metadata(value: object) -> tuple[bool, torch.Tensor | None]:
-    if value is None:
-        return True, None
-    if not isinstance(value, torch.fx.Node):
-        return False, None
-    metadata = preparation_sharing.tensor_metadata(value)
-    return metadata is not None, metadata
-
-
 def _shape_dimensions(value: object) -> tuple[int | torch.SymInt, ...] | None:
     if not isinstance(value, (list, tuple)):
         return None
@@ -134,10 +79,6 @@ def _shape_dimensions(value: object) -> tuple[int | torch.SymInt, ...] | None:
     if any(dimension is None for dimension in dimensions):
         return None
     return dimensions  # type: ignore[return-value]
-
-
-def _same_dimension(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
-    return preparation_sharing.dimension_key(left) == preparation_sharing.dimension_key(right)
 
 
 def _prepared_gate_projection(
@@ -167,8 +108,8 @@ def _prepared_gate_projection(
         or gate_value.ndim != 4
         or gate_value.dtype not in SUPPORTED_DTYPES
         or gate_value.shape[0] != 1
-        or not _same_dimension(gate_value.shape[1], shape.rows)
-        or not _same_dimension(
+        or not sparse_piper_compile.same_dimension(gate_value.shape[1], shape.rows)
+        or not sparse_piper_compile.same_dimension(
             gate_value.shape[2] * gate_value.shape[3],
             shape.output_features,
         )
@@ -204,7 +145,7 @@ def _prepared_query_projection(
     )
     if producer is None or query_value is None or query_value.ndim != 4:
         return None
-    bound = _bind_schema_arguments(producer)
+    bound = linear_fx.bind_arguments(producer)
     if bound is None:
         return None
     head_dim = bound.get("head_dim")
@@ -279,22 +220,22 @@ def _valid_attention_output_metadata(  # noqa: PLR0911
 
     input_features = heads * head_dim
     if (
-        not _same_dimension(attention.shape[0], batch)
+        not sparse_piper_compile.same_dimension(attention.shape[0], batch)
         or attention.shape[2] != heads
         or attention.shape[3] != head_dim
-        or not _same_dimension(attention_shape[0], batch)
-        or not _same_dimension(attention_shape[1], attention.shape[1])
+        or not sparse_piper_compile.same_dimension(attention_shape[0], batch)
+        or not sparse_piper_compile.same_dimension(attention_shape[1], attention.shape[1])
         or attention_shape[2] != input_features
-        or not _same_dimension(projected.shape[0], batch)
-        or not _same_dimension(projected.shape[1], attention.shape[1])
+        or not sparse_piper_compile.same_dimension(projected.shape[0], batch)
+        or not sparse_piper_compile.same_dimension(projected.shape[1], attention.shape[1])
     ):
         return None
 
-    weight_global_valid, weight_global = _optional_tensor_metadata(
+    weight_global_valid, weight_global = sparse_piper_compile.optional_tensor_metadata(
         linear_args["weight_per_tensor_scale"]
     )
-    bias_valid, bias = _optional_tensor_metadata(linear_args["bias"])
-    activation_valid, activation_scale = _optional_tensor_metadata(
+    bias_valid, bias = sparse_piper_compile.optional_tensor_metadata(linear_args["bias"])
+    activation_valid, activation_scale = sparse_piper_compile.optional_tensor_metadata(
         linear_args["activation_per_tensor_scale"]
     )
     if not weight_global_valid or not bias_valid or not activation_valid:
@@ -330,45 +271,18 @@ def _valid_attention_output_metadata(  # noqa: PLR0911
 
 def _match_attention_output(linear_node: torch.fx.Node) -> _MatchedAttentionOutput | None:  # noqa: PLR0911
     """Anchor-match one attention -> reshape -> (ConvRot) NVFP4 linear region."""
-    nvfp4_linear = torch.ops.piper_kernels.nvfp4_linear.default
-    convrot_linear = torch.ops.piper_kernels.convrot_nvfp4_linear.default
-    if linear_node.op != "call_function" or linear_node.target not in (
-        nvfp4_linear,
-        convrot_linear,
-    ):
+    op_name = linear_fx.schema_name(linear_node)
+    if op_name not in (_NVFP4_LINEAR, _CONVROT_NVFP4_LINEAR):
         return None
-    is_convrot = linear_node.target is convrot_linear
-    linear_args = _bind_schema_arguments(linear_node)
+    is_convrot = op_name == _CONVROT_NVFP4_LINEAR
+    linear_args = linear_fx.bind_arguments(linear_node)
     if linear_args is None:
         return None
 
-    reshape_node = linear_args["input"]
-    if (
-        not isinstance(reshape_node, torch.fx.Node)
-        or reshape_node.op != "call_function"
-        or reshape_node.target is not torch.ops.aten.reshape.default
-        or len(reshape_node.users) != 1
-        or reshape_node.kwargs
-        or len(reshape_node.args) != 2
-    ):
+    reshaped_match = sparse_piper_compile.match_reshaped_quantized_attention(linear_args["input"])
+    if reshaped_match is None:
         return None
-
-    attention_node, attention_shape_arg = reshape_node.args
-    quantized_attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default
-    coarse_attention = (
-        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-    )
-    if (
-        not isinstance(attention_node, torch.fx.Node)
-        or attention_node.op != "call_function"
-        or attention_node.target not in (quantized_attention, coarse_attention)
-        or len(attention_node.users) != 1
-    ):
-        return None
-    is_coarse = attention_node.target is coarse_attention
-    attention_args = _bind_schema_arguments(attention_node)
-    if attention_args is None:
-        return None
+    attention_args = reshaped_match.attention_args
 
     dynamic_activation_scale = linear_args["dynamic_activation_scale"]
     high_first = linear_args.get("high_first", False)
@@ -382,20 +296,10 @@ def _match_attention_output(linear_node: torch.fx.Node) -> _MatchedAttentionOutp
             return None
         group_size = raw_group_size
 
-    force_tile_ids = attention_args.get("force_tile_ids")
-    force_tile_counts = attention_args.get("force_tile_counts")
-    if (force_tile_ids is None) != (force_tile_counts is None):
-        return None
-    force_kwargs: dict[str, Argument] = (
-        {}
-        if force_tile_ids is None
-        else {"force_tile_ids": force_tile_ids, "force_tile_counts": force_tile_counts}
-    )
-
     output_dtype = _valid_attention_output_metadata(
         linear_node,
-        attention_node,
-        attention_shape_arg,
+        reshaped_match.attention_node,
+        reshaped_match.attention_shape,
         linear_args,
         attention_args,
         dynamic_activation_scale=dynamic_activation_scale,
@@ -406,11 +310,9 @@ def _match_attention_output(linear_node: torch.fx.Node) -> _MatchedAttentionOutp
 
     return _MatchedAttentionOutput(
         linear_node=linear_node,
-        reshape_node=reshape_node,
-        attention_node=attention_node,
-        attention_arguments=tuple(
-            attention_args[name] for name in _QUANTIZED_ATTENTION_ARGUMENT_NAMES
-        ),
+        reshape_node=reshaped_match.reshape_node,
+        attention_node=reshaped_match.attention_node,
+        attention_arguments=reshaped_match.attention_arguments,
         projection_arguments=(
             linear_args["weight_qdata"],
             linear_args["weight_scale"],
@@ -418,14 +320,8 @@ def _match_attention_output(linear_node: torch.fx.Node) -> _MatchedAttentionOutp
             linear_args["activation_per_tensor_scale"],
             linear_args["bias"],
         ),
-        bounded_arguments=(
-            attention_args.get("block_lengths"),
-            attention_args["coarse_gate"] if is_coarse else None,
-            attention_args["coarse_scale"] if is_coarse else None,
-            attention_args["coarse_key_blocks"] if is_coarse else None,
-            attention_args.get("sparse_query_blocks"),
-        ),
-        force_kwargs=force_kwargs,
+        bounded_arguments=reshaped_match.bounded_arguments,
+        force_kwargs=reshaped_match.force_kwargs,
         high_first=high_first,
         dynamic_activation_scale=dynamic_activation_scale,
         group_size=group_size,

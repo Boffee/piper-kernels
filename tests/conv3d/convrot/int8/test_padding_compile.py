@@ -6,8 +6,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.nn import functional
 
-from piper_kernels.conv3d.convrot.int8 import convrot_int8_conv3d_compile_options
-from piper_kernels.conv3d.convrot.int8._compile import compile_pass, fuse_padding
+from piper_kernels import compile_options
+from piper_kernels.conv3d.convrot.int8._compile import fuse_padding
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
@@ -106,7 +106,9 @@ def test_padding_fusion_preserves_autocast_rounding(device, scope):
     x = torch.randn(1, 64, 2, 4, 6, device=device)
     bias = torch.randn(16, device=device)
     weight = _weight(device)
-    compiled = torch.compile(run, fullgraph=True, options=convrot_int8_conv3d_compile_options())
+    compiled = torch.compile(
+        run, fullgraph=True, options=compile_options(linear=False, conv3d=True)
+    )
     with torch.no_grad(), torch.autocast(device, dtype=torch.float16, enabled=scope != "inner"):
         expected = run(x, weight, bias)
         torch.testing.assert_close(compiled(x, weight, bias), expected, atol=0, rtol=0)
@@ -119,10 +121,11 @@ def test_padding_options_composition_and_no_float_weight_rewrite():
     def existing(graph):
         pass
 
-    options = convrot_int8_conv3d_compile_options({"pre_grad_custom_pass": existing})
-    assert convrot_int8_conv3d_compile_options(options)["pre_grad_custom_pass"] == (
+    options = compile_options({"pre_grad_custom_pass": existing}, linear=False, conv3d=True)
+    expected_pass = compile_options(linear=False, conv3d=True)["pre_grad_custom_pass"][0]
+    assert compile_options(options, linear=False, conv3d=True)["pre_grad_custom_pass"] == (
         existing,
-        compile_pass,
+        expected_pass,
     )
     with torch.no_grad():
         gm = torch._dynamo.export(_padded_conv, assume_static_by_default=True)(

@@ -7,6 +7,7 @@ from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import (
     SparsePiperAttention,
+    compile_options,
     sparse_piper_coarse_residual,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -17,20 +18,12 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
-from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    convrot_int8_sparse_piper_compile_options,
-)
 from piper_kernels.fusions.convrot_int8_sparse_piper import key as fused_key
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 from piper_kernels.fusions.convrot_int8_sparse_piper import query as fused_query
 from piper_kernels.fusions.convrot_int8_sparse_piper import value as fused_value
-from piper_kernels.fusions.convrot_int8_sparse_piper._compile import (
-    compile_pass as fusion_compile_pass,
-)
-from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
-from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_int8_compile_pass
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 from .._accuracy import assert_fusion_output_close
@@ -716,42 +709,27 @@ def _run_explicit_attention_output(  # noqa: PLR0913
     return projected, attention
 
 
-def test_compile_options_install_fusion_before_convrot() -> None:
-    options = convrot_int8_sparse_piper_compile_options({"max_autotune": True})
-
+def test_compile_options_merge_attention_and_linear_without_duplication() -> None:
+    options = compile_options({"max_autotune": True}, attention=True)
     assert options["max_autotune"] is True
-    assert options[_POST_GRAD_PRE_PASS] == (fusion_compile_pass, convrot_int8_compile_pass)
-
-
-def test_compile_options_reorder_existing_convrot_pass_without_duplication() -> None:
-    base_options = convrot_int8_compile_options()
-    options = convrot_int8_sparse_piper_compile_options(base_options)
-    reapplied = convrot_int8_sparse_piper_compile_options(options)
-
-    assert options[_POST_GRAD_PRE_PASS] == (fusion_compile_pass, convrot_int8_compile_pass)
-    assert reapplied == options
+    passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(passes, tuple)
+    assert len(passes) == 1
+    assert compile_options(compile_options(), attention=True) == compile_options(attention=True)
+    assert compile_options(options, attention=True) == options
 
 
 def test_compile_options_preserve_unrelated_pass_order() -> None:
     before_convrot = object()
     after_convrot = object()
-    options = convrot_int8_sparse_piper_compile_options(
-        {
-            _POST_GRAD_PRE_PASS: (
-                before_convrot,
-                convrot_int8_compile_pass,
-                after_convrot,
-            )
-        }
+    linear_pass = compile_options()[_POST_GRAD_PRE_PASS][0]  # type: ignore[index]
+    options = compile_options(
+        {_POST_GRAD_PRE_PASS: (before_convrot, linear_pass, after_convrot)},
+        attention=True,
     )
-
-    assert options[_POST_GRAD_PRE_PASS] == (
-        before_convrot,
-        fusion_compile_pass,
-        convrot_int8_compile_pass,
-        after_convrot,
-    )
-    assert convrot_int8_sparse_piper_compile_options(options) == options
+    expected = compile_options(attention=True)[_POST_GRAD_PRE_PASS][0]  # type: ignore[index]
+    assert options[_POST_GRAD_PRE_PASS] == (before_convrot, expected, after_convrot)
+    assert compile_options(options, attention=True) == options
 
 
 @pytest.mark.gpu
@@ -784,7 +762,7 @@ def test_compile_options_fuse_sparse_piper_projection_region(monkeypatch, head_d
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True)(hidden_states)
@@ -844,7 +822,7 @@ def test_projection_fusion_respects_internal_block_lengths(routing: str) -> None
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
 
     with torch.no_grad():
         expected = _run_explicit_fused_projection(
@@ -895,7 +873,7 @@ def test_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
 
     with torch.no_grad():
         semantic = model(hidden_states, coarse_gate)
@@ -970,7 +948,7 @@ def test_coarse_projection_fusion_respects_internal_block_lengths(routing: str) 
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
 
     with torch.no_grad():
         semantic = model(hidden_states, coarse_gate, block_lengths)
@@ -1031,7 +1009,7 @@ def test_padded_coarse_fusion_reuses_graph_for_changed_block_lengths() -> None:
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
     compiled = torch.compile(model, fullgraph=True, options=options)
 
     with torch.no_grad():
@@ -1081,7 +1059,7 @@ def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
 
     with torch.no_grad():
         torch._dynamo.reset()
@@ -1153,7 +1131,7 @@ def test_compile_options_fuse_attention_output_boundary(
         dtype=dtype,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
 
     with torch.no_grad():
         expected, _attention = _run_explicit_attention_output(
@@ -1201,7 +1179,7 @@ def test_compile_fuses_padded_mixed_query_attention_output() -> None:
     )
     block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
 
     with torch.no_grad():
         expected, _attention = _run_explicit_attention_output(
@@ -1249,7 +1227,7 @@ def test_compile_options_fuse_mean_pool_attention_and_output() -> None:
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
 
     with torch.no_grad():
         expected, _attention = _run_explicit_attention_output(
@@ -1328,7 +1306,7 @@ def test_compile_fuses_every_bounded_attention_feature(
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
     torch._dynamo.reset()
     compiled = torch.compile(model, fullgraph=True, options=options)
 
@@ -1422,7 +1400,7 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
         coarse_key_blocks=model.coarse_key_blocks,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
 
     with torch.no_grad():
         torch._dynamo.reset()
@@ -1465,7 +1443,7 @@ def test_attention_output_fusion_fails_closed_when_attention_escapes() -> None:
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
 
     with torch.no_grad():
         expected_projected, expected_attention = _run_explicit_attention_output(
@@ -1504,7 +1482,7 @@ def test_fused_projection_reuses_one_dynamic_shape_route_capacity_graph() -> Non
     attention_kernel = _reset_attention_kernel_cache()
     model = _DynamicSparseProjectionAttention().eval()
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
     compiled = torch.compile(
         model,
         dynamic=True,
@@ -1574,7 +1552,7 @@ def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
     attention_kernel = _reset_attention_kernel_cache()
     model = _DynamicCoarseSparseProjectionAttention().eval()
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
     compiled = torch.compile(
         model,
         dynamic=True,
@@ -1671,7 +1649,7 @@ def test_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
     cos = angles.cos().contiguous()
     sin = angles.sin().contiguous()
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
 
     with torch.no_grad():
         expected_narrow = model(
@@ -1719,7 +1697,7 @@ def test_attention_output_fusion_reuses_one_dynamic_shape_graph() -> None:
     torch.manual_seed(733)
     model = _DynamicSparseProjectionAttentionOutput().eval()
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
     compiled = torch.compile(
         model,
         dynamic=True,
@@ -1781,7 +1759,7 @@ def test_sparse_piper_projection_fails_closed_for_strided_rope() -> None:
         dtype=torch.bfloat16,
     )
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_sparse_piper_compile_options())
+    options = capture.wrap_options(compile_options(attention=True))
     with torch.no_grad():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True)(hidden_states)
@@ -1821,7 +1799,7 @@ def test_forced_output_fusion_reuses_dynamic_shapes_and_runtime_contents(monkeyp
     compiled = torch.compile(
         run,
         fullgraph=True,
-        options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+        options=capture.wrap_options(compile_options(attention=True)),
     )
     attention_kernel = _reset_attention_kernel_cache()
     kernels = (
@@ -1899,7 +1877,7 @@ def test_forced_coarse_output_builds_membership_once(monkeypatch) -> None:
     compiled = torch.compile(
         model,
         fullgraph=True,
-        options=capture.wrap_options(convrot_int8_sparse_piper_compile_options()),
+        options=capture.wrap_options(compile_options(attention=True)),
     )
     with torch.no_grad():
         gate = model.gate(hidden).reshape(1, 512, model.heads, model.head_dim)

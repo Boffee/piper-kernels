@@ -22,11 +22,11 @@ from lib.reporting import BenchmarkRecord, add_output_arguments, output_target, 
 from lib.timing import DeviceTimings, measure_device
 from torch.nn import functional
 
+from piper_kernels import compile_options
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import (
     _policy,
     conv3d,
-    convrot_int8_conv3d_compile_options,
     group_norm_silu_conv3d,
     reference,
 )
@@ -270,7 +270,7 @@ def _benchmark_shape(
             _standard_conv3d,
             fullgraph=True,
             dynamic=False,
-            options=cast(Any, convrot_int8_conv3d_compile_options()),
+            options=cast(Any, compile_options(conv3d=True)),
         )
         compiled_h3 = torch.compile(
             _quantized_h3_block,

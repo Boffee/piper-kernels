@@ -11,31 +11,31 @@ import piper_kernels.attention
 import piper_kernels.attention.piper_attention
 import piper_kernels.attention.sage_attention_2pp
 import piper_kernels.attention.sparse_piper_attention
+import piper_kernels.conv3d.convrot.int8
 import piper_kernels.fusions
+import piper_kernels.fusions.convrot_int8_piper
 import piper_kernels.fusions.convrot_int8_sparse_piper
+import piper_kernels.fusions.ffn
 import piper_kernels.fusions.nvfp4_sparse_piper
+import piper_kernels.fusions.residual_updates
 import piper_kernels.linear
 import piper_kernels.linear.convrot
 import piper_kernels.linear.convrot.int8
 import piper_kernels.linear.convrot.nvfp4
+import piper_kernels.linear.nvfp4
 from piper_kernels import (
     SparsePiperAttention,
     apply_coarse_attention_residual,
     coarse_attention,
     coarse_attention_residual,
+    compile_options,
     mean_pool_block_values,
     piper_attention,
     sage_attention_2pp,
     sparse_piper_coarse_residual,
 )
-from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    convrot_int8_sparse_piper_compile_options,
-)
-from piper_kernels.fusions.nvfp4_sparse_piper import (
-    nvfp4_sparse_piper_compile_options,
-)
-from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
-from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options, convrot_nvfp4_linear
+from piper_kernels.linear.convrot import convrot_int8_linear
+from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_linear
 from piper_kernels.weights.convrot import SUPPORTED_GROUP_SIZES
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
@@ -119,6 +119,63 @@ assert "triton" not in sys.modules
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_compile_options_is_lazy_and_triton_torchao_free() -> None:
+    script = """
+import builtins
+import importlib.util
+import sys
+
+original_import = builtins.__import__
+original_find_spec = importlib.util.find_spec
+blocked = ("triton", "torchao")
+
+def guarded_import(name, *args, **kwargs):
+    if any(name == pkg or name.startswith(pkg + ".") for pkg in blocked):
+        raise ModuleNotFoundError(f"{name} intentionally unavailable", name=name)
+    return original_import(name, *args, **kwargs)
+
+def guarded_find_spec(name, *args, **kwargs):
+    if any(name == pkg or name.startswith(pkg + ".") for pkg in blocked):
+        return None
+    return original_find_spec(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+importlib.util.find_spec = guarded_find_spec
+
+import piper_kernels
+assert "piper_kernels._inductor_options" not in sys.modules
+
+options = piper_kernels.compile_options(
+    linear=True,
+    ffn=True,
+    attention=True,
+    attention_output=True,
+    residual_updates=True,
+    conv3d=True,
+)
+assert options["allow_buffer_reuse"] is False
+post = options["post_grad_custom_pre_pass"]
+pre = options["pre_grad_custom_pass"]
+assert isinstance(post, tuple) and len(post) == 1
+assert isinstance(pre, tuple) and len(pre) == 1
+assert post[0].uuid() != pre[0].uuid()
+
+for forbidden_prefix in (
+    "triton",
+    "torchao",
+    "piper_kernels.linear",
+    "piper_kernels.conv3d",
+    "piper_kernels.fusions",
+    "piper_kernels.attention.sparse_piper_attention._quantized_dispatch",
+):
+    assert not any(
+        mod == forbidden_prefix or mod.startswith(forbidden_prefix + ".")
+        for mod in sys.modules
+    ), f"unexpected eager import of {forbidden_prefix}"
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 @pytest.mark.parametrize("family", ["sparse_piper", "projection"])
 def test_convrot_int8_fusion_packages_have_explicit_names(family: str) -> None:
     current = f"piper_kernels.fusions.convrot_int8_{family}"
@@ -129,38 +186,39 @@ def test_convrot_int8_fusion_packages_have_explicit_names(family: str) -> None:
     assert error.value.name == previous
 
 
-def test_convrot_int8_compiler_integration_is_loaded_lazily() -> None:
+def test_subpackages_keep_compiler_modules_lazy_on_import() -> None:
     script = """
 import sys
-import piper_kernels.linear.convrot as convrot
+import piper_kernels.linear.convrot
+import piper_kernels.linear.nvfp4
+import piper_kernels.linear.convrot.nvfp4
+import piper_kernels.fusions.ffn
+import piper_kernels.fusions.residual_updates
+import piper_kernels.fusions.convrot_int8_piper
+import piper_kernels.fusions.convrot_int8_sparse_piper
+import piper_kernels.fusions.nvfp4_sparse_piper
 
-assert "piper_kernels.linear.convrot.int8._compile" not in sys.modules
-assert "piper_kernels.linear.convrot.int8._distributed_compile" not in sys.modules
-assert "piper_kernels._distributed._fx" not in sys.modules
-assert "piper_kernels.linear._preparation_sharing" not in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper._compile" not in sys.modules
-assert "piper_kernels.attention.sparse_piper_attention._quantized_dispatch" not in sys.modules
-convrot.convrot_int8_compile_options()
-assert "piper_kernels.linear.convrot.int8._compile" in sys.modules
-assert "piper_kernels.linear.convrot.int8._distributed_compile" in sys.modules
-assert "piper_kernels._distributed._fx" in sys.modules
-assert "piper_kernels.linear._preparation_sharing" in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper._compile" not in sys.modules
-assert "piper_kernels.attention.sparse_piper_attention._quantized_dispatch" not in sys.modules
-"""
-    subprocess.run([sys.executable, "-c", script], check=True)
-
-
-def test_convrot_nvfp4_compiler_integration_is_loaded_lazily() -> None:
-    script = """
-import sys
-import piper_kernels.linear.convrot.nvfp4 as convrot_nvfp4
-
-assert "piper_kernels.linear.convrot.nvfp4._compile" not in sys.modules
-assert "piper_kernels.linear._preparation_sharing" not in sys.modules
-convrot_nvfp4.convrot_nvfp4_compile_options()
-assert "piper_kernels.linear.convrot.nvfp4._compile" in sys.modules
-assert "piper_kernels.linear._preparation_sharing" in sys.modules
+for forbidden in (
+    "piper_kernels._inductor_options",
+    "piper_kernels.linear._preparation_sharing",
+    "piper_kernels.linear.convrot.int8._compile",
+    "piper_kernels.linear.convrot.int8._distributed_compile",
+    "piper_kernels.linear.nvfp4._compile",
+    "piper_kernels.linear.convrot.nvfp4._compile",
+    "piper_kernels.fusions.ffn._compile",
+    "piper_kernels.fusions.residual_updates._compile",
+    "piper_kernels.fusions.convrot_int8_piper._compile",
+    "piper_kernels.fusions.convrot_int8_piper._output_compile",
+    "piper_kernels.fusions.convrot_int8_piper._distributed_compile",
+    "piper_kernels.fusions.convrot_int8_sparse_piper._compile",
+    "piper_kernels.fusions.convrot_int8_sparse_piper._output_compile",
+    "piper_kernels.fusions.convrot_int8_sparse_piper._distributed_compile",
+    "piper_kernels.fusions.nvfp4_sparse_piper._compile",
+    "piper_kernels.fusions.nvfp4_sparse_piper._output_compile",
+    "piper_kernels._distributed._fx",
+    "piper_kernels._distributed._peer_exchange",
+):
+    assert forbidden not in sys.modules, f"unexpected eager import: {forbidden}"
 """
     subprocess.run([sys.executable, "-c", script], check=True)
 
@@ -188,72 +246,9 @@ assert "piper_kernels.attention.sparse_piper_attention._quantized_dispatch" not 
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
-def test_convrot_int8_sparse_piper_compiler_integration_is_loaded_lazily() -> None:
-    script = """
-import sys
-from piper_kernels.fusions import convrot_int8_sparse_piper
-
-assert "piper_kernels.fusions.convrot_int8_sparse_piper._compile" not in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper._distributed_compile" not in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper.distributed_output" not in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper.kv_gather" not in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper._output_compile" not in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper.output" not in sys.modules
-convrot_int8_sparse_piper.convrot_int8_sparse_piper_compile_options()
-assert "piper_kernels.fusions.convrot_int8_sparse_piper._compile" in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper._distributed_compile" in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper.distributed_output" in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper.kv_gather" in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper._output_compile" in sys.modules
-assert "piper_kernels.fusions.convrot_int8_sparse_piper.output" in sys.modules
-assert "piper_kernels.linear.convrot.int8._compile" in sys.modules
-"""
-    subprocess.run([sys.executable, "-c", script], check=True)
-
-
-def test_convrot_int8_piper_compiler_integration_is_loaded_lazily() -> None:
-    script = """
-import sys
-from piper_kernels.fusions import convrot_int8_piper
-
-assert "piper_kernels.fusions.convrot_int8_piper._compile" not in sys.modules
-assert "piper_kernels.fusions.convrot_int8_piper._distributed_compile" not in sys.modules
-assert "piper_kernels.fusions.convrot_int8_piper.distributed_output" not in sys.modules
-assert "piper_kernels._distributed._peer_exchange" not in sys.modules
-assert "piper_kernels.fusions.convrot_int8_piper._output_compile" not in sys.modules
-assert "piper_kernels.fusions.convrot_int8_piper.output" not in sys.modules
-convrot_int8_piper.convrot_int8_piper_compile_options(fuse_output=True)
-assert "piper_kernels.fusions.convrot_int8_piper._compile" in sys.modules
-assert "piper_kernels.fusions.convrot_int8_piper._distributed_compile" in sys.modules
-assert "piper_kernels.fusions.convrot_int8_piper.distributed_output" in sys.modules
-assert "piper_kernels._distributed._peer_exchange" in sys.modules
-assert "piper_kernels.fusions.convrot_int8_piper._output_compile" in sys.modules
-assert "piper_kernels.fusions.convrot_int8_piper.output" in sys.modules
-assert "piper_kernels.linear.convrot.int8._compile" in sys.modules
-"""
-    subprocess.run([sys.executable, "-c", script], check=True)
-
-
-def test_nvfp4_sparse_piper_compiler_integration_is_loaded_lazily() -> None:
-    script = """
-import sys
-from piper_kernels.fusions import nvfp4_sparse_piper
-
-assert "piper_kernels.fusions.nvfp4_sparse_piper._compile" not in sys.modules
-assert "piper_kernels.fusions.nvfp4_sparse_piper._output_compile" not in sys.modules
-assert "piper_kernels.fusions.nvfp4_sparse_piper.output" not in sys.modules
-nvfp4_sparse_piper.nvfp4_sparse_piper_compile_options()
-assert "piper_kernels.fusions.nvfp4_sparse_piper._compile" in sys.modules
-assert "piper_kernels.fusions.nvfp4_sparse_piper._output_compile" in sys.modules
-assert "piper_kernels.fusions.nvfp4_sparse_piper.output" in sys.modules
-assert "piper_kernels.linear.nvfp4._compile" in sys.modules
-assert "piper_kernels.linear.convrot.nvfp4._compile" in sys.modules
-"""
-    subprocess.run([sys.executable, "-c", script], check=True)
-
-
 def test_public_packages_import() -> None:
     assert piper_kernels.__name__ == "piper_kernels"
+    assert piper_kernels.compile_options is compile_options
     assert piper_kernels.piper_attention is piper_attention
     assert piper_kernels.sage_attention_2pp is sage_attention_2pp
     assert piper_kernels.SparsePiperAttention is SparsePiperAttention
@@ -267,6 +262,7 @@ def test_public_packages_import() -> None:
         "apply_coarse_attention_residual",
         "coarse_attention",
         "coarse_attention_residual",
+        "compile_options",
         "mean_pool_block_values",
         "piper_attention",
         "sage_attention_2pp",
@@ -286,16 +282,8 @@ def test_public_packages_import() -> None:
     assert piper_kernels.fusions.nvfp4_sparse_piper.__name__ == (
         "piper_kernels.fusions.nvfp4_sparse_piper"
     )
-    assert (
-        piper_kernels.fusions.nvfp4_sparse_piper.nvfp4_sparse_piper_compile_options
-        is nvfp4_sparse_piper_compile_options
-    )
     assert piper_kernels.fusions.convrot_int8_sparse_piper.__name__ == (
         "piper_kernels.fusions.convrot_int8_sparse_piper"
-    )
-    assert (
-        piper_kernels.fusions.convrot_int8_sparse_piper.convrot_int8_sparse_piper_compile_options
-        is convrot_int8_sparse_piper_compile_options
     )
     assert piper_kernels.linear.__name__ == "piper_kernels.linear"
     assert piper_kernels.linear.convrot.__name__ == "piper_kernels.linear.convrot"
@@ -303,28 +291,35 @@ def test_public_packages_import() -> None:
     assert piper_kernels.linear.convrot.nvfp4.__name__ == "piper_kernels.linear.convrot.nvfp4"
     assert piper_kernels.weights.convrot.SUPPORTED_GROUP_SIZES is SUPPORTED_GROUP_SIZES
     assert piper_kernels.weights.convrot.int8.ConvRotInt8Tensor is ConvRotInt8Tensor
-    assert piper_kernels.weights.convrot.int8.ConvRotInt8Tensor is ConvRotInt8Tensor
     assert piper_kernels.weights.convrot.nvfp4.ConvRotNVFP4Tensor is ConvRotNVFP4Tensor
-    assert (
-        piper_kernels.linear.convrot.nvfp4.convrot_nvfp4_compile_options
-        is convrot_nvfp4_compile_options
-    )
-    assert piper_kernels.linear.convrot.convrot_int8_compile_options is convrot_int8_compile_options
     assert piper_kernels.linear.convrot.convrot_int8_linear is convrot_int8_linear
     assert piper_kernels.linear.convrot.nvfp4.convrot_nvfp4_linear is convrot_nvfp4_linear
     assert convrot_int8_linear.__module__ == "piper_kernels.linear.convrot.int8._functional"
     assert not hasattr(piper_kernels.linear.convrot, "convrot_linear")
     assert not hasattr(piper_kernels.linear.convrot, "convrot_compile_options")
+    assert not hasattr(piper_kernels.linear.convrot, "convrot_int8_compile_options")
+    assert not hasattr(piper_kernels.linear.nvfp4, "nvfp4_compile_options")
+    assert not hasattr(piper_kernels.linear.convrot.nvfp4, "convrot_nvfp4_compile_options")
+    assert not hasattr(piper_kernels.conv3d.convrot.int8, "convrot_int8_conv3d_compile_options")
+    assert not hasattr(piper_kernels.fusions.ffn, "ffn_compile_options")
+    assert not hasattr(piper_kernels.fusions.residual_updates, "residual_updates_compile_options")
+    assert not hasattr(
+        piper_kernels.fusions.convrot_int8_piper, "convrot_int8_piper_compile_options"
+    )
+    assert not hasattr(
+        piper_kernels.fusions.convrot_int8_sparse_piper, "convrot_int8_sparse_piper_compile_options"
+    )
+    assert not hasattr(
+        piper_kernels.fusions.nvfp4_sparse_piper, "nvfp4_sparse_piper_compile_options"
+    )
     assert not hasattr(piper_kernels.linear.convrot.int8, "convrot_int8_linear")
     assert not hasattr(piper_kernels.linear.convrot, "linear_input_act")
     assert not hasattr(piper_kernels.linear.convrot.int8, "linear_input_act")
     assert piper_kernels.linear.convrot.__all__ == [
-        "convrot_int8_compile_options",
         "convrot_int8_linear",
     ]
     assert not hasattr(piper_kernels.linear.convrot.int8, "ConvRotInt8Tensor")
     assert piper_kernels.linear.convrot.nvfp4.__all__ == [
-        "convrot_nvfp4_compile_options",
         "convrot_nvfp4_linear",
         "dynamic_scale",
         "prepare_dynamic",

@@ -5,11 +5,7 @@ import torch
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 
-from piper_kernels import SparsePiperAttention
-from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    convrot_int8_sparse_piper_compile_options,
-)
-from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_options
+from piper_kernels import SparsePiperAttention, compile_options
 
 from ._accuracy import assert_fusion_output_close
 from .convrot_int8_sparse_piper import test_compile as int8_cases
@@ -30,10 +26,9 @@ def test_sparse_projection_and_output_reuse_graph_across_profiles(
     attention_kernel = int8_cases._reset_attention_kernel_cache()
     if weight_format == "convrot_int8":
         model_type = int8_cases._SparseProjectionAttentionOutput
-        options = convrot_int8_sparse_piper_compile_options()
     else:
         model_type = nvfp4_cases._SparseProjectionAttentionOutput
-        options = nvfp4_sparse_piper_compile_options()
+    options = compile_options(attention=True)
     monkeypatch.setattr(model_type, "sequence_length", 1024)
     monkeypatch.setattr(model_type, "sparse_key_blocks", 12)
     if weight_format == "convrot_int8":

@@ -8,9 +8,7 @@ from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
-from piper_kernels.linear.convrot import convrot_int8_compile_options
-from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options
-from piper_kernels.linear.nvfp4 import nvfp4_compile_options
+from piper_kernels import compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
@@ -236,11 +234,6 @@ def test_cuda_quantized_linear_composition(cls, high_first, compiled, creation_d
     linear = F.linear
     if compiled:
         torch.compiler.reset()
-        compile_options = {
-            ConvRotInt8Tensor: convrot_int8_compile_options,
-            PiperNVFP4Tensor: nvfp4_compile_options,
-            ConvRotNVFP4Tensor: convrot_nvfp4_compile_options,
-        }[cls]
         linear = torch.compile(
             F.linear, fullgraph=True, options=compile_options({"triton.cudagraphs": False})
         )

@@ -9,13 +9,12 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.node import map_arg
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import piper_attention
+from piper_kernels import compile_options, piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.fusions.convrot_int8_piper import (
     _backend,
     _compile,
-    convrot_int8_piper_compile_options,
     query,
 )
 from piper_kernels.fusions.convrot_int8_piper import (
@@ -24,7 +23,6 @@ from piper_kernels.fusions.convrot_int8_piper import (
 from piper_kernels.fusions.convrot_int8_piper import (
     value as value_projection,
 )
-from piper_kernels.linear.convrot.int8 import _compile as linear_compile
 from piper_kernels.linear.convrot.int8 import _ops
 
 from .test_query import _qk_quantization
@@ -120,7 +118,7 @@ def test_fake_cpu_rewrite_preserves_floating_key_value_and_padded_query(
     value = next(node for node in graph.nodes if node.target == "value")
     monkeypatch.setattr(_backend, "select_projection_backend", lambda *_args, **_kwargs: object())
 
-    _compile.compile_pass(graph, is_inference=True)
+    _compile.fold_attention_projections(graph)
 
     targets = _targets(graph)
     assert targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
@@ -201,47 +199,44 @@ def test_unrecognized_or_unsupported_region_stays_unchanged(monkeypatch, invalid
         negated.target = torch.ops.aten.clone.default
     before = str(graph)
 
-    _compile.compile_pass(graph, is_inference=invalid != "training")
+    compiler_pass = compile_options(linear=False, attention=True)["post_grad_custom_pre_pass"][0]
+    compiler_pass(graph, is_inference=invalid != "training")
 
     assert str(graph) == before
 
 
 def test_compile_options_preserve_external_order_and_are_idempotent():
     before, after = object(), object()
+    linear_pass = compile_options()["post_grad_custom_pre_pass"][0]
     original = {
         "max_autotune": True,
-        "post_grad_custom_pre_pass": [before, linear_compile.compile_pass, after],
+        "post_grad_custom_pre_pass": [before, linear_pass, after],
     }
-    options = convrot_int8_piper_compile_options(original)
-    assert options["post_grad_custom_pre_pass"] == (
-        before,
-        _compile.compile_pass,
-        linear_compile.compile_pass,
-        after,
-    )
+    options = compile_options(original, attention=True)
+    expected_pass = compile_options(attention=True)["post_grad_custom_pre_pass"][0]
+    assert options["post_grad_custom_pre_pass"] == (before, expected_pass, after)
     assert options["max_autotune"] is True
-    assert original["post_grad_custom_pre_pass"] == [before, linear_compile.compile_pass, after]
-    assert convrot_int8_piper_compile_options(options) == options
+    assert original["post_grad_custom_pre_pass"] == [before, linear_pass, after]
+    assert compile_options(options, attention=True) == options
 
 
 def test_output_pipeline_is_explicit_and_preserves_pass_order():
     before, after = object(), object()
-    original = {"post_grad_custom_pre_pass": [before, linear_compile.compile_pass, after]}
-    default = convrot_int8_piper_compile_options(original)
-    assert _compile.output_compile_pass not in default["post_grad_custom_pre_pass"]
-    enabled = convrot_int8_piper_compile_options(original, fuse_output=True)
-    assert enabled["post_grad_custom_pre_pass"] == (
-        before,
-        _compile.compile_pass,
-        _compile.output_compile_pass,
-        linear_compile.compile_pass,
-        after,
-    )
-    assert convrot_int8_piper_compile_options(enabled, fuse_output=True) == enabled
-    assert original["post_grad_custom_pre_pass"] == [before, linear_compile.compile_pass, after]
-    assert _compile.output_compile_pass.uuid() != _compile.compile_pass.uuid()
+    linear_pass = compile_options()["post_grad_custom_pre_pass"][0]
+    original = {"post_grad_custom_pre_pass": [before, linear_pass, after]}
+    default = compile_options(original, attention=True)
+    enabled = compile_options(original, attention_output=True)
+    default_pass = default["post_grad_custom_pre_pass"][1]
+    enabled_pass = enabled["post_grad_custom_pre_pass"][1]
+    assert default_pass.attention_output is False
+    assert enabled["post_grad_custom_pre_pass"] == (before, enabled_pass, after)
+    assert enabled_pass.attention is True
+    assert enabled_pass.attention_output is True
+    assert compile_options(enabled, attention_output=True) == enabled
+    assert original["post_grad_custom_pre_pass"] == [before, linear_pass, after]
+    assert enabled_pass.uuid() != default_pass.uuid()
     with pytest.raises(TypeError, match="boolean"):
-        convrot_int8_piper_compile_options(fuse_output=1)
+        compile_options(attention_output=1)
 
 
 def _available():
@@ -327,7 +322,7 @@ def _explicit_fused(model, arguments):
 def _compiled_model(model, *, dynamic=False, fuse_output=False):
     torch._dynamo.reset()
     capture = TargetCapturePass()
-    options = capture.wrap_options(convrot_int8_piper_compile_options(fuse_output=fuse_output))
+    options = capture.wrap_options(compile_options(attention=True, attention_output=fuse_output))
     return torch.compile(model, fullgraph=True, dynamic=dynamic, options=options), capture
 
 
@@ -625,7 +620,7 @@ def test_qkv_fake_rewrite_shares_preparation_without_hardware_execution(
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda _device: AcceleratorTarget("cuda", architecture)
     )
-    _compile.compile_pass(graph, is_inference=True)
+    _compile.fold_attention_projections(graph)
     granularity = "per_thread" if architecture == "sm89" else "per_warp"
     for operation, scales in (("query", query_scales), ("key", key_scales)):
         producer = next(
@@ -673,7 +668,7 @@ def test_qkv_preparation_reuse_keeps_late_tuple_users_after_attention(monkeypatc
     graph.lint()
     monkeypatch.setattr(_backend, "select_projection_backend", lambda *_args, **_kwargs: object())
 
-    _compile.compile_pass(graph, is_inference=True)
+    _compile.fold_attention_projections(graph)
 
     graph.lint()
     targets = _targets(graph)
@@ -693,7 +688,7 @@ def test_context_escape_preserves_the_query_only_rewrite(monkeypatch, escaped_op
     output = next(node for node in graph.nodes if node.op == "output")
     output.args = ((attention, attention.args[escaped_operand]),)
     monkeypatch.setattr(_backend, "select_projection_backend", lambda *_args, **_kwargs: object())
-    _compile.compile_pass(graph, is_inference=True)
+    _compile.fold_attention_projections(graph)
     targets = _targets(graph)
     assert torch.ops.piper_kernels.piper_attention_from_quantized_query.default in targets
     assert torch.ops.piper_kernels.piper_attention_from_quantized.default not in targets

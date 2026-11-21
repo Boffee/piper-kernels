@@ -16,29 +16,10 @@ from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    convrot_int8_sparse_piper_compile_options,
-)
-from piper_kernels.fusions.convrot_int8_sparse_piper._compile import (
-    compile_pass as int8_sparse_compile_pass,
-)
-from piper_kernels.fusions.ffn import ffn_compile_options
-from piper_kernels.fusions.ffn._compile import compile_pass as ffn_compile_pass
-from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_options
-from piper_kernels.fusions.nvfp4_sparse_piper._compile import (
-    compile_pass as nvfp4_sparse_compile_pass,
-)
-from piper_kernels.fusions.residual_updates import _compile as residual_compile
-from piper_kernels.fusions.residual_updates import residual_updates_compile_options
-from piper_kernels.linear.convrot import convrot_int8_compile_options
+from piper_kernels import compile_options
+from piper_kernels.fusions.ffn._compile import fold_ffns
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
-from piper_kernels.linear.convrot.int8._compile import compile_pass as convrot_int8_compile_pass
-from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options
-from piper_kernels.linear.convrot.nvfp4._compile import (
-    compile_pass as convrot_nvfp4_compile_pass,
-)
-from piper_kernels.linear.nvfp4 import nvfp4_compile_options
-from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
+from piper_kernels.linear.nvfp4 import _ops as _nvfp4_ops  # noqa: F401 - registers nvfp4_linear
 
 from ._helpers import (
     Activation,
@@ -61,80 +42,34 @@ _SM120 = pytest.mark.skipif(not exact_sm120_available(), reason="requires exact 
 
 
 def test_compile_options_install_idempotent_and_preserve_unrelated_options() -> None:
-    options = ffn_compile_options({"max_autotune": True})
+    options = compile_options({"max_autotune": True}, ffn=True)
     assert options["max_autotune"] is True
-    assert options[_POST_GRAD_PRE_PASS] == (ffn_compile_pass,)
-    assert ffn_compile_options(options) == options
+    passes = options[_POST_GRAD_PRE_PASS]
+    assert isinstance(passes, tuple)
+    assert len(passes) == 1
+    assert compile_options(options, ffn=True) == options
 
 
-@pytest.mark.parametrize(
-    ("linear_options_fn", "linear_pass"),
-    [
-        (convrot_int8_compile_options, convrot_int8_compile_pass),
-        (nvfp4_compile_options, nvfp4_compile_pass),
-        (convrot_nvfp4_compile_options, convrot_nvfp4_compile_pass),
-    ],
-)
 @pytest.mark.parametrize("ffn_first", [False, True])
-def test_compile_options_place_ffn_before_linear_passes(
-    linear_options_fn, linear_pass, ffn_first: bool
+def test_compile_options_compose_with_linear_attention_and_residual_updates(
+    ffn_first: bool,
 ) -> None:
-    options = (
-        linear_options_fn(ffn_compile_options())
+    combined = (
+        compile_options(compile_options(ffn=True), attention=True, residual_updates=True)
         if ffn_first
-        else ffn_compile_options(linear_options_fn())
+        else compile_options(compile_options(attention=True, residual_updates=True), ffn=True)
     )
-    assert options[_POST_GRAD_PRE_PASS] == (ffn_compile_pass, linear_pass)
-    assert ffn_compile_options(options) == options
+    assert combined == compile_options(ffn=True, attention=True, residual_updates=True)
+    assert combined["allow_buffer_reuse"] is False
 
 
 def test_compile_options_preserve_unrelated_pass_order() -> None:
     before = object()
     after = object()
-    options = ffn_compile_options({_POST_GRAD_PRE_PASS: (before, convrot_int8_compile_pass, after)})
-    assert options[_POST_GRAD_PRE_PASS] == (
-        before,
-        ffn_compile_pass,
-        convrot_int8_compile_pass,
-        after,
-    )
-
-
-@pytest.mark.parametrize("ffn_first", [False, True])
-def test_compile_options_compose_with_sparse_piper_and_residual_updates(ffn_first: bool) -> None:
-    int8_opts = (
-        convrot_int8_sparse_piper_compile_options(ffn_compile_options())
-        if ffn_first
-        else ffn_compile_options(convrot_int8_sparse_piper_compile_options())
-    )
-    int8_passes = int8_opts[_POST_GRAD_PRE_PASS]
-    assert isinstance(int8_passes, tuple)
-    assert int8_passes.index(ffn_compile_pass) < int8_passes.index(convrot_int8_compile_pass)
-    assert int8_passes.index(int8_sparse_compile_pass) < int8_passes.index(
-        convrot_int8_compile_pass
-    )
-
-    nvfp4_opts = (
-        nvfp4_sparse_piper_compile_options(ffn_compile_options())
-        if ffn_first
-        else ffn_compile_options(nvfp4_sparse_piper_compile_options())
-    )
-    assert nvfp4_opts[_POST_GRAD_PRE_PASS] == (
-        ffn_compile_pass,
-        nvfp4_compile_pass,
-        convrot_nvfp4_compile_pass,
-        nvfp4_sparse_compile_pass,
-    )
-
-    residual_opts = (
-        residual_updates_compile_options(ffn_compile_options())
-        if ffn_first
-        else ffn_compile_options(residual_updates_compile_options())
-    )
-    assert residual_opts[_POST_GRAD_PRE_PASS] == (
-        residual_compile._compile_pass,
-        ffn_compile_pass,
-    )
+    linear_pass = compile_options()[_POST_GRAD_PRE_PASS][0]  # type: ignore[index]
+    options = compile_options({_POST_GRAD_PRE_PASS: (before, linear_pass, after)}, ffn=True)
+    expected = compile_options(ffn=True)[_POST_GRAD_PRE_PASS][0]  # type: ignore[index]
+    assert options[_POST_GRAD_PRE_PASS] == (before, expected, after)
 
 
 @pytest.mark.gpu
@@ -174,12 +109,10 @@ def test_convrot_int8_compile_folds_ffn(
     capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
-        expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
-            source
-        )
+        expected = torch.compile(model, fullgraph=True, options=compile_options())(source)
         torch._dynamo.reset()
         actual = torch.compile(
-            model, fullgraph=True, options=capture.wrap_options(ffn_compile_options())
+            model, fullgraph=True, options=capture.wrap_options(compile_options(ffn=True))
         )(source)
 
     assert isinstance(expected, torch.Tensor)
@@ -217,7 +150,7 @@ def test_convrot_int8_compile_fails_closed(activation: Activation, failure: str)
         arguments = (torch.randn(257, model.input_features, dtype=torch.bfloat16, device="cuda"),)
 
     capture = TargetCapturePass()
-    ordinary = convrot_int8_compile_options()
+    ordinary = compile_options()
     with torch.inference_mode():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=ordinary)(*arguments)
@@ -225,7 +158,7 @@ def test_convrot_int8_compile_fails_closed(activation: Activation, failure: str)
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=capture.wrap_options(ffn_compile_options(ordinary)),
+            options=capture.wrap_options(compile_options(ordinary, ffn=True)),
         )(*arguments)
 
     expected_values = expected if isinstance(expected, tuple) else (expected,)
@@ -233,7 +166,7 @@ def test_convrot_int8_compile_fails_closed(activation: Activation, failure: str)
     assert all(
         torch.equal(left, right) for left, right in zip(actual_values, expected_values, strict=True)
     )
-    assert torch.ops.piper_kernels.convrot_int8_ffn.default not in capture.targets
+    assert "piper_kernels.convrot_int8_ffn.default" not in capture.target_names
 
 
 @pytest.mark.gpu
@@ -249,26 +182,24 @@ def test_convrot_int8_compile_folds_gated_updates_and_residual_add(
     capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
-        expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
-            *arguments
-        )
+        expected = torch.compile(model, fullgraph=True, options=compile_options())(*arguments)
         torch._dynamo.reset()
         actual = torch.compile(
-            model, fullgraph=True, options=capture.wrap_options(ffn_compile_options())
+            model, fullgraph=True, options=capture.wrap_options(compile_options(ffn=True))
         )(*arguments)
 
     assert isinstance(expected, torch.Tensor)
     assert isinstance(actual, torch.Tensor)
     assert relative_l2(actual, expected) < 0.01
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_ffn_update_.default) == 1
-    assert torch.ops.piper_kernels.convrot_int8_ffn.default not in capture.targets
+    assert "piper_kernels.convrot_int8_ffn.default" not in capture.target_names
 
     assert_copy_back_computes_ffn_inside_its_add(
         model,
         arguments,
         "convrot_int8_ffn_update_",
-        convrot_int8_compile_options(),
-        ffn_compile_options(),
+        compile_options(),
+        compile_options(ffn=True),
         0.01,
     )
 
@@ -285,12 +216,10 @@ def test_convrot_int8_gated_updates_fail_closed_when_intermediate_escapes(
     capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
-        expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
-            *arguments
-        )
+        expected = torch.compile(model, fullgraph=True, options=compile_options())(*arguments)
         torch._dynamo.reset()
         actual = torch.compile(
-            model, fullgraph=True, options=capture.wrap_options(ffn_compile_options())
+            model, fullgraph=True, options=capture.wrap_options(compile_options(ffn=True))
         )(*arguments)
 
     assert isinstance(expected, tuple)
@@ -298,7 +227,7 @@ def test_convrot_int8_gated_updates_fail_closed_when_intermediate_escapes(
     assert all(
         relative_l2(left, right) < 0.01 for left, right in zip(actual, expected, strict=True)
     )
-    assert torch.ops.piper_kernels.convrot_int8_ffn_update_.default not in capture.targets
+    assert "piper_kernels.convrot_int8_ffn_update_.default" not in capture.target_names
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_ffn.default) == 1
 
 
@@ -314,18 +243,16 @@ def test_convrot_int8_gated_updates_do_not_mutate_caller_input(
     capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
-        expected = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())(
-            *arguments
-        )
+        expected = torch.compile(model, fullgraph=True, options=compile_options())(*arguments)
         torch._dynamo.reset()
         actual = torch.compile(
-            model, fullgraph=True, options=capture.wrap_options(ffn_compile_options())
+            model, fullgraph=True, options=capture.wrap_options(compile_options(ffn=True))
         )(*arguments)
 
     assert isinstance(expected, torch.Tensor)
     assert isinstance(actual, torch.Tensor)
     assert relative_l2(actual, expected) < 0.01
-    assert torch.ops.piper_kernels.convrot_int8_ffn_update_.default not in capture.targets
+    assert "piper_kernels.convrot_int8_ffn_update_.default" not in capture.target_names
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_ffn.default) == 1
 
 
@@ -354,9 +281,9 @@ def test_convrot_int8_compiled_static_scales_update_without_recompilation(mode: 
     source = torch.randn(129, model.input_features, device="cuda", dtype=torch.bfloat16)
     capture = TargetCapturePass()
     compiled = torch.compile(
-        model, fullgraph=True, options=capture.wrap_options(ffn_compile_options())
+        model, fullgraph=True, options=capture.wrap_options(compile_options(ffn=True))
     )
-    ordinary = torch.compile(model, fullgraph=True, options=convrot_int8_compile_options())
+    ordinary = torch.compile(model, fullgraph=True, options=compile_options())
     with torch.inference_mode():
         first = compiled(source)
         assert relative_l2(first, ordinary(source)) < 0.01
@@ -408,7 +335,7 @@ def test_convrot_int8_static_ffn_feeds_unfused_projection_and_cache_isolation() 
         )
         expected = model.tail(down)
         actual = torch.compile(
-            model, fullgraph=True, options=capture.wrap_options(ffn_compile_options())
+            model, fullgraph=True, options=capture.wrap_options(compile_options(ffn=True))
         )(source)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_ffn.default) == 1
@@ -416,7 +343,7 @@ def test_convrot_int8_static_ffn_feeds_unfused_projection_and_cache_isolation() 
 
     # Verify FX cache does not confuse shared vs distinct static scale aliases.
     cache_capture = TargetCapturePass(cache_key=b"ffn-int8-scale-cache-collisions")
-    cache_options = cache_capture.wrap_options(ffn_compile_options())
+    cache_options = cache_capture.wrap_options(compile_options(ffn=True))
     for mode in ("shared", "distinct", "mixed", "shared"):
         torch._dynamo.reset()
         torch.manual_seed(1074)
@@ -488,14 +415,14 @@ def test_nvfp4_compile_folds_standard_convrot_and_mixed_ffn(
         reverse_multiply=up_dynamic,
         explicit_promotion=high_first,
     ).eval()
-    ordinary = convrot_nvfp4_compile_options(nvfp4_compile_options())
+    ordinary = compile_options()
     capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=ordinary)(source)
         torch._dynamo.reset()
         actual = torch.compile(
-            model, fullgraph=True, options=capture.wrap_options(ffn_compile_options())
+            model, fullgraph=True, options=capture.wrap_options(compile_options(ffn=True))
         )(source)
 
     assert isinstance(expected, torch.Tensor)
@@ -505,10 +432,9 @@ def test_nvfp4_compile_folds_standard_convrot_and_mixed_ffn(
     if up_group_size is None and down_group_size is None:
         reference = materialized_nvfp4(operands).reshape_as(actual)
         assert relative_l2(actual, reference) < (0.1 if down_dynamic else 0.08)
-    assert capture.targets.count(torch.ops.piper_kernels.nvfp4_ffn.default) == 1
-    assert torch.ops.piper_kernels.nvfp4_linear.default not in capture.targets
-    if hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear"):
-        assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in capture.targets
+    assert capture.target_names.count("piper_kernels.nvfp4_ffn.default") == 1
+    assert "piper_kernels.nvfp4_linear.default" not in capture.target_names
+    assert "piper_kernels.convrot_nvfp4_linear.default" not in capture.target_names
 
 
 @pytest.mark.gpu
@@ -540,12 +466,12 @@ def test_nvfp4_shared_projection_weights_preserve_distinct_biases(
     model.up.weight = model.gate.weight
     capture = TargetCapturePass()
     with torch.no_grad():
-        expected = torch.ops.piper_kernels.nvfp4_ffn.default(**operands.arguments(1536))
         torch._dynamo.reset()
         actual = torch.compile(
-            model, fullgraph=True, options=capture.wrap_options(ffn_compile_options())
+            model, fullgraph=True, options=capture.wrap_options(compile_options(ffn=True))
         )(operands.input)
-    assert torch.ops.piper_kernels.nvfp4_ffn.default in capture.targets
+        expected = torch.ops.piper_kernels.nvfp4_ffn.default(**operands.arguments(1536))
+    assert "piper_kernels.nvfp4_ffn.default" in capture.target_names
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -576,18 +502,14 @@ def test_nvfp4_compile_fails_closed(
     else:
         arguments = (operands.input,)
 
-    ordinary = (
-        nvfp4_compile_options()
-        if group_size is None
-        else convrot_nvfp4_compile_options(nvfp4_compile_options())
-    )
+    ordinary = compile_options()
     capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=ordinary)(*arguments)
         torch._dynamo.reset()
         actual = torch.compile(
-            model, fullgraph=True, options=capture.wrap_options(ffn_compile_options(ordinary))
+            model, fullgraph=True, options=capture.wrap_options(compile_options(ordinary, ffn=True))
         )(*arguments)
 
     expected_values = expected if isinstance(expected, tuple) else (expected,)
@@ -595,7 +517,7 @@ def test_nvfp4_compile_fails_closed(
     assert all(
         torch.equal(left, right) for left, right in zip(actual_values, expected_values, strict=True)
     )
-    assert torch.ops.piper_kernels.nvfp4_ffn.default not in capture.targets
+    assert "piper_kernels.nvfp4_ffn.default" not in capture.target_names
 
 
 @pytest.mark.gpu
@@ -619,30 +541,26 @@ def test_nvfp4_compile_folds_gated_updates_and_residual_add(
     )
     model = Nvfp4GatedUpdates(operands, python_indexing=python_indexing).eval()
     arguments = make_nvfp4_gated_update_arguments(257, operands.down.weight.shape[0])
-    ordinary = (
-        nvfp4_compile_options()
-        if group_size is None
-        else convrot_nvfp4_compile_options(nvfp4_compile_options())
-    )
+    ordinary = compile_options()
     capture = TargetCapturePass()
     with torch.inference_mode():
         torch._dynamo.reset()
         expected = torch.compile(model, fullgraph=True, options=ordinary)(*arguments)
         torch._dynamo.reset()
         actual = torch.compile(
-            model, fullgraph=True, options=capture.wrap_options(ffn_compile_options())
+            model, fullgraph=True, options=capture.wrap_options(compile_options(ffn=True))
         )(*arguments)
 
     assert relative_l2(actual, expected) < 0.07
     assert capture.targets.count(torch.ops.piper_kernels.nvfp4_ffn_update_.default) == 1
-    assert torch.ops.piper_kernels.nvfp4_ffn.default not in capture.targets
+    assert "piper_kernels.nvfp4_ffn.default" not in capture.target_names
 
     assert_copy_back_computes_ffn_inside_its_add(
         model,
         arguments,
         "nvfp4_ffn_update_",
         ordinary,
-        ffn_compile_options(),
+        compile_options(ffn=True),
         0.07,
     )
 
@@ -663,7 +581,7 @@ def test_compiled_ffn_reuses_dynamic_graph_and_replays_in_cuda_graph(
         )
         width = 256
         out_width = 384
-        expected_op = torch.ops.piper_kernels.convrot_int8_ffn.default
+        expected_op = "piper_kernels.convrot_int8_ffn.default"
     else:
         group = 16 if fmt == "convrot_nvfp4" else None
         operands = make_nvfp4_operands(
@@ -678,7 +596,7 @@ def test_compiled_ffn_reuses_dynamic_graph_and_replays_in_cuda_graph(
         model = Nvfp4FfnModule(operands).eval()
         width = operands.input.shape[-1]
         out_width = operands.down.weight.shape[0]
-        expected_op = torch.ops.piper_kernels.nvfp4_ffn.default
+        expected_op = "piper_kernels.nvfp4_ffn.default"
 
     first = torch.randn(257, width, device="cuda", dtype=torch.bfloat16)
     second = torch.randn(385, width, device="cuda", dtype=torch.bfloat16)
@@ -687,19 +605,19 @@ def test_compiled_ffn_reuses_dynamic_graph_and_replays_in_cuda_graph(
     capture = TargetCapturePass()
     torch._dynamo.reset()
     compiled = torch.compile(
-        model, fullgraph=True, options=capture.wrap_options(ffn_compile_options())
+        model, fullgraph=True, options=capture.wrap_options(compile_options(ffn=True))
     )
     with torch.inference_mode():
         assert compiled(first).shape == (257, out_width)
         assert compiled(second).shape == (385, out_width)
     assert capture.calls == 1
-    assert capture.targets.count(expected_op) == 1
+    assert capture.target_names.count(expected_op) == 1
 
     # Explicit CUDA graph capture & replay with updated input values.
     static_x = torch.randn(256, width, device="cuda", dtype=torch.bfloat16)
     torch._dynamo.reset()
     compiled_static = torch.compile(
-        model, fullgraph=True, options=ffn_compile_options({"triton.cudagraphs": False})
+        model, fullgraph=True, options=compile_options({"triton.cudagraphs": False}, ffn=True)
     )
     with torch.inference_mode():
         warmup_out = compiled_static(static_x)
@@ -727,14 +645,13 @@ import sys
 sys.path.insert(0, sys.argv[2])
 import torch
 from _compile_capture import TargetCapturePass
-from piper_kernels.fusions.ffn import ffn_compile_options
+from piper_kernels import compile_options
 from tests.fusions.ffn._helpers import Nvfp4FfnModule, make_nvfp4_operands
 
 assert not hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
 register_convrot = sys.argv[1] == "True"
 if register_convrot:
-    from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options
-    convrot_nvfp4_compile_options()
+    import piper_kernels.linear.convrot.nvfp4._ops  # noqa: F401
 
 torch.set_num_threads(1)
 operands = make_nvfp4_operands(
@@ -742,7 +659,7 @@ operands = make_nvfp4_operands(
 )
 model = Nvfp4FfnModule(operands).eval()
 capture = TargetCapturePass()
-options = capture.wrap_options(ffn_compile_options())
+options = capture.wrap_options(compile_options(ffn=True))
 options.update({"triton.cudagraphs": False, "compile_threads": 1})
 with torch.no_grad():
     actual = torch.compile(model, fullgraph=True, options=options)(operands.input)
@@ -947,7 +864,7 @@ def test_schema_bound_activation_matching_accepts_kwargs_and_checks_alpha(
 
         down = _add_nvfp4_meta_linear_node(graph, "down", activated, rows, features)
         graph.output(down)
-        ffn_compile_pass(graph, is_inference=True)
+        fold_ffns(graph)
         targets = [node.target for node in graph.nodes if node.op == "call_function"]
 
     ffn_op = getattr(torch.ops.piper_kernels, "nvfp4_ffn", None)
@@ -1021,10 +938,8 @@ def test_schema_bound_gated_updates_accept_kwargs_and_check_alpha(
         )
         output.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
         graph.output(output)
-        ffn_compile_pass(graph, is_inference=True)
-        targets = [node.target for node in graph.nodes if node.op == "call_function"]
+        fold_ffns(graph)
+        target_names = [str(node.target) for node in graph.nodes if node.op == "call_function"]
 
-    assert (
-        torch.ops.piper_kernels.convrot_int8_ffn_update_.default in targets
-    ) is should_fold_update
-    assert (torch.ops.piper_kernels.convrot_int8_ffn.default in targets) is not should_fold_update
+    assert ("piper_kernels.convrot_int8_ffn_update_.default" in target_names) is should_fold_update
+    assert ("piper_kernels.convrot_int8_ffn.default" in target_names) is not should_fold_update

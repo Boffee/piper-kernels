@@ -5,7 +5,8 @@ import torch
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 
-from piper_kernels.fusions.nvfp4_sparse_piper import _output, nvfp4_sparse_piper_compile_options
+from piper_kernels import compile_options
+from piper_kernels.fusions.nvfp4_sparse_piper import _output
 
 from ._accuracy import assert_fusion_output_close
 from .nvfp4_sparse_piper import test_compile as nvfp4
@@ -19,7 +20,7 @@ def test_forced_nvfp4_output_matches_materialized_attention(monkeypatch, group_s
     torch.manual_seed(1093)
     monkeypatch.setattr(_output, "DEFAULT_QUERY_CHUNK_ROWS", 128)
     model = nvfp4._SparseProjectionAttentionOutput(dynamic=True, group_size=group_size).eval()
-    options = nvfp4_sparse_piper_compile_options()
+    options = compile_options(attention=True)
     hidden = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",

@@ -13,7 +13,8 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     per_tensor_amax_to_scale,
 )
 
-from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_compile_options, convrot_nvfp4_linear
+from piper_kernels import compile_options
+from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_linear
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
@@ -697,7 +698,7 @@ def test_cuda_linear_supports_mixed_precision_bias(
 
     expected = convrot_nvfp4_linear(activation, weight, bias)
     call = (
-        torch.compile(projection, fullgraph=True, options=convrot_nvfp4_compile_options())
+        torch.compile(projection, fullgraph=True, options=compile_options())
         if compiled
         else projection
     )
@@ -780,7 +781,7 @@ def test_cuda_autocast_normalizes_semantic_linear(
         return F.linear(value, weight, offset)
 
     call = (
-        torch.compile(projection, fullgraph=True, options=convrot_nvfp4_compile_options())
+        torch.compile(projection, fullgraph=True, options=compile_options())
         if compiled
         else projection
     )

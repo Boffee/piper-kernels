@@ -509,23 +509,64 @@ def test_shared_boundary_check_rejects_relative_and_absolute_vendor_imports(sour
 
 def _projection_match(head_dim, input_features=256):
     graph = torch.fx.Graph()
-    arguments = {"sparse_routing_mode": _MINMAX_ROUTING, "sparse_group_size": 16}
 
     def operand(name, shape, dtype):
         node = graph.placeholder(name)
         node.meta["val"] = torch.empty(shape, dtype=dtype)
-        arguments[name] = node
-        return node.meta["val"]
+        return node
 
-    input_value = operand("sparse_input", (1, 128, input_features), torch.bfloat16)
+    input_node = operand("sparse_input", (1, 128, input_features), torch.bfloat16)
+    projections = []
     for kind in ("q", "k", "v"):
-        operand(f"sparse_{kind}_weight_qdata", (2 * head_dim, input_features), torch.int8)
-        operand(f"sparse_{kind}_weight_scale", (2 * head_dim, 1), torch.float32)
-        arguments[f"sparse_{kind}_bias"] = None
-        arguments[f"sparse_{kind}_input_scale"] = None
-    operand("attention_output", (1, 128, 2, head_dim), torch.bfloat16)
-    match = SimpleNamespace(kwargs=arguments, output_node=lambda: arguments["attention_output"])
-    return match, input_value
+        weight_qdata = operand(
+            f"sparse_{kind}_weight_qdata", (2 * head_dim, input_features), torch.int8
+        )
+        weight_scale = operand(f"sparse_{kind}_weight_scale", (2 * head_dim, 1), torch.float32)
+        projections.append(
+            _compile._BoundInt8Projection(
+                node=input_node,
+                input=input_node,
+                weight_qdata=weight_qdata,
+                weight_scale=weight_scale,
+                bias=None,
+                group_size=16,
+                input_scale=None,
+            )
+        )
+    attention_output = operand("attention_output", (1, 128, 2, head_dim), torch.bfloat16)
+    cos = operand("cos", (128, head_dim // 2), torch.float32)
+    sin = operand("sin", (128, head_dim // 2), torch.float32)
+    matched = _compile.sparse_piper_compile.SparsePiperProjectionMatch(
+        output_node=attention_output,
+        fine_node=attention_output,
+        coarse_node=None,
+        query_projection=input_node,
+        key_projection=input_node,
+        value_projection=input_node,
+        attention_shape=(1, 128, 2, head_dim),
+        q_norm_weight=None,
+        q_norm_epsilon=1e-5,
+        k_norm_weight=None,
+        k_norm_epsilon=1e-5,
+        cos=cos,
+        sin=sin,
+        rotary_dim=head_dim // 2,
+        half_rotary_dim=head_dim // 4,
+        activation_dtype=torch.bfloat16,
+        ratio_profile=operand("ratio_profile", (2,), torch.int64),
+        sparse_key_blocks=2,
+        softmax_scale=head_dim**-0.5,
+        routing_mode=_MINMAX_ROUTING,
+        block_lengths=None,
+        sparse_query_blocks=None,
+        force_tile_ids=None,
+        force_tile_counts=None,
+        coarse_gate=None,
+        coarse_key_blocks=None,
+        coarse_scale=None,
+        coarse_routing_mode=None,
+    )
+    return matched, tuple(projections), input_node.meta["val"]
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -542,8 +583,8 @@ def test_amd_projection_compiler_selects_actual_attention_width(
     )
     validate = Mock(return_value=True)
     monkeypatch.setattr(_compile.sparse_piper_compile, "valid_sparse_piper_attention", validate)
-    match, _ = _projection_match(head_dim, input_features)
-    assert _compile._valid_sparse_piper_projection(match)
+    matched, projections, _ = _projection_match(head_dim, input_features)
+    assert _compile._valid_sparse_piper_projection(matched, *projections)
     validate.assert_called_once()
 
 
@@ -563,8 +604,8 @@ def test_projection_compiler_requires_each_emitted_operation(monkeypatch, missin
     monkeypatch.setattr(
         _compile.sparse_piper_compile, "valid_sparse_piper_attention", validate_attention
     )
-    match, input_value = _projection_match(128)
-    assert _compile._valid_sparse_piper_projection(match) is (missing is None)
+    matched, projections, input_value = _projection_match(128)
+    assert _compile._valid_sparse_piper_projection(matched, *projections) is (missing is None)
     for probe in probes:
         if probe.called:
             if probe is probes[0]:
@@ -595,19 +636,20 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
         torch.ops.piper_kernels.convrot_int8_linear.default, (reshaped, weight, scale, None, 16)
     )
     projected.meta["val"] = torch.empty((1, 128, 384), dtype=torch.bfloat16)
-    match = SimpleNamespace(
-        output_node=lambda: projected,
-        kwargs={
-            "output_query": query_node,
-            "output_weight_qdata": weight,
-            "output_weight_scale": scale,
-            "output_attention_shape": [1, 128, 256],
-            "output_group_size": 16,
-            "output_input_scale": None,
-            "output_bias": None,
-        },
+    reshaped_match = _compile.sparse_piper_compile.ReshapedQuantizedAttentionMatch(
+        reshape_node=reshaped,
+        attention_node=attention,
+        attention_shape=[1, 128, 256],
+        attention_args={"query": query_node},
+        is_coarse=False,
+        force_kwargs={},
     )
-    assert _output_compile._valid_attention_output(match) is supported
+    assert (
+        _output_compile._valid_attention_output(
+            projected, reshaped_match, weight, scale, None, 16, None
+        )
+        is supported
+    )
     select.assert_called_once_with(query_node.meta["val"])
 
 

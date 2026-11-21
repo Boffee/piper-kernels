@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels import _input_activations as input_activations
+from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
@@ -26,15 +27,28 @@ class SemanticLinearNodes:
 
     @classmethod
     def from_call(cls, node: torch.fx.Node) -> SemanticLinearNodes | None:
-        """Parse one positional ConvRot NVFP4 semantic-linear call."""
-        if node.kwargs or len(node.args) not in (8, 9):
+        """Parse one schema-bound ConvRot NVFP4 semantic-linear call."""
+        bound = linear_fx.bind_call(node, torch.ops.piper_kernels.convrot_nvfp4_linear.default)
+        if bound is None:
             return None
-        group_size = node.args[-1] if len(node.args) == 8 else node.args[-2]
-        high_first = False if len(node.args) == 8 else node.args[-1]
+        group_size = bound["group_size"]
         if not isinstance(group_size, int) or isinstance(group_size, bool):
             return None
-        linear_values = node.args[:-1] if len(node.args) == 8 else (*node.args[:-2], high_first)
-        linear = nvfp4_compile_fx.SemanticLinearNodes.from_values(linear_values)
+        linear = nvfp4_compile_fx.SemanticLinearNodes.from_values(
+            tuple(
+                bound[name]
+                for name in (
+                    "input",
+                    "weight_qdata",
+                    "weight_scale",
+                    "weight_per_tensor_scale",
+                    "activation_per_tensor_scale",
+                    "bias",
+                    "dynamic_activation_scale",
+                    "high_first",
+                )
+            )
+        )
         return None if linear is None else cls(linear, group_size)
 
 

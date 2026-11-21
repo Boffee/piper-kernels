@@ -3,36 +3,12 @@
 from __future__ import annotations
 
 import operator
-from collections.abc import Iterator
-from contextlib import contextmanager
 
 import torch
 
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 type PreparedInputNodes = tuple[torch.fx.Node, torch.fx.Node, torch.dtype]
-
-
-@contextmanager
-def canonical_linear_calls(graph: torch.fx.Graph) -> Iterator[None]:
-    """Match optional defaults while preserving surviving calls' arity and rewritten inputs."""
-    original_arity = {}
-    for node in graph.nodes:
-        if (
-            node.op == "call_function"
-            and node.target == torch.ops.piper_kernels.convrot_int8_linear.default
-            and not node.kwargs
-            and len(node.args) in (5, 6)
-        ):
-            original_arity[node] = len(node.args)
-            node.args = node.args + (None,) * (7 - len(node.args))
-    try:
-        yield
-    finally:
-        live_nodes = set(graph.nodes)
-        for node, arity in original_arity.items():
-            if node in live_nodes:
-                node.args = node.args[:arity]
 
 
 def valid_input_scale(node: object, device: torch.device) -> bool:
@@ -79,7 +55,6 @@ def emit_prepared_input(
 
 __all__ = [
     "PreparedInputNodes",
-    "canonical_linear_calls",
     "emit_prepared_input",
     "valid_input_scale",
 ]

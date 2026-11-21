@@ -30,7 +30,12 @@ from torch.distributed.tensor.parallel import (
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels import SparsePiperAttention, piper_attention, sparse_piper_coarse_residual
+from piper_kernels import (
+    SparsePiperAttention,
+    compile_options,
+    piper_attention,
+    sparse_piper_coarse_residual,
+)
 from piper_kernels._distributed import _comm as distributed_comm
 from piper_kernels._distributed import _fx as distributed_fx
 from piper_kernels._distributed import _peer_exchange as peer_exchange
@@ -44,7 +49,6 @@ from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_piper import _backend as dense_fusion_backend
 from piper_kernels.fusions.convrot_int8_piper import _distributed_compile as dense_dist_compile
-from piper_kernels.fusions.convrot_int8_piper import convrot_int8_piper_compile_options
 from piper_kernels.fusions.convrot_int8_piper import distributed_output as dense_distributed_output
 from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import NvidiaExecutionPlan
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
@@ -54,7 +58,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _distributed_compile as sparse_dist_compile,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    convrot_int8_sparse_piper_compile_options,
     distributed_output,
     kv_gather,
 )
@@ -64,9 +67,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     value as value_ops,
 )
-from piper_kernels.fusions.ffn import ffn_compile_options
-from piper_kernels.fusions.residual_updates import residual_updates_compile_options
-from piper_kernels.linear.convrot import convrot_int8_compile_options
 from piper_kernels.linear.convrot.int8 import _backend as convrot_linear_backend
 from piper_kernels.linear.convrot.int8 import _distributed_compile as linear_dist_compile
 from piper_kernels.linear.convrot.int8 import _ops as convrot_int8_ops
@@ -2027,11 +2027,7 @@ _ATTN_RS_RESIDUAL_OP = (
 
 
 def _build_compile_options(capture: FunctionalTargetCapturePass) -> dict[str, Any]:
-    opts: dict[str, Any] = {}
-    opts = residual_updates_compile_options(opts)
-    opts = convrot_int8_sparse_piper_compile_options(opts)
-    opts = ffn_compile_options(opts)
-    opts = convrot_int8_compile_options(opts)
+    opts = compile_options(ffn=True, attention=True, residual_updates=True)
     return capture.wrap_options(opts)
 
 
@@ -2101,18 +2097,14 @@ def _check_quantized_all_gather_sibling_linears(
         },
         src_data_rank=None,
     )
-    from piper_kernels._inductor_options import add_post_grad_pass  # noqa: PLC0415
-
     capture = FunctionalTargetCapturePass()
-    compiled_dist = torch.compile(
-        dist_mod, options=add_post_grad_pass(convrot_int8_compile_options({}), capture)
-    )
+    compiled_dist = torch.compile(dist_mod, options=capture.wrap_options(compile_options()))
 
     ref_fn = None
     if rank == 0:
         ref_mod = _WrapPair().to(device).eval()
         _quantize_module_linears(ref_mod, pair_weights, {}, biases=pair_biases, device=device)
-        ref_fn = torch.compile(ref_mod, options=convrot_int8_compile_options({}))
+        ref_fn = torch.compile(ref_mod, options=compile_options())
 
     seq = 256
     local_seq = seq // world
@@ -2487,11 +2479,7 @@ def _check_standalone(
     cap_sa = FunctionalTargetCapturePass()
     compiled_sa = torch.compile(
         standalone,
-        options=cap_sa.wrap_options(
-            convrot_int8_compile_options(
-                ffn_compile_options(convrot_int8_sparse_piper_compile_options({}))
-            )
-        ),
+        options=cap_sa.wrap_options(compile_options(ffn=True, attention=True)),
     )
     torch.manual_seed(505)
     sa_h = torch.randn(1, seq, _LIVE_HIDDEN, dtype=torch.bfloat16)
@@ -2505,9 +2493,7 @@ def _check_standalone(
     if rank == 0:
         sa_ref = _WrapStandalone(_LIVE_HEADS).to(device).eval()
         _quantize_module_linears(sa_ref, weights, norms, device=device)
-        sa_ref_opts = convrot_int8_compile_options(
-            ffn_compile_options(convrot_int8_sparse_piper_compile_options({}))
-        )
+        sa_ref_opts = compile_options(ffn=True, attention=True)
         compiled_sa_ref = torch.compile(sa_ref, options=sa_ref_opts)
         ref_sa_out = compiled_sa_ref(sa_h.to(device), cos_all, sin_all)
         rel = _rel_l2(gathered_sa, ref_sa_out)
@@ -2583,9 +2569,7 @@ def _check_bias_fp16_and_projected_gate(
     capture = FunctionalTargetCapturePass()
     compiled_dist = torch.compile(
         dist_mod,
-        options=capture.wrap_options(
-            convrot_int8_compile_options(convrot_int8_sparse_piper_compile_options({}))
-        ),
+        options=capture.wrap_options(compile_options(attention=True)),
     )
 
     ref_fn = None
@@ -2596,7 +2580,7 @@ def _check_bias_fp16_and_projected_gate(
         )
         ref_fn = torch.compile(
             ref_mod,
-            options=convrot_int8_compile_options(convrot_int8_sparse_piper_compile_options({})),
+            options=compile_options(attention=True),
         )
 
     seq = 512
@@ -2886,11 +2870,7 @@ def _parallelize_dense_attention_module(module: nn.Module, mesh: DeviceMesh) -> 
 
 
 def _build_dense_compile_options(capture: FunctionalTargetCapturePass | None) -> dict[str, Any]:
-    opts: dict[str, Any] = {}
-    opts = residual_updates_compile_options(opts)
-    opts = convrot_int8_piper_compile_options(opts, fuse_output=True)
-    opts = ffn_compile_options(opts)
-    opts = convrot_int8_compile_options(opts)
+    opts = compile_options(ffn=True, attention_output=True, residual_updates=True)
     return opts if capture is None else capture.wrap_options(opts)
 
 
@@ -3105,9 +3085,7 @@ def _check_dense_batched_and_standalone(
     )
     _parallelize_dense_attention_module(sa_mod, mesh)
     cap_sa = FunctionalTargetCapturePass()
-    sa_opts = convrot_int8_compile_options(
-        ffn_compile_options(convrot_int8_piper_compile_options({}, fuse_output=True))
-    )
+    sa_opts = compile_options(ffn=True, attention_output=True)
     compiled_sa = torch.compile(sa_mod, options=cap_sa.wrap_options(sa_opts))
     torch.manual_seed(1404)
     sa_h = torch.randn(1, seq, _LIVE_HIDDEN, dtype=torch.bfloat16)
@@ -3354,9 +3332,7 @@ def _check_dense_fp16_bias(
     )
     _parallelize_dense_attention_module(dist_mod, mesh)
     capture = FunctionalTargetCapturePass()
-    fp16_opts = convrot_int8_compile_options(
-        convrot_int8_piper_compile_options({}, fuse_output=True)
-    )
+    fp16_opts = compile_options(attention_output=True)
     compiled_dist = torch.compile(dist_mod, options=capture.wrap_options(fp16_opts))
 
     ref_fn = None
@@ -3607,11 +3583,7 @@ def _2gpu_block_worker(rank: int, world: int, store_path: str, backend: str) -> 
             if rank == 0:
                 ref_block = _LiveH3Block(_LIVE_HEADS).to(device).eval()
                 _quantize_module_linears(ref_block, weights, norms, device=device)
-                ref_opts = residual_updates_compile_options(
-                    convrot_int8_compile_options(
-                        ffn_compile_options(convrot_int8_sparse_piper_compile_options({}))
-                    )
-                )
+                ref_opts = compile_options(ffn=True, attention=True, residual_updates=True)
                 ref_fn = torch.compile(
                     lambda h, c, s, gi, bl, cg: h.copy_(ref_block(h, c, s, gi, bl, cg)),
                     dynamic=True,

@@ -154,8 +154,8 @@ def test_output_rewrite_preserves_unsupported_or_escaping_regions(monkeypatch, u
         linear.args[1].meta["val"] = torch.empty(80, 128, dtype=torch.int8)
     elif unsupported == "metadata":
         linear.args[2].meta["val"] = None
-    _compile.compile_pass(graph, is_inference=True)
-    _compile.output_compile_pass(graph, is_inference=True)
+    _compile.fold_attention_projections(graph)
+    _compile.fold_attention_output(graph)
     graph.lint()
     targets = [node.target for node in graph.nodes]
     assert (
@@ -172,7 +172,7 @@ def test_output_rewrite_keeps_a_different_logical_query_extent(monkeypatch):
     monkeypatch.setattr(
         _output_compile.linear_backend, "select_linear_backend", lambda *a, **kw: object()
     )
-    _compile.compile_pass(graph, is_inference=True)
+    _compile.fold_attention_projections(graph)
     attention = next(
         node
         for node in graph.nodes

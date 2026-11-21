@@ -2,6 +2,7 @@
 
 import copy
 from datetime import timedelta
+from functools import partial
 
 import pytest
 import torch
@@ -14,11 +15,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
-from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    convrot_int8_sparse_piper_compile_options,
-)
-from piper_kernels.fusions.ffn import ffn_compile_options
-from piper_kernels.fusions.nvfp4_sparse_piper import nvfp4_sparse_piper_compile_options
+from piper_kernels import compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
@@ -36,15 +33,15 @@ pytestmark = [
 ]
 
 _FFN_OPTIONS = {
-    "convrot_int8": ffn_compile_options,
-    "nvfp4": ffn_compile_options,
-    "convrot_nvfp4": ffn_compile_options,
+    "convrot_int8": partial(compile_options, ffn=True),
+    "nvfp4": partial(compile_options, ffn=True),
+    "convrot_nvfp4": partial(compile_options, ffn=True),
 }
 _GELU_FFN_OPTIONS = _FFN_OPTIONS
 _ATTENTION_OPTIONS = {
-    "convrot_int8": convrot_int8_sparse_piper_compile_options,
-    "nvfp4": nvfp4_sparse_piper_compile_options,
-    "convrot_nvfp4": nvfp4_sparse_piper_compile_options,
+    "convrot_int8": partial(compile_options, attention=True),
+    "nvfp4": partial(compile_options, attention=True),
+    "convrot_nvfp4": partial(compile_options, attention=True),
 }
 _FFN_PROJECTIONS = ("gate", "value", "down")
 _GELU_FFN_PROJECTIONS = ("up", "down")

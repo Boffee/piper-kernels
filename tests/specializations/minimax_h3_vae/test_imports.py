@@ -70,11 +70,9 @@ class BlockLinear(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, BlockLinear())
 
+from piper_kernels import compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-from piper_kernels.conv3d.convrot.int8 import (
-    ConvRotInt8Conv3d,
-    convrot_int8_conv3d_compile_options,
-)
+from piper_kernels.conv3d.convrot.int8 import ConvRotInt8Conv3d
 from piper_kernels.specializations.minimax_h3_vae import (
     minimax_h3_vae_convrot_int8_conv3d_compile_options,
 )
@@ -92,8 +90,10 @@ with torch.inference_mode():
     assert torch.isfinite(output).all()
 
 assert 'piper_kernels.conv3d.convrot.int8._compile' not in sys.modules
-generic_options = convrot_int8_conv3d_compile_options()
+generic_options = compile_options(linear=False, conv3d=True)
 assert generic_options['pre_grad_custom_pass']
+assert 'post_grad_custom_pre_pass' not in generic_options
+assert 'piper_kernels.conv3d.convrot.int8._compile' not in sys.modules
 options = minimax_h3_vae_convrot_int8_conv3d_compile_options()
 for graph_pass in options['pre_grad_custom_pass']:
     assert graph_pass.uuid()

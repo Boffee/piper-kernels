@@ -1,22 +1,13 @@
-"""NVFP4 projection folding for sparse Piper attention."""
+"""NVFP4 and ConvRot NVFP4 projection folding for sparse Piper attention."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from itertools import product
+from dataclasses import dataclass
+from typing import cast
 
 import torch
-from torch._inductor.custom_graph_pass import CustomInferenceAwareGraphPass
-from torch._inductor.pattern_matcher import (
-    CallFunction,
-    KeywordArg,
-    Match,
-    PatternMatcherPass,
-    register_graph_pattern,
-)
 from torch.fx.node import Argument
 
-from piper_kernels import _inductor_options as inductor_options
 from piper_kernels.attention.kernels.sparse_piper import layout
 from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
 from piper_kernels.attention.sparse_piper_attention._routing_modes import (
@@ -24,361 +15,450 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     is_valid_routing_mode,
 )
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
-from piper_kernels.fusions.sparse_piper import _pattern as sparse_piper_pattern
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-from piper_kernels.linear.convrot.nvfp4 import _compile as convrot_nvfp4_compile
+from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.nvfp4 import _chunking as nvfp4_chunking
-from piper_kernels.linear.nvfp4 import _compile as nvfp4_compile
 from piper_kernels.linear.nvfp4 import _compile_fx
 
 from . import _output_compile, _validation
 from . import key as key_operators  # noqa: F401 - registers the K projection
 from . import value as value_operators  # noqa: F401 - registers the V projections
 
+_aten = torch.ops.aten
 _TILE_ROWS = layout.TILE_ROWS
-_QUERY_SCALE_ROWS = layout.QUERY_SCALE_ROWS
+_NVFP4_LINEAR = "piper_kernels::nvfp4_linear"
+_CONVROT_NVFP4_LINEAR = "piper_kernels::convrot_nvfp4_linear"
+_NVFP4_LINEAR_PREPARED = "piper_kernels::nvfp4_linear_prepared"
 
 
-def _linear_pattern(prefix: str) -> CallFunction:
-    prepared = CallFunction(
-        torch.ops.piper_kernels.nvfp4_linear_prepared.default,
-        KeywordArg(f"{prefix}_input_qdata"),
-        KeywordArg(f"{prefix}_input_scale"),
-        KeywordArg(f"{prefix}_input_per_tensor_scale"),
-        KeywordArg(f"{prefix}_weight_qdata"),
-        KeywordArg(f"{prefix}_weight_scale"),
-        KeywordArg(f"{prefix}_weight_per_tensor_scale"),
-        KeywordArg(f"{prefix}_bias"),
-        KeywordArg(f"{prefix}_logical_dtype"),
-        _users=1,
+@dataclass(frozen=True, slots=True)
+class _MatchedNvfp4Projection:
+    """One validated prepared or semantic NVFP4 / ConvRot NVFP4 projection."""
+
+    sequence_length: int | torch.SymInt
+    heads: int
+    device: torch.device
+    prepared: _compile_fx.PreparedLinearNodes | None = None
+    semantic: _compile_fx.SemanticLinearNodes | None = None
+    group_size: int | None = None
+
+
+def _parse_prepared_projection(  # noqa: PLR0911
+    node: torch.fx.Node,
+    *,
+    head_dim: int,
+    name: str,
+) -> _MatchedNvfp4Projection | None:
+    reshape_bound = linear_compile_fx.bind_call(node, _aten.reshape.default)
+    if reshape_bound is None:
+        return None
+    prepared_node = reshape_bound["self"]
+    if (
+        not isinstance(prepared_node, torch.fx.Node)
+        or len(prepared_node.users) != 1
+        or linear_compile_fx.schema_name(prepared_node) != _NVFP4_LINEAR_PREPARED
+    ):
+        return None
+    operands = _compile_fx.PreparedLinearNodes.from_call(prepared_node)
+    if operands is None or operands.logical_dtype not in SUPPORTED_DTYPES:
+        return None
+    input_qdata = preparation_sharing.tensor_metadata(operands.input_qdata)
+    input_scale = preparation_sharing.tensor_metadata(operands.input_scale)
+    input_global = preparation_sharing.tensor_metadata(operands.input_per_tensor_scale)
+    weight = preparation_sharing.tensor_metadata(operands.weight_qdata)
+    weight_scale = preparation_sharing.tensor_metadata(operands.weight_scale)
+    global_valid, global_scale = sparse_piper_compile.optional_tensor_metadata(
+        operands.weight_per_tensor_scale
     )
-    return CallFunction(
-        torch.ops.aten.reshape.default,
-        prepared,
-        KeywordArg(f"{prefix}_linear_shape"),
-        _users=1,
-    )
-
-
-def _optional_tensor_metadata(value: object) -> tuple[bool, torch.Tensor | None]:
-    if value is None:
-        return True, None
-    if not isinstance(value, torch.fx.Node):
-        return False, None
-    metadata = preparation_sharing.tensor_metadata(value)
-    return metadata is not None, metadata
-
-
-def _valid_projection(match: Match) -> bool:  # noqa: PLR0911
-    if not is_valid_routing_mode(match.kwargs["sparse_routing_mode"]):
-        return False
-    prefixes = ("sparse_q", "sparse_k", "sparse_v")
-    projections = tuple(
-        _compile_fx.PreparedLinearNodes.from_match(match, prefix) for prefix in prefixes
-    )
-    if any(projection is None for projection in projections):
-        return False
-    q_projection = projections[0]
-    assert q_projection is not None
-    q_input = preparation_sharing.tensor_metadata(q_projection.input_qdata)
-    q_weight = preparation_sharing.tensor_metadata(q_projection.weight_qdata)
-    if q_input is None or q_weight is None or q_input.ndim != 2:
-        return False
-    sequence_length = q_input.shape[0]
-    output_features = sparse_piper_compile.static_int(q_weight.shape[0])
-    head_dim = sparse_piper_compile.attention_head_dim(match)
-    if output_features is None or head_dim is None or output_features % head_dim:
-        return False
-    heads = output_features // head_dim
-
-    for prefix, projection in zip(prefixes, projections, strict=True):
-        assert projection is not None
-        input_qdata = preparation_sharing.tensor_metadata(projection.input_qdata)
-        input_scale = preparation_sharing.tensor_metadata(projection.input_scale)
-        input_global_scale = preparation_sharing.tensor_metadata(projection.input_per_tensor_scale)
-        weight = preparation_sharing.tensor_metadata(projection.weight_qdata)
-        weight_scale = preparation_sharing.tensor_metadata(projection.weight_scale)
-        global_scale_valid, global_scale = _optional_tensor_metadata(
-            projection.weight_per_tensor_scale
+    bias_valid, bias = sparse_piper_compile.optional_tensor_metadata(operands.bias)
+    if (
+        input_qdata is None
+        or input_scale is None
+        or input_global is None
+        or weight is None
+        or weight_scale is None
+        or not global_valid
+        or not bias_valid
+    ):
+        return None
+    try:
+        sequence_length, heads = _validation.validate_projection(
+            input_qdata,
+            input_scale,
+            input_global,
+            weight,
+            weight_scale,
+            global_scale,
+            bias,
+            nvfp4_chunking.DEFAULT_CHUNK_ROWS,
+            name,
+            head_dim,
         )
-        bias_valid, bias = _optional_tensor_metadata(projection.bias)
-        if (
-            input_qdata is None
-            or input_scale is None
-            or input_global_scale is None
-            or weight is None
-            or weight_scale is None
-            or not global_scale_valid
-            or not bias_valid
-        ):
-            return False
-        try:
-            projection_sequence_length, projection_heads = _validation.validate_projection(
-                input_qdata,
-                input_scale,
-                input_global_scale,
-                weight,
-                weight_scale,
-                global_scale,
-                bias,
-                nvfp4_chunking.DEFAULT_CHUNK_ROWS,
-                f"{prefix} compiler projection",
-                head_dim,
-            )
-        except ValueError:
-            return False
+    except ValueError:
+        return None
+    linear_shape = reshape_bound["shape"]
+    linear_sequence_length = (
+        sparse_piper_compile.integer_scalar_metadata(linear_shape[1])
+        if isinstance(linear_shape, (list, tuple)) and len(linear_shape) == 3
+        else None
+    )
+    output_features = heads * head_dim
+    if (
+        not isinstance(linear_shape, (list, tuple))
+        or len(linear_shape) != 3
+        or sparse_piper_compile.static_int(linear_shape[0]) != 1
+        or linear_sequence_length is None
+        or preparation_sharing.dimension_key(linear_sequence_length)
+        != preparation_sharing.dimension_key(sequence_length)
+        or sparse_piper_compile.static_int(linear_shape[2]) != output_features
+    ):
+        return None
+    return _MatchedNvfp4Projection(
+        sequence_length=sequence_length,
+        heads=heads,
+        device=input_qdata.device,
+        prepared=operands,
+    )
 
-        linear_shape = match.kwargs[f"{prefix}_linear_shape"]
-        linear_sequence_length = (
-            sparse_piper_compile.integer_scalar_metadata(linear_shape[1])
-            if isinstance(linear_shape, (list, tuple)) and len(linear_shape) == 3
-            else None
+
+def _parse_semantic_projection(  # noqa: PLR0911
+    node: torch.fx.Node,
+    *,
+    head_dim: int,
+    name: str,
+) -> _MatchedNvfp4Projection | None:
+    op_name = linear_compile_fx.schema_name(node)
+    if op_name == _NVFP4_LINEAR:
+        linear = _compile_fx.SemanticLinearNodes.from_call(node)
+        if linear is None:
+            return None
+        validated = _compile_fx.validated_semantic_linear(linear, name)
+        group_size: int | None = None
+    elif op_name == _CONVROT_NVFP4_LINEAR:
+        from piper_kernels.linear.convrot.nvfp4 import (  # noqa: PLC0415
+            _compile_fx as convrot_nvfp4_compile_fx,
         )
-        if (
-            preparation_sharing.dimension_key(projection_sequence_length)
-            != preparation_sharing.dimension_key(sequence_length)
-            or projection_heads != heads
-            or not isinstance(linear_shape, (list, tuple))
-            or len(linear_shape) != 3
-            or sparse_piper_compile.static_int(linear_shape[0]) != 1
-            or linear_sequence_length is None
-            or preparation_sharing.dimension_key(linear_sequence_length)
-            != preparation_sharing.dimension_key(sequence_length)
-            or sparse_piper_compile.static_int(linear_shape[2]) != output_features
-            or projection.logical_dtype not in SUPPORTED_DTYPES
-        ):
-            return False
 
-    return sparse_piper_compile.valid_sparse_piper_attention(
-        match,
+        convrot = convrot_nvfp4_compile_fx.SemanticLinearNodes.from_call(node)
+        if convrot is None:
+            return None
+        validated = convrot_nvfp4_compile_fx.validated_semantic_linear(convrot, name)
+        linear = convrot.linear
+        group_size = convrot.group_size
+    else:
+        return None
+
+    if validated is None:
+        return None
+    input_value, shape = validated
+    output_features = sparse_piper_compile.static_int(shape.output_features)
+    if (
+        input_value.ndim != 3
+        or sparse_piper_compile.static_int(input_value.shape[0]) != 1
+        or input_value.dtype not in SUPPORTED_DTYPES
+        or not input_value.is_contiguous()
+        or output_features is None
+        or output_features % head_dim
+    ):
+        return None
+    sequence_length = input_value.shape[1]
+    if isinstance(sequence_length, int) and sequence_length < _TILE_ROWS:
+        return None
+    return _MatchedNvfp4Projection(
+        sequence_length=sequence_length,
+        heads=output_features // head_dim,
+        device=input_value.device,
+        semantic=linear,
+        group_size=group_size,
+    )
+
+
+def _parse_projection(
+    node: torch.fx.Node,
+    *,
+    head_dim: int,
+    name: str,
+) -> _MatchedNvfp4Projection | None:
+    prepared = _parse_prepared_projection(node, head_dim=head_dim, name=name)
+    if prepared is not None:
+        return prepared
+    return _parse_semantic_projection(node, head_dim=head_dim, name=name)
+
+
+def _valid_projections(  # noqa: PLR0911
+    matched: sparse_piper_compile.SparsePiperProjectionMatch,
+) -> tuple[_MatchedNvfp4Projection, _MatchedNvfp4Projection, _MatchedNvfp4Projection, int] | None:
+    routing_mode = matched.routing_mode
+    if (
+        isinstance(routing_mode, bool)
+        or not isinstance(routing_mode, int)
+        or not is_valid_routing_mode(routing_mode)
+    ):
+        return None
+    head_dim = sparse_piper_compile.attention_head_dim(matched.output_node)
+    if head_dim is None:
+        return None
+    parsed = tuple(
+        _parse_projection(node, head_dim=head_dim, name=f"sparse_{prefix} compiler projection")
+        for prefix, node in (
+            ("q", matched.query_projection),
+            ("k", matched.key_projection),
+            ("v", matched.value_projection),
+        )
+    )
+    if any(item is None for item in parsed):
+        return None
+    q_proj, k_proj, v_proj = cast(
+        tuple[_MatchedNvfp4Projection, _MatchedNvfp4Projection, _MatchedNvfp4Projection], parsed
+    )
+    sequence_length = q_proj.sequence_length
+    heads = q_proj.heads
+    device = q_proj.device
+    if any(
+        preparation_sharing.dimension_key(proj.sequence_length)
+        != preparation_sharing.dimension_key(sequence_length)
+        or proj.heads != heads
+        or proj.device != device
+        for proj in (k_proj, v_proj)
+    ):
+        return None
+    if not sparse_piper_compile.valid_sparse_piper_attention(
+        matched,
         batch=1,
         sequence_length=sequence_length,
         heads=heads,
-        device=q_input.device,
+        device=device,
         head_dim=head_dim,
         tile_rows=_TILE_ROWS,
+    ):
+        return None
+    if (
+        matched.coarse_node is not None
+        and not sparse_piper_compile.valid_sparse_piper_coarse_residual(matched)
+    ):
+        return None
+    return q_proj, k_proj, v_proj, head_dim
+
+
+def _emit_prepared_storage(
+    graph: torch.fx.Graph,
+    projection: _MatchedNvfp4Projection,
+    preparations: dict[tuple[object, ...], _compile_fx.PreparedInputNodes],
+) -> tuple[torch.fx.Node | None, ...]:
+    if projection.prepared is not None:
+        return projection.prepared.storage_arguments()
+    semantic = projection.semantic
+    assert semantic is not None
+    key = (
+        semantic.input,
+        projection.group_size,
+        semantic.activation_per_tensor_scale,
+        semantic.dynamic_activation_scale,
+        semantic.high_first,
+    )
+    if key not in preparations:
+        if projection.group_size is None:
+            preparations[key] = _compile_fx.emit_prepared_input(
+                graph,
+                semantic.input,
+                semantic.activation_per_tensor_scale,
+                semantic.dynamic_activation_scale,
+                high_first=semantic.high_first,
+            )
+        else:
+            from piper_kernels.linear.convrot.nvfp4 import (  # noqa: PLC0415
+                _compile_fx as convrot_nvfp4_compile_fx,
+            )
+
+            preparations[key] = convrot_nvfp4_compile_fx.emit_prepared_input(
+                graph,
+                convrot_nvfp4_compile_fx.SemanticLinearNodes(semantic, projection.group_size),
+            )
+    input_qdata, input_scale, input_per_tensor_scale, _ = preparations[key]
+    return (
+        input_qdata,
+        input_scale,
+        input_per_tensor_scale,
+        semantic.weight_qdata,
+        semantic.weight_scale,
+        semantic.weight_per_tensor_scale,
+        semantic.bias,
     )
 
 
-def _valid_coarse_projection(match: Match) -> bool:
-    if not _valid_projection(match):
-        return False
-    return sparse_piper_compile.valid_sparse_piper_coarse_residual(match)
-
-
-def _matched_node(match: Match, name: str) -> torch.fx.Node:
-    node = match.kwargs[name]
-    assert isinstance(node, torch.fx.Node)
-    return node
-
-
-def _replace_projection(  # noqa: PLR0913, PLR0917
-    match: Match,
-    sparse_attention_shape: list[Argument],
-    sparse_ratio_profile: torch.fx.Node,
-    sparse_q_norm_epsilon: float,
-    sparse_k_norm_epsilon: float,
-    sparse_key_blocks: Argument,
-    sparse_softmax_scale: float,
-    sparse_routing_mode: int,
-    sparse_block_lengths: torch.fx.Node | None = None,
-    sparse_query_blocks: Argument | None = None,
-    sparse_force_tile_ids: torch.fx.Node | None = None,
-    sparse_force_tile_counts: torch.fx.Node | None = None,
-    coarse_gate: torch.fx.Node | None = None,
-    coarse_key_blocks: Argument | None = None,
-    coarse_scale: float | None = None,
-    **_unused: object,
-) -> None:
-    original = match.output_node()
-    graph = match.graph
-    query_projection = _compile_fx.PreparedLinearNodes.from_match(match, "sparse_q")
-    key_projection = _compile_fx.PreparedLinearNodes.from_match(match, "sparse_k")
-    value_projection = _compile_fx.PreparedLinearNodes.from_match(match, "sparse_v")
-    assert query_projection is not None
-    assert key_projection is not None
-    assert value_projection is not None
-    q_norm_weight = match.kwargs.get("sparse_q_norm_weight")
-    assert q_norm_weight is None or isinstance(q_norm_weight, torch.fx.Node)
-    k_norm_weight = match.kwargs.get("sparse_k_norm_weight")
-    assert k_norm_weight is None or isinstance(k_norm_weight, torch.fx.Node)
-    cos = _matched_node(match, "sparse_cos")
-    sin = _matched_node(match, "sparse_sin")
-    input_value = preparation_sharing.tensor_metadata(query_projection.input_qdata)
-    q_weight_value = preparation_sharing.tensor_metadata(query_projection.weight_qdata)
+def _prepare_semantic_coarse_gate(
+    graph: torch.fx.Graph,
+    coarse_gate: Argument,
+    head_dim: int,
+    preparations: dict[tuple[object, ...], _compile_fx.PreparedInputNodes],
+) -> Argument:
+    """Lower a semantic coarse gate to prepared form so output folding can defer it."""
+    if not isinstance(coarse_gate, torch.fx.Node):
+        return coarse_gate
+    linear_node = sparse_piper_compile.unwrap_shape_only_views(coarse_gate)
+    if linear_node is None or linear_node is coarse_gate:
+        return coarse_gate
+    parsed = _parse_semantic_projection(
+        linear_node, head_dim=head_dim, name="NVFP4 sparse coarse gate"
+    )
+    if parsed is None or parsed.semantic is None:
+        return coarse_gate
+    storage = _emit_prepared_storage(graph, parsed, preparations)
+    input_qdata, input_scale, input_per_tensor_scale = storage[:3]
+    assert isinstance(input_qdata, torch.fx.Node)
+    assert isinstance(input_scale, torch.fx.Node)
+    assert isinstance(input_per_tensor_scale, torch.fx.Node)
+    input_value = preparation_sharing.tensor_metadata(parsed.semantic.input)
+    weight_value = preparation_sharing.tensor_metadata(parsed.semantic.weight_qdata)
     assert input_value is not None
-    assert q_weight_value is not None
-    sequence_length = input_value.shape[0]
-    head_dim = sparse_piper_compile.attention_head_dim(match)
-    assert head_dim is not None
-    heads = q_weight_value.shape[0] // head_dim
-    storage_sequence_length = layout.padded_sequence_length(sequence_length)
-    logical_sequence_length = sparse_piper_compile.integer_scalar_argument(
-        sparse_attention_shape[1]
+    assert weight_value is not None
+    prepared_linear = graph.call_function(
+        torch.ops.piper_kernels.nvfp4_linear_prepared.default,
+        args=(
+            input_qdata,
+            input_scale,
+            input_per_tensor_scale,
+            parsed.semantic.weight_qdata,
+            parsed.semantic.weight_scale,
+            parsed.semantic.weight_per_tensor_scale,
+            parsed.semantic.bias,
+            input_value.dtype,
+        ),
     )
+    prepared_linear.meta["val"] = input_value.new_empty(
+        (input_qdata.meta["val"].shape[0], weight_value.shape[0])
+    )
+    reshaped = graph.call_function(
+        _aten.reshape.default,
+        args=(prepared_linear, sparse_piper_compile.view_shape_argument(coarse_gate)),
+    )
+    reshaped.meta = coarse_gate.meta.copy()
+    return reshaped
+
+
+def _replace_projection(
+    graph: torch.fx.Graph,
+    matched: sparse_piper_compile.SparsePiperProjectionMatch,
+    q_proj: _MatchedNvfp4Projection,
+    k_proj: _MatchedNvfp4Projection,
+    v_proj: _MatchedNvfp4Projection,
+    head_dim: int,
+) -> None:
+    original = matched.output_node
+    sequence_length = q_proj.sequence_length
+    heads = q_proj.heads
+    storage_sequence_length = ((sequence_length + _TILE_ROWS - 1) // _TILE_ROWS) * _TILE_ROWS
+    attention_shape = matched.attention_shape
+    assert isinstance(attention_shape, (list, tuple))
+    logical_sequence_length = sparse_piper_compile.integer_scalar_argument(attention_shape[1])
     assert logical_sequence_length is not None
-    block_length_arguments = () if sparse_block_lengths is None else (sparse_block_lengths,)
+    block_length_arguments = () if matched.block_lengths is None else (matched.block_lengths,)
+    output_value = preparation_sharing.tensor_metadata(original)
+    assert output_value is not None
+    query_values, key_values, value_values = sparse_piper_compile.sparse_projection_metadata(
+        output_value,
+        batch=1,
+        heads=heads,
+        storage_sequence_length=storage_sequence_length,
+        head_dim=head_dim,
+        mean_pool_routing=bool(matched.routing_mode == _MEAN_ROUTING),
+        value_shape=(1, heads, head_dim, storage_sequence_length),
+    )
     with graph.inserting_before(original):
-        query_values = (
-            input_value.new_empty((1, heads, storage_sequence_length, head_dim), dtype=torch.int8),
-            input_value.new_empty(
-                (1, heads, storage_sequence_length // _QUERY_SCALE_ROWS),
-                dtype=torch.float32,
-            ),
-            input_value.new_empty(
-                (1, heads, storage_sequence_length // _TILE_ROWS, head_dim),
-                dtype=torch.float32,
-            ),
+        preparations: dict[tuple[object, ...], _compile_fx.PreparedInputNodes] = {}
+        q_storage = _emit_prepared_storage(graph, q_proj, preparations)
+        k_storage = _emit_prepared_storage(graph, k_proj, preparations)
+        v_storage = _emit_prepared_storage(graph, v_proj, preparations)
+        prepared_coarse_gate = _prepare_semantic_coarse_gate(
+            graph, matched.coarse_gate, head_dim, preparations
         )
         query_nodes = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default,
             (
-                *query_projection.storage_arguments(),
-                q_norm_weight,
-                cos,
-                sin,
-                sparse_q_norm_epsilon,
-                sparse_softmax_scale,
+                *q_storage,
+                matched.q_norm_weight,
+                matched.cos,
+                matched.sin,
+                matched.q_norm_epsilon,
+                matched.softmax_scale,
                 nvfp4_chunking.DEFAULT_CHUNK_ROWS,
-                sparse_routing_mode,
+                matched.routing_mode,
                 *block_length_arguments,
             ),
             query_values,
             kwargs={"head_dim": head_dim},
         )
-        storage_tiles = storage_sequence_length // _TILE_ROWS
-        key_summary = input_value.new_empty(
-            (1, heads, storage_tiles, head_dim),
-            dtype=torch.float32,
-        )
-        key_values = (
-            input_value.new_empty((1, heads, storage_sequence_length, head_dim), dtype=torch.int8),
-            input_value.new_empty((1, heads, storage_tiles), dtype=torch.float32),
-            input_value.new_empty((1, heads, storage_tiles, 2, head_dim), dtype=torch.int8),
-            input_value.new_empty((1, heads, storage_tiles, 2), dtype=torch.float32),
-            key_summary,
-            (
-                input_value.new_empty((1, heads, 0, head_dim), dtype=torch.float32)
-                if sparse_routing_mode == _MEAN_ROUTING
-                else input_value.new_empty(key_summary.shape, dtype=torch.float32)
-            ),
-        )
         key_nodes = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default,
             (
-                *key_projection.storage_arguments(),
-                k_norm_weight,
-                cos,
-                sin,
-                sparse_k_norm_epsilon,
+                *k_storage,
+                matched.k_norm_weight,
+                matched.cos,
+                matched.sin,
+                matched.k_norm_epsilon,
                 nvfp4_chunking.DEFAULT_CHUNK_ROWS,
-                sparse_routing_mode,
+                matched.routing_mode,
                 *block_length_arguments,
             ),
             key_values,
             kwargs={"head_dim": head_dim},
         )
-        value_values = (
-            input_value.new_empty((1, heads, head_dim, storage_sequence_length), dtype=torch.int8),
-            input_value.new_empty((1, heads, storage_tiles, 1), dtype=torch.float32),
-            input_value.new_empty((1, heads, storage_tiles, head_dim), dtype=torch.bfloat16),
-        )
         value_nodes = linear_compile_fx.emit_tuple_result(
             graph,
             torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default,
-            (
-                *value_projection.storage_arguments(),
-                nvfp4_chunking.DEFAULT_CHUNK_ROWS,
-                *block_length_arguments,
-            ),
+            (*v_storage, nvfp4_chunking.DEFAULT_CHUNK_ROWS, *block_length_arguments),
             value_values,
             kwargs={"head_dim": head_dim},
         )
-        attention_arguments = (
-            *query_nodes,
-            *key_nodes,
-            *value_nodes,
-        )
         replacement = sparse_piper_compile.emit_quantized_sparse_piper_attention(
             graph,
-            attention_arguments,
-            ratio_profile=sparse_ratio_profile,
-            sparse_key_blocks=sparse_key_blocks,
+            (*query_nodes, *key_nodes, *value_nodes),
+            ratio_profile=matched.ratio_profile,
+            sparse_key_blocks=matched.sparse_key_blocks,
             logical_sequence_length=logical_sequence_length,
-            routing_mode=sparse_routing_mode,
-            block_lengths=sparse_block_lengths,
-            sparse_query_blocks=sparse_query_blocks,
-            force_tile_ids=sparse_force_tile_ids,
-            force_tile_counts=sparse_force_tile_counts,
-            coarse_gate=coarse_gate,
-            coarse_scale=coarse_scale,
-            coarse_key_blocks=coarse_key_blocks,
-            output_dtype=original.meta["val"].dtype,
+            routing_mode=matched.routing_mode,
+            block_lengths=matched.block_lengths,
+            sparse_query_blocks=matched.sparse_query_blocks,
+            force_tile_ids=matched.force_tile_ids,
+            force_tile_counts=matched.force_tile_counts,
+            coarse_gate=prepared_coarse_gate,
+            coarse_scale=matched.coarse_scale,
+            coarse_key_blocks=matched.coarse_key_blocks,
+            output_dtype=output_value.dtype,
         )
     replacement.meta = original.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
     original.replace_all_uses_with(replacement)
-    match.erase_nodes()
-
-
-_patterns = PatternMatcherPass("nvfp4_sparse_piper_projection")
-for _activation_dtype in SUPPORTED_DTYPES:
-    for (
-        _q_affine,
-        _k_affine,
-        _with_coarse,
-        _with_block_lengths,
-        _with_sparse_query_blocks,
-        _with_force_tiles,
-    ) in product((True, False), repeat=6):
-        register_graph_pattern(
-            sparse_piper_pattern.sparse_piper_projection_pattern(
-                _linear_pattern,
-                activation_dtype=_activation_dtype,
-                q_affine=_q_affine,
-                k_affine=_k_affine,
-                with_block_lengths=_with_block_lengths,
-                with_coarse=_with_coarse,
-                with_sparse_query_blocks=_with_sparse_query_blocks,
-                with_force_tiles=_with_force_tiles,
-            ),
-            extra_check=_valid_coarse_projection if _with_coarse else _valid_projection,
-            pass_dict=_patterns,  # pyright: ignore[reportArgumentType]
-        )(_replace_projection)
+    graph.erase_node(original)
 
 
 def _fold_projection(graph: torch.fx.Graph) -> bool:
-    changed = _patterns.apply(graph) > 0
+    changed = False
+    for node in list(graph.nodes):
+        matched = sparse_piper_compile.match_sparse_piper_projection(node)
+        if matched is None:
+            continue
+        validated = _valid_projections(matched)
+        if validated is None:
+            continue
+        q_proj, k_proj, v_proj, head_dim = validated
+        _replace_projection(graph, matched, q_proj, k_proj, v_proj, head_dim)
+        changed = True
     if changed:
         graph.eliminate_dead_code()
         graph.lint()
     return changed
 
 
-class _CompilePass(CustomInferenceAwareGraphPass):
-    def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
-        if is_inference:
-            _fold_projection(graph)
-            _output_compile._fold_attention_output(graph)
-
-    def uuid(self) -> bytes:
-        return inductor_options.compute_compile_pass_uuid(self)
+def fold_sparse_attention(graph: torch.fx.Graph) -> bool:
+    """Fold NVFP4 / ConvRot NVFP4 sparse-Piper projections and output projections."""
+    changed = projection_views.normalize_projection_views(graph)
+    changed = _fold_projection(graph) or changed
+    changed = _output_compile._fold_attention_output(graph) or changed
+    return changed
 
 
-compile_pass = _CompilePass()
-
-
-def nvfp4_sparse_piper_compile_options(
-    options: Mapping[str, object] | None = None,
-) -> dict[str, object]:
-    """Canonicalize repeated NVFP4 and ConvRot NVFP4 projections before sparse fusion."""
-    return inductor_options.add_ordered_post_grad_passes(
-        options,
-        (nvfp4_compile.compile_pass, convrot_nvfp4_compile.compile_pass, compile_pass),
-    )
-
-
-__all__ = ["nvfp4_sparse_piper_compile_options"]
+__all__ = ["fold_sparse_attention"]

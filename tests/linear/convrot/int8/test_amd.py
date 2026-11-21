@@ -8,10 +8,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from piper_kernels import compile_options
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
+from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, reference
 from piper_kernels.linear.convrot.int8._amd import policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd
@@ -396,7 +397,7 @@ def test_amd_compiled_shared_preparation(monkeypatch):
     expected = project(value)
     prepare = Mock(wraps=amd.prepare_input)
     monkeypatch.setattr(amd, "prepare_input", prepare)
-    call = torch.compile(project, fullgraph=True, options=convrot_int8_compile_options())
+    call = torch.compile(project, fullgraph=True, options=compile_options())
     call(value)
     prepare.reset_mock()
     actual = call(value)

@@ -6,16 +6,16 @@ import operator
 from dataclasses import dataclass
 
 import torch
-from torch._inductor.pattern_matcher import Match
 
 from piper_kernels import _input_activations as input_activations
+from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.weights.nvfp4 import _layout
 
 from . import _validation
 
 
-def coalesce_input_casts(graph: torch.fx.Graph) -> None:
+def coalesce_input_casts(graph: torch.fx.Graph) -> bool:
     """Share identical autocasts consumed exclusively by ordinary NVFP4 linears.
 
     Post-AOT graphs represent input mutations as distinct values. Match exact
@@ -23,31 +23,28 @@ def coalesce_input_casts(graph: torch.fx.Graph) -> None:
     so this does not change externally visible storage aliasing.
     """
     casts: dict[tuple[torch.fx.Node, torch.dtype], torch.fx.Node] = {}
+    changed = False
     for node in list(graph.nodes):
-        if (
-            node.op != "call_function"
-            or node.target != torch.ops.prims.convert_element_type.default
-            or node.kwargs
-            or len(node.args) != 2
-            or not isinstance(node.args[0], torch.fx.Node)
-            or not isinstance(node.args[1], torch.dtype)
-            or not node.users
-            or any(
-                user.op != "call_function"
-                or user.target != torch.ops.piper_kernels.nvfp4_linear.default
-                or not user.args
-                or user.args[0] is not node
-                for user in node.users
-            )
+        converted = linear_fx.convert_dtype(node)
+        if converted is None or not node.users:
+            continue
+        source, dtype = converted
+        if any(
+            (user_bound := linear_fx.bind_call(user, torch.ops.piper_kernels.nvfp4_linear.default))
+            is None
+            or user_bound["input"] is not node
+            for user in node.users
         ):
             continue
-        key = (node.args[0], node.args[1])
+        key = (source, dtype)
         previous = casts.get(key)
         if previous is None:
             casts[key] = node
         else:
             node.replace_all_uses_with(previous)
             graph.erase_node(node)
+            changed = True
+    return changed
 
 
 type PreparedInputNodes = tuple[
@@ -113,17 +110,13 @@ class SemanticLinearNodes:
 
     @classmethod
     def from_call(cls, node: torch.fx.Node) -> SemanticLinearNodes | None:
-        """Parse positional operands from one semantic-linear call node."""
-        if node.kwargs:
+        """Parse schema-bound operands from one semantic-linear call node."""
+        bound = linear_fx.bind_call(node, torch.ops.piper_kernels.nvfp4_linear.default)
+        if bound is None:
             return None
-        return cls.from_values(node.args)
-
-    @classmethod
-    def from_match(cls, match: Match) -> SemanticLinearNodes | None:
-        """Parse canonical semantic-linear keywords from a pattern match."""
         return cls.from_values(
             tuple(
-                match.kwargs[name]
+                bound[name]
                 for name in (
                     "input",
                     "weight_qdata",
@@ -166,18 +159,14 @@ class PreparedLinearNodes:
 
     @classmethod
     def from_call(cls, node: torch.fx.Node) -> PreparedLinearNodes | None:
-        """Parse positional operands from one prepared-linear call node."""
-        if node.kwargs:
+        """Parse schema-bound operands from one prepared-linear call node."""
+        bound = linear_fx.bind_call(node, torch.ops.piper_kernels.nvfp4_linear_prepared.default)
+        if bound is None:
             return None
-        return cls._from_values(node.args)
-
-    @classmethod
-    def from_match(cls, match: Match, prefix: str) -> PreparedLinearNodes | None:
-        """Parse a prefixed prepared-linear pattern match."""
         return cls._from_values(
             tuple(
-                match.kwargs[f"{prefix}_{suffix}"]
-                for suffix in (
+                bound[name]
+                for name in (
                     "input_qdata",
                     "input_scale",
                     "input_per_tensor_scale",
@@ -367,6 +356,7 @@ __all__ = [
     "PreparedInputNodes",
     "PreparedLinearNodes",
     "SemanticLinearNodes",
+    "coalesce_input_casts",
     "emit_prepared_input",
     "emit_prepared_linear",
     "validated_prepared_linear",

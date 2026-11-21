@@ -17,6 +17,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 
 from piper_kernels import (
     SparsePiperAttention,
+    compile_options,
     sparse_piper_coarse_residual,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -24,29 +25,18 @@ from piper_kernels.attention.sparse_piper_attention._routing_modes import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
-from piper_kernels.fusions.nvfp4_sparse_piper import (
-    _output,
-    nvfp4_sparse_piper_compile_options,
-)
+from piper_kernels.fusions.nvfp4_sparse_piper import _output
 from piper_kernels.fusions.nvfp4_sparse_piper import key as fused_key
 from piper_kernels.fusions.nvfp4_sparse_piper import query as fused_query
 from piper_kernels.fusions.nvfp4_sparse_piper import value as fused_value
-from piper_kernels.fusions.nvfp4_sparse_piper._compile import compile_pass
+from piper_kernels.fusions.nvfp4_sparse_piper._compile import fold_sparse_attention
 from piper_kernels.fusions.nvfp4_sparse_piper._output_compile import (
     _fold_attention_output,
 )
-from piper_kernels.linear.convrot.nvfp4 import (
-    _ops as convrot_nvfp4_ops,
-)
-from piper_kernels.linear.convrot.nvfp4 import (
-    convrot_nvfp4_compile_options,
-)
-from piper_kernels.linear.convrot.nvfp4._compile import (
-    compile_pass as convrot_nvfp4_compile_pass,
-)
+from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
+from piper_kernels.linear.convrot.nvfp4._compile import fold_linear as fold_convrot_nvfp4_linear
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
-from piper_kernels.linear.nvfp4 import nvfp4_compile_options
-from piper_kernels.linear.nvfp4._compile import compile_pass as nvfp4_compile_pass
+from piper_kernels.linear.nvfp4._compile import fold_linear as fold_nvfp4_linear
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
@@ -558,31 +548,23 @@ def _run_explicit_attention_output(
 
 
 def test_compile_options_install_idempotent_passes() -> None:
-    options = nvfp4_sparse_piper_compile_options({"max_autotune": True})
+    options = compile_options({"max_autotune": True}, attention=True)
 
     assert options["max_autotune"] is True
     passes = options[_POST_GRAD_PRE_PASS]
     assert isinstance(passes, tuple)
-    assert passes == (nvfp4_compile_pass, convrot_nvfp4_compile_pass, compile_pass)
-    assert nvfp4_sparse_piper_compile_options(options) == options
+    assert len(passes) == 1
+    assert compile_options(options, attention=True) == options
 
 
 @pytest.mark.parametrize("sparse_first", [False, True])
 def test_compile_options_compose_with_linear_options(sparse_first: bool) -> None:
     if sparse_first:
-        options = convrot_nvfp4_compile_options(
-            nvfp4_compile_options(nvfp4_sparse_piper_compile_options())
-        )
+        options = compile_options(compile_options(attention=True))
     else:
-        options = nvfp4_sparse_piper_compile_options(
-            convrot_nvfp4_compile_options(nvfp4_compile_options())
-        )
+        options = compile_options(compile_options(), attention=True)
 
-    assert options[_POST_GRAD_PRE_PASS] == (
-        nvfp4_compile_pass,
-        convrot_nvfp4_compile_pass,
-        compile_pass,
-    )
+    assert options == compile_options(attention=True)
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
@@ -612,8 +594,8 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
         classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
     )
 
-    nvfp4_compile_pass(graph, is_inference=True)
-    convrot_nvfp4_compile_pass(graph, is_inference=True)
+    fold_nvfp4_linear(graph)
+    fold_convrot_nvfp4_linear(graph)
     expected_prepare = (
         torch.ops.piper_kernels.nvfp4_prepare_input.default
         if group_size is None
@@ -623,7 +605,7 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
     assert prepared_targets.count(expected_prepare) == preparation_count
     assert prepared_targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 3
 
-    compile_pass(graph, is_inference=True)
+    fold_sparse_attention(graph)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     assert targets.count(expected_prepare) == preparation_count
@@ -632,6 +614,53 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
     assert torch.ops.piper_kernels.nvfp4_linear_mean.default not in targets
     assert targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default) == 1
+    assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
+    assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
+    assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
+    assert torch.ops.piper_kernels.sparse_piper_attention.default not in targets
+    graph.lint()
+
+
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+@pytest.mark.parametrize(
+    ("linear_enabled", "distinct_query_input", "expected_prepares"),
+    [
+        (False, False, 1),
+        (True, True, 2),
+        (False, True, 2),
+    ],
+    ids=["semantic-only", "cross-attention", "cross-attention-semantic-only"],
+)
+def test_semantic_and_cross_attention_projections_fuse_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+    group_size: int | None,
+    linear_enabled: bool,
+    distinct_query_input: bool,
+    expected_prepares: int,
+) -> None:
+    graph = build_attention_graph(
+        dynamic=True,
+        output_dynamic=False,
+        group_size=group_size,
+        distinct_query_input=distinct_query_input,
+    )
+    run_nvfp4_passes(graph, monkeypatch, linear=linear_enabled)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    expected_prepare = (
+        torch.ops.piper_kernels.nvfp4_prepare_input.default
+        if group_size is None
+        else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
+    )
+    assert targets.count(expected_prepare) == expected_prepares
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
+    assert (
+        targets.count(
+            torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
+        )
+        == 1
+    )
     assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
@@ -954,7 +983,7 @@ def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
+            options=capture.wrap_options(compile_options(attention=True)),
         )(hidden_states)
 
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
@@ -1041,7 +1070,7 @@ def test_cuda_compile_fuses_nvfp4_attention_output(
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
+            options=capture.wrap_options(compile_options(attention=True)),
         )(hidden_states)
 
     expected_prepare = (
@@ -1120,7 +1149,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
+            options=capture.wrap_options(compile_options(attention=True)),
         )(
             hidden_states,
             coarse_gate,
@@ -1232,7 +1261,7 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
         actual = torch.compile(
             model,
             fullgraph=True,
-            options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
+            options=capture.wrap_options(compile_options(attention=True)),
         )(hidden_states, block_lengths, 2)
 
     expected_prepare = (
@@ -1283,7 +1312,7 @@ def test_cuda_compile_fails_closed_for_batch_two() -> None:
         torch.compile(
             model,
             fullgraph=True,
-            options=capture.wrap_options(nvfp4_sparse_piper_compile_options()),
+            options=capture.wrap_options(compile_options(attention=True)),
         )(hidden_states)
 
     assert torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default not in capture.targets

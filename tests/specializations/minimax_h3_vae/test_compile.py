@@ -4,18 +4,12 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot.int8._compile import (
-    compile_pass as convrot_int8_compile_pass,
-)
 from piper_kernels.specializations.minimax_h3_vae import (
     minimax_h3_vae_convrot_int8_compile_options,
 )
 from piper_kernels.specializations.minimax_h3_vae._compile import (
     _schedule_for,
     _specialize_linears,
-)
-from piper_kernels.specializations.minimax_h3_vae._compile import (
-    compile_pass as specialization_compile_pass,
 )
 from piper_kernels.specializations.minimax_h3_vae._ops import _execution_plan
 
@@ -107,11 +101,16 @@ def _run_passes(
     target: AcceleratorTarget = _SM120,
 ) -> None:
     torch.fx.GraphModule({}, graph)
-    convrot_int8_compile_pass(graph, is_inference=is_inference)
-    if is_inference:
-        _specialize_linears(graph, target=target)
-    else:
-        specialization_compile_pass(graph, is_inference=False)
+    if not is_inference:
+        passes = minimax_h3_vae_convrot_int8_compile_options()["post_grad_custom_pre_pass"]
+        assert isinstance(passes, tuple)
+        for compiler_pass in passes:
+            compiler_pass(graph, is_inference=False)
+        return
+    from piper_kernels.linear.convrot.int8._compile import fold_linear  # noqa: PLC0415
+
+    fold_linear(graph)
+    _specialize_linears(graph, target=target)
 
 
 @pytest.mark.parametrize("static", [False, True])
@@ -306,17 +305,18 @@ def test_compile_options_install_generic_then_specialized_pass() -> None:
     options = minimax_h3_vae_convrot_int8_compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
-    assert options["post_grad_custom_pre_pass"] == (
-        convrot_int8_compile_pass,
-        specialization_compile_pass,
+    passes = options["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    assert len(passes) == 1
+    assert passes[0].linear is True
+    assert tuple(hook.key for hook in passes[0].hooks) == (
+        "piper_kernels.specializations.minimax_h3_vae.linear",
     )
 
 
 def test_compile_options_are_idempotent() -> None:
-    options = minimax_h3_vae_convrot_int8_compile_options()
-    options = minimax_h3_vae_convrot_int8_compile_options(options)
+    first = minimax_h3_vae_convrot_int8_compile_options()
+    second = minimax_h3_vae_convrot_int8_compile_options(first)
 
-    assert options["post_grad_custom_pre_pass"] == (
-        convrot_int8_compile_pass,
-        specialization_compile_pass,
-    )
+    assert second == first
+    assert len(second["post_grad_custom_pre_pass"]) == 1  # type: ignore[arg-type]

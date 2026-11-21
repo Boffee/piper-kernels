@@ -13,8 +13,8 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     per_tensor_amax_to_scale,
 )
 
-from piper_kernels.linear.nvfp4 import nvfp4_compile_options
-from piper_kernels.linear.nvfp4._compile import compile_pass
+from piper_kernels import compile_options
+from piper_kernels.linear.nvfp4 import _ops as _nvfp4_ops  # noqa: F401 - registers custom ops
 from piper_kernels.linear.nvfp4._compile_fx import coalesce_input_casts
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
@@ -45,7 +45,10 @@ def _linear(
 
 def _run_compile_pass(graph: torch.fx.Graph, *, is_inference: bool = True) -> None:
     torch.fx.GraphModule({}, graph)
-    compile_pass(graph, is_inference=is_inference)
+    passes = compile_options()["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=is_inference)
 
 
 def test_pass_canonicalizes_repeated_family_and_shares_identical_preparations() -> None:
@@ -161,11 +164,13 @@ def test_pass_fails_closed_for_malformed_semantic_linears(case: str) -> None:
 
 
 def test_compile_options_install_idempotent_pass() -> None:
-    options = nvfp4_compile_options({"max_autotune": True})
+    options = compile_options({"max_autotune": True})
 
     assert options["max_autotune"] is True
-    assert options["post_grad_custom_pre_pass"] is compile_pass
-    assert nvfp4_compile_options(options) == options
+    passes = options["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    assert len(passes) == 1
+    assert compile_options(options) == options
 
 
 @pytest.mark.parametrize("difference", [None, "source", "dtype", "external-consumer"])
@@ -242,11 +247,7 @@ def test_cuda_compile_shares_three_static_projections(unit_scale: bool, autocast
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
         expected = projections(input)
     capture = TargetCapturePass()
-    options = nvfp4_compile_options()
-    options["post_grad_custom_pre_pass"] = (
-        options["post_grad_custom_pre_pass"],
-        capture,
-    )
+    options = capture.wrap_options(compile_options())
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
         actual = torch.compile(projections, fullgraph=True, options=options)(input)
 

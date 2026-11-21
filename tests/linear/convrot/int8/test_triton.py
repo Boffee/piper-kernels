@@ -10,8 +10,9 @@ import triton.language as tl
 from _accelerators import exact_sm120_available
 from torch import nn
 
+from piper_kernels import compile_options
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot import convrot_int8_compile_options, convrot_int8_linear
+from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8._kernels import triton as int8_kernels
 from piper_kernels.linear.convrot.int8._nvidia import dispatch as int8_nvidia
@@ -119,7 +120,7 @@ def test_triton_linear_supports_mixed_precision_bias(
 
     expected = linear(activation, qdata, scale, 256, bias)
     call = (
-        torch.compile(projection, fullgraph=True, options=convrot_int8_compile_options())
+        torch.compile(projection, fullgraph=True, options=compile_options())
         if compiled
         else projection
     )
@@ -1486,7 +1487,7 @@ def test_cuda_autocast_normalizes_semantic_linear(
         return torch.nn.functional.linear(value, weight, offset)
 
     call = (
-        torch.compile(projection, fullgraph=True, options=convrot_int8_compile_options())
+        torch.compile(projection, fullgraph=True, options=compile_options())
         if compiled
         else projection
     )

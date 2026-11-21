@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from piper_kernels.linear.convrot import convrot_int8_compile_options
+from piper_kernels import compile_options
 from piper_kernels.linear.convrot.int8 import _ops
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -72,9 +72,7 @@ def test_compiled_weight_observes_static_scale_mutation(device):
         act_per_tensor_scale=input_scale,
     )
     value = torch.randn(7, 512, device=device, dtype=weight.dtype) * 4
-    compiled = torch.compile(
-        torch.nn.functional.linear, fullgraph=True, options=convrot_int8_compile_options()
-    )
+    compiled = torch.compile(torch.nn.functional.linear, fullgraph=True, options=compile_options())
     with torch.inference_mode():
         first = compiled(value, weight)
         torch.testing.assert_close(first, torch.nn.functional.linear(value, weight), rtol=0, atol=0)

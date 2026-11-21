@@ -170,7 +170,7 @@ def test_ffn_compiler_uses_backend_support_not_device_family(monkeypatch, device
     monkeypatch.setattr(_backend, "select_linear_backend", select)
     with FakeTensorMode():
         module, value = _semantic_ffn_graph(device)
-        ffn_compile.compile_pass(module.graph, is_inference=True)
+        ffn_compile.fold_ffns(module.graph)
     targets = [node.target for node in module.graph.nodes]
     assert (torch.ops.piper_kernels.convrot_int8_ffn.default in targets) is supported
     assert targets.count(torch.ops.piper_kernels.convrot_int8_linear.default) == (
@@ -195,7 +195,7 @@ def test_ffn_compiler_preserves_unfused_consumers(monkeypatch, argument_count):
             )
         consumer.meta = down.meta.copy()
         output.args = (consumer,)
-        ffn_compile.compile_pass(graph, is_inference=True)
+        ffn_compile.fold_ffns(graph)
         graph.lint()
     assert len(consumer.args) == argument_count
     assert consumer.args[0].target == torch.ops.piper_kernels.convrot_int8_ffn.default
