@@ -14,7 +14,7 @@ from triton.runtime.errors import OutOfResources
 
 from .cases import catalog_metadata
 from .environment import EnvironmentInfo
-from .providers import Implementation, Operation
+from .providers import Implementation, Operation, _no_sync
 from .quality import QualityMetrics
 from .reporting import (
     SCHEMA_VERSION,
@@ -30,6 +30,32 @@ class TuningPhase(StrEnum):
 
     PREPARED_EXECUTION = "prepared_execution"
     OPERATOR_END_TO_END = "operator_end_to_end"
+
+
+def phase_operation[PreparedT, OutputT](
+    prepare: Callable[[], PreparedT],
+    launch: Callable[[PreparedT], OutputT],
+    *,
+    phase: TuningPhase,
+    synchronize: Callable[[], None] = _no_sync,
+    configuration: Mapping[str, Any] | None = None,
+) -> Operation[OutputT]:
+    """Bind prepare/launch callables into one Operation for the selected tuning phase."""
+    if phase is TuningPhase.PREPARED_EXECUTION:
+        prepared = prepare()
+
+        def run() -> OutputT:
+            return launch(prepared)
+    else:
+
+        def run() -> OutputT:
+            return launch(prepare())
+
+    return Operation(
+        run=run,
+        synchronize=synchronize,
+        configuration=dict(configuration) if configuration else {},
+    )
 
 
 class DistributionTimer(Protocol):

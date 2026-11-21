@@ -39,6 +39,10 @@ _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
 _MAX_TEST_PRIVATE_IMPORT_FILES = 159
 _MAX_TEST_PRIVATE_IMPORTS = 687
 
+# Legacy private-global monkeypatch totals in tests/ (lower as tests decouple).
+_MAX_TEST_PRIVATE_MONKEYPATCH_FILES = 56
+_MAX_TEST_PRIVATE_MONKEYPATCHES = 413
+
 _PASS_BASE_NAMES = frozenset(
     {
         "CustomGraphPass",
@@ -94,6 +98,118 @@ def _count_private_piper_imports(path: Path) -> int:
                 1 for alias in node.names if module_is_private or alias.name.startswith("_")
             )
     return count
+
+
+def _private_piper_import_names(tree: ast.AST) -> set[str]:
+    """Return local names bound to private piper_kernels modules or symbols."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                parts = alias.name.split(".")
+                if (
+                    parts[0] == "piper_kernels"
+                    and any(part.startswith("_") for part in parts[1:])
+                    and alias.asname
+                ):
+                    names.add(alias.asname)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            parts = node.module.split(".")
+            if parts[0] != "piper_kernels":
+                continue
+            module_is_private = any(part.startswith("_") for part in parts[1:])
+            for alias in node.names:
+                if module_is_private or alias.name.startswith("_"):
+                    names.add(alias.asname or alias.name)
+    return names
+
+
+def _is_private_string(expr: ast.expr | None) -> bool:
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return expr.value.startswith("_") or "._" in expr.value
+    if isinstance(expr, ast.JoinedStr):
+        first = expr.values[0] if expr.values else None
+        if (
+            isinstance(first, ast.Constant)
+            and isinstance(first.value, str)
+            and first.value.startswith("_")
+        ):
+            return True
+        return any(
+            isinstance(item, ast.Constant) and isinstance(item.value, str) and "._" in item.value
+            for item in expr.values
+        )
+    return False
+
+
+def _expr_is_private_target(expr: ast.expr | None, private_imports: set[str]) -> bool:
+    current = expr
+    while isinstance(current, ast.Attribute):
+        if current.attr.startswith("_"):
+            return True
+        current = current.value
+    if isinstance(current, ast.Name):
+        return current.id.startswith("_") or current.id in private_imports
+    if isinstance(current, ast.Call) and _callable_name(current.func) == "getattr" and current.args:
+        return _expr_is_private_target(current.args[0], private_imports) or (
+            len(current.args) >= 2 and _is_private_string(current.args[1])
+        )
+    return False
+
+
+def _count_private_monkeypatches_in_source(source: str, filename: str = "<string>") -> int:
+    """Count private-global monkeypatch/mock.patch calls in one Python source string."""
+    tree = ast.parse(source, filename=filename)
+    private_imports = _private_piper_import_names(tree)
+    count = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        kind: str | None = None
+        if isinstance(node.func, ast.Attribute) and node.func.attr in ("setattr", "delattr"):
+            kind = "monkeypatch"
+        elif _callable_name(node.func) == "patch":
+            kind = "patch"
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "object"
+            and _callable_name(node.func.value) == "patch"
+        ):
+            kind = "patch_object"
+        if kind is None:
+            continue
+
+        keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg is not None}
+        target_expr = node.args[0] if node.args else keywords.get("target")
+        if kind == "patch":
+            attr_expr = None
+        elif kind == "patch_object":
+            attr_expr = node.args[1] if len(node.args) >= 2 else keywords.get("attribute")
+        else:
+            is_string_target = (
+                isinstance(target_expr, ast.Constant) and isinstance(target_expr.value, str)
+            ) or isinstance(target_expr, ast.JoinedStr)
+            attr_expr = (
+                None
+                if is_string_target
+                else (
+                    node.args[1]
+                    if len(node.args) >= 2
+                    else (keywords.get("name") or keywords.get("attribute"))
+                )
+            )
+
+        if (
+            _is_private_string(target_expr)
+            or _is_private_string(attr_expr)
+            or _expr_is_private_target(target_expr, private_imports)
+        ):
+            count += 1
+    return count
+
+
+def _count_private_monkeypatches(path: Path) -> int:
+    return _count_private_monkeypatches_in_source(path.read_text(encoding="utf-8"), str(path))
 
 
 def _imports_ast(path: Path) -> bool:
@@ -257,6 +373,59 @@ def test_test_private_import_ratchet() -> None:
         f"Private piper_kernels imports in tests/ grew to {total_imports} "
         f"(max {_MAX_TEST_PRIVATE_IMPORTS}); test public contracts and compiler "
         "invariants instead (see AGENTS.md and docs/development.md#writing-tests)."
+    )
+
+
+def test_private_monkeypatch_ratchet() -> None:
+    """Block new private-global monkeypatches across tests/ (see AGENTS.md Rule 8)."""
+    actual_by_file: dict[str, int] = {}
+    for path in _iter_python_files(_TESTS_ROOT):
+        if path.relative_to(_REPO_ROOT).as_posix() == "tests/test_architecture.py":
+            continue
+        count = _count_private_monkeypatches(path)
+        if count > 0:
+            actual_by_file[path.relative_to(_REPO_ROOT).as_posix()] = count
+
+    total_files = len(actual_by_file)
+    total_patches = sum(actual_by_file.values())
+
+    assert total_files <= _MAX_TEST_PRIVATE_MONKEYPATCH_FILES, (
+        f"Files with private-global monkeypatches grew to {total_files} "
+        f"(max {_MAX_TEST_PRIVATE_MONKEYPATCH_FILES}); test observable contracts or use "
+        "explicit dependency injection instead (see AGENTS.md Rule 8)."
+    )
+    assert total_patches <= _MAX_TEST_PRIVATE_MONKEYPATCHES, (
+        f"Private-global monkeypatches in tests/ grew to {total_patches} "
+        f"(max {_MAX_TEST_PRIVATE_MONKEYPATCHES}); test observable contracts or use "
+        "explicit dependency injection instead (see AGENTS.md Rule 8)."
+    )
+
+
+def test_private_monkeypatch_detector_catches_all_patterns() -> None:
+    """Verify the AST ratchet catches string, attribute, and private-import patches."""
+    assert (
+        _count_private_monkeypatches_in_source(
+            'monkeypatch.setattr("pkg._mod._fn", fake)\n'
+            'monkeypatch.setattr(mod, "_helper", fake)\n'
+            'monkeypatch.setattr(_backend, "select_linear_backend", fake)\n'
+            'monkeypatch.delattr(mod._private, "flag")\n'
+            'patch("piper_kernels._backend.select")\n'
+            'patch.object(mod, "_internal")\n'
+            "from piper_kernels.linear.convrot.int8 import _backend as linear_backend\n"
+            'monkeypatch.setattr(linear_backend, "select_linear_backend", fake)\n'
+            "from piper_kernels._triton.targets import AcceleratorTarget\n"
+            'monkeypatch.setattr(AcceleratorTarget, "from_device", fake)\n'
+        )
+        == 8
+    )
+    assert (
+        _count_private_monkeypatches_in_source(
+            'monkeypatch.setattr(torch.cuda, "get_device_capability", fake)\n'
+            'monkeypatch.setattr(sys, "platform", "linux")\n'
+            'monkeypatch.setattr("torch.cuda.is_available", lambda: False)\n'
+            'monkeypatch.setattr("pkg.mod.public", "_replacement_value")\n'
+        )
+        == 0
     )
 
 

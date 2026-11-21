@@ -13,6 +13,7 @@ from lib.tuning import (
     boolean_tuning_axis,
     meets_minimum_sqnr,
     parse_optional_integer,
+    phase_operation,
     report_tuning_run,
     tune_candidates,
     tuning_axis,
@@ -247,3 +248,27 @@ def test_report_tuning_run_prints_and_writes_selected_candidate(
 
     assert "selected: winner" in capsys.readouterr().out
     assert '"candidate": "winner"' in path.read_text()
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_tokens"),
+    [
+        (TuningPhase.PREPARED_EXECUTION, [1, 1]),
+        (TuningPhase.OPERATOR_END_TO_END, [1, 2]),
+    ],
+)
+def test_phase_operation_controls_preparation_reuse(
+    phase: TuningPhase,
+    expected_tokens: list[int],
+) -> None:
+    prepared_count = 0
+
+    def prepare() -> int:
+        nonlocal prepared_count
+        prepared_count += 1
+        return prepared_count
+
+    operation = phase_operation(prepare, lambda token: token * 10, phase=phase)
+
+    assert [operation.run(), operation.run()] == [token * 10 for token in expected_tokens]
+    assert prepared_count == expected_tokens[-1]

@@ -173,7 +173,7 @@ def test_projection_facades_forward_shared_buffers_without_execution_plans(
     select = Mock(return_value=backend)
     monkeypatch.setattr(_backend, "require_projection_backend", select)
     monkeypatch.setattr(
-        AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("direct target probe"))
+        torch.cuda, "get_device_capability", Mock(side_effect=AssertionError("direct target probe"))
     )
     with FakeTensorMode():
         operands = _operands()
@@ -392,7 +392,7 @@ def test_output_fusion_selects_once_before_preparation_and_reuses_backend(
     monkeypatch.setattr(_backend, "require_projection_backend", select_projection)
     monkeypatch.setattr(_backend, "require_output_backend", select_output)
     monkeypatch.setattr(
-        AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("direct target probe"))
+        torch.cuda, "get_device_capability", Mock(side_effect=AssertionError("direct target probe"))
     )
     prepare = Mock(
         side_effect=lambda *args, **kwargs: (

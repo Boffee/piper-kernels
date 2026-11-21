@@ -5,6 +5,7 @@ import torch
 from lib.attention import AttentionConfig
 from lib.tuning import TuningPhase, UnsupportedTuningCandidateError
 from tune_piper_attention import (
+    _AttentionBackend,
     _candidate_plans,
     _make_candidate,
     _parse_args,
@@ -272,40 +273,37 @@ def test_tuner_rejects_nonfinite_minimum_sqnr(value: str) -> None:
     ],
 )
 def test_candidate_phase_controls_preparation_frequency(
-    monkeypatch: pytest.MonkeyPatch,
     phase: TuningPhase,
     expected_prepares: int,
 ) -> None:
-    prepares = 0
-    launches = 0
+    prepare_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    launch_calls: list[int] = []
+    plan = _production_plan()
     tensor = torch.empty((1, 1, 8, 128), device="meta")
+    expected_output = torch.empty_like(tensor)
 
-    def fake_prepare(*_args, **_kwargs):
-        nonlocal prepares
-        prepares += 1
-        return "prepared"
+    def fake_prepare(*args, **kwargs) -> int:
+        prepare_calls.append((args, kwargs))
+        return len(prepare_calls)
 
-    def fake_launch(prepared):
-        nonlocal launches
-        assert prepared == "prepared"
-        launches += 1
-        return tensor
+    def fake_launch(prepared: int) -> torch.Tensor:
+        launch_calls.append(prepared)
+        return expected_output
 
-    monkeypatch.setattr(
-        "tune_piper_attention.piper_attention_backend._prepare_piper_attention", fake_prepare
-    )
-    monkeypatch.setattr(
-        "tune_piper_attention.piper_attention_backend._launch_piper_attention", fake_launch
-    )
     operation = _make_candidate(
-        _production_plan(),
+        plan,
         (tensor, tensor, tensor),
         config=AttentionConfig(dtype=torch.float16, scale=128**-0.5, seed=7),
         target=_SM120,
         phase=phase,
+        backend=_AttentionBackend(prepare=fake_prepare, launch=fake_launch),
     ).build()
-    operation.run()
-    operation.run()
+    first = operation.run()
+    second = operation.run()
 
-    assert prepares == expected_prepares
-    assert launches == 2
+    assert first is expected_output
+    assert second is expected_output
+    assert len(prepare_calls) == expected_prepares
+    assert launch_calls == ([1, 1] if phase is TuningPhase.PREPARED_EXECUTION else [1, 2])
+    assert prepare_calls[0][0][3:] == (128**-0.5, False)
+    assert prepare_calls[0][1] == {"execution_plan": plan}

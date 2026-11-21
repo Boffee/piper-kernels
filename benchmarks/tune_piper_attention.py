@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
-from dataclasses import replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
 
@@ -31,6 +31,7 @@ from lib.tuning import (
     UnsupportedTuningCandidateError,
     boolean_tuning_axis,
     meets_minimum_sqnr,
+    phase_operation,
     report_tuning_run,
     tune_candidates,
     tuning_axis,
@@ -159,13 +160,28 @@ def _plan_name(plan: PiperAttentionExecutionPlan) -> str:
     )
 
 
-def _make_candidate(
+@dataclass(frozen=True, slots=True)
+class _AttentionBackend[PreparedT]:
+    """Explicit prepare/launch pair bound by the Piper Attention tuner."""
+
+    prepare: Callable[..., PreparedT]
+    launch: Callable[[PreparedT], torch.Tensor]
+
+
+_DEFAULT_BACKEND = _AttentionBackend(
+    prepare=piper_attention_backend._prepare_piper_attention,
+    launch=piper_attention_backend._launch_piper_attention,
+)
+
+
+def _make_candidate[PreparedT](
     plan: PiperAttentionExecutionPlan,
     inputs: AttentionInputs,
     *,
     config: AttentionConfig,
     target: AcceleratorTarget,
     phase: TuningPhase = TuningPhase.PREPARED_EXECUTION,
+    backend: _AttentionBackend[PreparedT] | None = None,
 ) -> Implementation[Operation[torch.Tensor]]:
     name = _plan_name(plan)
     query, key, value = inputs
@@ -181,27 +197,22 @@ def _make_candidate(
         except ValueError as error:
             raise UnsupportedTuningCandidateError(str(error)) from error
 
-        def prepare() -> piper_attention_backend._PreparedPiperAttention:
-            return piper_attention_backend._prepare_piper_attention(
-                query,
-                key,
-                value,
-                scale,
-                config.is_causal,
-                execution_plan=plan,
+        def bind[T](selected: _AttentionBackend[T]) -> Operation[torch.Tensor]:
+            return phase_operation(
+                lambda: selected.prepare(
+                    query,
+                    key,
+                    value,
+                    scale,
+                    config.is_causal,
+                    execution_plan=plan,
+                ),
+                selected.launch,
+                phase=phase,
+                synchronize=torch.cuda.synchronize,
             )
 
-        if phase is TuningPhase.PREPARED_EXECUTION:
-            prepared = prepare()
-
-            def run() -> torch.Tensor:
-                return piper_attention_backend._launch_piper_attention(prepared)
-        else:
-
-            def run() -> torch.Tensor:
-                return piper_attention_backend._launch_piper_attention(prepare())
-
-        return Operation(run=run, synchronize=torch.cuda.synchronize)
+        return bind(_DEFAULT_BACKEND) if backend is None else bind(backend)
 
     return Implementation(
         name=name,
