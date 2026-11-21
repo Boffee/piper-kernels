@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 
-from ._dtype import SUPPORTED_DTYPES
+from ._contracts import SUPPORTED_DTYPES
 from ._prepared import _PreparedSparsePiperContext, _PreparedSparsePiperQuery
 
 _DO_NOT_SPECIALIZE_ARGUMENTS = (
@@ -204,3 +205,41 @@ def validate_attention_launch(
         apply_coarse_residual=has_coarse_residual,
         skip_dense_routing=context.routes_per_query == 0,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _ContextLauncher:
+    """Validate each query-window launch against a bound context and dispatch to a backend."""
+
+    context: _PreparedSparsePiperContext
+    _dispatch: Callable[
+        [
+            _PreparedSparsePiperContext,
+            _PreparedSparsePiperQuery,
+            torch.Tensor,
+            _ValidatedAttentionLaunch,
+        ],
+        None,
+    ]
+
+    def __call__(
+        self,
+        query_state: _PreparedSparsePiperQuery,
+        output: torch.Tensor,
+        *,
+        query_block_offset: int = 0,
+        query_block_count: int | None = None,
+        coarse_output: torch.Tensor | None = None,
+        coarse_gate: torch.Tensor | None = None,
+    ) -> None:
+        """Execute a query window against the bound global context."""
+        launch = validate_attention_launch(
+            self.context,
+            query_state,
+            output,
+            query_block_offset,
+            query_block_count,
+            coarse_output,
+            coarse_gate,
+        )
+        self._dispatch(self.context, query_state, output, launch)

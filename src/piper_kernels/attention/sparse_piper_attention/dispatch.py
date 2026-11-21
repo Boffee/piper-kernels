@@ -9,10 +9,8 @@ import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 
 from . import _backend
-from ._block_layout import validate_block_lengths, validate_sparse_query_blocks
 from ._budget import (
     _RATIO_SCALE,
     _normalize_head_keep_ratios,
@@ -20,13 +18,19 @@ from ._budget import (
     _resolve_route_layout,
     _ResolvedRouteLayout,
 )
-from ._dtype import SUPPORTED_DTYPES
-from ._force_tiles import validate_force_tiles
-from ._routing import packed_routes_from_sequences, packed_routes_from_summaries
-from ._routing_modes import (
+from ._contracts import (
     _ROUTING_NAME_BY_MODE,
+    SUPPORTED_DTYPES,
+    _SparsePiperRatioProfile,
     routing_mode_from_name,
+    validate_block_lengths,
+    validate_force_tiles,
     validate_routing_mode,
+    validate_sparse_query_blocks,
+)
+from ._routing import (
+    packed_routes_from_sequences,
+    packed_routes_from_summaries,
 )
 from .reference import reference_sparse_piper_attention
 
@@ -252,7 +256,6 @@ def _run_sparse_piper_attention(  # noqa: PLR0913
     query_head_major = query.transpose(1, 2)
     key_head_major = key.transpose(1, 2)
     sparse_key = key_head_major[:, :, :sparse_key_rows]
-    validate_routing_mode(routing_mode)
     force_tile_mask = None
     if force_tile_ids is not None and not layout.keeps_all_blocks(sparse_key_blocks):
         assert force_tile_counts is not None
@@ -275,6 +278,7 @@ def _run_sparse_piper_attention(  # noqa: PLR0913
             block_lengths,
             skip_dense_routing=backend is not None and backend.skip_dense_routing,
             force_tile_mask=force_tile_mask,
+            validate=False,
         )
         if backend is None:
             return reference_sparse_piper_attention(
@@ -326,6 +330,7 @@ def _run_sparse_piper_attention(  # noqa: PLR0913
             routing_mode,
             skip_dense_routing=backend.skip_dense_routing,
             force_tile_mask=force_tile_mask,
+            validate=False,
         )
         prepared = operands.with_routes(
             routes.indices,
@@ -359,6 +364,7 @@ def _sparse_piper_attention_op(  # noqa: PLR0913, PLR0917
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    validate_routing_mode(routing_mode)
     layout = _resolve_route_layout(
         ratio_profile.units,
         sparse_key_blocks,
@@ -387,10 +393,11 @@ def _sparse_piper_attention_op_fake(
     _ratio_profile: _SparsePiperRatioProfile,
     _sparse_key_blocks: int,
     _scale: float,
-    _routing_mode: int,
+    routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
     _sparse_query_blocks: int | None = None,
     _force_tile_ids: torch.Tensor | None = None,
     _force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    validate_routing_mode(routing_mode)
     return torch.empty_like(query, memory_format=torch.contiguous_format)

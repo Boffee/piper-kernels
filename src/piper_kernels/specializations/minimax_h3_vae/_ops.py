@@ -5,19 +5,23 @@ from dataclasses import replace
 import torch
 
 from piper_kernels.linear.convrot.int8 import _backend as convrot_int8_backend
-from piper_kernels.linear.convrot.int8._nvidia._plan import NvidiaExecutionPlan
+from piper_kernels.linear.convrot.int8._nvidia.policy import NvidiaExecutionPlan
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
 
 
 def _execution_plan(
     weight_qdata: torch.Tensor,
     schedule: list[int],
+    *,
+    backend: convrot_int8_backend.LinearBackend | None = None,
 ) -> LinearExecutionPlan:
     if len(schedule) != 5:
         raise ValueError("H3 VAE ConvRot schedule must contain exactly five integers")
     block_m, block_n, block_k, num_warps, num_stages = schedule
-    backend = convrot_int8_backend.require_linear_backend(weight_qdata)
-    plan = backend.default_execution_plan(weight_qdata)
+    resolved = (
+        convrot_int8_backend.require_linear_backend(weight_qdata) if backend is None else backend
+    )
+    plan = resolved.default_execution_plan(weight_qdata)
     choices: dict[str, object] = {
         "matmul_block_m": block_m,
         "matmul_block_n": block_n,
@@ -54,7 +58,7 @@ def linear_prepared(
         weight_scale,
         bias,
         logical_dtype,
-        _execution_plan(weight_qdata, schedule),
+        _execution_plan(weight_qdata, schedule, backend=backend),
     )
 
 

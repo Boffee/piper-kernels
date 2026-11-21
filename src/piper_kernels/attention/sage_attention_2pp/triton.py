@@ -149,6 +149,121 @@ def _finish_kv_statistics_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["key_length", "heads", "stride_sb", "stride_sh"])
+def quantize_key_per_thread_kernel(
+    key_ptr,
+    mean_ptr,
+    output_ptr,
+    scale_ptr,
+    key_length,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_sb,
+    stride_sh,
+    heads,
+    head_dim: tl.constexpr,
+):
+    """Quantize one per-thread globally-centered K scale group for SageAttention2++."""
+    scale_group = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    batch = tl.program_id(2).to(tl.int64)
+    key_block = scale_group // 4
+    thread = scale_group % 4
+    group_offsets = tl.arange(0, 16)
+    offsets_n = key_block * 64 + (group_offsets // 2) * 8 + (group_offsets % 2) + thread * 2
+    offsets_d = tl.arange(0, head_dim)
+    mask = offsets_n[:, None] < key_length
+    mean = tl.load(mean_ptr + (batch * heads + head) * head_dim + offsets_d)
+    values = tl.load(
+        key_ptr
+        + batch * stride_kb
+        + head * stride_kh
+        + offsets_n[:, None] * stride_kn
+        + offsets_d[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    values = tl.where(mask, values - mean[None, :], 0.0)
+    values = qk_quantization.rotate_signed_hadamard_heads(values, head_dim)
+    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
+    scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
+    quantized = qk_quantization.round_to_int8(values / scale)
+    tl.store(
+        output_ptr
+        + batch * stride_ob
+        + head * stride_oh
+        + offsets_n[:, None] * stride_on
+        + offsets_d[None, :],
+        quantized,
+        mask=mask,
+    )
+    tl.store(
+        scale_ptr + batch * stride_sb + head * stride_sh + offsets_n,
+        scale,
+        mask=offsets_n < key_length,
+    )
+
+
+@triton.jit(do_not_specialize=["key_length", "heads"])
+def quantize_key_per_block_kernel(
+    key_ptr,
+    mean_ptr,
+    output_ptr,
+    scale_ptr,
+    key_length,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_sb,
+    stride_sh,
+    heads,
+    head_dim: tl.constexpr,
+    block_n: tl.constexpr,
+):
+    """Quantize one per-block globally-centered K tile for SageAttention2++."""
+    scale_group = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    batch = tl.program_id(2).to(tl.int64)
+    offsets_n = scale_group * block_n + tl.arange(0, block_n)
+    offsets_d = tl.arange(0, head_dim)
+    mask = offsets_n[:, None] < key_length
+    mean = tl.load(mean_ptr + (batch * heads + head) * head_dim + offsets_d)
+    values = tl.load(
+        key_ptr
+        + batch * stride_kb
+        + head * stride_kh
+        + offsets_n[:, None] * stride_kn
+        + offsets_d[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    values = tl.where(mask, values - mean[None, :], 0.0)
+    values = qk_quantization.rotate_signed_hadamard_heads(values, head_dim)
+    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
+    scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
+    quantized = qk_quantization.round_to_int8(values / scale)
+    tl.store(
+        output_ptr
+        + batch * stride_ob
+        + head * stride_oh
+        + offsets_n[:, None] * stride_on
+        + offsets_d[None, :],
+        quantized,
+        mask=mask,
+    )
+    tl.store(
+        scale_ptr + batch * stride_sb + head * stride_sh + scale_group,
+        scale,
+    )
+
+
 @triton.jit
 def _quantize_value_kernel(
     value_ptr,
@@ -773,6 +888,118 @@ def _quantize_value(
         return value_fp8
 
 
+def prepare_key(
+    key: torch.Tensor,
+    key_mean: torch.Tensor,
+    *,
+    grouped: bool,
+    storage_key_length: int,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize globally centered K for SageAttention2++, optionally into caller storage."""
+    batch, heads, key_length, head_dim = key.shape
+    key_block = int(_BLOCK_N)
+    key_shape = (batch, heads, storage_key_length, head_dim)
+    key_int8 = (
+        out[0]
+        if out is not None
+        else (
+            torch.zeros(key_shape, device=key.device, dtype=torch.int8)
+            if storage_key_length != key_length
+            else torch.empty(key_shape, device=key.device, dtype=torch.int8)
+        )
+    )
+    if out is not None and storage_key_length != key_length:
+        key_int8.zero_()
+    with device_context(key.device):
+        if grouped:
+            scale_groups = int(triton.cdiv(key_length, key_block))
+            key_scale = (
+                out[1]
+                if out is not None
+                else torch.empty(
+                    (batch, heads, scale_groups),
+                    device=key.device,
+                    dtype=torch.float32,
+                )
+            )
+            quantize_key_per_block_kernel[(scale_groups, heads, batch)](
+                key,
+                key_mean,
+                key_int8,
+                key_scale,
+                key_length,
+                key.stride(0),
+                key.stride(1),
+                key.stride(2),
+                key_int8.stride(0),
+                key_int8.stride(1),
+                key_int8.stride(2),
+                key_scale.stride(0),
+                key_scale.stride(1),
+                heads=heads,
+                head_dim=head_dim,
+                block_n=_BLOCK_N,
+                num_warps=4,
+            )
+        else:
+            key_scale = (
+                out[1]
+                if out is not None
+                else torch.empty(key.shape[:3], device=key.device, dtype=torch.float32)
+            )
+            quantize_key_per_thread_kernel[(triton.cdiv(key_length, key_block) * 4, heads, batch)](
+                key,
+                key_mean,
+                key_int8,
+                key_scale,
+                key_length,
+                key.stride(0),
+                key.stride(1),
+                key.stride(2),
+                key_int8.stride(0),
+                key_int8.stride(1),
+                key_int8.stride(2),
+                key_scale.stride(0),
+                key_scale.stride(1),
+                heads=heads,
+                head_dim=head_dim,
+                num_warps=4,
+            )
+        return key_int8, key_scale
+
+
+def prepare_query_key(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    key_mean: torch.Tensor,
+    softmax_scale: float,
+    *,
+    grouped: bool,
+    storage_key_length: int,
+    storage_query_length: int | None = None,
+) -> qk_quantization.PreparedInt8QueryKey:
+    """Prepare globally-centered INT8 Q/K operands for SageAttention2++."""
+    query_int8, query_scale = qk_quantization.prepare_query(
+        query,
+        softmax_scale,
+        grouped=grouped,
+        storage_query_length=storage_query_length,
+    )
+    key_int8, key_scale = prepare_key(
+        key,
+        key_mean,
+        grouped=grouped,
+        storage_key_length=storage_key_length,
+    )
+    return qk_quantization.PreparedInt8QueryKey(
+        query=query_int8,
+        key=key_int8,
+        query_scale=query_scale,
+        key_scale=key_scale,
+    )
+
+
 def _prepare_sage_attention_2pp(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -795,7 +1022,7 @@ def _prepare_sage_attention_2pp(
         else key_length
     )
     key_mean, value_scale = _compute_kv_statistics(key, value)
-    prepared_qk = qk_quantization.prepare_query_key(
+    prepared_qk = prepare_query_key(
         query,
         key,
         key_mean,

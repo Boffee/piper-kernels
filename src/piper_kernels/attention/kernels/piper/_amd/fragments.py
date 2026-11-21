@@ -12,6 +12,7 @@ from triton.experimental.gluon.language.amd.rdna4 import wmma
 
 from piper_kernels._triton import amd_compiler_workarounds
 
+from ..gluon import split_bf16_pair
 from ._wmma import int8_wmma, uint8_int8_wmma
 
 MMA_LAYOUT: gl.constexpr = AMDWMMALayout(
@@ -219,18 +220,6 @@ def qk_tiles(
 
 
 @gluon.jit
-def _split_bf16_pair(value):
-    """Split finite non-negative FP32 values into two BF16 terms (high + low)."""
-    # Bitwise shifts avoid tt.fp_to_fp and extra arith.truncf ops in TTGIR.
-    bits = value.to(gl.uint32, bitcast=True)
-    high = (bits >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
-    high_fp32 = (bits & 0xFFFF0000).to(gl.float32, bitcast=True)
-    residual_bits = (value - high_fp32).to(gl.uint32, bitcast=True)
-    low = ((residual_bits + 0x8000) >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
-    return high, low
-
-
-@gluon.jit
 def compute_chunk_key_biases(
     query,
     key_center_ptr,
@@ -314,7 +303,7 @@ def accumulate_chunk_value_means(
     pair_decay = gl.where(has_valid_scores, gl.exp2(pair_max - row_running_max), 0.0)
     # Gate invalid/masked slots outside the product so uninitialized or NaN masses become 0.0.
     scaled_masses = gl.where(has_valid_scores, tile_masses * pair_decay * 255.0, 0.0)
-    masses_high, masses_low = _split_bf16_pair(scaled_masses)
+    masses_high, masses_low = split_bf16_pair(scaled_masses)
     lhs_high = gl.convert_layout(masses_high, lhs_layout)
     lhs_low = gl.convert_layout(masses_low, lhs_layout)
 

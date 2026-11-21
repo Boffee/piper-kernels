@@ -8,7 +8,7 @@ from typing import cast
 import torch
 from torch.fx.node import Argument
 
-from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
+from piper_kernels.attention.sparse_piper_attention._contracts import SUPPORTED_DTYPES
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.linear import _bias
 from piper_kernels.linear import _compile_fx as linear_fx

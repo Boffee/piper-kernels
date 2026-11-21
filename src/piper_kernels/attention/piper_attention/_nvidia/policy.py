@@ -1,4 +1,30 @@
-"""NVIDIA execution planning for Piper Attention."""
+"""NVIDIA execution planning for dense Piper Attention.
+
+Scheduling and backend boundaries:
+- Full query tiles and a ragged final tile share one launch. Full tiles use
+  unmasked access; the tail uses masked Q pointer loads and output stores, even
+  when full tiles use descriptors. Optimized causal traversal starts with the
+  longest prefixes. Quantization and statistics use separate preparation launches.
+- Exact SM120 uses Triton (``attention_kernel="triton"``). Its execution plan
+  chooses descriptor loads, tiling, pipeline stages, and causal ordering from
+  host metadata. Descriptor setup must be amortized by traversal work; rectangular
+  attention uses actual K length. Output strides matter for fused output buffers:
+  the causal strided D64 schedule interleaves heads across query-tile groups and
+  bounds ragged-kernel registers to preserve occupancy, while D128 splits PV into
+  two FP32 D64 accumulators.
+- Exact SM89 uses the Gluon kernel (``attention_kernel="gluon_async_copy"``),
+  staging Q/K/V and per-key V multipliers through ``cp.async`` commit groups. It
+  retains per-thread Q/K scales, derives the V log-scale bound, computes per-chunk
+  ``k_bias`` in FP32 directly from SMEM Q and ``key_center``, and masks the final K
+  tile plus the causal diagonal when needed. D64 quantizes Q in the prologue; D128
+  uses a smaller query tile and a register cap to retain occupancy. Ragged lengths
+  reuse one compiled kernel. Q quantized by a fused producer skips the prologue;
+  Q128 tiles zero-fill rows past Q64-padded storage, and producer K scales and V
+  multipliers span K64-padded storage.
+- Capability checks belong to ``PiperAttentionExecutionPlan``; offline tuning
+  (``benchmarks/tune_piper_attention.py``) can compare implementations without
+  changing production dispatch.
+"""
 
 from piper_kernels._triton.targets import AcceleratorTarget
 

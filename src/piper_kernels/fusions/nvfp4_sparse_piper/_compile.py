@@ -9,9 +9,9 @@ import torch
 from torch.fx.node import Argument
 
 from piper_kernels.attention.kernels.sparse_piper import layout
-from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
+    SUPPORTED_DTYPES,
     is_valid_routing_mode,
 )
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile

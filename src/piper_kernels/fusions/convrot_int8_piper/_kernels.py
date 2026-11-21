@@ -8,6 +8,7 @@
 import triton
 import triton.language as tl
 
+from piper_kernels.attention.kernels.piper.triton import pack_amd_wmma_token
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 from piper_kernels.attention.piper_attention import _quantization
 from piper_kernels.fusions.convrot_int8_projection.triton import (
@@ -286,8 +287,7 @@ def _project_value_kernel(  # noqa: PLR0913, PLR0917
     scales = scales.reshape((block_m, heads_per_program)).T
     batch_heads = batch * heads + head_offsets.to(tl.int64)
     if packed_amd:
-        token = tl.arange(0, block_m)
-        packed_token = (token & ~24) | ((token & 8) << 1) | ((token & 16) >> 1)
+        packed_token = pack_amd_wmma_token(tl.arange(0, block_m))
         offsets = (
             (batch_heads[:, None, None] * (storage_length // 64) + row_block) * head_dim * 64
             + dim[None, None, :] * 64

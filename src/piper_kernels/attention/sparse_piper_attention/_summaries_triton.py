@@ -13,13 +13,8 @@ import triton.language as tl
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels._grid import select_block_grid
 from piper_kernels.attention.kernels.sparse_piper import triton as sparse_piper_kernels
-from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 
-from ._dtype import SUPPORTED_DTYPES
-from ._routing_modes import (
-    _MEAN_ROUTING,
-    validate_routing_mode,
-)
+from ._contracts import _MEAN_ROUTING
 
 _BLOCK_ROWS = 64
 
@@ -100,42 +95,9 @@ def sequence_block_summaries(
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Summarize compact or valid-front padded Q/K blocks on CUDA."""
-    validate_routing_mode(routing_mode)
-    if query.ndim != 4 or key.ndim != 4:
-        raise ValueError("optimized sequence summaries require rank-four Q/K tensors")
-    if (
-        query.shape[0] != key.shape[0]
-        or key.shape[1] < 1
-        or query.shape[1] < 1
-        or query.shape[1] % key.shape[1]
-        or query.shape[-1] not in SUPPORTED_HEAD_DIMS
-        or key.shape[-1] != query.shape[-1]
-        or query.shape[2] < 1
-        or key.shape[2] < 1
-    ):
-        raise ValueError("optimized summaries require nonempty ragged Q/K with D64/D128 K")
-    if query.device.type != "cuda" or query.dtype not in SUPPORTED_DTYPES:
-        raise ValueError("optimized summaries require CUDA FP16/BF16/FP32 inputs")
-    if key.device != query.device or key.dtype != query.dtype:
-        raise ValueError("optimized summary Q/K sequences must share a device and dtype")
-    if query.stride(-1) != 1 or key.stride(-1) != 1:
-        raise ValueError("optimized summaries require contiguous feature dimensions")
-
+    """Summarize validated compact or valid-front padded Q/K blocks on CUDA."""
     batch, heads, query_rows, head_dim = query.shape
     key_rows = key.shape[2]
-    if block_lengths is not None and (
-        query_rows % _BLOCK_ROWS
-        or block_lengths.shape != (query_rows // _BLOCK_ROWS,)
-        or block_lengths.dtype is not torch.int32
-        or block_lengths.device != query.device
-        or not block_lengths.is_contiguous()
-        or key_rows % _BLOCK_ROWS
-        or key_rows // _BLOCK_ROWS > block_lengths.numel()
-    ):
-        raise ValueError(
-            "optimized padded summaries require one contiguous device INT32 length per query K64"
-        )
     query_blocks = (query_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     key_blocks = (key_rows + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     query_summary = torch.empty(

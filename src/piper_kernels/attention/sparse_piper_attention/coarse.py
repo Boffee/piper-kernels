@@ -1,15 +1,22 @@
-"""Policy-independent coarse-attention residuals for Sparse Piper."""
+"""Policy-independent coarse-attention residuals and compiler boundary for Sparse Piper."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Iterable
+from typing import Literal
 
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
-from ._block_layout import valid_block_rows, validate_block_lengths
+from ._contracts import (
+    _ROUTING_NAME_BY_MODE,
+    routing_mode_from_name,
+    valid_block_rows,
+    validate_block_lengths,
+    validate_routing_mode,
+)
 
 
 def _preserve_coarse_residual_in_graph(*tensors: torch.Tensor) -> bool:
@@ -38,7 +45,7 @@ def _validate_coarse_key_blocks(
         )
 
 
-def validate_coarse_residual_inputs(
+def validate_coarse_residual_inputs(  # noqa: PLR0912
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -57,6 +64,10 @@ def validate_coarse_residual_inputs(
         )
     if query.shape != key.shape or query.shape != value.shape:
         raise ValueError(f"{routing_label} coarse attention requires equal Q/K/V shapes")
+    if query.shape[1] < 1 or query.shape[2] < 1:
+        raise ValueError(
+            f"{routing_label} coarse attention requires nonempty sequence and head dimensions"
+        )
     if coarse_gate.shape != query.shape:
         raise ValueError(f"{routing_label} coarse attention gate must match Q/K/V")
     if any(tensor.device != query.device for tensor in (key, value, coarse_gate)):
@@ -65,6 +76,13 @@ def validate_coarse_residual_inputs(
         raise TypeError(f"{routing_label} coarse attention tensors must be floating-point")
     if not coarse_gate.is_floating_point() or coarse_gate.dtype is not query.dtype:
         raise ValueError(f"{routing_label} coarse attention gate must share the Q/K/V dtype")
+    if (
+        query.layout is not torch.strided
+        or key.layout is not torch.strided
+        or query.stride(-1) != 1
+        or key.stride(-1) != 1
+    ):
+        raise ValueError(f"{routing_label} coarse attention Q/K features must be contiguous")
 
     validate_coarse_scale(coarse_scale)
     if block_lengths is None:
@@ -122,6 +140,7 @@ def mean_pool_block_values(
             sequence_length=sequence_length,
             device=value.device,
             context="coarse attention",
+            require_contiguous=False,
         )
     return _mean_pool_token_blocks(value, block_lengths)
 
@@ -180,6 +199,14 @@ def _mean_pool_sequence_blocks(
     return summaries[0] if len(summaries) == 1 else torch.cat(summaries, dim=sequence_dim)
 
 
+def _coarse_attention_unchecked(
+    block_scores: torch.Tensor,
+    pooled_value: torch.Tensor,
+) -> torch.Tensor:
+    """Apply dense FP32 attention to validated block logits and pooled V."""
+    return torch.matmul(torch.softmax(block_scores, dim=-1), pooled_value)
+
+
 def coarse_attention(
     block_scores: torch.Tensor,
     pooled_value: torch.Tensor,
@@ -197,7 +224,17 @@ def coarse_attention(
         raise ValueError("coarse score key blocks must match pooled V blocks")
     if block_scores.shape[-2] < 1 or block_scores.shape[-1] < 1:
         raise ValueError("coarse attention requires query and key blocks")
-    return torch.matmul(torch.softmax(block_scores, dim=-1), pooled_value)
+    return _coarse_attention_unchecked(block_scores, pooled_value)
+
+
+def _apply_coarse_attention_residual_unchecked(
+    coarse_output: torch.Tensor,
+    coarse_gate: torch.Tensor,
+) -> torch.Tensor:
+    sequence_length = coarse_gate.shape[1]
+    expanded = coarse_output.permute(0, 2, 1, 3).repeat_interleave(_BLOCK_ROWS, dim=1)
+    expanded = expanded[:, :sequence_length]
+    return (coarse_gate.float() * expanded).to(coarse_gate.dtype).contiguous()
 
 
 def apply_coarse_attention_residual(
@@ -217,10 +254,7 @@ def apply_coarse_attention_residual(
     query_blocks = (sequence_length + _BLOCK_ROWS - 1) // _BLOCK_ROWS
     if coarse_output.shape != (batch, heads, query_blocks, features):
         raise ValueError("coarse output must contain one Q64 result per fine query block")
-
-    expanded = coarse_output.permute(0, 2, 1, 3).repeat_interleave(_BLOCK_ROWS, dim=1)
-    expanded = expanded[:, :sequence_length]
-    return (coarse_gate.float() * expanded).to(coarse_gate.dtype).contiguous()
+    return _apply_coarse_attention_residual_unchecked(coarse_output, coarse_gate)
 
 
 def _apply_chunked_coarse_residual(
@@ -228,15 +262,12 @@ def _apply_chunked_coarse_residual(
     coarse_gate: torch.Tensor,
     score_chunks: Iterable[tuple[int, torch.Tensor]],
 ) -> torch.Tensor:
-    """Apply and concatenate coarse-score chunks before the gated residual."""
+    """Apply and concatenate validated coarse-score chunks before the gated residual."""
     coarse_chunks = [
-        coarse_attention(scores, pooled_value) for _query_offset, scores in score_chunks
+        _coarse_attention_unchecked(scores, pooled_value) for _query_offset, scores in score_chunks
     ]
     coarse_output = coarse_chunks[0] if len(coarse_chunks) == 1 else torch.cat(coarse_chunks, dim=2)
-    return apply_coarse_attention_residual(
-        coarse_output,
-        coarse_gate,
-    )
+    return _apply_coarse_attention_residual_unchecked(coarse_output, coarse_gate)
 
 
 def coarse_attention_residual(
@@ -251,9 +282,161 @@ def coarse_attention_residual(
     )
 
 
+def _coarse_residual_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    coarse_gate: torch.Tensor,
+    *,
+    coarse_key_blocks: int | None,
+    coarse_scale: float,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply the common Q/K/V-derived coarse residual implementation."""
+    from ._routing import score_chunks  # noqa: PLC0415
+    from ._summaries import _sequence_block_summaries_validated  # noqa: PLC0415
+
+    validate_routing_mode(routing_mode)
+    resolved_blocks = validate_coarse_residual_inputs(
+        query,
+        key,
+        value,
+        coarse_gate,
+        coarse_key_blocks,
+        coarse_scale,
+        block_lengths,
+        routing_label=_ROUTING_NAME_BY_MODE[routing_mode],
+    )
+    query_head_major = query.transpose(1, 2)
+    coarse_key = key.transpose(1, 2)[:, :, : resolved_blocks * _BLOCK_ROWS]
+    query_summary, key_primary, key_aux = _sequence_block_summaries_validated(
+        query_head_major,
+        coarse_key,
+        routing_mode,
+        block_lengths,
+    )
+    pooled_value = _mean_pool_token_blocks(value, block_lengths)[:, :, :resolved_blocks]
+    return _apply_chunked_coarse_residual(
+        pooled_value,
+        coarse_gate,
+        score_chunks(
+            query_summary,
+            key_primary,
+            key_aux,
+            routing_mode,
+            score_scale=coarse_scale,
+        ),
+    )
+
+
+@torch.library.custom_op(
+    "piper_kernels::sparse_piper_coarse_residual",
+    mutates_args=(),
+)
+def _sparse_piper_coarse_residual_op(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    coarse_gate: torch.Tensor,
+    coarse_key_blocks: int,
+    coarse_scale: float,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Preserve a Q/K/V-derived coarse residual as one semantic operation."""
+    return _coarse_residual_impl(
+        query,
+        key,
+        value,
+        coarse_gate,
+        coarse_key_blocks=coarse_key_blocks,
+        coarse_scale=coarse_scale,
+        routing_mode=routing_mode,
+        block_lengths=block_lengths,
+    )
+
+
+@_sparse_piper_coarse_residual_op.register_fake
+def _sparse_piper_coarse_residual_op_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    coarse_gate: torch.Tensor,
+    coarse_key_blocks: int,
+    coarse_scale: float,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    validate_routing_mode(routing_mode)
+    validate_coarse_residual_inputs(
+        query,
+        key,
+        value,
+        coarse_gate,
+        coarse_key_blocks,
+        coarse_scale,
+        block_lengths,
+        routing_label=_ROUTING_NAME_BY_MODE[routing_mode],
+    )
+    return torch.empty_like(query, memory_format=torch.contiguous_format)
+
+
+def sparse_piper_coarse_residual(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    coarse_gate: torch.Tensor,
+    *,
+    routing: Literal["mean", "minmax"],
+    coarse_key_blocks: int | None = None,
+    coarse_scale: float,
+    block_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return a gated coarse branch using the selected block-summary policy.
+
+    All token tensors use ``[batch,sequence,heads,features]``. Compact storage
+    may end in one partial block. With ``block_lengths``, storage instead holds
+    complete physical K64 blocks whose valid rows occupy each block's prefix.
+    ``coarse_key_blocks`` defaults to every available K64 block.
+    """
+    routing_mode = routing_mode_from_name(routing)
+    if _preserve_coarse_residual_in_graph(query, key, value, coarse_gate):
+        resolved_coarse_key_blocks = (
+            (
+                block_lengths.numel()
+                if block_lengths is not None
+                else (query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS
+            )
+            if coarse_key_blocks is None
+            else coarse_key_blocks
+        )
+        return torch.ops.piper_kernels.sparse_piper_coarse_residual.default(
+            query,
+            key,
+            value,
+            coarse_gate,
+            resolved_coarse_key_blocks,
+            coarse_scale,
+            routing_mode,
+            block_lengths,
+        )
+    return _coarse_residual_impl(
+        query,
+        key,
+        value,
+        coarse_gate,
+        coarse_key_blocks=coarse_key_blocks,
+        coarse_scale=coarse_scale,
+        routing_mode=routing_mode,
+        block_lengths=block_lengths,
+    )
+
+
 __all__ = [
     "apply_coarse_attention_residual",
     "coarse_attention",
     "coarse_attention_residual",
     "mean_pool_block_values",
+    "sparse_piper_coarse_residual",
 ]

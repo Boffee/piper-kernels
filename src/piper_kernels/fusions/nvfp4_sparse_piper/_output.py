@@ -7,7 +7,7 @@ from typing import cast
 
 import torch
 
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
+from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4_backend
 from piper_kernels.linear.nvfp4 import _projection, _validation

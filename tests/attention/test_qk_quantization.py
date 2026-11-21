@@ -15,6 +15,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
     quantize_query_key,
     quantize_tile_centered_query_key,
 )
+from piper_kernels.attention.sage_attention_2pp import triton as sage_triton
 
 
 def _signed_hadamard(head_dim: int) -> torch.Tensor:
@@ -102,7 +103,7 @@ def test_prepared_query_key_is_shared_quantization_contract(grouped: bool) -> No
     key_mean = key.float().mean(dim=2)
     softmax_scale = 128**-0.5
 
-    actual = triton_qk_quantization.prepare_query_key(
+    actual = sage_triton.prepare_query_key(
         query,
         key,
         key_mean,
@@ -117,7 +118,7 @@ def test_prepared_query_key_is_shared_quantization_contract(grouped: bool) -> No
         grouped=grouped,
         storage_query_length=64,
     )
-    expected_key, expected_key_scale = triton_qk_quantization.prepare_key(
+    expected_key, expected_key_scale = sage_triton.prepare_key(
         key,
         key_mean,
         grouped=grouped,
@@ -158,13 +159,13 @@ def test_query_key_quantization_preserves_offsets_above_int32(
     torch.testing.assert_close(query, expected_query, atol=0, rtol=0)
     torch.testing.assert_close(query_scale, expected_query_scale, atol=0, rtol=0)
 
-    expected_key, expected_key_scale = triton_qk_quantization.prepare_key(
+    expected_key, expected_key_scale = sage_triton.prepare_key(
         compact, mean, grouped=grouped, storage_key_length=shape[2]
     )
     # Exercise wide output offsets too; prepare_query owns compact output storage.
     key = torch.empty_strided(shape, strides, device="cuda", dtype=torch.int8)
     key_scale = torch.empty_like(expected_key_scale)
-    triton_qk_quantization.prepare_key(
+    sage_triton.prepare_key(
         value, mean, grouped=grouped, storage_key_length=shape[2], out=(key, key_scale)
     )
     torch.testing.assert_close(key, expected_key, atol=0, rtol=0)

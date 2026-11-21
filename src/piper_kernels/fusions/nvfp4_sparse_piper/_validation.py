@@ -8,10 +8,10 @@ from typing import cast
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
-from piper_kernels.attention.sparse_piper_attention._block_layout import (
+from piper_kernels.attention.sparse_piper_attention._contracts import SUPPORTED_DTYPES
+from piper_kernels.attention.sparse_piper_attention._contracts import (
     validate_block_lengths as validate_k64_block_lengths,
 )
-from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
 from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 

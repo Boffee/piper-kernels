@@ -8,8 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
-from types import ModuleType
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 import torch
 from lib.case_cli import apply_case
@@ -40,36 +39,12 @@ from lib.tuning import (
 )
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot.int8._amd import triton as amd
-from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
+from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8.reference import linear as reference_linear
 from piper_kernels.weights.convrot import SUPPORTED_GROUP_SIZES
 
 _MATMUL_KERNEL_VALUES = ("triton", "gluon_async_copy", "gluon_tma")
 _MATMUL_GROUP_M_VALUES = (0, 8, 16)
-
-
-class _ExecutionPlan(Protocol):
-    @property
-    def fuse_rotation_quantization(self) -> bool: ...
-    @property
-    def fused_num_warps(self) -> int: ...
-    @property
-    def rotation_num_warps(self) -> int: ...
-    @property
-    def quantization_num_warps(self) -> int: ...
-    @property
-    def matmul_block_m(self) -> int: ...
-    @property
-    def matmul_block_n(self) -> int: ...
-    @property
-    def matmul_block_k(self) -> int: ...
-    @property
-    def matmul_num_warps(self) -> int: ...
-    @property
-    def matmul_num_stages(self) -> int: ...
-
-    def as_dict(self) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,8 +54,8 @@ class ConvRotInt8Workload:
     shape: ConvRotShape
     config: ConvRotConfig
     inputs: ConvRotInputs
-    production_plan: _ExecutionPlan
-    backend: ModuleType
+    production_plan: linear_backend.LinearExecutionPlan
+    backend: linear_backend.LinearBackend
 
     def common_configuration(self) -> dict[str, object]:
         """Return provider-neutral workload metadata."""
@@ -116,14 +91,7 @@ def make_convrot_int8_workload(
 ) -> ConvRotInt8Workload:
     """Create tensors and resolve policy; an explicit target permits offline inspection."""
     resolved_target = AcceleratorTarget.from_device(device) if target is None else target
-    backend = next(
-        (
-            candidate
-            for candidate in (nvidia, amd)
-            if candidate.policy.supports_target(resolved_target)
-        ),
-        None,
-    )
+    backend = linear_backend.select_linear_backend_for_target(resolved_target)
     if backend is None:
         raise ValueError(f"ConvRot INT8 tuning has no optimized backend for {resolved_target}")
     inputs = make_convrot_inputs(shape, config, device=device)
@@ -258,8 +226,8 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _candidate_plans(
     args: argparse.Namespace,
-    production_plan: _ExecutionPlan,
-) -> tuple[_ExecutionPlan, ...]:
+    production_plan: linear_backend.LinearExecutionPlan,
+) -> tuple[linear_backend.LinearExecutionPlan, ...]:
     """Build a bounded explicit search around the production execution plan."""
     fusion_axis = boolean_tuning_axis(
         args.fuse_rotation_quantization,
@@ -294,7 +262,7 @@ def _candidate_plans(
         "matmul_num_warps": tuning_axis(args.matmul_num_warps, production_plan.matmul_num_warps),
         "matmul_num_stages": tuning_axis(args.matmul_num_stages, production_plan.matmul_num_stages),
     }
-    if isinstance(production_plan, nvidia.policy.NvidiaExecutionPlan):
+    if isinstance(production_plan, linear_backend.nvidia_policy.NvidiaExecutionPlan):
         axes.update(
             matmul_kernel=tuning_axis(args.matmul_kernel, production_plan.matmul_kernel),
             matmul_group_m=tuning_axis(args.matmul_group_m, production_plan.matmul_group_m),
@@ -308,7 +276,7 @@ def _candidate_plans(
         try:
             # All backend execution plans are frozen dataclasses validated on construction.
             plan = cast(
-                _ExecutionPlan,
+                linear_backend.LinearExecutionPlan,
                 replace(cast(Any, production_plan), **dict(zip(axes, values, strict=True))),
             )
         except ValueError as error:
@@ -323,7 +291,7 @@ def _candidate_plans(
     return tuple(plans)
 
 
-def _plan_name(plan: _ExecutionPlan) -> str:
+def _plan_name(plan: linear_backend.LinearExecutionPlan) -> str:
     preparation = (
         f"fused-pw{plan.fused_num_warps}"
         if plan.fuse_rotation_quantization
@@ -331,7 +299,7 @@ def _plan_name(plan: _ExecutionPlan) -> str:
     )
     implementation = (
         f"{plan.matmul_kernel}-g{plan.matmul_group_m}-"
-        if isinstance(plan, nvidia.policy.NvidiaExecutionPlan)
+        if isinstance(plan, linear_backend.nvidia_policy.NvidiaExecutionPlan)
         else ""
     )
     return (
@@ -342,7 +310,7 @@ def _plan_name(plan: _ExecutionPlan) -> str:
 
 
 def _make_candidate(
-    plan: _ExecutionPlan,
+    plan: linear_backend.LinearExecutionPlan,
     workload: ConvRotInt8Workload,
 ) -> Implementation[Operation[torch.Tensor]]:
     """Wrap one plan around the complete production-paid ConvRot device path."""

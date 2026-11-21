@@ -19,6 +19,7 @@ from ._amd import gluon as amd_backend
 from ._amd import policy as amd_policy
 from ._nvidia import policy as nvidia_policy
 from ._nvidia import triton as nvidia_backend
+from ._validation import PreparedContext, PreparedQuery
 
 
 def supports_quantized_query(target: AcceleratorTarget) -> bool:
@@ -169,7 +170,7 @@ def _piper_attention_from_quantized_query_op(
             if plan.use_tensor_descriptors and plan.block_m == 128
             else None
         )
-        prepared_query = nvidia_backend._PreparedPiperQuery(
+        prepared_query = PreparedQuery(
             data=query,
             scale=query_scale,
             descriptor=descriptor,
@@ -180,9 +181,7 @@ def _piper_attention_from_quantized_query_op(
             context, prepared_query, key.new_empty(shape)
         )
     amd_context = amd_backend.prepare_context(key, value, is_causal=is_causal)
-    amd_query = amd_backend.PreparedQuery(
-        data=query, scale=query_scale, shape=shape, dtype=key.dtype
-    )
+    amd_query = PreparedQuery(data=query, scale=query_scale, shape=shape, dtype=key.dtype)
     return amd_backend.launch_attention_into(amd_context, amd_query, key.new_empty(shape))
 
 
@@ -365,7 +364,7 @@ def _piper_attention_from_quantized_op(  # noqa: PLR0913, PLR0917
     )
 
 
-type QuantizedContext = nvidia_backend._PreparedPiperContext | amd_backend.PreparedContext
+type QuantizedContext = PreparedContext
 
 
 def prepare_quantized_context(
@@ -404,7 +403,7 @@ def prepare_quantized_context(
                 if plan.use_tensor_descriptors
                 else (key, value)
             )
-        return nvidia_backend._PreparedPiperContext(
+        return PreparedContext(
             key=key_argument,
             value=value_argument,
             key_scale=key_scale,
@@ -417,13 +416,13 @@ def prepare_quantized_context(
             execution_plan=plan,
             padded_kv=True,
         )
-    return amd_backend.PreparedContext(
+    return PreparedContext(
         key=key,
         value=value,
         key_scale=key_scale,
         key_center=key_center,
-        multiplier=multiplier,
-        log_scale=log_scale,
+        value_scale_multiplier=multiplier,
+        value_log_scale=log_scale,
         value_mean=value_mean,
         key_length=key_length,
         is_causal=is_causal,
@@ -441,14 +440,14 @@ def launch_quantized_attention_into(
     """Consume local Q storage and fill a validated BHSD output window."""
     batch, heads, rows, head_dim = output.shape
     shape = (batch, heads, rows, head_dim)
-    if isinstance(context, nvidia_backend._PreparedPiperContext):
+    if context.execution_plan is not None:
         plan = context.execution_plan
         descriptor = (
             nvidia_backend._make_query_descriptor(query, plan.block_m)
             if plan.use_tensor_descriptors and plan.block_m == 128
             else None
         )
-        prepared = nvidia_backend._PreparedPiperQuery(
+        prepared = PreparedQuery(
             data=query,
             scale=query_scale,
             descriptor=descriptor,
@@ -457,7 +456,7 @@ def launch_quantized_attention_into(
             global_row_offset=global_row_offset,
         )
         return nvidia_backend._launch_piper_attention_into(context, prepared, output)
-    prepared = amd_backend.PreparedQuery(
+    prepared = PreparedQuery(
         data=query,
         scale=query_scale,
         shape=shape,

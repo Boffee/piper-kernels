@@ -15,17 +15,17 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import triton as sage
 from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
 from piper_kernels.gguf import GGUFQuantizationType
-from piper_kernels.linear.convrot.int8 import _generic
-from piper_kernels.linear.convrot.int8._amd import triton as amd
-from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
+from piper_kernels.linear.convrot.int8 import _backend, _generic
 from piper_kernels.linear.convrot.int8._generic import triton as generic
-from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
 from piper_kernels.weights.convrot import triton as rotation
 from piper_kernels.weights.convrot.int8 import _gguf
 from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 from piper_kernels.weights.convrot.nvfp4 import triton as convrot_nvfp4_weight_triton
 from piper_kernels.weights.nvfp4 import triton as nvfp4_primitives
+
+amd = _backend._amd_backend
+nvidia = _backend._nvidia_backend
 
 
 @pytest.fixture
@@ -84,7 +84,7 @@ def launches(monkeypatch):
 def test_gguf_and_generic_operations_accept_supported_noncurrent_gpu(launches):
     value = SimpleNamespace(device=torch.device("cuda:0"), shape=(2, 256), numel=lambda: 512)
     assert int8_gguf.select_gguf_converter(value) is int8_weight_triton.convert_gguf_out
-    assert generic_dispatch._use_triton(value)
+    assert _generic._use_triton(value)
     assert launches.queries == [0, 0]
     assert launches.current == 1
 
@@ -191,7 +191,7 @@ def test_fused_int8_merge_restores_device_after_all_passes(
 def test_prepared_paired_projection_owns_context_for_all_launches(launches, backend, fail):
     launches.backend = "hip" if backend is amd else "cuda"
     launches.fail = fail
-    kernel_backend = nvidia.triton_kernels if backend is nvidia else backend
+    kernel_backend = backend.kernels
     launches.watch(kernel_backend, "int8_matmul_kernel")
     if backend is nvidia:
         launches.watch(kernel_backend, "dynamic_m_int8_matmul_kernel")
@@ -229,7 +229,7 @@ def test_prepared_paired_projection_owns_context_for_all_launches(launches, back
 def test_prepared_residual_projection_owns_context_for_all_launches(launches, backend, dtype, fail):
     launches.backend = "hip" if backend is amd else "cuda"
     launches.fail = fail
-    kernel_backend = nvidia.triton_kernels if backend is nvidia else backend
+    kernel_backend = backend.kernels
     launches.watch(kernel_backend, "int8_matmul_kernel")
     launches.watch(residual_kernels, "_residual_add_kernel")
     if backend is nvidia:
@@ -294,10 +294,10 @@ def test_sm120_tma_projections_and_residual_own_device_context(launches, monkeyp
         descriptor_contexts.append(launches.current)
         return object()
 
-    monkeypatch.setattr(nvidia.gluon_tma, "operands_aligned", lambda *operands: True)
-    monkeypatch.setattr(nvidia.gluon_tma, "TensorDescriptor", make_descriptor)
-    launches.watch(nvidia.gluon_tma, "_int8_tma_matmul_kernel")
-    launches.watch(nvidia.gluon_tma, "_int8_tma_residual_matmul_kernel")
+    monkeypatch.setattr(nvidia.kernels.gluon_tma, "operands_aligned", lambda *operands: True)
+    monkeypatch.setattr(nvidia.kernels.gluon_tma, "TensorDescriptor", make_descriptor)
+    launches.watch(nvidia.kernels.gluon_tma, "_int8_tma_matmul_kernel")
+    launches.watch(nvidia.kernels.gluon_tma, "_int8_tma_residual_matmul_kernel")
     with FakeTensorMode():
         rows, k, n = 2304, 256, 1024
         value = torch.empty(rows, k, dtype=torch.int8, device="cuda:0")

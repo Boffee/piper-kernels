@@ -9,8 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
-from piper_kernels.linear.convrot.int8._kernels.triton import scaled_int8_matmul
 from piper_kernels.linear.convrot.int8._plan import LinearExecutionPlan
+from piper_kernels.linear.convrot.int8.triton import scaled_int8_matmul
 
 
 @triton.jit

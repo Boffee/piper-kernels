@@ -13,9 +13,9 @@ from torch import nn
 from piper_kernels import compile_options
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
+from piper_kernels.linear.convrot.int8 import _backend
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
-from piper_kernels.linear.convrot.int8._kernels import triton as int8_kernels
-from piper_kernels.linear.convrot.int8._nvidia import dispatch as int8_nvidia
+from piper_kernels.linear.convrot.int8 import triton as int8_kernels
 from piper_kernels.linear.convrot.int8._nvidia.policy import (
     baseline_execution_plan,
     grouped_triton_plan,
@@ -30,6 +30,8 @@ from piper_kernels.weights.convrot.int8._update_reference import add_ as referen
 from piper_kernels.weights.convrot.int8._update_reference import addmm_
 
 from ._legacy_matmul import legacy_matmul
+
+int8_nvidia = _backend._nvidia_backend
 
 
 @triton.jit
@@ -196,7 +198,7 @@ def test_fused_rotation_quantization_matches_fp32_rotation_exactly(
     expected_qdata = torch.empty_like(activation, dtype=torch.int8)
     expected_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
     convrot_backend.rotate_input(activation, rotated, 256, num_warps=4)
-    int8_nvidia.triton_kernels.quantize_input(
+    int8_nvidia.kernels.quantize_input(
         rotated,
         expected_qdata,
         expected_scale,
@@ -205,7 +207,7 @@ def test_fused_rotation_quantization_matches_fp32_rotation_exactly(
 
     actual_qdata = torch.empty_like(expected_qdata)
     actual_scale = torch.empty_like(expected_scale)
-    int8_nvidia.triton_kernels.fused_rotate_quantize_input(
+    int8_nvidia.kernels.fused_rotate_quantize_input(
         activation,
         actual_qdata,
         actual_scale,
@@ -240,7 +242,7 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
     expected_qdata = torch.empty_like(activation, dtype=torch.int8)
     expected_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
     convrot_backend.rotate_input(activation, rotated, 256, num_warps=4)
-    int8_nvidia.triton_kernels.quantize_input(
+    int8_nvidia.kernels.quantize_input(
         rotated,
         expected_qdata,
         expected_scale,
@@ -249,7 +251,7 @@ def test_fused_up_gate_swiglu_preparation_matches_materialized_path(
 
     actual_qdata = torch.empty_like(expected_qdata)
     actual_scale = torch.empty_like(expected_scale)
-    int8_nvidia.triton_kernels.fused_rotate_quantize_input(
+    int8_nvidia.kernels.fused_rotate_quantize_input(
         raw_activation,
         actual_qdata,
         actual_scale,
@@ -290,7 +292,7 @@ def test_fused_gelu_tanh_preparation_matches_materialized_path(
     expected_qdata = torch.empty_like(activated_input, dtype=torch.int8)
     expected_scale = torch.empty(rows, dtype=torch.float32, device="cuda")
     convrot_backend.rotate_input(activated_input, rotated, 256, num_warps=4)
-    int8_nvidia.triton_kernels.quantize_input(
+    int8_nvidia.kernels.quantize_input(
         rotated,
         expected_qdata,
         expected_scale,
@@ -299,7 +301,7 @@ def test_fused_gelu_tanh_preparation_matches_materialized_path(
 
     actual_qdata = torch.empty_like(expected_qdata)
     actual_scale = torch.empty_like(expected_scale)
-    int8_nvidia.triton_kernels.fused_rotate_quantize_input(
+    int8_nvidia.kernels.fused_rotate_quantize_input(
         raw_input,
         actual_qdata,
         actual_scale,
@@ -573,7 +575,7 @@ def test_fused_preparation_keeps_rotation_beyond_fp16_range(activation_fn):
         maximum = 131072.0
     output = torch.empty((1, 256), device="cuda", dtype=torch.int8)
     scale = torch.empty(1, device="cuda")
-    int8_nvidia.triton_kernels.fused_rotate_quantize_input(
+    int8_nvidia.kernels.fused_rotate_quantize_input(
         activation,
         output,
         scale,
@@ -754,8 +756,8 @@ def test_sm120_tma_gemm_matches_baseline_across_tails_dtypes_and_paired(
     expected = int8_nvidia.execute_prepared_linear(
         value, row_scale, weight, scale, bias, dtype, reference_plan, second_projection=second
     )
-    tma_launch = Mock(wraps=int8_nvidia.gluon_tma.launch_int8_matmul)
-    monkeypatch.setattr(int8_nvidia.gluon_tma, "launch_int8_matmul", tma_launch)
+    tma_launch = Mock(wraps=int8_nvidia.kernels.gluon_tma.launch_int8_matmul)
+    monkeypatch.setattr(int8_nvidia.kernels.gluon_tma, "launch_int8_matmul", tma_launch)
     tma_plan = select_execution_plan(AcceleratorTarget("cuda", "sm120"), in_features=k)
     assert tma_plan.matmul_kernel == "gluon_tma"
     width = n * (2 if paired else 1)
@@ -776,7 +778,7 @@ def test_sm120_tma_gemm_matches_baseline_across_tails_dtypes_and_paired(
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_sm120_tma_gemm_compiles_once_across_row_counts():
-    kernel = int8_nvidia.gluon_tma._int8_tma_matmul_kernel
+    kernel = int8_nvidia.kernels.gluon_tma._int8_tma_matmul_kernel
     kernel.device_caches.clear()
     torch.manual_seed(701)
     k, n = 512, 1024
@@ -840,9 +842,9 @@ def test_sm120_tma_gemm_falls_back_for_unaligned_operands(monkeypatch, case):
         second_projection=second,
     )
     launches = []
-    launch = int8_nvidia.gluon_tma.launch_int8_matmul
+    launch = int8_nvidia.kernels.gluon_tma.launch_int8_matmul
     monkeypatch.setattr(
-        int8_nvidia.gluon_tma,
+        int8_nvidia.kernels.gluon_tma,
         "launch_int8_matmul",
         lambda *a, **kw: launches.append(kw["execution_plan"].matmul_kernel) or launch(*a, **kw),
     )
@@ -877,8 +879,8 @@ def test_sm120_tma_gemm_supports_cuda_graph_capture_and_replay(monkeypatch):
         weight, target=AcceleratorTarget("cuda", "sm120"), rows=rows
     )
     assert plan.matmul_kernel == "gluon_tma"
-    tma_launch = Mock(wraps=int8_nvidia.gluon_tma.launch_int8_matmul)
-    monkeypatch.setattr(int8_nvidia.gluon_tma, "launch_int8_matmul", tma_launch)
+    tma_launch = Mock(wraps=int8_nvidia.kernels.gluon_tma.launch_int8_matmul)
+    monkeypatch.setattr(int8_nvidia.kernels.gluon_tma, "launch_int8_matmul", tma_launch)
     out_plain = torch.empty((rows, n), device="cuda", dtype=torch.bfloat16)
     out_paired = torch.empty((rows, 2 * n), device="cuda", dtype=torch.bfloat16)
     int8_nvidia.execute_prepared_linear(
@@ -1022,8 +1024,8 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
 def test_sm8x_layer_compiles_at_most_three_gemms_across_row_counts(k, n):
     # Clear in-memory caches so earlier tests cannot hide a per-row-count compile.
     kernels = (
-        int8_nvidia.triton_kernels.dynamic_m_int8_matmul_kernel,
-        int8_nvidia.gluon_async_copy._int8_matmul_kernel,
+        int8_nvidia.kernels.dynamic_m_int8_matmul_kernel,
+        int8_nvidia.kernels.gluon_async_copy._int8_matmul_kernel,
     )
     for kernel in kernels:
         kernel.device_caches.clear()
@@ -1090,9 +1092,9 @@ def test_sm8x_gluon_gemm_falls_back_for_unaligned_operands(monkeypatch, offset, 
         weight, target=AcceleratorTarget("cuda", "sm89"), rows=rows
     )
     launches = []
-    launch = int8_nvidia.gluon_async_copy.launch_int8_matmul
+    launch = int8_nvidia.kernels.gluon_async_copy.launch_int8_matmul
     monkeypatch.setattr(
-        int8_nvidia.gluon_async_copy,
+        int8_nvidia.kernels.gluon_async_copy,
         "launch_int8_matmul",
         lambda *a, **kw: launches.append(kw["execution_plan"].matmul_block_m) or launch(*a, **kw),
     )
@@ -1202,7 +1204,7 @@ def test_fused_preparation_validates_input_width_from_qdata(
     input_scale = torch.empty(rows, dtype=torch.float32)
 
     with pytest.raises(ValueError, match=f"must have shape \\({rows}, {expected_width}\\)"):
-        int8_nvidia.triton_kernels.fused_rotate_quantize_input(
+        int8_nvidia.kernels.fused_rotate_quantize_input(
             activation,
             input_qdata,
             input_scale,
@@ -1219,7 +1221,7 @@ def test_fused_preparation_rejects_unsupported_row_width() -> None:
     input_scale = torch.empty(rows, dtype=torch.float32)
 
     with pytest.raises(ValueError, match=f"does not support row width {in_features}"):
-        int8_nvidia.triton_kernels.fused_rotate_quantize_input(
+        int8_nvidia.kernels.fused_rotate_quantize_input(
             activation,
             input_qdata,
             input_scale,

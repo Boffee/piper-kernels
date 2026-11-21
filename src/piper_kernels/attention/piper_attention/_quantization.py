@@ -1,4 +1,25 @@
-"""Shared K1024/V1024 statistics and quantization for Piper Attention."""
+"""Shared K1024/V1024 statistics and quantization for dense Piper Attention.
+
+Numerical boundaries:
+- Dense V has an FP32 scale per token (sparse V has one per K64 tile), so a full
+  sparse route list does not reproduce dense quantization. Q/K scale granularity is
+  backend-specific (Q32/K64 groups on SM12x and RDNA4; per-thread scales on SM89).
+- Both K and V are centered independently per 1024-token chunk (``K1024 + V1024``)
+  in FP32 for both non-causal and causal attention without sequence-wide reductions:
+  per-chunk K bias is computed in FP32 inside each attention kernel from quantized Q
+  and ``key_center`` to compensate centered K scores inside the online softmax
+  maximum, and per-chunk V means fold into the FP32 numerator once per chunk.
+- The recurrence uses signed INT8 QK, unsigned-by-signed INT8 PV, and FP32 online
+  softmax. Numerators remain in UINT8 probability-code units until final division by
+  255 and the unrounded FP32 softmax denominator. Preserve the all-zero scale guards
+  and handle zero QK scales before applying masked infinities.
+- GQA/MQA maps each query head to its KV head without repeating K/V storage. Query
+  windows retain global row coordinates for causal masking. Window shapes and output
+  strides can change FMA contraction and final rounding; cross-backend bitwise
+  equality is not guaranteed. Preparation and attention reductions are numerical work,
+  not implicit input validation; changes here must stay aligned with
+  ``piper_kernels.fusions.convrot_int8_piper``.
+"""
 
 # Triton's JIT launcher accepts compile-time options not represented in its
 # Python call signature.
@@ -9,6 +30,7 @@ import triton
 import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels.piper.triton import pack_amd_wmma_token
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
@@ -218,9 +240,7 @@ def _quantize_value_k1024_kernel(
             tl.store(log_scale_ptr + meta_base + rows, tl.log2(scales), mask=meta_mask)
         transposed = tl.trans(codes)
         if pack_wmma:
-            packed_token = (
-                (offsets_tile & ~24) | ((offsets_tile & 8) << 1) | ((offsets_tile & 16) >> 1)
-            )
+            packed_token = pack_amd_wmma_token(offsets_tile)
             tl.store(
                 out_base
                 + tile * head_dim * _TL_BLOCK_N

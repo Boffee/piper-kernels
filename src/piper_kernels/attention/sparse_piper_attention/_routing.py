@@ -10,117 +10,20 @@ from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BL
 
 from . import _backend
 from ._budget import _ResolvedRouteLayout
+from ._contracts import (
+    _MEAN_ROUTING,
+    validate_routing_mode,
+)
 from ._routes import (
     PackedRouteAndCoarseBuilder,
     PackedRouteBuilder,
     PackedRoutes,
     PackedRoutesAndCoarseOutput,
 )
-from ._routing_modes import (
-    _MEAN_ROUTING,
-    _ROUTING_NAME_BY_MODE,
-    validate_routing_mode,
-)
 from ._summaries import _validate_sequences, sequence_block_summaries
-from .coarse import (
-    _apply_chunked_coarse_residual,
-    _mean_pool_token_blocks,
-    _preserve_coarse_residual_in_graph,
-    validate_coarse_residual_inputs,
-    validate_coarse_scale,
-)
+from .coarse import validate_coarse_scale
 
 _QUERY_CHUNK_BLOCKS = 384
-
-
-def _coarse_residual_from_mode(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    coarse_gate: torch.Tensor,
-    *,
-    coarse_key_blocks: int | None,
-    coarse_scale: float,
-    routing_mode: int,
-    block_lengths: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Return one policy-selected coarse branch while preserving its graph boundary."""
-    validate_routing_mode(routing_mode)
-    if _preserve_coarse_residual_in_graph(query, key, value, coarse_gate):
-        resolved_coarse_key_blocks = (
-            (
-                block_lengths.numel()
-                if block_lengths is not None
-                else (query.shape[1] + _BLOCK_ROWS - 1) // _BLOCK_ROWS
-            )
-            if coarse_key_blocks is None
-            else coarse_key_blocks
-        )
-        return torch.ops.piper_kernels.sparse_piper_coarse_residual.default(
-            query,
-            key,
-            value,
-            coarse_gate,
-            resolved_coarse_key_blocks,
-            coarse_scale,
-            routing_mode,
-            block_lengths,
-        )
-    return coarse_residual_impl(
-        query,
-        key,
-        value,
-        coarse_gate,
-        coarse_key_blocks=coarse_key_blocks,
-        coarse_scale=coarse_scale,
-        routing_mode=routing_mode,
-        block_lengths=block_lengths,
-    )
-
-
-def coarse_residual_impl(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    coarse_gate: torch.Tensor,
-    *,
-    coarse_key_blocks: int | None,
-    coarse_scale: float,
-    routing_mode: int,
-    block_lengths: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Apply the common Q/K/V-derived coarse residual implementation."""
-    validate_routing_mode(routing_mode)
-    coarse_key_blocks = validate_coarse_residual_inputs(
-        query,
-        key,
-        value,
-        coarse_gate,
-        coarse_key_blocks,
-        coarse_scale,
-        block_lengths,
-        routing_label=_ROUTING_NAME_BY_MODE[routing_mode],
-    )
-    query_head_major = query.transpose(1, 2)
-    coarse_key = key.transpose(1, 2)[:, :, : coarse_key_blocks * _BLOCK_ROWS]
-    query_summary, key_primary, key_aux = sequence_block_summaries(
-        query_head_major,
-        coarse_key,
-        routing_mode,
-        block_lengths,
-    )
-    pooled_value = _mean_pool_token_blocks(value, block_lengths)[:, :, :coarse_key_blocks]
-    return _apply_chunked_coarse_residual(
-        pooled_value,
-        coarse_gate,
-        score_chunks(
-            query_summary,
-            key_primary,
-            key_aux,
-            routing_mode,
-            score_scale=coarse_scale,
-        ),
-    )
 
 
 def packed_routes_from_sequences(
@@ -132,13 +35,15 @@ def packed_routes_from_sequences(
     *,
     skip_dense_routing: bool = False,
     force_tile_mask: torch.Tensor | None = None,
+    validate: bool = True,
 ) -> PackedRoutes:
     """Select routes for compact or valid-front padded Q and K64 sequences."""
-    if key.ndim == 4 and (key.shape[2] < _BLOCK_ROWS or key.shape[2] % _BLOCK_ROWS):
+    if validate and key.ndim == 4 and (key.shape[2] < _BLOCK_ROWS or key.shape[2] % _BLOCK_ROWS):
         raise ValueError("sparse routing requires complete sparse-prefix K64 blocks")
     if key.ndim == 4 and layout.keeps_all_blocks(key.shape[2] // _BLOCK_ROWS):
-        validate_routing_mode(routing_mode)
-        _validate_sequences(query, key, block_lengths)
+        if validate:
+            validate_routing_mode(routing_mode)
+            _validate_sequences(query, key, block_lengths)
         return PackedRouteBuilder(
             layout,
             batch=query.shape[0],
@@ -154,6 +59,7 @@ def packed_routes_from_sequences(
         key,
         routing_mode,
         block_lengths,
+        validate=validate,
     )
     return packed_routes_from_summaries(
         query_summary,
@@ -163,6 +69,7 @@ def packed_routes_from_sequences(
         routing_mode,
         skip_dense_routing=skip_dense_routing,
         force_tile_mask=force_tile_mask,
+        validate=False,
     )
 
 
@@ -175,9 +82,11 @@ def packed_routes_from_summaries(
     *,
     skip_dense_routing: bool = False,
     force_tile_mask: torch.Tensor | None = None,
+    validate: bool = True,
 ) -> PackedRoutes:
     """Select routes through the fixed policy-independent summary contract."""
-    _validate_summaries(query_summary, key_primary, key_aux, routing_mode)
+    if validate:
+        _validate_summaries(query_summary, key_primary, key_aux, routing_mode)
     batch, heads, query_blocks, _head_dim = query_summary.shape
     builder = PackedRouteBuilder(
         layout,
@@ -217,6 +126,8 @@ def packed_routes_and_coarse_from_summaries(
     """Route sparsely and attend coarsely from the same summary score chunks."""
     _validate_summaries(query_summary, key_primary, key_aux, routing_mode)
     validate_coarse_scale(coarse_scale)
+    if key_primary.shape[2] != pooled_value.shape[2]:
+        raise ValueError("coarse score key blocks must match pooled V blocks")
     batch, heads, query_blocks, _head_dim = query_summary.shape
     builder = PackedRouteAndCoarseBuilder(
         layout,
@@ -240,7 +151,7 @@ def packed_routes_and_coarse_from_summaries(
     return builder.finish()
 
 
-def routing_scores(
+def _routing_scores_unchecked(
     query_summary: torch.Tensor,
     key_primary: torch.Tensor,
     key_aux: torch.Tensor,
@@ -248,8 +159,7 @@ def routing_scores(
     *,
     score_scale: float | None = None,
 ) -> torch.Tensor:
-    """Contract one summary chunk using the selected routing policy."""
-    validate_routing_mode(routing_mode)
+    """Contract one validated summary chunk using the selected routing policy."""
     if routing_mode != _MEAN_ROUTING:
         score = _backend.select_minmax_scores(query_summary, key_primary, key_aux)
         if score is not None:
@@ -290,6 +200,25 @@ def routing_scores(
     return scores.reshape(batch, heads, query_blocks, key_blocks)
 
 
+def routing_scores(
+    query_summary: torch.Tensor,
+    key_primary: torch.Tensor,
+    key_aux: torch.Tensor,
+    routing_mode: int,
+    *,
+    score_scale: float | None = None,
+) -> torch.Tensor:
+    """Contract one summary chunk using the selected routing policy."""
+    validate_routing_mode(routing_mode)
+    return _routing_scores_unchecked(
+        query_summary,
+        key_primary,
+        key_aux,
+        routing_mode,
+        score_scale=score_scale,
+    )
+
+
 def score_chunks(
     query_summary: torch.Tensor,
     key_primary: torch.Tensor,
@@ -299,11 +228,12 @@ def score_chunks(
     score_scale: float | None = None,
 ) -> Iterator[tuple[int, torch.Tensor]]:
     """Yield bounded query-block score chunks for either routing policy."""
+    validate_routing_mode(routing_mode)
     for start in range(0, query_summary.shape[2], _QUERY_CHUNK_BLOCKS):
         stop = min(start + _QUERY_CHUNK_BLOCKS, query_summary.shape[2])
         yield (
             start,
-            routing_scores(
+            _routing_scores_unchecked(
                 query_summary[:, :, start:stop],
                 key_primary,
                 key_aux,
@@ -353,7 +283,6 @@ def _validate_summaries(
 
 
 __all__ = [
-    "coarse_residual_impl",
     "packed_routes_and_coarse_from_summaries",
     "packed_routes_from_sequences",
     "packed_routes_from_summaries",

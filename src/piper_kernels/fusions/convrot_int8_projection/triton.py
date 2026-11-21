@@ -9,7 +9,7 @@ import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.fusions.projected_qk import triton as projected_qk
-from piper_kernels.linear.convrot.int8._kernels import triton as convrot_int8_kernels
+from piper_kernels.linear.convrot.int8 import triton as convrot_int8_kernels
 
 _CHUNK_ROWS = 1024
 _TL_CHUNK_ROWS = tl.constexpr(_CHUNK_ROWS)

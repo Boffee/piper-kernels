@@ -12,12 +12,12 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
+from piper_kernels.attention.sparse_piper_attention._contracts import _MINMAX_ROUTING
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy as nvidia_policy
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_from_summaries,
     routing_scores,
 )
-from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
 
 pytestmark = pytest.mark.gpu
 

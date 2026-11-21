@@ -19,10 +19,10 @@ from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
+    _SparsePiperRatioProfile,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend,

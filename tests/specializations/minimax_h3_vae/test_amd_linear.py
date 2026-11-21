@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8 import _backend
 from piper_kernels.specializations.minimax_h3_vae._ops import linear_prepared
 
 _TARGET = AcceleratorTarget.from_device(torch.device("cuda")) if torch.cuda.is_available() else None
@@ -27,7 +27,7 @@ def test_specialized_prepared_linear_matches_default_rdna4_execution() -> None:
     weight_qdata = torch.randint(-127, 128, (2_048, 2_048), device="cuda", dtype=torch.int8)
     weight_scale = torch.rand(2_048, 1, device="cuda", dtype=torch.float32) / 127
 
-    expected = amd.linear_prepared(
+    expected = _backend.require_linear_backend(input_qdata).linear_prepared(
         input_qdata,
         input_scale,
         weight_qdata,

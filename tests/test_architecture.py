@@ -30,18 +30,18 @@ _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
     "benchmarks/lib/suite_attention.py": 9,
     "benchmarks/lib/suite_pipeline.py": 11,
     "benchmarks/lib/suite_weights.py": 6,
-    "benchmarks/tune_convrot_int8_linear.py": 3,
+    "benchmarks/tune_convrot_int8_linear.py": 2,
     "benchmarks/tune_piper_attention.py": 4,
     "benchmarks/tune_sage_attention_2pp.py": 2,
 }
 
 # Legacy private piper_kernels import totals in tests/ (lower as tests decouple).
 _MAX_TEST_PRIVATE_IMPORT_FILES = 159
-_MAX_TEST_PRIVATE_IMPORTS = 687
+_MAX_TEST_PRIVATE_IMPORTS = 674
 
 # Legacy private-global monkeypatch totals in tests/ (lower as tests decouple).
-_MAX_TEST_PRIVATE_MONKEYPATCH_FILES = 56
-_MAX_TEST_PRIVATE_MONKEYPATCHES = 413
+_MAX_TEST_PRIVATE_MONKEYPATCH_FILES = 55
+_MAX_TEST_PRIVATE_MONKEYPATCHES = 389
 
 _PASS_BASE_NAMES = frozenset(
     {

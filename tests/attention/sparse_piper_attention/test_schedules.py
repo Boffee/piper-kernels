@@ -14,6 +14,7 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
+from piper_kernels.attention.sparse_piper_attention._contracts import _MINMAX_ROUTING
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_context_from_quantized,
@@ -21,7 +22,6 @@ from piper_kernels.attention.sparse_piper_attention._prepared import (
     _PreparedSparsePiperAttention,
 )
 from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
-from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
 
 requires_sm120 = pytest.mark.skipif(
     not exact_sm120_available(), reason="requires exact NVIDIA SM120"

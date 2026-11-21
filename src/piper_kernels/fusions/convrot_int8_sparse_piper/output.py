@@ -8,13 +8,13 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._residual import ResidualAdd, validate_residual_add
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
+from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.fusions.convrot_int8_projection._validation import validate_qk_transform_inputs
 from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
-from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
+from piper_kernels.linear.convrot.int8._backend import LinearBackend
 from piper_kernels.weights.convrot.int8._quantization import (
     validate_activation_scale,
     validate_storage,

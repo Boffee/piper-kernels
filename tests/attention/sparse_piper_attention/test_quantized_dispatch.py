@@ -18,11 +18,15 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
+from piper_kernels.attention.sparse_piper_attention._contracts import (
+    _MEAN_ROUTING,
+    _MINMAX_ROUTING,
+    _SparsePiperRatioProfile,
+)
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_query_from_quantized,
     _PreparedSparsePiperAttention,
 )
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
     _sparse_piper_attention_with_coarse_residual_from_quantized_op,
@@ -30,10 +34,6 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_from_sequences,
     routing_scores,
-)
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
-    _MEAN_ROUTING,
-    _MINMAX_ROUTING,
 )
 from piper_kernels.attention.sparse_piper_attention._summaries import (
     sequence_block_summaries,

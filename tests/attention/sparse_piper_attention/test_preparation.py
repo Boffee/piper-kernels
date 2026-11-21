@@ -9,7 +9,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels._grid import select_block_grid
-from piper_kernels.attention.sparse_piper_attention import _backend, _routing_modes
+from piper_kernels.attention.sparse_piper_attention import _backend, _contracts
 
 
 def test_select_block_grid_respects_strides_and_cuda_grid_y_limit():
@@ -45,9 +45,9 @@ def test_fused_preparation_selection(monkeypatch, target, head_dim, rows, fused)
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     query = torch.empty(1, 4, rows, head_dim, device="meta", dtype=torch.bfloat16)
     key = torch.empty(1, 2, rows, head_dim, device="meta", dtype=torch.bfloat16)
-    selected = _backend.use_fused_operand_preparation(query, key, _routing_modes._MINMAX_ROUTING)
+    selected = _backend.use_fused_operand_preparation(query, key, _contracts._MINMAX_ROUTING)
     assert selected is fused
-    assert _backend.use_fused_operand_preparation(query, key, _routing_modes._MEAN_ROUTING) is False
+    assert _backend.use_fused_operand_preparation(query, key, _contracts._MEAN_ROUTING) is False
 
 
 def test_fused_preparation_rejects_unsupported_metadata_before_probing(monkeypatch):
@@ -55,8 +55,7 @@ def test_fused_preparation_rejects_unsupported_metadata_before_probing(monkeypat
     query = torch.empty(1, 2, 2048, 128, device="meta", dtype=torch.bfloat16)
     for key in (query.float(), query[..., ::2], torch.empty_like(query, device="cpu")):
         assert (
-            _backend.use_fused_operand_preparation(query, key, _routing_modes._MINMAX_ROUTING)
-            is False
+            _backend.use_fused_operand_preparation(query, key, _contracts._MINMAX_ROUTING) is False
         )
 
 
@@ -85,7 +84,7 @@ def test_fused_preparation_matches_separate_passes(
         triton as qk_quantization,
     )
     from piper_kernels.attention.sparse_piper_attention import _summaries_triton  # noqa: PLC0415
-    from piper_kernels.attention.sparse_piper_attention._block_layout import (  # noqa: PLC0415
+    from piper_kernels.attention.sparse_piper_attention._contracts import (  # noqa: PLC0415
         valid_block_rows,
     )
     from piper_kernels.attention.sparse_piper_attention.coarse import (  # noqa: PLC0415
@@ -140,7 +139,7 @@ def test_fused_preparation_matches_separate_passes(
     expected_summaries = _summaries_triton.sequence_block_summaries(
         masked_query,
         masked_key[:, :, : sparse_key_blocks * 64],
-        _routing_modes._MINMAX_ROUTING,
+        _contracts._MINMAX_ROUTING,
         lengths,
     )
     options = {
@@ -202,7 +201,7 @@ def test_public_fused_preparation_matches_separate_and_graph(
         pytest.skip("requires native sparse attention")
     assert (
         _backend.use_fused_operand_preparation(
-            query.transpose(1, 2), key.transpose(1, 2), _routing_modes._MINMAX_ROUTING
+            query.transpose(1, 2), key.transpose(1, 2), _contracts._MINMAX_ROUTING
         )
         is True
     )
@@ -335,7 +334,7 @@ def test_fused_qk_compilation_is_reused_across_sequence_shapes(preparation, head
             query, head_dim**-0.5, grouped=True, storage_query_length=rows
         )
         qk_quantization.prepare_tile_centered_key(key, storage_key_length=rows)
-        _summaries_triton.sequence_block_summaries(query, key, _routing_modes._MINMAX_ROUTING)
+        _summaries_triton.sequence_block_summaries(query, key, _contracts._MINMAX_ROUTING)
         # The fused producer must retain all-zero quantization and summary guards.
         assert torch.count_nonzero(prepared_ops.query) == 0
         assert torch.count_nonzero(prepared_ops.key) == 0

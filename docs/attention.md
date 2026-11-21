@@ -54,8 +54,10 @@ chunk share its local statistics). Sage uses INT8 Q/K and FP8 probabilities/V wi
 FP16 accumulation. Their numerical results are not interchangeable.
 
 Dense Piper has native NVIDIA SM8x/SM12x and AMD RDNA4 backends. Sage's optimized
-path requires NVIDIA FP8 tensor cores with FP16 accumulation. See the
-[dense implementation guide](../src/piper_kernels/attention/piper_attention/README.md)
+path requires NVIDIA FP8 tensor cores with FP16 accumulation. See
+[`_quantization.py`](../src/piper_kernels/attention/piper_attention/_quantization.py),
+[`_nvidia/policy.py`](../src/piper_kernels/attention/piper_attention/_nvidia/policy.py),
+and [`_amd/gluon.py`](../src/piper_kernels/attention/piper_attention/_amd/gluon.py)
 for arithmetic, architecture differences, and scheduling.
 
 ## Sparse attention
@@ -138,8 +140,7 @@ the supplied gate directly without applying an activation. Q/K/V and the gate
 must match in shape (equal head counts) with matching query dtype/device on the
 gate. Pass `routing="mean"` or `"minmax"` and a finite positive `coarse_scale`;
 `coarse_key_blocks` defaults to all available blocks and supports compact tails and
-`block_lengths`. See [residual.py](../src/piper_kernels/attention/sparse_piper_attention/residual.py)
-and [coarse.py](../src/piper_kernels/attention/sparse_piper_attention/coarse.py).
+`block_lengths`. See [coarse.py](../src/piper_kernels/attention/sparse_piper_attention/coarse.py).
 Compatible compiler fusions accumulate fine and coarse outputs in FP32 before
 casting, so outputs can differ slightly from standalone addition.
 
@@ -202,8 +203,9 @@ any view of it) after the call; if the block reads the original input afterward,
 Inductor inserts a copy instead. Per-token indexed gates
 (`base + gate[indices] * update`) and eligible ConvRot/NVFP4 FFN and
 Q-projected ConvRot INT8 attention outputs fold into the add; row-broadcast gates
-stay unchanged. In-place adds round separately per update (`_nvidia` ConvRot INT8
-uses its [residual epilogues](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md#residual-epilogues)).
+stay unchanged. In-place adds round separately per update (ConvRot INT8 uses
+fused 16-bit [residual epilogues](../src/piper_kernels/linear/convrot/int8/_nvidia/gluon_tma.py)
+on SM120 and RDNA4).
 
 Eligible folded attention runs in two sequential head slices when head counts are
 even and output widths align, trading slightly lower active K/V memory for small

@@ -11,8 +11,8 @@ from torch.fx.node import Argument
 
 from piper_kernels.attention.kernels.sparse_piper import layout as sparse_layout
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
-from piper_kernels.attention.sparse_piper_attention import _dtype
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
+from piper_kernels.attention.sparse_piper_attention import _contracts as _dtype
+from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.projected_qk import _compile as projected_qk_compile
 from piper_kernels.fusions.projected_qk._compile import (
     integer_scalar_argument,
