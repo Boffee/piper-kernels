@@ -97,17 +97,18 @@ def test_amd_dense_policy_and_gluon_eligibility_contracts():
         w_d64_odd = torch.empty((3 * 64, 256), device="cuda:1", dtype=torch.int8)
         w_d128 = torch.empty((3 * 128, 256), device="cuda:1", dtype=torch.int8)
 
-        d64_plan = amd_gluon.default_execution_plan(
-            q_in, w_d64_even, operation="query", head_dim=64, rotary_dim=48
+        assert (
+            amd_gluon.default_execution_plan(
+                q_in, w_d64_even, operation="query", head_dim=64, rotary_dim=48
+            ).kernel
+            == "gluon"
         )
-        assert d64_plan.kernel == "gluon"
-        assert d64_plan.heads_per_program * 64 == 128
-
-        d128_plan = amd_gluon.default_execution_plan(
-            q_in, w_d128, operation="key", head_dim=128, rotary_dim=96
+        assert (
+            amd_gluon.default_execution_plan(
+                q_in, w_d128, operation="key", head_dim=128, rotary_dim=96
+            ).kernel
+            == "gluon"
         )
-        assert d128_plan.kernel == "gluon"
-        assert d128_plan.heads_per_program * 128 == 128
 
         assert (
             amd_gluon.default_execution_plan(

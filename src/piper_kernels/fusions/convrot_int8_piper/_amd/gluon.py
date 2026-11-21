@@ -19,7 +19,10 @@ from piper_kernels.attention.piper_attention import _quantization as piper_quant
 from piper_kernels.fusions.convrot_int8_projection import triton as shared_projection
 from piper_kernels.fusions.convrot_int8_projection._amd import fragments
 from piper_kernels.fusions.convrot_int8_projection._amd import policy as amd_policy
-from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
+from piper_kernels.fusions.convrot_int8_projection._plan import (
+    ProjectionExecutionPlan,
+    resolve_row_block_launches,
+)
 
 from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
@@ -444,17 +447,6 @@ def _value_kernel(
         )
 
 
-def _iter_row_block_launches(rows: int) -> tuple[tuple[int, int, bool], ...]:
-    """Return ``(row_blocks, row_block_offset, mask_rows)`` launches for dense row windows."""
-    full_blocks = rows // amd_policy.GLUON_BLOCK_M
-    launches: list[tuple[int, int, bool]] = []
-    if full_blocks:
-        launches.append((full_blocks, 0, False))
-    if rows % amd_policy.GLUON_BLOCK_M:
-        launches.append((1, full_blocks, True))
-    return tuple(launches)
-
-
 def _kernel_options(operation: amd_policy.ProjectionOperation) -> dict[str, object]:
     """Return RDNA4 Gluon kernel launch options for dense Q/K/V projections."""
     # Capping V at 6-8 waves/EU avoids L2 contention across warps (~2% faster on RDNA4).
@@ -563,8 +555,8 @@ def project_query(
     col_blocks = (heads * head_dim) // 128
     options = _kernel_options("query")
     with device_context(input_qdata.device):
-        for row_blocks, row_block_offset, mask_rows in _iter_row_block_launches(
-            resolved_chunk_rows
+        for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
+            resolved_chunk_rows, amd_policy.GLUON_BLOCK_M
         ):
             _query_kernel[(row_blocks * col_blocks, batch)](
                 input_qdata,
@@ -589,7 +581,7 @@ def project_query(
                 rotary_dim=cos.shape[1],
                 norm_epsilon=norm_epsilon,
                 softmax_scale=softmax_scale,
-                mask_rows=mask_rows,
+                mask_rows=not aligned_rows,
                 group_m=plan.group_m,
                 num_warps=plan.num_warps,
                 **options,
@@ -647,7 +639,9 @@ def project_key(
     col_blocks = (heads * head_dim) // 128
     options = _kernel_options("key")
     with device_context(input_qdata.device):
-        for row_blocks, row_block_offset, mask_rows in _iter_row_block_launches(sequence_length):
+        for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
+            sequence_length, amd_policy.GLUON_BLOCK_M
+        ):
             _key_kernel[(row_blocks * col_blocks, batch)](
                 input_qdata,
                 input_scale,
@@ -667,7 +661,7 @@ def project_key(
                 head_dim=head_dim,
                 rotary_dim=cos.shape[1],
                 norm_epsilon=norm_epsilon,
-                mask_rows=mask_rows,
+                mask_rows=not aligned_rows,
                 group_m=plan.group_m,
                 num_warps=plan.num_warps,
                 **options,
@@ -734,7 +728,9 @@ def project_value(
             block_k=plan.block_k,
             out=mean,
         )
-        for row_blocks, row_block_offset, mask_rows in _iter_row_block_launches(sequence_length):
+        for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
+            sequence_length, amd_policy.GLUON_BLOCK_M
+        ):
             _value_kernel[(row_blocks * col_blocks, batch)](
                 input_qdata,
                 input_scale,
@@ -753,7 +749,7 @@ def project_value(
                 input_features=input_qdata.shape[2],
                 heads=heads,
                 head_dim=head_dim,
-                mask_rows=mask_rows,
+                mask_rows=not aligned_rows,
                 group_m=plan.group_m,
                 num_warps=plan.num_warps,
                 **options,
