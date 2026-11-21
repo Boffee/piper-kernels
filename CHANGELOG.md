@@ -49,8 +49,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Improved RX 9070 XT (RDNA4) execution speed across ConvRot INT8 linears, FFNs, Conv3D,
   dense/sparse Piper attention, standalone `SparsePiperAttention`
   preparation/routing/scoring/coarse residuals, and RDNA4 Gluon fused ConvRot INT8
-  sparse Q/K/V projections (with minor FP32 differences within `1e-6` / INT8 tolerances
-  and a one-time ROCm Triton kernel recompile).
+  dense and sparse Q/K/V projections (with minor FP32 differences within `1e-6` / INT8
+  tolerances and a one-time ROCm Triton kernel recompile).
 - Improved RTX 5090 (SM120) execution speed and reduced scratch memory across sparse Piper
   routing/attention, D128 Q/K/V projections, and large ConvRot INT8 linear, FFN, and
   fused residual projections (with minor rounding differences within INT8 tolerances).
