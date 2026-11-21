@@ -1,9 +1,8 @@
 """One-pass ConvRot INT8 projection and dense Piper Q preparation."""
 
-import math
-
 import torch
 
+from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import (
     count_query_scales,
     validate_qk_quantization,
@@ -40,8 +39,10 @@ def _validate_inputs(  # noqa: PLR0913, PLR0917
         head_dim=head_dim,
         bias=bias,
     )
-    if not math.isfinite(softmax_scale) or softmax_scale <= 0:
-        raise ValueError("dense Piper Q projection softmax scale must be finite and positive")
+    validate_positive_finite_float(
+        softmax_scale,
+        "dense Piper Q projection softmax scale must be finite and positive",
+    )
     return shape
 
 

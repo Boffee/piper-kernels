@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
@@ -10,6 +9,7 @@ from typing import cast
 import torch
 from torch.fx.node import Argument
 
+from piper_kernels._validation import static_positive_finite_float
 from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
@@ -337,10 +337,7 @@ def integer_scalar_argument(value: object) -> Argument | None:
 
 def positive_float(value: object) -> float | None:
     """Return a finite positive Python configuration value."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    converted = float(value)
-    return converted if math.isfinite(converted) and converted > 0 else None
+    return static_positive_finite_float(value)
 
 
 def valid_rmsnorm(

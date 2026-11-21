@@ -1,9 +1,8 @@
 """Metadata checks for prepared ConvRot INT8 projections into attention heads."""
 
-import math
-
 import torch
 
+from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
 from piper_kernels.linear import _bias
 
@@ -81,8 +80,10 @@ def validate_qk_transform_inputs(
         raise ValueError(f"{name} projection operands must be contiguous strided tensors")
     if sequence_length < 1:
         raise ValueError(f"{name} projection sequence must contain at least one row")
-    if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
-        raise ValueError(f"{name} projection RMSNorm epsilon must be finite and positive")
+    validate_positive_finite_float(
+        norm_epsilon,
+        f"{name} projection RMSNorm epsilon must be finite and positive",
+    )
     return resolved_head_dim
 
 

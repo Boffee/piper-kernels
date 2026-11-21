@@ -8,7 +8,6 @@ functional boundary, and Triton is loaded lazily only for supported accelerators
 from __future__ import annotations
 
 import importlib
-import math
 from collections.abc import Sequence
 from types import ModuleType
 from typing import cast
@@ -16,6 +15,7 @@ from typing import cast
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.weights.convrot.int8._quantization import (
     validate_activation_scale,
     validate_storage,
@@ -142,10 +142,10 @@ def _validate_norm(
             raise ValueError(
                 f"Framewise GroupNorm {name} must be float16/float32 on {input.device}"
             )
-    if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
-        raise ValueError(
-            f"Framewise GroupNorm epsilon must be finite and positive, got {norm_epsilon}"
-        )
+    validate_positive_finite_float(
+        norm_epsilon,
+        "Framewise GroupNorm epsilon must be finite and positive",
+    )
 
 
 def _validate_inference(tensors: Sequence[torch.Tensor | None]) -> None:

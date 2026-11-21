@@ -467,3 +467,56 @@ def test_every_native_launch_and_descriptor_has_an_explicit_device_context() -> 
         Audit().visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
     assert native_calls
     assert not unguarded, unguarded
+
+
+_MATH_FLOAT_PREDICATES = frozenset({"isfinite", "isnan", "isinf"})
+_RAW_MATH_FLOAT_PREDICATE_ALLOWLIST = frozenset({"src/piper_kernels/_validation.py"})
+
+
+def _raw_math_float_predicates(path: Path) -> list[tuple[int, str]]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    math_aliases: set[str] = set()
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "math":
+                    math_aliases.add(alias.asname or "math")
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "math":
+            for alias in node.names:
+                if alias.name in _MATH_FLOAT_PREDICATES:
+                    hits.append((node.lineno, f"math.{alias.name}"))
+    if math_aliases:
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in math_aliases
+                and node.attr in _MATH_FLOAT_PREDICATES
+            ):
+                hits.append((node.lineno, f"math.{node.attr}"))
+    return sorted(hits)
+
+
+def test_no_raw_math_float_predicates_in_src() -> None:
+    """Require scalar finiteness checks in src/ to route through _validation.py."""
+    actual: dict[str, list[tuple[int, str]]] = {}
+    for path in _iter_python_files(_SRC_ROOT):
+        hits = _raw_math_float_predicates(path)
+        if hits:
+            actual[path.relative_to(_REPO_ROOT).as_posix()] = hits
+
+    unexpected = {
+        rel: hits
+        for rel, hits in sorted(actual.items())
+        if rel not in _RAW_MATH_FLOAT_PREDICATE_ALLOWLIST
+    }
+    assert not unexpected, (
+        "Use piper_kernels._validation helpers instead of raw math.isfinite/isnan/isinf "
+        f"in src/piper_kernels/ (SymFloat-safe under torch.compile): {unexpected}"
+    )
+    stale = sorted(_RAW_MATH_FLOAT_PREDICATE_ALLOWLIST - set(actual))
+    assert not stale, (
+        "Remove unused entries from _RAW_MATH_FLOAT_PREDICATE_ALLOWLIST in "
+        f"tests/test_architecture.py: {stale}"
+    )

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Iterable
 from typing import Literal
 
 import torch
 
+from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
 from ._contracts import (
@@ -26,10 +26,12 @@ def _preserve_coarse_residual_in_graph(*tensors: torch.Tensor) -> bool:
     )
 
 
-def validate_coarse_scale(coarse_scale: float) -> None:
+def validate_coarse_scale(coarse_scale: float) -> float:
     """Reject scales that do not preserve fine-route score ordering."""
-    if not math.isfinite(coarse_scale) or coarse_scale <= 0:
-        raise ValueError("coarse attention scale must be finite and positive")
+    return validate_positive_finite_float(
+        coarse_scale,
+        "coarse attention scale must be finite and positive",
+    )
 
 
 def _validate_coarse_key_blocks(

@@ -59,6 +59,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - Preserved autograd gradients and compact sequence support below 64 tokens for native GPU
   `sparse_piper_coarse_residual` and `sequence_block_summaries` (`D64`/`D128`) calls.
+- Made runtime float-scalar validation (`scale`, `coarse_scale`, `norm_epsilon`,
+  `softmax_scale`, and quantized weight update coefficients) safe for `SymFloat` inputs
+  under `torch.compile(..., dynamic=True)` and automatic-dynamic compilation.
 
 ## [0.8.0rc6] - 2026-11-12
 
