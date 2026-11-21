@@ -31,11 +31,12 @@ def select_projection_backend(
     input: torch.Tensor,  # noqa: A002
     *,
     head_dim: int = 128,
+    target: AcceleratorTarget | None = None,
 ) -> ProjectionBackend | None:
     """Select fused Q/K/V execution, independently of standalone linear support."""
     if _nvidia_projection is None and _amd_projection is None:
         return None
-    target = AcceleratorTarget.from_device(input.device)
+    target = AcceleratorTarget.from_device(input.device) if target is None else target
     if nvidia_policy.supports_target(target):
         return _nvidia_projection
     return (
@@ -56,14 +57,18 @@ def require_projection_backend(
     return backend
 
 
-def select_output_backend(input: torch.Tensor) -> LinearBackend | None:  # noqa: A002
+def select_output_backend(
+    input: torch.Tensor,  # noqa: A002
+    *,
+    target: AcceleratorTarget | None = None,
+) -> LinearBackend | None:
     """Select the validated chunked attention-to-output integration on this device."""
-    target = AcceleratorTarget.from_device(input.device)
+    target = AcceleratorTarget.from_device(input.device) if target is None else target
     if not (nvidia_policy.supports_target(target) or amd_policy.supports_target(target)):
         return None
-    if attention_backend.select_attention_backend(input) is None:
+    if attention_backend.select_attention_backend(input, target=target) is None:
         return None
-    return linear_backend.select_linear_backend(input)
+    return linear_backend.select_linear_backend(input, target=target)
 
 
 def require_output_backend(input: torch.Tensor) -> LinearBackend:  # noqa: A002

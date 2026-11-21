@@ -71,9 +71,13 @@ builtins.__import__ = without_triton
 importlib.util.find_spec = find_spec
 
 import torch
+torch.cuda.get_device_capability = lambda *_a: (_ for _ in ()).throw(AssertionError("probe"))
+torch.cuda.get_device_properties = lambda *_a: (_ for _ in ()).throw(AssertionError("probe"))
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops
+import piper_kernels.fusions.convrot_int8_sparse_piper._backend as sparse_proj_backend
 from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels._distributed import _fx as distributed_fx
 assert hasattr(distributed_fx, "has_c10d_collectives")
@@ -91,6 +95,15 @@ weight = ConvRotInt8Tensor.from_quantized(
 result = convrot_int8_linear(torch.ones(2, 32), weight)
 assert result.shape == (2, 7)
 assert _backend.select_linear_backend(torch.ones(1)) is None
+assert _backend.select_linear_backend_for_target(AcceleratorTarget("cuda", "sm120")) is None
+assert _backend.select_linear_backend_for_target(AcceleratorTarget("hip", "gfx1201")) is None
+assert sparse_proj_backend.select_projection_backend(torch.ones(1)) is None
+assert (
+    sparse_proj_backend.select_projection_backend(
+        torch.ones(1), target=AcceleratorTarget("cuda", "sm120")
+    )
+    is None
+)
 assert "triton" not in sys.modules
 assert hasattr(torch.ops.piper_kernels, "convrot_int8_prepare_input")
 assert _generic._triton_backend is None

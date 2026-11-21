@@ -105,7 +105,11 @@ except ModuleNotFoundError as error:
     _score_backend = None
 
 
-def select_attention_backend(query: torch.Tensor) -> AttentionBackend | None:
+def select_attention_backend(
+    query: torch.Tensor,
+    *,
+    target: AcceleratorTarget | None = None,
+) -> AttentionBackend | None:
     """Return native execution or let the caller use the quantized reference."""
     if (
         _nvidia_tma_attention is None
@@ -113,7 +117,7 @@ def select_attention_backend(query: torch.Tensor) -> AttentionBackend | None:
         and _amd_attention is None
     ):
         return None
-    target = AcceleratorTarget.from_device(query.device)
+    target = AcceleratorTarget.from_device(query.device) if target is None else target
     # Device probes and pre-projection activations do not have an attention head axis.
     head_dim = query.shape[-1] if query.ndim == 4 else 128
     if nvidia_policy.uses_tensor_descriptors(target):
@@ -144,11 +148,15 @@ def require_attention_backend(query: torch.Tensor) -> AttentionBackend:
     return backend
 
 
-def select_route_selector(routes: torch.Tensor) -> SelectRoutes | None:
+def select_route_selector(
+    routes: torch.Tensor,
+    *,
+    target: AcceleratorTarget | None = None,
+) -> SelectRoutes | None:
     """Select route acceleration independently of the attention kernel."""
     if _route_backend is None:
         return None
-    target = AcceleratorTarget.from_device(routes.device)
+    target = AcceleratorTarget.from_device(routes.device) if target is None else target
     if not (nvidia_policy.supports_target(target) or amd_policy.supports_target(target)):
         return None
     return _route_backend.tiled_radix_select_packed_routes
@@ -158,6 +166,8 @@ def select_minmax_scores(
     query_summary: torch.Tensor,
     key_primary: torch.Tensor,
     key_aux: torch.Tensor,
+    *,
+    target: AcceleratorTarget | None = None,
 ) -> MinmaxScores | None:
     """Use tiled FP32 scoring for D128 min/max summaries on RDNA4 and SM120."""
     if _score_backend is None:
@@ -186,7 +196,7 @@ def select_minmax_scores(
         return None
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
         return None
-    target = AcceleratorTarget.from_device(query_summary.device)
+    target = AcceleratorTarget.from_device(query_summary.device) if target is None else target
     if amd_policy.supports_target(target):
         schedule = amd_policy.select_minmax_score_schedule(query_summary.shape[2])
     elif nvidia_policy.supports_minmax_scores(target):
@@ -209,6 +219,8 @@ def use_fused_operand_preparation(
     query: torch.Tensor,
     key: torch.Tensor,
     routing_mode: int,
+    *,
+    target: AcceleratorTarget | None = None,
 ) -> bool:
     """Fuse min/max summaries into Q/K quantization on native attention backends.
 
@@ -229,7 +241,7 @@ def use_fused_operand_preparation(
         and key.dtype == query.dtype
     ):
         return False
-    target = AcceleratorTarget.from_device(query.device)
+    target = AcceleratorTarget.from_device(query.device) if target is None else target
     if nvidia_policy.uses_tensor_descriptors(target):
         return nvidia_policy.use_sm120_fused_preparation(query.shape[-1], query.shape[2])
     return nvidia_policy.uses_async_copies(target) or amd_policy.supports_target(target)
@@ -239,6 +251,8 @@ def select_sequence_summaries(
     query: torch.Tensor,
     key: torch.Tensor,
     block_lengths: torch.Tensor | None = None,
+    *,
+    target: AcceleratorTarget | None = None,
 ) -> SequenceSummaries | None:
     """Select native Q/K summaries for a supported device, layout, and dtype."""
     if _summary_backend is None:
@@ -264,7 +278,7 @@ def select_sequence_summaries(
         )
     ):
         return None
-    target = AcceleratorTarget.from_device(query.device)
+    target = AcceleratorTarget.from_device(query.device) if target is None else target
     if not (nvidia_policy.supports_target(target) or amd_policy.supports_target(target)):
         return None
     return _summary_backend.sequence_block_summaries

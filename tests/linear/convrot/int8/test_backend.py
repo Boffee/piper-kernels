@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock, call
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._residual import ResidualAdd, ReusableUpdate
 from piper_kernels._triton import runtime
@@ -24,42 +25,29 @@ nvidia_kernels = nvidia.kernels
 
 
 @pytest.mark.parametrize(
-    ("target", "supported"),
+    ("target", "platform", "expected"),
     [
-        (AcceleratorTarget("cuda", "sm70"), False),
-        (AcceleratorTarget("cuda", "sm75"), True),
-        (AcceleratorTarget("cuda", "sm80"), True),
-        (AcceleratorTarget("cuda", "sm89"), True),
-        (AcceleratorTarget("cuda", "sm90"), True),
-        (AcceleratorTarget("cuda", "sm100"), True),
-        (AcceleratorTarget("cuda", "sm120"), True),
-        (AcceleratorTarget("cuda", "sm121"), True),
-        (AcceleratorTarget("cuda"), False),
-        (AcceleratorTarget("hip", "gfx1201"), False),
-        (AcceleratorTarget("hip", "gfx942"), False),
-        (AcceleratorTarget("cpu"), False),
-        (AcceleratorTarget("meta"), False),
+        (AcceleratorTarget("cuda", "sm70"), "linux", None),
+        (AcceleratorTarget("cuda", "sm75"), "linux", nvidia),
+        (AcceleratorTarget("cuda", "sm80"), "linux", nvidia),
+        (AcceleratorTarget("cuda", "sm89"), "linux", nvidia),
+        (AcceleratorTarget("cuda", "sm90"), "linux", nvidia),
+        (AcceleratorTarget("cuda", "sm100"), "linux", nvidia),
+        (AcceleratorTarget("cuda", "sm120"), "linux", nvidia),
+        (AcceleratorTarget("cuda", "sm121"), "linux", nvidia),
+        (AcceleratorTarget("cuda"), "linux", None),
+        (AcceleratorTarget("hip", "gfx1201"), "linux", amd),
+        (AcceleratorTarget("hip", "gfx942"), "win32", amd),
+        (AcceleratorTarget("hip", "gfx1201"), "darwin", None),
+        (AcceleratorTarget("hip", "gfx90a"), "linux", None),
+        (AcceleratorTarget("cpu"), "linux", None),
+        (AcceleratorTarget("meta"), "linux", None),
     ],
 )
-def test_select_backend_preserves_supported_targets(monkeypatch, target, supported):
-    implementation = ModuleType("test_convrot_implementation")
-    monkeypatch.setattr(_backend, "_nvidia_backend", implementation)
-    monkeypatch.setattr(_backend, "_amd_backend", None)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-
-    selected = _backend.select_linear_backend(torch.empty(1))
-
-    assert selected is (implementation if supported else None)
-
-
-def test_missing_triton_uses_reference_without_querying_hardware(monkeypatch):
-    resolve_target = Mock(side_effect=AssertionError("unexpected hardware query"))
-    monkeypatch.setattr(_backend, "_nvidia_backend", None)
-    monkeypatch.setattr(_backend, "_amd_backend", None)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", resolve_target)
-
+def test_select_backend_preserves_supported_targets(monkeypatch, target, platform, expected):
+    monkeypatch.setattr(sys, "platform", platform)
+    assert _backend.select_linear_backend_for_target(target) is expected
     assert _backend.select_linear_backend(torch.empty(1)) is None
-    resolve_target.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -91,7 +79,6 @@ def test_missing_triton_uses_reference_without_querying_hardware(monkeypatch):
     ],
 )
 def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, m, n, k):
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     kernel_backend = backend.kernels
     monkeypatch.setattr(kernel_backend, "device_context", lambda device: nullcontext())
     kernel = MagicMock()
@@ -108,7 +95,7 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
     scale = torch.empty(n, 1, device="meta")
     plan = backend.default_execution_plan(weight, target=target)
     result = backend.execute_prepared_linear(
-        value, row_scale, weight, scale, None, torch.bfloat16, plan
+        value, row_scale, weight, scale, None, torch.bfloat16, plan, target=target
     )
     assert result.shape == (m, n)
     plan_kernel = getattr(plan, "matmul_kernel", "triton")
@@ -315,7 +302,6 @@ def test_sm120_large_projections_launch_tma_or_fall_back_to_grouped_triton(monke
 @pytest.mark.parametrize("k", [256, 264])
 def test_sm120_large_residual_launches_tma_or_falls_back_when_unaligned(monkeypatch, k):
     target = AcceleratorTarget("cuda", "sm120")
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     monkeypatch.setattr(nvidia_kernels, "device_context", lambda device: nullcontext())
     triton_residual = MagicMock()
     tma_residual = MagicMock()
@@ -336,6 +322,7 @@ def test_sm120_large_residual_launches_tma_or_falls_back_when_unaligned(monkeypa
         torch.empty(n, 1, device="meta"),
         None,
         residual,
+        target=target,
     )
     if k % 16 == 0:
         tiles = (rows + 127) // 128 * ((n + 255) // 256)
@@ -349,10 +336,10 @@ def test_sm120_large_residual_launches_tma_or_falls_back_when_unaligned(monkeypa
         assert triton_residual.__getitem__.return_value.call_args.kwargs["group_m"] == 16
 
 
-@pytest.mark.parametrize("architecture", ["sm70", "sm75", "sm120"])
-def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architecture):
-    target = AcceleratorTarget("cuda", architecture)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
+def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch):
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", Mock(side_effect=AssertionError("capability probe"))
+    )
     monkeypatch.setattr(runtime, "supports_device", lambda device: True)
     value = SimpleNamespace(device=torch.device("cuda"), shape=(2, 256), numel=lambda: 512)
 
@@ -377,41 +364,75 @@ def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch, architec
 @pytest.mark.parametrize("static", [False, True])
 @pytest.mark.parametrize(("rows", "columns"), [(2, 7), (64, 25600)])
 def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
-    monkeypatch, backend, target, static, rows, columns
+    backend, target, static, rows, columns
 ):
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     value = torch.empty(rows, 64)
     prepared = (torch.empty(rows, 32, dtype=torch.int8), torch.empty(rows))
     weight = torch.empty(columns, 32, dtype=torch.int8)
     scale = torch.empty(columns, 1)
     second = (torch.empty_like(weight), torch.empty_like(scale), torch.empty(columns))
     output = torch.empty(rows, 2 * columns + 4)[:, 2:-2]
-    prepare = Mock(return_value=prepared)
-    project = Mock(return_value=output)
-    monkeypatch.setattr(backend, "prepare_input_with_plan", prepare)
-    monkeypatch.setattr(backend, "execute_prepared_linear", project)
-    implementation = _backend.require_linear_backend(value)
-    assert implementation is backend
+    fake_kernels = SimpleNamespace(
+        fused_rotate_quantize_input=Mock(),
+        launch_prepared_linear=Mock(),
+    )
+    implementation = _backend.LinearBackend(backend.policy, fake_kernels)  # type: ignore[arg-type]
 
     input_scale = torch.tensor(0.02) if static else None
-    assert implementation.prepare_input(value, 16, "swiglu", input_scale, out=prepared) is prepared
-    assert prepare.call_args.kwargs["input_scale"] is input_scale
-    assert prepare.call_args.args == (value, 32, 16)
-    assert prepare.call_args.kwargs["out"] is prepared
-    assert prepare.call_args.kwargs["activation_fn"] == "swiglu"
-    assert prepare.call_args.kwargs["target"] == target
-    expected_plan = backend.default_execution_plan(weight, target=target)
-    assert prepare.call_args.kwargs["execution_plan"] == expected_plan
+    assert (
+        implementation.prepare_input(value, 16, "swiglu", input_scale, out=prepared, target=target)
+        is prepared
+    )
+    prep_call = fake_kernels.fused_rotate_quantize_input.call_args
+    assert [t.data_ptr() for t in prep_call.args[:3]] == [
+        value.data_ptr(),
+        prepared[0].data_ptr(),
+        prepared[1].data_ptr(),
+    ]
+    assert [t.shape for t in prep_call.args[:3]] == [
+        value.shape,
+        prepared[0].shape,
+        prepared[1].shape,
+    ]
+    assert prep_call.args[3] == 16
+    expected_prep_plan = backend.default_execution_plan(weight, target=target)
+    assert prep_call.kwargs == {
+        "activation_fn": "swiglu",
+        "input_scale": input_scale,
+        "num_warps": expected_prep_plan.fused_num_warps,
+        "target": target,
+    }
 
     result = implementation.linear_prepared(
-        *prepared, weight, scale, None, torch.float32, out=output, second_projection=second
+        *prepared,
+        weight,
+        scale,
+        None,
+        torch.float32,
+        out=output,
+        second_projection=second,
+        target=target,
     )
     assert result is output
-    expected_plan = backend.default_execution_plan(weight, target=target, rows=rows)
-    assert project.call_args.args[-1] == expected_plan
-    assert project.call_args.kwargs == {
-        "out": output,
-        "second_projection": second,
+    launch_call = fake_kernels.launch_prepared_linear.call_args
+    assert [launch_call.args[i].data_ptr() for i in (0, 1, 5)] == [
+        prepared[0].data_ptr(),
+        prepared[1].data_ptr(),
+        output.data_ptr(),
+    ]
+    assert all(
+        a is b
+        for a, b in zip(
+            (launch_call.args[2], launch_call.args[3], launch_call.args[4], *launch_call.args[6:9]),
+            (weight, scale, None, *second),
+            strict=True,
+        )
+    )
+    expected_gemm_plan = backend.default_execution_plan(weight, target=target, rows=rows)
+    assert launch_call.kwargs == {
+        "paired": True,
+        "logical_dtype": torch.float32,
+        "execution_plan": expected_gemm_plan,
         "target": target,
     }
 
@@ -427,14 +448,15 @@ def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
     ],
 )
 def test_nvidia_fused_launcher_validates_target_before_launch(monkeypatch, target, supported):
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
     kernel = MagicMock()
     monkeypatch.setattr(nvidia_kernels, "rotate_quantize_rows_kernel", kernel)
     value = torch.empty(2, 512)
     qdata, scale = torch.full((2, 512), 99, dtype=torch.int8), torch.full((2,), -99.0)
     if supported:
         # SM70 preparation still works without INT8 matrix instructions.
-        nvidia_kernels.fused_rotate_quantize_input(value, qdata, scale, 16, num_warps=4)
+        nvidia_kernels.fused_rotate_quantize_input(
+            value, qdata, scale, 16, num_warps=4, target=target
+        )
         kernel.__getitem__.assert_called_once_with((2,))
         launch = kernel.__getitem__.return_value
         launch.assert_called_once()
@@ -443,7 +465,9 @@ def test_nvidia_fused_launcher_validates_target_before_launch(monkeypatch, targe
         assert launch.call_args.kwargs["accelerator_backend"] == "cuda"
     else:
         with pytest.raises(ValueError, match="preparation has no optimized policy"):
-            nvidia_kernels.fused_rotate_quantize_input(value, qdata, scale, 16, num_warps=4)
+            nvidia_kernels.fused_rotate_quantize_input(
+                value, qdata, scale, 16, num_warps=4, target=target
+            )
         kernel.__getitem__.assert_not_called()
         assert (qdata == 99).all()
         assert (scale == -99.0).all()
@@ -451,38 +475,49 @@ def test_nvidia_fused_launcher_validates_target_before_launch(monkeypatch, targe
 
 @pytest.mark.parametrize("operation", ["linear", "add_", "addmm_"])
 def test_validated_operations_call_the_selected_implementation(monkeypatch, operation):
-    qdata = torch.zeros(7, 32, dtype=torch.int8)
-    scale = torch.ones(7, 1)
-    activation = torch.zeros(3, 64)
-    bias = torch.ones(7)
-    update = torch.zeros(7, 32)
-    mat1, mat2 = torch.zeros(7, 3), torch.zeros(3, 32)
-    expected_output = torch.ones(3, 7)
-    execute = Mock(return_value=expected_output)
+    execute = Mock()
     implementation = ModuleType("test_convrot_implementation")
     monkeypatch.setattr(implementation, operation, execute, raising=False)
-    monkeypatch.setattr(_backend, "_nvidia_backend", implementation)
-    monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("cuda", "sm120")
-    )
 
     if operation == "linear":
+        qdata = torch.zeros(7, 32, dtype=torch.int8)
+        scale = torch.ones(7, 1)
+        activation = torch.zeros(3, 64)
+        bias = torch.ones(7)
+        expected_output = torch.ones(3, 7)
+        execute.return_value = expected_output
+        monkeypatch.setattr(_backend, "_nvidia_backend", implementation)
+        monkeypatch.setattr(
+            AcceleratorTarget, "from_device", lambda _device: AcceleratorTarget("cuda", "sm120")
+        )
         actual = _functional.linear(
             activation, qdata, scale, torch.float32, 16, bias, activation_fn="swiglu"
         )
         assert actual is expected_output
         execute.assert_called_once_with(activation, qdata, scale, bias, 16, "swiglu", None)
-    elif operation == "add_":
-        monkeypatch.setattr(_update, "_use_triton", lambda value: True)
+        return
+
+    with FakeTensorMode():
+        qdata = torch.zeros(7, 32, device="cuda:0", dtype=torch.int8)
+        scale = torch.ones(7, 1, device="cuda:0")
+        update = torch.zeros(7, 32, device="cuda:0")
+        mat1, mat2 = torch.zeros(7, 3, device="cuda:0"), torch.zeros(3, 32, device="cuda:0")
         monkeypatch.setattr(_update, "_triton_backend", implementation)
-        _update.add_(
-            qdata, scale, torch.float32, 16, update, beta=0.25, alpha=2, rounding_seed=2**64 - 1
-        )
-        execute.assert_called_once_with(qdata, scale, update, 16, 2.0, -1, beta=0.25)
-    else:
-        monkeypatch.setattr(_update, "_use_triton", lambda value: True)
-        monkeypatch.setattr(_update, "_triton_backend", implementation)
-        _update.addmm_(
-            qdata, scale, torch.float32, 16, mat1, mat2, beta=3, alpha=2, rounding_seed=2**64 - 1
-        )
-        execute.assert_called_once_with(qdata, scale, mat1, mat2, 16, 3.0, 2.0, -1)
+        if operation == "add_":
+            _update.add_(
+                qdata, scale, torch.float32, 16, update, beta=0.25, alpha=2, rounding_seed=2**64 - 1
+            )
+            execute.assert_called_once_with(qdata, scale, update, 16, 2.0, -1, beta=0.25)
+        else:
+            _update.addmm_(
+                qdata,
+                scale,
+                torch.float32,
+                16,
+                mat1,
+                mat2,
+                beta=3,
+                alpha=2,
+                rounding_seed=2**64 - 1,
+            )
+            execute.assert_called_once_with(qdata, scale, mat1, mat2, 16, 3.0, 2.0, -1)
