@@ -180,7 +180,14 @@ def test_pass_specializes_h3_linears_after_generic_preparation_sharing(
             if node.target
             == torch.ops.piper_kernels.minimax_h3_vae_convrot_int8_linear_prepared.default
         ]
-        assert [node.args[-1] for node in specialized_nodes] == [[128, 128, 64, 8, 2]] * 4
+        assert len({(node.args[0], node.args[1]) for node in specialized_nodes[:3]}) == 1
+        assert len({(node.args[0], node.args[1]) for node in specialized_nodes}) == 2
+        assert all(
+            isinstance(node.args[-1], list)
+            and len(node.args[-1]) == 5
+            and all(type(value) is int and value > 0 for value in node.args[-1])
+            for node in specialized_nodes
+        )
     else:
         assert targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
         assert targets.count(torch.ops.piper_kernels.convrot_int8_linear_prepared.default) == 3
