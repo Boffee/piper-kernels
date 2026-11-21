@@ -214,9 +214,13 @@ def select_execution_plan(
     fused_num_warps = 4
     if rdna4:
         if in_features & (in_features - 1):
-            fused_num_warps = 16 if block_size > 8192 else 4
+            fused_num_warps = 8 if block_size > 8192 else 4
+        elif block_size > 8192:
+            fused_num_warps = 16
+        elif block_size > 2048:
+            fused_num_warps = 8
         else:
-            fused_num_warps = 32 if block_size > 8192 else 8
+            fused_num_warps = 4
     # At 8 KiB row-stride multiples, fetching 128 adjacent K bytes improves
     # throughput on gfx1201. Halve N to keep the accumulator spill-free.
     # Keep the existing tile for underfilled grids: below two workgroups per

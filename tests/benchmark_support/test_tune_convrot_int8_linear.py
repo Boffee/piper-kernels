@@ -89,7 +89,9 @@ def test_amd_tuning_accepts_its_preparation_warp_count_and_preserves_backend_con
         device=torch.device("cpu"),
         target=AcceleratorTarget("hip", "gfx1201"),
     )
-    assert workload.production_plan.fused_num_warps == 32
+    assert _candidate_plans(_parse_args([]), workload.production_plan) == (
+        workload.production_plan,
+    )
     arguments = _parse_args(["--fused-num-warps", "32", "--matmul-block-k", "256"])
     (plan,) = _candidate_plans(arguments, workload.production_plan)
     assert plan.fused_num_warps == 32
