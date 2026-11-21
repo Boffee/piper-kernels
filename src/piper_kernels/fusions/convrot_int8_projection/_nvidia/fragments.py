@@ -24,28 +24,51 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.hopper import tma
+from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 from triton.language.extra import libdevice
 
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
     SIGNED_HADAMARD_MASK,
 )
+from piper_kernels.linear.convrot.int8._nvidia import gluon_tma
 from piper_kernels.linear.convrot.int8._nvidia.gluon_async_copy import (
     _accumulate as _accumulate_tiles,
 )
 
-from . import _tma
-from ._plan import GLUON_BLOCK_K, GLUON_BLOCK_M, GLUON_NUM_STAGES, GLUON_NUM_WARPS
-
-resolve_operands = _tma.resolve_operands
+from ._plan import (
+    GLUON_BLOCK_K,
+    GLUON_BLOCK_M,
+    GLUON_NUM_STAGES,
+    GLUON_NUM_WARPS,
+    NvidiaExecutionPlan,
+)
 
 HEAD_DIM = 128
 BLOCK_M = GLUON_BLOCK_M
 _BLOCK_K = GLUON_BLOCK_K
 _NUM_STAGES = GLUON_NUM_STAGES
 NUM_WARPS = GLUON_NUM_WARPS
+
+
+def resolve_operands(
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    execution_plan: NvidiaExecutionPlan,
+) -> tuple[torch.Tensor | TensorDescriptor, torch.Tensor | TensorDescriptor]:
+    """Return TMA descriptors or raw tensor operands matching ``execution_plan.kernel``."""
+    if execution_plan.kernel == "gluon_tma":
+        return (
+            gluon_tma.build_matrix_descriptor(input_qdata, BLOCK_M),
+            gluon_tma.build_matrix_descriptor(weight_qdata, HEAD_DIM),
+        )
+    if execution_plan.kernel == "gluon_async_copy":
+        return input_qdata, weight_qdata
+    raise ValueError(f"Unsupported Gluon projection kernel: {execution_plan.kernel}")
+
 
 _GL_HEAD_DIM = gl.constexpr(HEAD_DIM)
 _GL_BLOCK_M = gl.constexpr(BLOCK_M)
@@ -282,13 +305,15 @@ def project_rmsnorm_rope(
     )
     if isinstance(input_ptr, tma.tensor_descriptor):
         gl.static_assert(isinstance(weight_ptr, tma.tensor_descriptor))
-        accumulator = _tma.project_int8(
+        accumulator = gluon_tma.accumulate_tma(
             input_ptr,
             weight_ptr,
             input_row_start + first_row,
-            head,
+            head * _GL_HEAD_DIM,
             input_features,
             mma_layout,
+            _GL_HEAD_DIM,
+            _GL_MMA_K,
         )
         accumulator = gl.convert_layout(accumulator, FEATURE_LAYOUT)
         # Defer epilogue row-index materialization until after the TMA GEMM so the
@@ -411,13 +436,15 @@ def project_value_tiles(
     )
     if isinstance(input_ptr, tma.tensor_descriptor):
         gl.static_assert(isinstance(weight_ptr, tma.tensor_descriptor))
-        accumulator = _tma.project_int8(
+        accumulator = gluon_tma.accumulate_tma(
             input_ptr,
             weight_ptr,
             input_row_start + row_block * _GL_BLOCK_M,
-            head,
+            head * _GL_HEAD_DIM,
             input_features,
             mma_layout,
+            _GL_HEAD_DIM,
+            _GL_MMA_K,
         )
     else:
         gl.static_assert(not isinstance(weight_ptr, tma.tensor_descriptor))

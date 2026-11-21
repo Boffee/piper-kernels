@@ -15,7 +15,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, reference
 from piper_kernels.linear.convrot.int8._amd import policy
-from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8._amd import triton as amd_triton
 from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -32,6 +32,7 @@ _gpu = pytest.mark.skipif(
     torch.version.hip is None or not torch.cuda.is_available(),
     reason="requires a supported ROCm GPU",
 )
+amd = _backend._amd_backend
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"])
@@ -147,8 +148,8 @@ def test_gfx1201_short_batch_matmul_schedules(architecture, rows, outputs, width
 
 def test_optional_amd_compiler_option_compatibility(monkeypatch):
     target = AcceleratorTarget("hip", "gfx1201")
-    monkeypatch.setattr(amd.importlib, "import_module", Mock(return_value=object()))
-    assert amd._amd_matmul_compiler_options(target) == {}
+    monkeypatch.setattr(amd_triton.importlib, "import_module", Mock(return_value=object()))
+    assert amd_triton._amd_matmul_compiler_options(target) == {}
 
 
 def test_gfx1201_accumulator_seed_fits_every_int8_partial_sum():

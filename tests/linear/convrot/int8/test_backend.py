@@ -12,14 +12,15 @@ import torch
 from piper_kernels._residual import ResidualAdd, ReusableUpdate
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear.convrot.int8 import _backend, dispatch
-from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.linear.convrot.int8 import _backend, _functional
 from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
-from piper_kernels.linear.convrot.int8._nvidia import dispatch as nvidia
-from piper_kernels.linear.convrot.int8._nvidia import triton as nvidia_kernels
 from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
 from piper_kernels.weights.convrot.int8 import _update
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
+
+nvidia = _backend._nvidia_backend
+amd = _backend._amd_backend
+nvidia_kernels = nvidia.kernels
 
 
 @pytest.mark.parametrize(
@@ -91,7 +92,7 @@ def test_missing_triton_uses_reference_without_querying_hardware(monkeypatch):
 )
 def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, m, n, k):
     monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    kernel_backend = nvidia_kernels if backend is nvidia else backend
+    kernel_backend = backend.kernels
     monkeypatch.setattr(kernel_backend, "device_context", lambda device: nullcontext())
     kernel = MagicMock()
     gluon_kernel = MagicMock()
@@ -99,8 +100,8 @@ def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, 
     monkeypatch.setattr(kernel_backend, "int8_matmul_kernel", kernel)
     if backend is nvidia:
         monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
-        monkeypatch.setattr(nvidia.gluon_async_copy, "_int8_matmul_kernel", gluon_kernel)
-        monkeypatch.setattr(nvidia.gluon_tma, "_int8_tma_matmul_kernel", tma_kernel)
+        monkeypatch.setattr(nvidia_kernels.gluon_async_copy, "_int8_matmul_kernel", gluon_kernel)
+        monkeypatch.setattr(nvidia_kernels.gluon_tma, "_int8_tma_matmul_kernel", tma_kernel)
     value = torch.empty(m, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
     row_scale = torch.empty(m, device="meta")
@@ -250,7 +251,7 @@ def test_sm8x_wide_projections_launch_the_gluon_kernel(
     gluon_kernel = MagicMock()
     monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", kernel)
     monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
-    monkeypatch.setattr(nvidia.gluon_async_copy, "_int8_matmul_kernel", gluon_kernel)
+    monkeypatch.setattr(nvidia_kernels.gluon_async_copy, "_int8_matmul_kernel", gluon_kernel)
     k = 1024
     value = torch.empty(rows, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
@@ -282,7 +283,7 @@ def test_sm120_large_projections_launch_tma_or_fall_back_to_grouped_triton(monke
     tma_kernel = MagicMock()
     monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", triton_kernel)
     monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", triton_kernel)
-    monkeypatch.setattr(nvidia.gluon_tma, "_int8_tma_matmul_kernel", tma_kernel)
+    monkeypatch.setattr(nvidia_kernels.gluon_tma, "_int8_tma_matmul_kernel", tma_kernel)
     rows, n = 4096, 1000
     value = torch.empty(rows, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
@@ -320,7 +321,7 @@ def test_sm120_large_residual_launches_tma_or_falls_back_when_unaligned(monkeypa
     tma_residual = MagicMock()
     monkeypatch.setattr(nvidia_kernels, "int8_residual_matmul_kernel", triton_residual)
     monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_residual_matmul_kernel", triton_residual)
-    monkeypatch.setattr(nvidia.gluon_tma, "_int8_tma_residual_matmul_kernel", tma_residual)
+    monkeypatch.setattr(nvidia_kernels.gluon_tma, "_int8_tma_residual_matmul_kernel", tma_residual)
     rows, n = 1024, 2560
     value = torch.empty(rows, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
@@ -408,7 +409,11 @@ def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
     assert result is output
     expected_plan = backend.default_execution_plan(weight, target=target, rows=rows)
     assert project.call_args.args[-1] == expected_plan
-    assert project.call_args.kwargs == {"out": output, "second_projection": second}
+    assert project.call_args.kwargs == {
+        "out": output,
+        "second_projection": second,
+        "target": target,
+    }
 
 
 @pytest.mark.parametrize(
@@ -462,7 +467,7 @@ def test_validated_operations_call_the_selected_implementation(monkeypatch, oper
     )
 
     if operation == "linear":
-        actual = dispatch.linear(
+        actual = _functional.linear(
             activation, qdata, scale, torch.float32, 16, bias, activation_fn="swiglu"
         )
         assert actual is expected_output

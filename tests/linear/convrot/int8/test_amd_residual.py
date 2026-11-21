@@ -10,8 +10,10 @@ import torch
 from piper_kernels._residual import ResidualAdd, ReusableUpdate, validate_residual_add
 from piper_kernels._residual import triton as residual_kernels
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.convrot.int8 import _backend
 from piper_kernels.linear.convrot.int8._amd import policy
-from piper_kernels.linear.convrot.int8._amd import triton as amd
+
+amd = _backend._amd_backend
 
 _ROCM_GFX1201 = (
     sys.platform in ("linux", "win32")
@@ -146,7 +148,7 @@ def test_amd_residual_projection_preserves_math_and_storage(
         if fused
         else Mock(wraps=residual_kernels.apply_residual_add)
     )
-    monkeypatch.setattr(amd, "apply_residual_add", standalone)
+    monkeypatch.setattr(_backend, "apply_residual_add", standalone)
     actual = amd.linear_prepared_residual(*args[:-1], residual, row_offset=start)
     assert actual.data_ptr() == residual.output.view(-1, features)[start:].data_ptr()
     torch.testing.assert_close(actual, wanted, atol=2e-5, rtol=max(2e-5, torch.finfo(dtype).eps))
@@ -199,7 +201,7 @@ def test_amd_backend_fallback_keeps_residual_semantics(kind, monkeypatch):
     residual_kernels.apply_residual_add(projection, reference, start)
     monkeypatch.setattr(policy, "supports_residual_epilogue", lambda *args, **kwargs: False)
     standalone = Mock(wraps=residual_kernels.apply_residual_add)
-    monkeypatch.setattr(amd, "apply_residual_add", standalone)
+    monkeypatch.setattr(_backend, "apply_residual_add", standalone)
     scratch = torch.empty(rows, features + 8, device="cuda", dtype=args[-1])[:, 4:-4]
     output = residual.output.view(-1, features)[start : start + rows]
     actual = amd.linear_prepared_residual(

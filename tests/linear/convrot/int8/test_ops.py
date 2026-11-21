@@ -6,7 +6,7 @@ from _compile_capture import TargetCapturePass
 
 from piper_kernels import compile_options
 from piper_kernels._input_activations import apply_input_activation
-from piper_kernels.linear.convrot.int8 import _backend, _ops, dispatch, reference
+from piper_kernels.linear.convrot.int8 import _backend, _functional, _ops, reference
 from piper_kernels.weights.convrot.int8 import _update
 from piper_kernels.weights.convrot.int8 import _update_reference as int8_update_reference
 from piper_kernels.weights.convrot.int8 import triton as int8_update_ops
@@ -96,13 +96,21 @@ def test_eager_validated_linear_uses_shared_op(monkeypatch, activation_fn):
     if activation_fn == "swiglu":
         value = torch.cat((value, value / 2), dim=-1)
 
-    actual = dispatch.linear(
+    actual = _functional.linear(
         value, weight, scale, value.dtype, 16, bias, activation_fn=activation_fn
     )
     expected = reference.linear(value, weight, scale, 16, bias, activation_fn=activation_fn)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert implementation.calls == ["linear"]
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_linear_storage_entrypoint_rejects_convolution_weights(device):
+    qdata = torch.empty(2, 3, 3, 3, 64, dtype=torch.int8, device=device)
+    scale = torch.ones(2, 1, device=device)
+    with pytest.raises(ValueError, match="requires 2-D qdata"):
+        _functional.linear(torch.empty(1, 3, device=device), qdata, scale, torch.float32, 64)
 
 
 def test_compiled_preparation_sharing_resolves_backend_at_execution(monkeypatch):

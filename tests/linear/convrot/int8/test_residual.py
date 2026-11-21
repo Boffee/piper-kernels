@@ -9,7 +9,10 @@ from _accelerators import exact_sm120_available
 
 from piper_kernels._residual import ResidualAdd, ReusableUpdate, validate_residual_add
 from piper_kernels._residual import triton as residual_kernels
-from piper_kernels.linear.convrot.int8._nvidia import dispatch, policy
+from piper_kernels.linear.convrot.int8 import _backend
+from piper_kernels.linear.convrot.int8._nvidia import gluon_tma, policy
+
+dispatch = _backend._nvidia_backend
 
 pytestmark = [
     pytest.mark.gpu,
@@ -104,9 +107,9 @@ def test_residual_projection_preserves_math_and_storage(
         if dtype is torch.float32
         else Mock(side_effect=AssertionError("residual launched separately"))
     )
-    tma_launch = Mock(wraps=dispatch.gluon_tma.launch_int8_residual_matmul)
-    monkeypatch.setattr(dispatch, "apply_residual_add", standalone)
-    monkeypatch.setattr(dispatch.gluon_tma, "launch_int8_residual_matmul", tma_launch)
+    tma_launch = Mock(wraps=gluon_tma.launch_int8_residual_matmul)
+    monkeypatch.setattr(_backend, "apply_residual_add", standalone)
+    monkeypatch.setattr(gluon_tma, "launch_int8_residual_matmul", tma_launch)
     actual = dispatch.linear_prepared_residual(*args[:-1], residual, row_offset=start)
     assert actual.data_ptr() == residual.output.view(-1, features)[start:].data_ptr()
     torch.testing.assert_close(actual, wanted, atol=2e-5, rtol=max(2e-5, torch.finfo(dtype).eps))
@@ -159,7 +162,7 @@ def test_backend_fallback_keeps_residual_semantics(kind, monkeypatch):
     residual_kernels.apply_residual_add(projection, reference, start)
     monkeypatch.setattr(policy, "supports_residual_epilogue", lambda *args: False)
     standalone = Mock(wraps=residual_kernels.apply_residual_add)
-    monkeypatch.setattr(dispatch, "apply_residual_add", standalone)
+    monkeypatch.setattr(_backend, "apply_residual_add", standalone)
     scratch = torch.empty(rows, features + 8, device="cuda", dtype=args[-1])[:, 4:-4]
     output = residual.output.view(-1, features)[start : start + rows]
     actual = dispatch.linear_prepared_residual(
@@ -197,12 +200,12 @@ def test_sm120_tma_residual_falls_back_to_triton_for_unaligned_operands(dtype, c
     materialized = dispatch.linear_prepared(qdata, scales, weight, weight_scales, bias, dtype)
     residual_kernels.apply_residual_add(materialized, reference, start)
     monkeypatch.setattr(
-        dispatch.gluon_tma,
+        gluon_tma,
         "launch_int8_residual_matmul",
         Mock(side_effect=AssertionError("TMA residual launched on unaligned operands")),
     )
     monkeypatch.setattr(
-        dispatch,
+        _backend,
         "apply_residual_add",
         Mock(side_effect=AssertionError("standalone residual launched")),
     )
@@ -215,7 +218,7 @@ def test_sm120_tma_residual_falls_back_to_triton_for_unaligned_operands(dtype, c
 
 
 def test_sm120_tma_residual_compiles_once_across_row_counts_and_offsets():
-    kernel = dispatch.gluon_tma._int8_tma_residual_matmul_kernel
+    kernel = gluon_tma._int8_tma_residual_matmul_kernel
     kernel.device_caches.clear()
     width, features = 256, 2560
     torch.manual_seed(704)
@@ -251,8 +254,8 @@ def test_sm120_tma_residual_supports_cuda_graph_capture_and_replay(monkeypatch):
     args, residual, start = _case(torch.bfloat16, rows, width, features, "two", torch.float32)
     qdata, scales, weight, weight_scales, bias, dtype = args
     assert dispatch.default_execution_plan(weight, rows=rows).matmul_kernel == "gluon_tma"
-    tma_launch = Mock(wraps=dispatch.gluon_tma.launch_int8_residual_matmul)
-    monkeypatch.setattr(dispatch.gluon_tma, "launch_int8_residual_matmul", tma_launch)
+    tma_launch = Mock(wraps=gluon_tma.launch_int8_residual_matmul)
+    monkeypatch.setattr(gluon_tma, "launch_int8_residual_matmul", tma_launch)
     initial_base = residual.base.clone()
     initial_update = residual.reusable.update.clone()
     dispatch.linear_prepared_residual(

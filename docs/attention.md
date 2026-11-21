@@ -203,8 +203,9 @@ any view of it) after the call; if the block reads the original input afterward,
 Inductor inserts a copy instead. Per-token indexed gates
 (`base + gate[indices] * update`) and eligible ConvRot/NVFP4 FFN and
 Q-projected ConvRot INT8 attention outputs fold into the add; row-broadcast gates
-stay unchanged. In-place adds round separately per update (`_nvidia` ConvRot INT8
-uses its [residual epilogues](../src/piper_kernels/linear/convrot/int8/_nvidia/README.md#residual-epilogues)).
+stay unchanged. In-place adds round separately per update (ConvRot INT8 uses
+fused 16-bit [residual epilogues](../src/piper_kernels/linear/convrot/int8/_nvidia/gluon_tma.py)
+on SM120 and RDNA4).
 
 Eligible folded attention runs in two sequential head slices when head counts are
 even and output widths align, trading slightly lower active K/V memory for small

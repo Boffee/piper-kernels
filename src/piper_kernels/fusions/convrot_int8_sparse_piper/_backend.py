@@ -5,7 +5,7 @@ import torch
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
-from piper_kernels.linear.convrot.int8._interfaces import LinearBackend
+from piper_kernels.linear.convrot.int8._backend import LinearBackend
 
 from ._amd import policy as amd_policy
 from ._interfaces import ProjectionBackend

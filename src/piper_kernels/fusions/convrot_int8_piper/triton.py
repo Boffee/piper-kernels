@@ -3,6 +3,8 @@
 # Triton's launch options and constexpr arguments are not ordinary Python parameters.
 # pyright: reportCallIssue=false, reportArgumentType=false
 
+from functools import partial
+
 import torch
 import triton
 
@@ -16,7 +18,7 @@ from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecut
 from piper_kernels.fusions.convrot_int8_projection.triton import project_value_chunk_means
 
 from . import _kernels
-from ._interfaces import KeyOutput, QueryOutput, ValueOutput
+from ._interfaces import KeyOutput, ProjectionBackend, QueryOutput, ValueOutput
 
 
 def project_query(
@@ -240,3 +242,26 @@ def project_value(
                     num_stages=execution_plan.num_stages,
                     **lds_only_fence_options(execution_plan.lds_only_fences),
                 )
+
+
+_AMD_EXECUTION_PLAN = ProjectionExecutionPlan(
+    block_k=64,
+    heads_per_program=1,
+    num_warps=4,
+    num_stages=2,
+    group_m=8,
+    lds_only_fences=True,
+)
+
+
+class _AmdProjectionBackend:
+    """Bind shared dense projection launchers to the validated RDNA4 schedule."""
+
+    project_query = staticmethod(partial(project_query, execution_plan=_AMD_EXECUTION_PLAN))
+    project_key = staticmethod(partial(project_key, execution_plan=_AMD_EXECUTION_PLAN))
+    project_value = staticmethod(
+        partial(project_value, execution_plan=_AMD_EXECUTION_PLAN, packed_amd=True)
+    )
+
+
+amd_backend: ProjectionBackend = _AmdProjectionBackend()  # pyright: ignore[reportAssignmentType]

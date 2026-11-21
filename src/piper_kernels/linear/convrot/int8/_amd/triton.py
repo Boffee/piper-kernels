@@ -1,18 +1,25 @@
-"""ROCm ConvRot INT8 preparation and projection; weight updates are shared."""
+"""ROCm ConvRot INT8 preparation, RDNA4 paired/residual SRD kernels, and launchers.
+
+Shared host orchestration (buffer allocation, reshaping, target/plan resolution,
+and standalone residual fallback) lives in ``.._backend``. Matrix launches pass
+LLVM attributes from ``_triton.amd_compiler_workarounds`` so RDNA4 LDS barriers
+omit redundant ``global_inv`` fences, and long ``gfx1201`` reductions seed INT32
+accumulators with ``0x155555`` (see ``policy.matmul_accumulator_seed``) to avoid
+signed zero-crossing clock drops.
+"""
 
 # pyright: reportCallIssue=false
 
 import importlib
-import math
 
 import torch
 import triton
 import triton.language as tl
 
-from piper_kernels._input_activations import apply_input_activation, input_activation_width
+from piper_kernels._input_activations import input_activation_width
 from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._residual import ResidualAdd
-from piper_kernels._residual.triton import add_residual, apply_residual_add
+from piper_kernels._residual.triton import add_residual
 from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -25,8 +32,8 @@ from piper_kernels.weights.convrot.int8.triton import (
     round_to_int8,
 )
 
-from .._kernels.triton import int8_matmul_kernel
 from .._plan import LinearExecutionPlan
+from ..triton import int8_matmul_kernel
 from . import policy
 
 
@@ -353,7 +360,9 @@ def fused_rotate_quantize_input(
             f"got {tuple(input.shape)}"
         )
     target = AcceleratorTarget.from_device(input.device) if target is None else target
-    if not policy.select_execution_plan(target, in_features=k).fuse_rotation_quantization:
+    if not policy.supports_target(target):
+        raise ValueError(f"ConvRot INT8 execution has no optimized policy for {target}")
+    if not policy.supports_fused_preparation(k):
         raise ValueError(f"fused preparation does not support row width {k}")
     blocks = policy.preparation_blocks(k)
     if _uses_amd_chunked_preparation(target, input.dtype, blocks):
@@ -383,7 +392,12 @@ def fused_rotate_quantize_input(
 def _amd_matmul_compiler_options(
     target: AcceleratorTarget,
 ) -> dict[str, object]:
-    """Return optional AMD compiler controls supported by the installed Triton."""
+    """Return optional AMD compiler controls supported by the installed Triton.
+
+    On RDNA4 (``gfx1200``/``gfx1201``), adds ``LDS_ONLY_FENCE_ATTRS`` from
+    ``_triton.amd_compiler_workarounds`` so LDS barriers omit redundant
+    ``global_inv`` fences while keeping ``iterative-ilp`` scheduling.
+    """
     if not target.is_architecture("gfx1200", "gfx1201"):
         return {}
     # llvm_fn_attrs was added to Triton's HIP options after the initial gfx12
@@ -429,81 +443,6 @@ def quantize_input(
         )
 
 
-def default_execution_plan(
-    weight_qdata: torch.Tensor,
-    *,
-    target: AcceleratorTarget | None = None,
-    rows: int | None = None,
-) -> LinearExecutionPlan:
-    """Resolve production policy, accepting an explicit target for offline tuning."""
-    target = AcceleratorTarget.from_device(weight_qdata.device) if target is None else target
-    return policy.select_execution_plan(
-        target,
-        in_features=weight_qdata.shape[1],
-        rows=rows,
-        out_features=weight_qdata.shape[0],
-    )
-
-
-def prepare_input_with_plan(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    in_features: int,
-    group_size: int,
-    *,
-    activation_fn: str | None,
-    input_scale: torch.Tensor | None = None,
-    execution_plan: LinearExecutionPlan,
-    target: AcceleratorTarget,
-    out: tuple[torch.Tensor, torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate and quantize an input, optionally into caller-owned storage."""
-    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
-    m = input_2d.shape[0]
-    if out is None:
-        input_qdata = torch.empty(
-            (m, in_features),
-            device=input.device,
-            dtype=torch.int8,
-        )
-        row_scales = torch.empty(m, device=input.device, dtype=torch.float32)
-        result = (
-            input_qdata.reshape(*input.shape[:-1], in_features),
-            row_scales.reshape(input.shape[:-1]),
-        )
-    else:
-        result = out
-    input_qdata = result[0].reshape(m, in_features)
-    row_scales = result[1].reshape(m)
-    if execution_plan.fuse_rotation_quantization:
-        fused_rotate_quantize_input(
-            input_2d,
-            input_qdata,
-            row_scales,
-            group_size,
-            activation_fn=activation_fn,
-            input_scale=input_scale,
-            num_warps=execution_plan.fused_num_warps,
-            target=target,
-        )
-    else:
-        transformed_input = apply_input_activation(input_2d, activation_fn)
-        rotated = torch.empty_like(transformed_input)
-        convrot_backend.rotate_input(
-            transformed_input,
-            rotated,
-            group_size,
-            num_warps=execution_plan.rotation_num_warps,
-        )
-        quantize_input(
-            rotated,
-            input_qdata,
-            row_scales,
-            input_scale=input_scale,
-            num_warps=execution_plan.quantization_num_warps,
-        )
-    return result
-
-
 @triton.jit(do_not_specialize=["m"])
 def _paired_int8_matmul_kernel(
     input_ptr,
@@ -524,7 +463,13 @@ def _paired_int8_matmul_kernel(
     full_rows: tl.constexpr,
     accumulator_seed: tl.constexpr,
 ):
-    """Project one prepared input into two adjacent 128-column-tiled weights."""
+    """Project one prepared input into two adjacent 128-column-tiled weights.
+
+    Selected by ``policy.supports_paired_matmul`` on aligned ``gfx1201``
+    ``(128, 256, 64)`` shapes with ``rows > 64`` and signed 32-bit element/byte
+    offsets for SRD buffer addressing. Reuses each ``128x64`` activation tile
+    across both 128-column INT32 accumulators.
+    """
     # Caller validates that 32-bit element indexing fits inputs, weights, and outputs.
     pid = tl.program_id(0)
     row_tiles = tl.cdiv(m, 128)
@@ -574,57 +519,29 @@ def _paired_int8_matmul_kernel(
     tl.store(dest, first_result, mask=valid_rows)
 
 
-def execute_prepared_linear(
+def launch_prepared_linear(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
+    output: torch.Tensor,
+    second_weight: torch.Tensor,
+    second_scale: torch.Tensor,
+    second_bias: torch.Tensor | None,
+    *,
+    paired: bool,
     logical_dtype: torch.dtype,
     execution_plan: LinearExecutionPlan,
-    *,
-    out: torch.Tensor | None = None,
-    second_projection: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
-) -> torch.Tensor:
-    """Project prepared INT8 input, optionally to two equal-width independent weights.
-
-    Paired projections share a launch and write adjacent output columns without
-    packing weights. ``out`` may provide caller-owned, row-strided storage.
-    """
-    leading_shape = input_qdata.shape[:-1]
-    m = math.prod(leading_shape)
-    k = input_qdata.shape[-1]
+    target: AcceleratorTarget | None = None,
+) -> None:
+    """Launch RDNA4 paired SRD GEMM or shared INT8 GEMM for validated 2-D operands."""
+    m, k = input_qdata.shape
     n = weight_qdata.shape[0]
-    paired = second_projection is not None
-    second_weight, second_scale, second_bias = (
-        (weight_qdata, weight_scale, None) if second_projection is None else second_projection
-    )
-    if second_weight.shape != weight_qdata.shape:
-        raise ValueError("paired INT8 projections must have matching weight shapes")
-    output_features = n * (2 if paired else 1)
-    if out is None:
-        output = torch.empty(
-            (m, output_features),
-            device=input_qdata.device,
-            dtype=logical_dtype,
-        )
-        result = output.reshape(*leading_shape, output_features)
-    else:
-        result = out
-    input_qdata_2d = input_qdata.reshape(m, k)
-    input_scale_1d = input_scale.reshape(m)
-    output = result.reshape(m, output_features)
-    if output.stride(1) != 1:
-        raise ValueError("prepared INT8 GEMM output must be column-contiguous")
     plan = execution_plan
-    num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
-    group_m = policy.matmul_group_m(plan)
-    target = AcceleratorTarget.from_device(input_qdata.device)
+    target = AcceleratorTarget.from_device(input_qdata.device) if target is None else target
     compiler_options = _amd_matmul_compiler_options(target)
     bias_pointer = bias if bias is not None else output
-
-    if not m or not n:
-        return result
     if paired and policy.supports_paired_matmul(
         target,
         plan,
@@ -637,10 +554,10 @@ def execute_prepared_linear(
         output_tiles = triton.cdiv(m, 128) * (n // 128)
         with device_context(input_qdata.device):
             _paired_int8_matmul_kernel[(output_tiles,)](
-                input_qdata_2d,
+                input_qdata,
                 weight_qdata,
                 output,
-                input_scale_1d,
+                input_scale,
                 weight_scale,
                 bias_pointer,
                 second_weight,
@@ -658,16 +575,18 @@ def execute_prepared_linear(
                 num_stages=2,
                 num_warps=8,
             )
-        return result
+        return
+    num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
+    group_m = policy.matmul_group_m(plan)
     row_block_count = triton.cdiv(m, plan.matmul_block_m)
     output_tiles = row_block_count * num_n_tiles
     grid = (output_tiles,) if group_m else (row_block_count, num_n_tiles)
     with device_context(input_qdata.device):
         int8_matmul_kernel[grid](
-            input_qdata_2d,
+            input_qdata,
             weight_qdata,
             output,
-            input_scale_1d,
+            input_scale,
             weight_scale,
             bias_pointer,
             second_weight,
@@ -693,134 +612,18 @@ def execute_prepared_linear(
             num_stages=plan.matmul_num_stages,
             num_warps=plan.matmul_num_warps,
         )
-    return result
-
-
-def run_linear(
-    input: torch.Tensor,  # noqa: A002
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-    *,
-    activation_fn: str | None = None,
-    input_scale: torch.Tensor | None = None,
-    execution_plan: LinearExecutionPlan | None = None,
-) -> torch.Tensor:
-    """Run ConvRot input preparation and INT8 GEMM under one plan."""
-    original_shape = input.shape
-    k = weight_qdata.shape[1]
-    expected_width = k * input_activation_width(activation_fn)
-    if original_shape[-1] != expected_width:
-        operation = "activated linear input" if activation_fn is not None else "linear input"
-        raise ValueError(
-            f"{operation} has {original_shape[-1]} features, expected {expected_width}"
-        )
-    target = AcceleratorTarget.from_device(input.device)
-    plan = (
-        execution_plan
-        if execution_plan is not None
-        else default_execution_plan(
-            weight_qdata, target=target, rows=math.prod(original_shape[:-1])
-        )
-    )
-    input_qdata, row_scales = prepare_input_with_plan(
-        input,
-        k,
-        group_size,
-        activation_fn=activation_fn,
-        input_scale=input_scale,
-        execution_plan=plan,
-        target=target,
-    )
-    return execute_prepared_linear(
-        input_qdata,
-        row_scales,
-        weight_qdata,
-        weight_scale,
-        bias,
-        input.dtype,
-        plan,
-    )
-
-
-def linear(
-    input: torch.Tensor,  # noqa: A002
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-    activation_fn: str | None = None,
-    input_scale: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Run ConvRot input rotation, quantization, and INT8 GEMM."""
-    return run_linear(
-        input,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        activation_fn=activation_fn,
-        input_scale=input_scale,
-    )
-
-
-def prepare_input(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    group_size: int,
-    activation_fn: str | None = None,
-    input_scale: torch.Tensor | None = None,
-    *,
-    out: tuple[torch.Tensor, torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply an optional activation, then rotate and quantize a linear input."""
-    in_features = input.shape[-1] // input_activation_width(activation_fn)
-    target = AcceleratorTarget.from_device(input.device)
-    plan = policy.select_execution_plan(
-        target,
-        in_features=in_features,
-    )
-    return prepare_input_with_plan(
-        input,
-        in_features,
-        group_size,
-        activation_fn=activation_fn,
-        input_scale=input_scale,
-        execution_plan=plan,
-        target=target,
-        out=out,
-    )
-
-
-def linear_prepared(
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    logical_dtype: torch.dtype,
-    *,
-    out: torch.Tensor | None = None,
-    second_projection: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
-) -> torch.Tensor:
-    """Apply one weight to an input prepared by the matching operator."""
-    plan = default_execution_plan(weight_qdata, rows=math.prod(input_qdata.shape[:-1]))
-    return execute_prepared_linear(
-        input_qdata,
-        input_scale,
-        weight_qdata,
-        weight_scale,
-        bias,
-        logical_dtype,
-        plan,
-        out=out,
-        second_projection=second_projection,
-    )
 
 
 @triton.jit
 def _fence_register_value(value):
-    """Keep AMDGPU scheduling from hoisting second-half residual loads across rounding."""
+    """Sequence AMDGPU register scheduling to bound VGPR spills in 256-column epilogues.
+
+    In 256-column tiles, splitting the residual epilogue into two 128-column halves
+    separated by this zero-cost inline-asm fence and ``tl.debug_barrier()`` prevents
+    AMDGPU from hoisting residual global loads across both live ``128x256`` INT32
+    accumulators, keeping ``128x128`` and non-reusable ``256x64`` kernels spill-free
+    while keeping reusable-update ``256x64`` spills bounded.
+    """
     return tl.inline_asm_elementwise(
         ";;", "=v,0", [value], dtype=value.dtype, is_pure=False, pack=1
     )
@@ -918,7 +721,14 @@ def _amd_int8_residual_matmul_kernel(
     python_indexing: tl.constexpr,
     accumulator_seed: tl.constexpr,
 ):
-    """Project and fuse a gated residual update across one or two 128-column halves."""
+    """Project and fuse a gated residual update across one or two 128-column halves.
+
+    Selected on aligned ``gfx1201`` 16-bit projections with ``rows > 64`` and
+    signed 32-bit SRD offsets. Rounds each 128-column half to its logical dtype in
+    registers before calling shared Triton residual arithmetic; 256-column tiles
+    sequence the two halves with ``_fence_register_value`` and ``tl.debug_barrier()``
+    so residual global loads do not hoist across both live INT32 accumulators.
+    """
     pid = tl.program_id(0)
     num_pid_n: tl.constexpr = n // block_n
     row_block_count = tl.num_programs(0) // num_pid_n
@@ -990,26 +800,24 @@ def _amd_int8_residual_matmul_kernel(
         )
 
 
-def linear_prepared_residual(
+def try_launch_prepared_residual(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
+    output: torch.Tensor,
     residual_add: ResidualAdd,
     *,
-    row_offset: int = 0,
-    projection_scratch: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Use a measured native epilogue when supported, or the standalone add."""
-    leading_shape = input_qdata.shape[:-1]
-    m = math.prod(leading_shape)
-    n, k = weight_qdata.shape
-    target = AcceleratorTarget.from_device(input_qdata.device)
-    plan = default_execution_plan(weight_qdata, target=target, rows=m)
-    input_qdata_2d = input_qdata.reshape(m, k)
-    input_scale_1d = input_scale.reshape(m)
-    if policy.supports_residual_epilogue(
+    row_offset: int,
+    execution_plan: LinearExecutionPlan,
+    target: AcceleratorTarget,
+) -> bool:
+    """Launch the RDNA4 fused residual GEMM when supported; return False for fallback."""
+    m, k = input_qdata.shape
+    n = weight_qdata.shape[0]
+    plan = execution_plan
+    if not policy.supports_residual_epilogue(
         target,
         plan,
         residual_add.base.dtype,
@@ -1017,53 +825,42 @@ def linear_prepared_residual(
         in_features=k,
         out_features=n,
     ):
+        return False
+    if m and n:
         base = residual_add.base.view(-1, n)[row_offset : row_offset + m]
-        output = residual_add.output.view(-1, n)[row_offset : row_offset + m]
-        if m and n:
-            output_tiles = triton.cdiv(m, 128) * (n // plan.matmul_block_n)
-            gate = residual_add.gate
-            reusable = residual_add.reusable
-            reusable_gate = gate if reusable is None else reusable.gate
-            with device_context(input_qdata.device):
-                _amd_int8_residual_matmul_kernel[(output_tiles,)](
-                    input_qdata_2d,
-                    weight_qdata,
-                    output,
-                    input_scale_1d,
-                    weight_scale,
-                    bias if bias is not None else output,
-                    base,
-                    gate,
-                    reusable_gate,
-                    residual_add.gate_indices,
-                    row_offset,
-                    gate.shape[0],
-                    0 if reusable is None else reusable.gate.shape[0],
-                    m,
-                    n=n,
-                    k=k,
-                    block_n=plan.matmul_block_n,
-                    block_k=plan.matmul_block_k,
-                    has_bias=bias is not None,
-                    full_rows=m % 128 == 0,
-                    gate_row_stride=gate.stride(0),
-                    reusable_gate_row_stride=0 if reusable is None else reusable.gate.stride(0),
-                    has_reusable_update=reusable is not None,
-                    python_indexing=residual_add.python_indexing,
-                    accumulator_seed=policy.matmul_accumulator_seed(target, k, output_tiles),
-                    **_amd_matmul_compiler_options(target),
-                    num_stages=2,
-                    num_warps=8,
-                )
-        return output.view(*leading_shape, n)
-    projection = execute_prepared_linear(
-        input_qdata,
-        input_scale,
-        weight_qdata,
-        weight_scale,
-        bias,
-        residual_add.base.dtype,
-        plan,
-        out=projection_scratch,
-    )
-    return apply_residual_add(projection, residual_add, row_offset)
+        output_tiles = triton.cdiv(m, 128) * (n // plan.matmul_block_n)
+        gate = residual_add.gate
+        reusable = residual_add.reusable
+        reusable_gate = gate if reusable is None else reusable.gate
+        with device_context(input_qdata.device):
+            _amd_int8_residual_matmul_kernel[(output_tiles,)](
+                input_qdata,
+                weight_qdata,
+                output,
+                input_scale,
+                weight_scale,
+                bias if bias is not None else output,
+                base,
+                gate,
+                reusable_gate,
+                residual_add.gate_indices,
+                row_offset,
+                gate.shape[0],
+                0 if reusable is None else reusable.gate.shape[0],
+                m,
+                n=n,
+                k=k,
+                block_n=plan.matmul_block_n,
+                block_k=plan.matmul_block_k,
+                has_bias=bias is not None,
+                full_rows=m % 128 == 0,
+                gate_row_stride=gate.stride(0),
+                reusable_gate_row_stride=0 if reusable is None else reusable.gate.stride(0),
+                has_reusable_update=reusable is not None,
+                python_indexing=residual_add.python_indexing,
+                accumulator_seed=policy.matmul_accumulator_seed(target, k, output_tiles),
+                **_amd_matmul_compiler_options(target),
+                num_stages=2,
+                num_warps=8,
+            )
+    return True

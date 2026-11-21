@@ -13,9 +13,9 @@ from triton.compiler import ASTSource
 
 from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear.convrot.int8 import triton as kernels
 from piper_kernels.linear.convrot.int8._amd import policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd
-from piper_kernels.linear.convrot.int8._kernels import triton as kernels
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
 
