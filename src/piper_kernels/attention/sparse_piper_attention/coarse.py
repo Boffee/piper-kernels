@@ -45,7 +45,7 @@ def _validate_coarse_key_blocks(
         )
 
 
-def validate_coarse_residual_inputs(
+def validate_coarse_residual_inputs(  # noqa: PLR0912
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -64,6 +64,10 @@ def validate_coarse_residual_inputs(
         )
     if query.shape != key.shape or query.shape != value.shape:
         raise ValueError(f"{routing_label} coarse attention requires equal Q/K/V shapes")
+    if query.shape[1] < 1 or query.shape[2] < 1:
+        raise ValueError(
+            f"{routing_label} coarse attention requires nonempty sequence and head dimensions"
+        )
     if coarse_gate.shape != query.shape:
         raise ValueError(f"{routing_label} coarse attention gate must match Q/K/V")
     if any(tensor.device != query.device for tensor in (key, value, coarse_gate)):
@@ -72,6 +76,13 @@ def validate_coarse_residual_inputs(
         raise TypeError(f"{routing_label} coarse attention tensors must be floating-point")
     if not coarse_gate.is_floating_point() or coarse_gate.dtype is not query.dtype:
         raise ValueError(f"{routing_label} coarse attention gate must share the Q/K/V dtype")
+    if (
+        query.layout is not torch.strided
+        or key.layout is not torch.strided
+        or query.stride(-1) != 1
+        or key.stride(-1) != 1
+    ):
+        raise ValueError(f"{routing_label} coarse attention Q/K features must be contiguous")
 
     validate_coarse_scale(coarse_scale)
     if block_lengths is None:
@@ -129,6 +140,7 @@ def mean_pool_block_values(
             sequence_length=sequence_length,
             device=value.device,
             context="coarse attention",
+            require_contiguous=False,
         )
     return _mean_pool_token_blocks(value, block_lengths)
 

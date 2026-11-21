@@ -23,7 +23,7 @@ def _sequence_block_summaries_validated(
     block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute policy-specific Q/K summaries for already-validated operands."""
-    summarize = _backend.select_sequence_summaries(query, key)
+    summarize = _backend.select_sequence_summaries(query, key, block_lengths)
     if summarize is not None:
         return summarize(query, key, routing_mode, block_lengths)
 

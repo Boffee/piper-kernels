@@ -61,7 +61,7 @@ def packed_routes_from_sequences(
         block_lengths,
         validate=validate,
     )
-    return _packed_routes_from_validated_summaries(
+    return packed_routes_from_summaries(
         query_summary,
         key_primary,
         key_aux,
@@ -69,10 +69,11 @@ def packed_routes_from_sequences(
         routing_mode,
         skip_dense_routing=skip_dense_routing,
         force_tile_mask=force_tile_mask,
+        validate=False,
     )
 
 
-def _packed_routes_from_validated_summaries(
+def packed_routes_from_summaries(
     query_summary: torch.Tensor,
     key_primary: torch.Tensor,
     key_aux: torch.Tensor,
@@ -81,8 +82,11 @@ def _packed_routes_from_validated_summaries(
     *,
     skip_dense_routing: bool = False,
     force_tile_mask: torch.Tensor | None = None,
+    validate: bool = True,
 ) -> PackedRoutes:
-    """Select routes from already-validated Q/K summaries."""
+    """Select routes through the fixed policy-independent summary contract."""
+    if validate:
+        _validate_summaries(query_summary, key_primary, key_aux, routing_mode)
     batch, heads, query_blocks, _head_dim = query_summary.shape
     builder = PackedRouteBuilder(
         layout,
@@ -106,29 +110,6 @@ def _packed_routes_from_validated_summaries(
     return builder.routes
 
 
-def packed_routes_from_summaries(
-    query_summary: torch.Tensor,
-    key_primary: torch.Tensor,
-    key_aux: torch.Tensor,
-    layout: _ResolvedRouteLayout,
-    routing_mode: int,
-    *,
-    skip_dense_routing: bool = False,
-    force_tile_mask: torch.Tensor | None = None,
-) -> PackedRoutes:
-    """Select routes through the fixed policy-independent summary contract."""
-    _validate_summaries(query_summary, key_primary, key_aux, routing_mode)
-    return _packed_routes_from_validated_summaries(
-        query_summary,
-        key_primary,
-        key_aux,
-        layout,
-        routing_mode,
-        skip_dense_routing=skip_dense_routing,
-        force_tile_mask=force_tile_mask,
-    )
-
-
 def packed_routes_and_coarse_from_summaries(
     query_summary: torch.Tensor,
     key_primary: torch.Tensor,
@@ -145,6 +126,8 @@ def packed_routes_and_coarse_from_summaries(
     """Route sparsely and attend coarsely from the same summary score chunks."""
     _validate_summaries(query_summary, key_primary, key_aux, routing_mode)
     validate_coarse_scale(coarse_scale)
+    if key_primary.shape[2] != pooled_value.shape[2]:
+        raise ValueError("coarse score key blocks must match pooled V blocks")
     batch, heads, query_blocks, _head_dim = query_summary.shape
     builder = PackedRouteAndCoarseBuilder(
         layout,
@@ -168,7 +151,7 @@ def packed_routes_and_coarse_from_summaries(
     return builder.finish()
 
 
-def routing_scores(
+def _routing_scores_unchecked(
     query_summary: torch.Tensor,
     key_primary: torch.Tensor,
     key_aux: torch.Tensor,
@@ -217,6 +200,25 @@ def routing_scores(
     return scores.reshape(batch, heads, query_blocks, key_blocks)
 
 
+def routing_scores(
+    query_summary: torch.Tensor,
+    key_primary: torch.Tensor,
+    key_aux: torch.Tensor,
+    routing_mode: int,
+    *,
+    score_scale: float | None = None,
+) -> torch.Tensor:
+    """Contract one summary chunk using the selected routing policy."""
+    validate_routing_mode(routing_mode)
+    return _routing_scores_unchecked(
+        query_summary,
+        key_primary,
+        key_aux,
+        routing_mode,
+        score_scale=score_scale,
+    )
+
+
 def score_chunks(
     query_summary: torch.Tensor,
     key_primary: torch.Tensor,
@@ -226,11 +228,12 @@ def score_chunks(
     score_scale: float | None = None,
 ) -> Iterator[tuple[int, torch.Tensor]]:
     """Yield bounded query-block score chunks for either routing policy."""
+    validate_routing_mode(routing_mode)
     for start in range(0, query_summary.shape[2], _QUERY_CHUNK_BLOCKS):
         stop = min(start + _QUERY_CHUNK_BLOCKS, query_summary.shape[2])
         yield (
             start,
-            routing_scores(
+            _routing_scores_unchecked(
                 query_summary[:, :, start:stop],
                 key_primary,
                 key_aux,

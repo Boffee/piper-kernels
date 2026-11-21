@@ -385,3 +385,89 @@ def test_compiled_residual_accepts_changed_block_lengths_without_another_graph()
 
     assert len(captured_graphs) == 1
     assert not torch.equal(first, second)
+
+
+@pytest.mark.parametrize("routing", ["mean", "minmax"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("compile_function", [False, True])
+def test_sparse_piper_coarse_residual_rejects_noncontiguous_block_lengths(
+    routing: str,
+    device: str,
+    compile_function: bool,
+) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    shape = (1, 2 * 64, 2, 64)
+    tensors = [torch.randn(shape, device=device, dtype=torch.bfloat16) for _ in range(4)]
+    strided_lengths = torch.tensor([64, 17, 64, 17], dtype=torch.int32, device=device)[::2]
+    assert not strided_lengths.is_contiguous()
+    fn = (
+        torch.compile(sparse_piper_coarse_residual, backend="eager", fullgraph=True)
+        if compile_function
+        else sparse_piper_coarse_residual
+    )
+    expected_error = torch._dynamo.exc.TorchRuntimeError if compile_function else ValueError
+    with pytest.raises(expected_error, match="contiguous"):
+        fn(
+            *tensors,
+            routing=routing,  # type: ignore[arg-type]
+            coarse_scale=shape[-1] ** -0.5,
+            block_lengths=strided_lengths,
+        )
+
+
+@pytest.mark.parametrize("compile_function", [False, True])
+@pytest.mark.parametrize("bad_operand", ["query", "key"])
+def test_sparse_piper_coarse_residual_rejects_noncontiguous_feature_stride(
+    compile_function: bool,
+    bad_operand: str,
+) -> None:
+    shape = (1, 64, 2, 16)
+    query, key, value, coarse_gate = [torch.randn(shape) for _ in range(4)]
+    strided = torch.randn(1, 64, 2, 32)[..., ::2]
+    if bad_operand == "query":
+        query = strided
+    else:
+        key = strided
+    fn = (
+        torch.compile(sparse_piper_coarse_residual, backend="eager", fullgraph=True)
+        if compile_function
+        else sparse_piper_coarse_residual
+    )
+    expected_error = torch._dynamo.exc.TorchRuntimeError if compile_function else ValueError
+    with pytest.raises(expected_error, match="features must be contiguous"):
+        fn(query, key, value, coarse_gate, routing="minmax", coarse_scale=0.25)
+
+
+@pytest.mark.parametrize("compile_function", [False, True])
+@pytest.mark.parametrize("shape", [(1, 0, 2, 16), (1, 64, 0, 16)])
+def test_sparse_piper_coarse_residual_rejects_empty_sequence_or_zero_heads(
+    compile_function: bool,
+    shape: tuple[int, int, int, int],
+) -> None:
+    tensors = [torch.empty(shape) for _ in range(4)]
+    fn = (
+        torch.compile(sparse_piper_coarse_residual, backend="eager", fullgraph=True)
+        if compile_function
+        else sparse_piper_coarse_residual
+    )
+    expected_error = torch._dynamo.exc.TorchRuntimeError if compile_function else ValueError
+    with pytest.raises(expected_error, match="nonempty sequence and head dimensions"):
+        fn(*tensors, routing="mean", coarse_scale=0.25)
+
+
+def test_mean_pool_block_values_accepts_noncontiguous_block_lengths() -> None:
+    generator = torch.Generator().manual_seed(806)
+    value = torch.randn((1, 2 * 64, 2, 8), generator=generator)
+    strided_lengths = torch.tensor([64, 99, 17, 99], dtype=torch.int32)[::2]
+    assert not strided_lengths.is_contiguous()
+    torch.testing.assert_close(
+        mean_pool_block_values(value, strided_lengths),
+        mean_pool_block_values(value, strided_lengths.contiguous()),
+    )
+
+
+def test_routing_scores_rejects_invalid_routing_mode() -> None:
+    summary = torch.zeros((1, 1, 2, 16))
+    with pytest.raises(ValueError, match="routing mode"):
+        routing_scores(summary, summary, summary, 99)

@@ -432,13 +432,16 @@ def test_fused_operand_preparation_requires_native_preparation(monkeypatch):
     assert _backend.use_fused_operand_preparation(query, query, _contracts._MINMAX_ROUTING) is False
 
 
-@pytest.mark.parametrize("invalid", ["dtype", "width", "stride", "key_dtype", "device"])
+@pytest.mark.parametrize(
+    "invalid", ["dtype", "width", "stride", "key_dtype", "device", "noncontiguous_block_lengths"]
+)
 def test_summary_selection_preserves_tensor_constraints(monkeypatch, invalid):
     monkeypatch.setattr(
         AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("cuda", "sm120")
     )
     query = torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
     key = torch.empty_like(query)
+    block_lengths = None
     if invalid == "dtype":
         query, key = query.double(), key.double()
     elif invalid == "width":
@@ -447,9 +450,11 @@ def test_summary_selection_preserves_tensor_constraints(monkeypatch, invalid):
         query = query.transpose(-1, -2)
     elif invalid == "key_dtype":
         key = key.half()
-    else:
+    elif invalid == "device":
         key = key.to("meta")
-    assert _backend.select_sequence_summaries(query, key) is None
+    else:
+        block_lengths = torch.tensor([64, 17, 64, 17], dtype=torch.int32)[::2]
+    assert _backend.select_sequence_summaries(query, key, block_lengths) is None
 
 
 @pytest.mark.parametrize("grad_operand", ["query", "key"])
@@ -557,7 +562,7 @@ def test_dense_orchestration_uses_selected_operations(
     # Both policy paths must use the backend already selected for this call.
     monkeypatch.setattr(
         dispatch,
-        "_packed_routes_from_validated_summaries",
+        "packed_routes_from_summaries",
         Mock(
             return_value=_routing.packed_routes_from_sequences(
                 query.transpose(1, 2),
@@ -635,7 +640,7 @@ def test_summaries_use_selected_operation_after_validation(monkeypatch):
     select = Mock(return_value=summarize)
     monkeypatch.setattr(_backend, "select_sequence_summaries", select)
     assert _summaries.sequence_block_summaries(query, query, _contracts._MINMAX_ROUTING) is expected
-    select.assert_called_once_with(query, query)
+    select.assert_called_once_with(query, query, None)
     summarize.assert_called_once_with(query, query, _contracts._MINMAX_ROUTING, None)
     with pytest.raises(ValueError, match="rank-four"):
         _summaries.sequence_block_summaries(query[0], query, _contracts._MINMAX_ROUTING)

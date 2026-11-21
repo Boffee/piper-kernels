@@ -64,7 +64,7 @@ def validate_block_lengths(
     sequence_length: int,
     device: torch.device,
     context: str,
-    require_contiguous: bool = False,
+    require_contiguous: bool = True,
     check_values: bool = True,
 ) -> int:
     """Validate one valid-prefix length per physical K64 block."""

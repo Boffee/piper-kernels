@@ -235,7 +235,11 @@ def use_fused_operand_preparation(
     return nvidia_policy.uses_async_copies(target) or amd_policy.supports_target(target)
 
 
-def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> SequenceSummaries | None:
+def select_sequence_summaries(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
+) -> SequenceSummaries | None:
     """Select native Q/K summaries for a supported device, layout, and dtype."""
     if _summary_backend is None:
         return None
@@ -249,6 +253,15 @@ def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> Sequenc
         and key.stride(-1) == 1
         and query.dtype in SUPPORTED_DTYPES
         and key.dtype == query.dtype
+        and (
+            block_lengths is None
+            or (
+                block_lengths.ndim == 1
+                and block_lengths.dtype is torch.int32
+                and block_lengths.device == query.device
+                and block_lengths.is_contiguous()
+            )
+        )
     ):
         return None
     target = AcceleratorTarget.from_device(query.device)

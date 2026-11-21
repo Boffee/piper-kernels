@@ -25,11 +25,12 @@ from ._contracts import (
     routing_mode_from_name,
     validate_block_lengths,
     validate_force_tiles,
+    validate_routing_mode,
     validate_sparse_query_blocks,
 )
 from ._routing import (
-    _packed_routes_from_validated_summaries,
     packed_routes_from_sequences,
+    packed_routes_from_summaries,
 )
 from .reference import reference_sparse_piper_attention
 
@@ -321,7 +322,7 @@ def _run_sparse_piper_attention(  # noqa: PLR0913
         assert operands.query_summary is not None
         assert operands.key_summary is not None
         assert operands.key_aux is not None
-        routes = _packed_routes_from_validated_summaries(
+        routes = packed_routes_from_summaries(
             operands.query_summary,
             operands.key_summary,
             operands.key_aux,
@@ -329,6 +330,7 @@ def _run_sparse_piper_attention(  # noqa: PLR0913
             routing_mode,
             skip_dense_routing=backend.skip_dense_routing,
             force_tile_mask=force_tile_mask,
+            validate=False,
         )
         prepared = operands.with_routes(
             routes.indices,
@@ -362,6 +364,7 @@ def _sparse_piper_attention_op(  # noqa: PLR0913, PLR0917
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    validate_routing_mode(routing_mode)
     layout = _resolve_route_layout(
         ratio_profile.units,
         sparse_key_blocks,
@@ -390,10 +393,11 @@ def _sparse_piper_attention_op_fake(
     _ratio_profile: _SparsePiperRatioProfile,
     _sparse_key_blocks: int,
     _scale: float,
-    _routing_mode: int,
+    routing_mode: int,
     _block_lengths: torch.Tensor | None = None,
     _sparse_query_blocks: int | None = None,
     _force_tile_ids: torch.Tensor | None = None,
     _force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    validate_routing_mode(routing_mode)
     return torch.empty_like(query, memory_format=torch.contiguous_format)
