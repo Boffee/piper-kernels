@@ -80,12 +80,15 @@ def test_amd_missing_runtime_falls_back(monkeypatch):
 @pytest.mark.parametrize(
     ("width", "blocks", "warps", "fused"),
     [
-        (256, (256, 0, 0), 8, True),
+        (256, (256, 0, 0), 4, True),
+        (2048, (2048, 0, 0), 4, True),
+        (4096, (4096, 0, 0), 8, True),
         (5376, (2048, 2048, 2048), 4, True),
-        (9216, (8192, 1024, 0), 16, True),
-        (12288, (4096, 4096, 4096), 16, True),
-        (16384, (16384, 0, 0), 32, True),
-        (32768, (32768, 0, 0), 32, False),
+        (8192, (8192, 0, 0), 8, True),
+        (9216, (8192, 1024, 0), 8, True),
+        (12288, (4096, 4096, 4096), 8, True),
+        (16384, (16384, 0, 0), 16, True),
+        (32768, (32768, 0, 0), 16, False),
     ],
 )
 def test_rdna4_preparation_policy(width, blocks, warps, fused):
