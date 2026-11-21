@@ -1,6 +1,6 @@
 """Sparse fusion owns tensor contracts; selected operations own execution."""
 
-import builtins
+import importlib.abc
 import importlib.util
 import operator
 import sys
@@ -44,15 +44,15 @@ from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
 from piper_kernels.fusions.sparse_piper import _output as output_common
 
 
-def _operands(sequence=193, heads=3, head_dim=128, input_features=272):
+def _operands(sequence=193, heads=3, head_dim=128, input_features=272, device="cuda:1"):
     return (
-        torch.empty((2, sequence, input_features), device="cuda:1", dtype=torch.int8),
-        torch.empty((2, sequence), device="cuda:1"),
-        torch.empty((heads * head_dim, input_features), device="cuda:1", dtype=torch.int8),
-        torch.empty((heads * head_dim, 1), device="cuda:1"),
-        torch.empty(head_dim, device="cuda:1", dtype=torch.bfloat16),
-        torch.empty((sequence, head_dim * 3 // 4), device="cuda:1"),
-        torch.empty((sequence, head_dim * 3 // 4), device="cuda:1"),
+        torch.empty((2, sequence, input_features), device=device, dtype=torch.int8),
+        torch.empty((2, sequence), device=device),
+        torch.empty((heads * head_dim, input_features), device=device, dtype=torch.int8),
+        torch.empty((heads * head_dim, 1), device=device),
+        torch.empty(head_dim, device=device, dtype=torch.bfloat16),
+        torch.empty((sequence, head_dim * 3 // 4), device=device),
+        torch.empty((sequence, head_dim * 3 // 4), device=device),
     )
 
 
@@ -105,12 +105,7 @@ def test_projection_selection_uses_operand_target_and_keeps_support_closed(
     monkeypatch, target, head_dim, platform
 ):
     monkeypatch.setattr(sys, "platform", platform)
-    probe = Mock(return_value=target)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
-    monkeypatch.setattr(
-        torch.cuda, "current_device", Mock(side_effect=AssertionError("current GPU"))
-    )
-    operand = SimpleNamespace(device=torch.device("cuda:1"))
+    operand = torch.empty(1)
     expected = None
     if target.is_cuda_capability(12, 0) or target.is_cuda_capability(8):
         expected = nvidia
@@ -120,40 +115,59 @@ def test_projection_selection_uses_operand_target_and_keeps_support_closed(
         and target.is_architecture("gfx1200", "gfx1201")
     ):
         expected = amd
-    assert _backend.select_projection_backend(operand, head_dim=head_dim) is expected
-    probe.assert_called_once_with(operand.device)
+    assert _backend.select_projection_backend(operand, head_dim=head_dim, target=target) is expected
 
 
-def test_missing_projection_backend_does_not_probe_device(monkeypatch):
-    monkeypatch.setattr(_backend, "_nvidia_projection", None)
-    monkeypatch.setattr(_backend, "_amd_projection", None)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
-    assert _backend.select_projection_backend(torch.empty(1)) is None
+@pytest.mark.parametrize("is_hip", [False, True])
+def test_selectors_resolve_operand_device_not_current_device(monkeypatch, is_hip):
+    device = torch.device("cuda:1")
+    monkeypatch.setattr(
+        torch.cuda, "current_device", Mock(side_effect=AssertionError("current GPU"))
+    )
+    if is_hip:
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(torch.version, "hip", "7.0")
+        probe = Mock(return_value=SimpleNamespace(gcnArchName="gfx1201"))
+        monkeypatch.setattr(torch.cuda, "get_device_properties", probe)
+    else:
+        monkeypatch.setattr(torch.version, "hip", None)
+        probe = Mock(return_value=(12, 0))
+        monkeypatch.setattr(torch.cuda, "get_device_capability", probe)
+
+    operand = SimpleNamespace(device=device, ndim=0)
+    assert _backend.select_projection_backend(operand) is (amd if is_hip else nvidia)  # type: ignore[arg-type]
+    output_backend = _backend.select_output_backend(operand)  # type: ignore[arg-type]
+    assert output_backend is not None
+    assert probe.call_count == 2
+    assert all(call.args == (device,) for call in probe.call_args_list)
+
+
+class _MissingModuleFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, blocked_name: str, error: ModuleNotFoundError) -> None:
+        self._blocked_name = blocked_name
+        self._error = error
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == self._blocked_name:
+            raise self._error
 
 
 @pytest.mark.parametrize("missing", ["triton", "triton.language.extra.cuda", "triton_extra", None])
 @pytest.mark.parametrize("vendor", ["_nvidia", "_amd"])
 def test_projection_import_only_tolerates_absent_top_level_triton(monkeypatch, missing, vendor):
-    original_import = builtins.__import__
+    package = "piper_kernels.fusions.convrot_int8_sparse_piper"
+    implementation = "dispatch" if vendor == "_nvidia" else "triton"
+    fullname = f"{package}.{vendor}.{implementation}"
     error = ModuleNotFoundError("missing dependency", name=missing)
-
-    def import_with_missing_dependency(
-        name,
-        globals=None,  # noqa: A002 - match the builtin import signature
-        locals=None,  # noqa: A002
-        fromlist=(),
-        level=0,
-    ):
-        implementation = "dispatch" if vendor == "_nvidia" else "triton"
-        if name == vendor and fromlist == (implementation,) and level == 1:
-            raise error
-        return original_import(name, globals, locals, fromlist, level)
-
+    vendor_pkg = sys.modules.get(f"{package}.{vendor}")
+    if vendor_pkg is not None:
+        monkeypatch.delitem(vendor_pkg.__dict__, implementation, raising=False)
+    monkeypatch.delitem(sys.modules, fullname, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_MissingModuleFinder(fullname, error), *sys.meta_path])
     spec = importlib.util.spec_from_file_location(_backend.__name__, _backend.__file__)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    monkeypatch.setattr(builtins, "__import__", import_with_missing_dependency)
     if missing == "triton":
         spec.loader.exec_module(module)
         assert getattr(module, f"{vendor}_projection") is None
@@ -221,15 +235,10 @@ def test_projection_facades_forward_shared_buffers_without_execution_plans(
 
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
-@pytest.mark.parametrize(("architecture", "head_dim"), [("gfx1100", 128), ("gfx1100", 64)])
-def test_unvalidated_projection_rejects_before_output_allocation(
-    monkeypatch, operation, architecture, head_dim
-):
-    monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", architecture)
-    )
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_unvalidated_projection_rejects_before_output_allocation(monkeypatch, operation, head_dim):
     with FakeTensorMode():
-        operands = _operands(head_dim=head_dim)
+        operands = _operands(head_dim=head_dim, device="cpu")
         # Allocate the test's own inputs before guarding: a cold FakeTensorMode
         # dispatch routes new_empty through torch.empty, so allocating after the
         # guard fails on test setup instead of on library allocations.
@@ -253,27 +262,19 @@ def test_output_support_is_independent_of_qkv_projection_support(
     monkeypatch, missing, target, platform
 ):
     monkeypatch.setattr(sys, "platform", platform)
-    monkeypatch.setattr(_backend, "_nvidia_projection", None)
-    monkeypatch.setattr(_backend, "_amd_projection", None)
-    probe = Mock(return_value=target)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", probe)
-    monkeypatch.setattr(
-        torch.cuda, "current_device", Mock(side_effect=AssertionError("current GPU"))
-    )
     attention = Mock(return_value=None if missing == "attention" else object())
     linear = Mock(return_value=None if missing == "linear" else object())
     monkeypatch.setattr(_backend.attention_backend, "select_attention_backend", attention)
     monkeypatch.setattr(_backend.linear_backend, "select_linear_backend", linear)
-    operand = SimpleNamespace(device=torch.device("cuda:1"))
-    assert _backend.select_output_backend(operand) is (
+    operand = torch.empty(1)
+    assert _backend.select_output_backend(operand, target=target) is (
         linear.return_value if missing is None else None
     )
-    attention.assert_called_once_with(operand)
-    probe.assert_called_once_with(operand.device)
+    attention.assert_called_once_with(operand, target=target)
     if missing == "attention":
         linear.assert_not_called()
     else:
-        linear.assert_called_once_with(operand)
+        linear.assert_called_once_with(operand, target=target)
 
 
 @pytest.mark.parametrize(
@@ -294,12 +295,11 @@ def test_unvalidated_output_integration_rejects_before_resolving_operations(
     monkeypatch, platform, target
 ):
     monkeypatch.setattr(sys, "platform", platform)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(return_value=target))
     attention = Mock(side_effect=AssertionError("resolved unsupported attention"))
     linear = Mock(side_effect=AssertionError("resolved unsupported linear"))
     monkeypatch.setattr(_backend.attention_backend, "select_attention_backend", attention)
     monkeypatch.setattr(_backend.linear_backend, "select_linear_backend", linear)
-    assert _backend.select_output_backend(torch.empty(1)) is None
+    assert _backend.select_output_backend(torch.empty(1), target=target) is None
     attention.assert_not_called()
     linear.assert_not_called()
 
@@ -442,11 +442,14 @@ def test_output_fusion_selects_once_before_preparation_and_reuses_backend(
 def test_shared_output_validation_has_no_target_policy_but_nvfp4_still_does(
     monkeypatch, dynamic_activation_scale
 ):
+    monkeypatch.setattr(torch.version, "hip", "7.0")
     monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(gcnArchName="gfx1201"),
     )
     with FakeTensorMode():
-        storage = torch.empty((1, 1, 64, 128), dtype=torch.int8, device="cuda:1")
+        storage = torch.empty((1, 1, 64, 128), dtype=torch.int8, device="cuda:0")
         assert output_common.validate_attention_output(storage, 64, 128) == 128
         with pytest.raises(ValueError, match="requires exact NVIDIA SM120"):
             nvfp4_output._validate_output_projection(
@@ -454,12 +457,12 @@ def test_shared_output_validation_has_no_target_policy_but_nvfp4_still_does(
             )
 
 
-def _projection_match(head_dim, input_features=256):
+def _projection_match(head_dim, input_features=256, device="cpu"):
     graph = torch.fx.Graph()
 
     def operand(name, shape, dtype):
         node = graph.placeholder(name)
-        node.meta["val"] = torch.empty(shape, dtype=dtype)
+        node.meta["val"] = torch.empty(shape, dtype=dtype, device=device)
         return node
 
     input_node = operand("sparse_input", (1, 128, input_features), torch.bfloat16)
@@ -522,16 +525,17 @@ def test_amd_projection_compiler_selects_actual_attention_width(
     monkeypatch, head_dim, input_features
 ):
     monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(torch.version, "hip", "7.0")
     monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
-    )
-    monkeypatch.setattr(
-        _compile.linear_backend, "select_linear_backend", Mock(return_value=object())
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(gcnArchName="gfx1201"),
     )
     validate = Mock(return_value=True)
     monkeypatch.setattr(_compile.sparse_piper_compile, "valid_sparse_piper_attention", validate)
-    matched, projections, _ = _projection_match(head_dim, input_features)
-    assert _compile._valid_sparse_piper_projection(matched, *projections)
+    with FakeTensorMode():
+        matched, projections, _ = _projection_match(head_dim, input_features, device="cuda:0")
+        assert _compile._valid_sparse_piper_projection(matched, *projections)
     validate.assert_called_once()
 
 
@@ -611,11 +615,18 @@ def _capture_projection(
     sequence=193,
     heads=3,
     input_features=272,
+    execution_plan=None,
 ):
     monkeypatch.setattr(nvidia.linear_gluon, "operands_aligned", lambda *operands: True)
     if target is None:
         target = AcceleratorTarget("cuda", "sm120")
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
+    if target.is_nvidia_cuda:
+        monkeypatch.setattr(torch.version, "hip", None)
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_capability",
+            lambda _device, capability=target.cuda_capability: capability,
+        )
     functions = {
         "query": _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel,
         "key": _kernels._convrot_project_rmsnorm_rope_quantize_sparse_key_kernel,
@@ -635,12 +646,30 @@ def _capture_projection(
             input_features=input_features,
         )
         bias = operands[3].new_empty((heads * head_dim,)) if with_bias else None
-        _call(
-            operation,
-            operands,
-            bias=bias,
-            value_format=ValueFormat.AMD_WMMA if target.is_amd_hip else ValueFormat.TRANSPOSED,
-        )
+        if execution_plan is None:
+            _call(
+                operation,
+                operands,
+                bias=bias,
+                value_format=ValueFormat.AMD_WMMA if target.is_amd_hip else ValueFormat.TRANSPOSED,
+            )
+        else:
+            assert operation == "value"
+            qdata, scale, weight, weight_scale, *_ = operands
+            out = value.allocate_value_output(
+                qdata, qdata.shape[0], heads, sequence, head_dim, ValueFormat.AMD_WMMA
+            )
+            implementation.project_value(
+                qdata,
+                scale,
+                weight,
+                weight_scale,
+                None,
+                value_format=ValueFormat.AMD_WMMA,
+                out=out,
+                bias=bias,
+                execution_plan=execution_plan,
+            )
     guard.assert_called_once_with(torch.device("cuda:1"))
     for call in kernel.__getitem__.return_value.call_args_list:
         assert call.kwargs["bias_ptr"] is bias
@@ -799,7 +828,14 @@ def test_production_launches_compile_with_expected_storage_precision(
 def test_amd_aligned_value_projection_compiles_without_vgpr_spills(monkeypatch, head_dim):
     if sys.platform != "linux":
         pytest.skip("ROCm support is Linux-only")
-    monkeypatch.setattr(amd.policy, "supports_gluon", lambda *args, **kwargs: False)
+    plan = amd.policy.select_execution_plan(
+        "value",
+        head_dim=head_dim,
+        input_features=256,
+        heads=4,
+        operands_aligned=False,
+        value_format=ValueFormat.AMD_WMMA,
+    )
     function, kernel = _capture_projection(
         monkeypatch,
         "value",
@@ -809,6 +845,7 @@ def test_amd_aligned_value_projection_compiles_without_vgpr_spills(monkeypatch, 
         sequence=256,
         heads=4,
         input_features=256,
+        execution_plan=plan,
     )
     target = GPUTarget("hip", "gfx1201", 32)
     calls = kernel.__getitem__.return_value.call_args_list
@@ -932,10 +969,10 @@ def test_amd_policy_and_gluon_eligibility_contracts():
     )
 
     with FakeTensorMode():
-        q_in = torch.empty((1, 256, 256), device="cuda:1", dtype=torch.int8)
-        w_d64_even = torch.empty((4 * 64, 256), device="cuda:1", dtype=torch.int8)
-        w_d64_odd = torch.empty((3 * 64, 256), device="cuda:1", dtype=torch.int8)
-        w_d128 = torch.empty((3 * 128, 256), device="cuda:1", dtype=torch.int8)
+        q_in = torch.empty((1, 256, 256), device="cuda:0", dtype=torch.int8)
+        w_d64_even = torch.empty((4 * 64, 256), device="cuda:0", dtype=torch.int8)
+        w_d64_odd = torch.empty((3 * 64, 256), device="cuda:0", dtype=torch.int8)
+        w_d128 = torch.empty((3 * 128, 256), device="cuda:0", dtype=torch.int8)
 
         assert amd_gluon.operands_aligned(
             q_in, w_d64_even, storage_sequence_length=256, rotary_dim=48, head_dim=64
@@ -947,8 +984,8 @@ def test_amd_policy_and_gluon_eligibility_contracts():
             q_in, w_d64_even[:, ::2], storage_sequence_length=256, rotary_dim=48, head_dim=64
         )
         # Signed 32-bit FP32 byte-offset check: 8_388_608 * 64 * 4 exceeds 2**31 bytes.
-        q_large_fp32 = torch.empty((1, 8_388_608, 64), device="cuda:1", dtype=torch.int8)
-        w_small = torch.empty((4 * 64, 64), device="cuda:1", dtype=torch.int8)
+        q_large_fp32 = torch.empty((1, 8_388_608, 64), device="cuda:0", dtype=torch.int8)
+        w_small = torch.empty((4 * 64, 64), device="cuda:0", dtype=torch.int8)
         assert not amd_gluon.operands_aligned(
             q_large_fp32, w_small, storage_sequence_length=8_388_608, rotary_dim=64, head_dim=64
         )
@@ -1093,25 +1130,22 @@ def test_amd_gluon_value_compile_variants_keep_zero_spills(
 
 @pytest.mark.parametrize("operation", ["query", "key", "value"])
 @pytest.mark.parametrize("invalid", ["size", "rank", "dtype", "device", "strides"])
-def test_projection_rejects_invalid_bias_before_backend_selection(monkeypatch, operation, invalid):
-    select = Mock(side_effect=AssertionError("backend must not be selected"))
-    monkeypatch.setattr(_backend, "require_projection_backend", select)
+def test_projection_rejects_invalid_bias_before_backend_selection(operation, invalid):
     with FakeTensorMode():
-        operands = _operands()
-        bias = torch.empty(384, device="cuda:1", dtype=torch.float32)
+        operands = _operands(device="cpu")
+        bias = torch.empty(384, device="cpu", dtype=torch.float32)
         if invalid == "size":
-            bias = torch.empty(383, device="cuda:1")
+            bias = torch.empty(383, device="cpu")
         elif invalid == "rank":
-            bias = torch.empty((1, 384), device="cuda:1")
+            bias = torch.empty((1, 384), device="cpu")
         elif invalid == "dtype":
             bias = bias.to(torch.int8)
         elif invalid == "device":
-            bias = bias.to("cpu")
+            bias = bias.to("meta")
         elif invalid == "strides":
-            bias = torch.empty_strided((384,), (2,), device="cuda:1")
+            bias = torch.empty_strided((384,), (2,), device="cpu")
         with pytest.raises(ValueError, match=r"bias|device|contiguous"):
             _call(operation, operands, bias=bias)
-    select.assert_not_called()
 
 
 @pytest.mark.parametrize("bias_argument", ["positional", "keyword", "duplicate"])

@@ -41,7 +41,7 @@ _MAX_TEST_PRIVATE_IMPORTS = 673
 
 # Legacy private-global monkeypatch totals in tests/ (lower as tests decouple).
 _MAX_TEST_PRIVATE_MONKEYPATCH_FILES = 55
-_MAX_TEST_PRIVATE_MONKEYPATCHES = 389
+_MAX_TEST_PRIVATE_MONKEYPATCHES = 313
 
 _PASS_BASE_NAMES = frozenset(
     {

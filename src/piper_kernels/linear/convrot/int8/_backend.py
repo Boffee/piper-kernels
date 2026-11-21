@@ -366,10 +366,11 @@ class LinearBackend:
         input_scale: torch.Tensor | None = None,
         *,
         out: PreparedInput | None = None,
+        target: AcceleratorTarget | None = None,
     ) -> PreparedInput:
         """Apply an optional activation, then rotate and quantize a linear input."""
         in_features = input.shape[-1] // input_activation_width(activation_fn)
-        target = AcceleratorTarget.from_device(input.device)
+        target = AcceleratorTarget.from_device(input.device) if target is None else target
         plan = self.policy.select_execution_plan(target, in_features=in_features)
         return self.prepare_input_with_plan(
             input,
@@ -393,9 +394,10 @@ class LinearBackend:
         *,
         out: torch.Tensor | None = None,
         second_projection: SecondProjection | None = None,
+        target: AcceleratorTarget | None = None,
     ) -> torch.Tensor:
         """Apply one weight to an input prepared by the matching operator."""
-        target = AcceleratorTarget.from_device(input_qdata.device)
+        target = AcceleratorTarget.from_device(input_qdata.device) if target is None else target
         plan = self.default_execution_plan(
             weight_qdata, target=target, rows=math.prod(input_qdata.shape[:-1])
         )
@@ -423,6 +425,7 @@ class LinearBackend:
         *,
         row_offset: int = 0,
         projection_scratch: torch.Tensor | None = None,
+        target: AcceleratorTarget | None = None,
     ) -> torch.Tensor:
         """Project one chunk and update the corresponding residual output rows.
 
@@ -439,7 +442,7 @@ class LinearBackend:
         leading_shape = input_qdata.shape[:-1]
         m = math.prod(leading_shape)
         n, k = weight_qdata.shape
-        target = AcceleratorTarget.from_device(input_qdata.device)
+        target = AcceleratorTarget.from_device(input_qdata.device) if target is None else target
         plan = self.default_execution_plan(weight_qdata, target=target, rows=m)
         output = residual_add.output.view(-1, n)[row_offset : row_offset + m]
         if self.kernels.try_launch_prepared_residual(
@@ -500,11 +503,16 @@ def select_linear_backend_for_target(target: AcceleratorTarget) -> LinearBackend
     return _amd_backend if amd_policy.supports_target(target) else None
 
 
-def select_linear_backend(input: torch.Tensor) -> LinearBackend | None:  # noqa: A002
+def select_linear_backend(
+    input: torch.Tensor,  # noqa: A002
+    *,
+    target: AcceleratorTarget | None = None,
+) -> LinearBackend | None:
     """Select compatible linear/preparation/projection operations, or a portable fallback."""
     if _nvidia_backend is None and _amd_backend is None:
         return None
-    return select_linear_backend_for_target(AcceleratorTarget.from_device(input.device))
+    resolved_target = AcceleratorTarget.from_device(input.device) if target is None else target
+    return select_linear_backend_for_target(resolved_target)
 
 
 def require_linear_backend(input: torch.Tensor) -> LinearBackend:  # noqa: A002
