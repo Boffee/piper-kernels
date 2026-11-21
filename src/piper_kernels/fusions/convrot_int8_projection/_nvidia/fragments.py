@@ -39,6 +39,7 @@ from piper_kernels.linear.convrot.int8._nvidia.gluon_async_copy import (
     _accumulate as _accumulate_tiles,
 )
 
+from .._plan import resolve_row_block_launches
 from ._plan import (
     GLUON_BLOCK_K,
     GLUON_BLOCK_M,
@@ -504,8 +505,7 @@ def launch_row_blocks(
     their input rows in L2; grouping several row blocks per head, as the Triton kernels
     do, measured 1-3% slower for the sparse projections.
     """
-    full_row_blocks = sequence_rows // BLOCK_M
-    if full_row_blocks:
-        launch(full_row_blocks, 0, mask_rows=mask_full_tiles)
-    if sequence_rows % BLOCK_M:
-        launch(1, full_row_blocks, mask_rows=True)
+    for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
+        sequence_rows, BLOCK_M
+    ):
+        launch(row_blocks, row_block_offset, mask_rows=mask_full_tiles or not aligned_rows)

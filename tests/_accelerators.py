@@ -1,5 +1,7 @@
 """Accelerator gates shared by GPU tests."""
 
+import sys
+
 import torch
 
 from piper_kernels._triton import amd_compiler_workarounds
@@ -15,6 +17,14 @@ def exact_sm120_available() -> bool:
     return torch.cuda.is_available() and AcceleratorTarget.from_device(
         torch.device("cuda")
     ).is_cuda_capability(12, 0)
+
+
+def rdna4_available() -> bool:
+    """Return whether the default CUDA device is a supported Linux/Windows RDNA4 GPU."""
+    if sys.platform not in ("linux", "win32") or not torch.cuda.is_available():
+        return False
+    target = AcceleratorTarget.from_device(torch.device("cuda"))
+    return target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201")
 
 
 def rocm_fences_only_lds() -> bool:

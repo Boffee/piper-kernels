@@ -3,8 +3,6 @@
 # Triton's launch options and constexpr arguments are not ordinary Python parameters.
 # pyright: reportCallIssue=false, reportArgumentType=false
 
-from functools import partial
-
 import torch
 import triton
 
@@ -14,11 +12,14 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
     resolve_qk_quantization,
 )
 from piper_kernels.attention.piper_attention import _quantization
-from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
+from piper_kernels.fusions.convrot_int8_projection._plan import (
+    ProjectionExecutionPlan,
+    resolve_row_block_launches,
+)
 from piper_kernels.fusions.convrot_int8_projection.triton import project_value_chunk_means
 
 from . import _kernels
-from ._interfaces import KeyOutput, ProjectionBackend, QueryOutput, ValueOutput
+from ._interfaces import KeyOutput, QueryOutput, ValueOutput
 
 
 def project_query(
@@ -93,11 +94,8 @@ def project_query(
                 **lds_only_fence_options(execution_plan.lds_only_fences),
             )
 
-        full_blocks = chunk_rows // 64
-        if full_blocks:
-            launch(full_blocks, 0, mask_ragged_tail=False)
-        if chunk_rows % 64:
-            launch(1, full_blocks, mask_ragged_tail=True)
+        for count, offset, aligned_rows in resolve_row_block_launches(chunk_rows, 64):
+            launch(count, offset, mask_ragged_tail=not aligned_rows)
 
 
 def project_key(
@@ -122,16 +120,9 @@ def project_key(
     _, heads, storage_length, head_dim = key_int8.shape
     stored = input_qdata.new_empty((batch, heads, sequence_length, head_dim), dtype=torch.bfloat16)
     with device_context(input_qdata.device):
-        for count, offset, aligned_rows in (
-            (sequence_length // execution_plan.block_m, 0, True),
-            (
-                int(sequence_length % execution_plan.block_m != 0),
-                sequence_length // execution_plan.block_m,
-                False,
-            ),
+        for count, offset, aligned_rows in resolve_row_block_launches(
+            sequence_length, execution_plan.block_m
         ):
-            if not count:
-                continue
             _kernels._project_key_kernel[
                 (count, triton.cdiv(heads, execution_plan.heads_per_program), batch)
             ](
@@ -204,64 +195,37 @@ def project_value(
             block_k=execution_plan.block_k,
             out=mean,
         )
-        for count, offset, aligned in (
-            (sequence // 64, 0, True),
-            (int(sequence % 64 != 0), sequence // 64, False),
-        ):
-            if count:
-                _kernels._project_value_kernel[
-                    (count, triton.cdiv(heads, execution_plan.heads_per_program), batch)
-                ](
-                    input_qdata,
-                    input_scale,
-                    weight_qdata,
-                    weight_scale,
-                    mean,
-                    value,
-                    multiplier,
-                    log_scale,
-                    bias,
-                    sequence,
-                    storage,
-                    mean.shape[2],
-                    batch,
-                    offset,
-                    input_features=input_qdata.shape[2],
-                    heads=heads,
-                    head_dim=head_dim,
-                    heads_per_program=execution_plan.heads_per_program,
-                    block_k=execution_plan.block_k,
-                    group_m=execution_plan.group_m,
-                    packed_amd=packed_amd,
-                    aligned_projection=(
-                        aligned
-                        and input_qdata.shape[2] % execution_plan.block_k == 0
-                        and heads % execution_plan.heads_per_program == 0
-                    ),
-                    num_warps=execution_plan.num_warps,
-                    num_stages=execution_plan.num_stages,
-                    **lds_only_fence_options(execution_plan.lds_only_fences),
-                )
-
-
-_AMD_EXECUTION_PLAN = ProjectionExecutionPlan(
-    block_k=64,
-    heads_per_program=1,
-    num_warps=4,
-    num_stages=2,
-    group_m=8,
-    lds_only_fences=True,
-)
-
-
-class _AmdProjectionBackend:
-    """Bind shared dense projection launchers to the validated RDNA4 schedule."""
-
-    project_query = staticmethod(partial(project_query, execution_plan=_AMD_EXECUTION_PLAN))
-    project_key = staticmethod(partial(project_key, execution_plan=_AMD_EXECUTION_PLAN))
-    project_value = staticmethod(
-        partial(project_value, execution_plan=_AMD_EXECUTION_PLAN, packed_amd=True)
-    )
-
-
-amd_backend: ProjectionBackend = _AmdProjectionBackend()  # pyright: ignore[reportAssignmentType]
+        for count, offset, aligned in resolve_row_block_launches(sequence, 64):
+            _kernels._project_value_kernel[
+                (count, triton.cdiv(heads, execution_plan.heads_per_program), batch)
+            ](
+                input_qdata,
+                input_scale,
+                weight_qdata,
+                weight_scale,
+                mean,
+                value,
+                multiplier,
+                log_scale,
+                bias,
+                sequence,
+                storage,
+                mean.shape[2],
+                batch,
+                offset,
+                input_features=input_qdata.shape[2],
+                heads=heads,
+                head_dim=head_dim,
+                heads_per_program=execution_plan.heads_per_program,
+                block_k=execution_plan.block_k,
+                group_m=execution_plan.group_m,
+                packed_amd=packed_amd,
+                aligned_projection=(
+                    aligned
+                    and input_qdata.shape[2] % execution_plan.block_k == 0
+                    and heads % execution_plan.heads_per_program == 0
+                ),
+                num_warps=execution_plan.num_warps,
+                num_stages=execution_plan.num_stages,
+                **lds_only_fence_options(execution_plan.lds_only_fences),
+            )
