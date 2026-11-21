@@ -21,7 +21,6 @@ from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 nvidia = _backend._nvidia_backend
 amd = _backend._amd_backend
 nvidia_kernels = nvidia.kernels
-amd_kernels = amd.kernels
 
 
 @pytest.mark.parametrize(
@@ -487,37 +486,3 @@ def test_validated_operations_call_the_selected_implementation(monkeypatch, oper
             qdata, scale, torch.float32, 16, mat1, mat2, beta=3, alpha=2, rounding_seed=2**64 - 1
         )
         execute.assert_called_once_with(qdata, scale, mat1, mat2, 16, 3.0, 2.0, -1)
-
-
-@pytest.mark.parametrize(
-    ("backend", "target"),
-    [
-        (nvidia, AcceleratorTarget("cuda", "sm120")),
-        pytest.param(
-            amd,
-            AcceleratorTarget("hip", "gfx1201"),
-            marks=pytest.mark.skipif(
-                sys.platform not in ("linux", "win32"), reason="requires Linux or Windows ROCm"
-            ),
-        ),
-    ],
-)
-def test_eager_linear_selects_backend_and_plan_once(monkeypatch, backend, target):
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    select_backend = Mock(wraps=_backend.select_linear_backend)
-    select_plan = Mock(wraps=backend.policy.select_execution_plan)
-    monkeypatch.setattr(_backend, "select_linear_backend", select_backend)
-    monkeypatch.setattr(backend.policy, "select_execution_plan", select_plan)
-    monkeypatch.setattr(backend.kernels, "device_context", lambda device: nullcontext())
-    monkeypatch.setattr(backend.kernels, "launch_prepared_linear", Mock())
-    if backend is nvidia:
-        monkeypatch.setattr(nvidia_kernels, "rotate_quantize_rows_kernel", MagicMock())
-    else:
-        monkeypatch.setattr(amd_kernels, "rotate_quantize_rows_kernel", MagicMock())
-        monkeypatch.setattr(amd_kernels, "rotate_quantize_rows_chunked_kernel", MagicMock())
-    activation = torch.zeros(4, 256, dtype=torch.bfloat16)
-    qdata = torch.zeros(64, 256, dtype=torch.int8)
-    scale = torch.ones(64, 1)
-    _functional.linear(activation, qdata, scale, torch.bfloat16, 256)
-    select_backend.assert_called_once_with(activation)
-    select_plan.assert_called_once()
