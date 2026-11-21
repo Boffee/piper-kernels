@@ -7,7 +7,7 @@ SM8x launches follow choices measured on SM89, which represents the family.
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
-from .._plan import AttentionSchedule, MinmaxScoreSchedule
+from .._contracts import AttentionSchedule, MinmaxScoreSchedule
 
 
 def uses_tensor_descriptors(target: AcceleratorTarget) -> bool:

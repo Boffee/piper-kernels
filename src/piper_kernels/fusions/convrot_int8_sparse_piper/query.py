@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+from piper_kernels.attention.sparse_piper_attention._contracts import (
     validate_routing_mode,
 )
 from piper_kernels.fusions.convrot_int8_projection._validation import (

@@ -54,8 +54,10 @@ chunk share its local statistics). Sage uses INT8 Q/K and FP8 probabilities/V wi
 FP16 accumulation. Their numerical results are not interchangeable.
 
 Dense Piper has native NVIDIA SM8x/SM12x and AMD RDNA4 backends. Sage's optimized
-path requires NVIDIA FP8 tensor cores with FP16 accumulation. See the
-[dense implementation guide](../src/piper_kernels/attention/piper_attention/README.md)
+path requires NVIDIA FP8 tensor cores with FP16 accumulation. See
+[`_quantization.py`](../src/piper_kernels/attention/piper_attention/_quantization.py),
+[`_nvidia/policy.py`](../src/piper_kernels/attention/piper_attention/_nvidia/policy.py),
+and [`_amd/gluon.py`](../src/piper_kernels/attention/piper_attention/_amd/gluon.py)
 for arithmetic, architecture differences, and scheduling.
 
 ## Sparse attention
@@ -138,8 +140,7 @@ the supplied gate directly without applying an activation. Q/K/V and the gate
 must match in shape (equal head counts) with matching query dtype/device on the
 gate. Pass `routing="mean"` or `"minmax"` and a finite positive `coarse_scale`;
 `coarse_key_blocks` defaults to all available blocks and supports compact tails and
-`block_lengths`. See [residual.py](../src/piper_kernels/attention/sparse_piper_attention/residual.py)
-and [coarse.py](../src/piper_kernels/attention/sparse_piper_attention/coarse.py).
+`block_lengths`. See [coarse.py](../src/piper_kernels/attention/sparse_piper_attention/coarse.py).
 Compatible compiler fusions accumulate fine and coarse outputs in FP32 before
 casting, so outputs can differ slightly from standalone addition.
 

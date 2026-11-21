@@ -43,7 +43,7 @@ Do not use PyTorch's `download.pytorch.org/whl/rocm*` wheels: they are
 Linux-only (no Windows wheels) and their older ROCm runtimes can crash with a
 GPU fault (`HSA_STATUS_ERROR_EXCEPTION`) on out-of-memory instead of raising a
 recoverable OOM error. Attention uses RDNA4 codegen workarounds on Triton 3.9
-([dense implementation guide](../src/piper_kernels/attention/piper_attention/README.md#rdna4-behavior)).
+([`_amd/gluon.py`](../src/piper_kernels/attention/piper_attention/_amd/gluon.py)).
 
 AMD dispatch accepts Linux and Windows within the same architecture limits,
 though on-device INT8 validation currently covers Linux RX 9070 XT (`gfx1201`)

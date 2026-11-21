@@ -14,10 +14,10 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
     ValueFormat,
 )
 
-from ._block_layout import validate_sparse_query_blocks
+from ._contracts import validate_sparse_query_blocks
 
 if TYPE_CHECKING:
-    from ._interfaces import BindAttention, LaunchAttention
+    from ._contracts import BindAttention, LaunchAttention
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,8 +127,10 @@ class _PreparedSparsePiperOperands:
             sparse_query_blocks=self.sparse_query_blocks,
             logical_sequence_length=self.logical_sequence_length,
         )
-        query = _prepare_sparse_piper_query_from_quantized(
-            self.query, self.query_scale, routes, context
+        query = _PreparedSparsePiperQuery(
+            data=self.query,
+            scale=self.query_scale,
+            routes=routes,
         )
         return _PreparedSparsePiperAttention(launch=bind(context), query=query)
 

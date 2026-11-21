@@ -4,8 +4,8 @@ import pytest
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._amd import policy as amd_policy
+from piper_kernels.attention.sparse_piper_attention._contracts import MinmaxScoreSchedule
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
-from piper_kernels.attention.sparse_piper_attention._plan import MinmaxScoreSchedule
 
 
 @pytest.mark.parametrize(

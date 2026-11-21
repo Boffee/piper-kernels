@@ -165,9 +165,9 @@ def _sage_attention_2pp_jit_functions(
     plan: SageAttention2ppExecutionPlan,
 ) -> dict[str, object]:
     key_name, key_kernel = (
-        ("quantize-key-per-block", qk_backend.quantize_key_per_block_kernel)
+        ("quantize-key-per-block", sage_attention_2pp_backend.quantize_key_per_block_kernel)
         if plan.grouped_qk
-        else ("quantize-key-per-thread", qk_backend.quantize_key_per_thread_kernel)
+        else ("quantize-key-per-thread", sage_attention_2pp_backend.quantize_key_per_thread_kernel)
     )
     quantization_kernels: dict[str, object] = {
         "quantize-query-per-warp" if plan.grouped_qk else "quantize-query-per-thread": (

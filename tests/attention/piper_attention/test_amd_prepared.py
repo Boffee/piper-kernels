@@ -26,8 +26,8 @@ def _prepared(
             value=torch.empty((batch, 2, key_storage // 64, 64, 64), dtype=torch.int8),
             key_scale=torch.empty((batch, 2, key_storage // 64)),
             key_center=torch.empty((batch, 2, key_chunks, 64)),
-            multiplier=torch.empty((batch, 2, key_storage)),
-            log_scale=torch.empty((batch, 2, key_storage)),
+            value_scale_multiplier=torch.empty((batch, 2, key_storage)),
+            value_log_scale=torch.empty((batch, 2, key_storage)),
             value_mean=torch.empty((batch, 2, key_chunks, 64)),
             key_length=key_length,
             is_causal=causal,
@@ -71,8 +71,8 @@ def test_launch_reuses_operands_and_logical_metadata_with_independent_outputs(mo
             query.scale,
             context.key_scale,
             context.key_center,
-            context.multiplier,
-            context.log_scale,
+            context.value_scale_multiplier,
+            context.value_log_scale,
             context.value_mean,
             output,
         )
@@ -139,8 +139,8 @@ def test_independent_preparation_keeps_quantization_policy_without_allocating_ou
     value_quantization = Mock(
         return_value=(
             expected_context.value,
-            expected_context.multiplier,
-            expected_context.log_scale,
+            expected_context.value_scale_multiplier,
+            expected_context.value_log_scale,
             expected_context.value_mean,
         )
     )

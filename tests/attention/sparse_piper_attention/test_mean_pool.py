@@ -9,6 +9,9 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
+from piper_kernels.attention.sparse_piper_attention._contracts import (
+    _MEAN_ROUTING,
+)
 from piper_kernels.attention.sparse_piper_attention._routes import (
     PackedRouteAndCoarseBuilder,
 )
@@ -16,9 +19,6 @@ from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_and_coarse_from_summaries,
     packed_routes_from_sequences,
     packed_routes_from_summaries,
-)
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
-    _MEAN_ROUTING,
 )
 from piper_kernels.attention.sparse_piper_attention._summaries import (
     sequence_block_summaries,

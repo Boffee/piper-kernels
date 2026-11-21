@@ -7,24 +7,23 @@ import torch
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
 from . import _backend
-from ._block_layout import valid_block_rows, validate_block_lengths
-from ._routing_modes import (
+from ._contracts import (
     _MEAN_ROUTING,
+    valid_block_rows,
+    validate_block_lengths,
     validate_routing_mode,
 )
 from .coarse import _mean_pool_head_major_blocks
 
 
-def sequence_block_summaries(
+def _sequence_block_summaries_validated(
     query: torch.Tensor,
     key: torch.Tensor,
     routing_mode: int,
     block_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return policy-specific Q/K summaries through one fixed tensor contract."""
-    validate_routing_mode(routing_mode)
-    _validate_sequences(query, key, block_lengths)
-    summarize = _backend.select_sequence_summaries(query, key)
+    """Compute policy-specific Q/K summaries for already-validated operands."""
+    summarize = _backend.select_sequence_summaries(query, key, block_lengths)
     if summarize is not None:
         return summarize(query, key, routing_mode, block_lengths)
 
@@ -42,6 +41,21 @@ def sequence_block_summaries(
         query_max, query_min = _padded_block_extrema(query, block_lengths)
         key_primary, key_aux = _padded_block_extrema(key, key_lengths)
     return query_max + query_min, key_primary, key_aux
+
+
+def sequence_block_summaries(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None = None,
+    *,
+    validate: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return policy-specific Q/K summaries through one fixed tensor contract."""
+    if validate:
+        validate_routing_mode(routing_mode)
+        _validate_sequences(query, key, block_lengths)
+    return _sequence_block_summaries_validated(query, key, routing_mode, block_lengths)
 
 
 def _compact_block_extrema(sequence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

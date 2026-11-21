@@ -30,7 +30,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import 
     SIGNED_HADAMARD_MASK,
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
-from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
+from piper_kernels.attention.sparse_piper_attention._contracts import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput

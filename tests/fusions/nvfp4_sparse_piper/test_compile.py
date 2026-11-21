@@ -21,7 +21,7 @@ from piper_kernels import (
     sparse_piper_coarse_residual,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )

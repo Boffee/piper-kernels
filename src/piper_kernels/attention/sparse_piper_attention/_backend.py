@@ -9,16 +9,16 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, ValueFormat
 
 from ._amd import policy as amd_policy
-from ._dtype import SUPPORTED_DTYPES
-from ._force_tiles import build_portable_force_tile_bitmask
-from ._interfaces import (
+from ._contracts import (
+    _MEAN_ROUTING,
+    SUPPORTED_DTYPES,
     AttentionBackend,
     MinmaxScores,
     SelectRoutes,
     SequenceSummaries,
+    build_portable_force_tile_bitmask,
 )
 from ._nvidia import policy as nvidia_policy
-from ._routing_modes import _MEAN_ROUTING
 
 try:
     from . import triton as preparation
@@ -28,18 +28,11 @@ except ModuleNotFoundError as error:
     preparation = None
 
 try:
-    from ._nvidia import gluon_tma as nvidia_tma_gluon
+    from ._nvidia import gluon as nvidia_gluon
 except ModuleNotFoundError as error:
     if error.name is None or not error.name.startswith("triton"):
         raise
-    nvidia_tma_gluon = None
-
-try:
-    from ._nvidia import gluon_async_copy as nvidia_async_copy_gluon
-except ModuleNotFoundError as error:
-    if error.name is None or not error.name.startswith("triton"):
-        raise
-    nvidia_async_copy_gluon = None
+    nvidia_gluon = None
 
 try:
     from ._amd import gluon as amd_gluon
@@ -52,9 +45,9 @@ _nvidia_tma_attention = (
     AttentionBackend(
         prepare=preparation._prepare_sparse_piper_operands,
         value_format=ValueFormat.TRANSPOSED,
-        bind=nvidia_tma_gluon.bind_context,
+        bind=nvidia_gluon.bind_tma_context,
     )
-    if preparation is not None and nvidia_tma_gluon is not None
+    if preparation is not None and nvidia_gluon is not None
     else None
 )
 _nvidia_tma_attention_skip_dense_routing = (
@@ -66,9 +59,9 @@ _nvidia_async_copy_attention = (
     AttentionBackend(
         prepare=preparation._prepare_sparse_piper_operands,
         value_format=ValueFormat.TRANSPOSED,
-        bind=nvidia_async_copy_gluon.bind_context,
+        bind=nvidia_gluon.bind_async_copy_context,
     )
-    if preparation is not None and nvidia_async_copy_gluon is not None
+    if preparation is not None and nvidia_gluon is not None
     else None
 )
 _nvidia_async_copy_attention_skip_dense_routing = (
@@ -242,7 +235,11 @@ def use_fused_operand_preparation(
     return nvidia_policy.uses_async_copies(target) or amd_policy.supports_target(target)
 
 
-def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> SequenceSummaries | None:
+def select_sequence_summaries(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    block_lengths: torch.Tensor | None = None,
+) -> SequenceSummaries | None:
     """Select native Q/K summaries for a supported device, layout, and dtype."""
     if _summary_backend is None:
         return None
@@ -256,6 +253,15 @@ def select_sequence_summaries(query: torch.Tensor, key: torch.Tensor) -> Sequenc
         and key.stride(-1) == 1
         and query.dtype in SUPPORTED_DTYPES
         and key.dtype == query.dtype
+        and (
+            block_lengths is None
+            or (
+                block_lengths.ndim == 1
+                and block_lengths.dtype is torch.int32
+                and block_lengths.device == query.device
+                and block_lengths.is_contiguous()
+            )
+        )
     ):
         return None
     target = AcceleratorTarget.from_device(query.device)

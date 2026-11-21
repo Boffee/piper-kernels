@@ -11,7 +11,6 @@ the portable PyTorch reference.
 # Python call signature.
 # pyright: reportCallIssue=false
 
-from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
@@ -25,11 +24,21 @@ from piper_kernels._triton.mixed_int8 import (
 )
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.piper.triton import conservative_value_log_scale_bound
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
 
 from .. import _quantization
+from .._validation import (
+    PreparedAttention as _PreparedPiperAttention,
+)
+from .._validation import (
+    PreparedContext as _PreparedPiperContext,
+)
+from .._validation import (
+    PreparedQuery as _PreparedPiperQuery,
+)
 from .._validation import (
     resolve_query_window,
     validate_output_buffer,
@@ -43,10 +52,6 @@ _BLOCK_N = 64
 _TL_CENTER_CHUNK = tl.constexpr(_quantization.CENTER_CHUNK)
 _K_BIAS_SLICE_D = tl.constexpr(16)
 _P_UINT8_RANGE = tl.constexpr(255.0)
-_P_UINT8_LOG2_RANGE = tl.constexpr(7.994353436858858)
-# Pad the analytical maximum to the next effective FP32 constant so the
-# lowered expression remains an upper bound after integer-to-FP32 rounding.
-_VALUE_LOG_BOUND_CORRECTION = tl.constexpr(0.086085)
 
 
 @triton.jit
@@ -70,15 +75,6 @@ def _ptx_float32_to_uint8x4(values):
         dtype=tl.uint8,
         is_pure=True,
         pack=4,
-    )
-
-
-@triton.jit
-def _conservative_value_log_scale_bound(value_scale_multiplier):
-    """Bound log2(scale) from the positive FP32 multiplier's IEEE-754 bits."""
-    multiplier_bits = value_scale_multiplier.to(tl.int32, bitcast=True)
-    return multiplier_bits.to(tl.float32) * (1.0 / 8388608.0) - (
-        127.0 + _P_UINT8_LOG2_RANGE - _VALUE_LOG_BOUND_CORRECTION
     )
 
 
@@ -336,7 +332,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             mask=current_n < key_length,
             other=0.0,
         )
-        value_log_scale = _conservative_value_log_scale_bound(value_scale_multiplier)
+        value_log_scale = conservative_value_log_scale_bound(value_scale_multiplier)
     else:
         value_log_scale = tl.load(
             value_log_scale_ptr + batch_head * metadata_stride + current_n,
@@ -1186,49 +1182,6 @@ def default_execution_plan(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _PreparedPiperContext:
-    """Reusable K/V operands and the plan defining their quantization and layout."""
-
-    key: torch.Tensor | TensorDescriptor
-    value: torch.Tensor | TensorDescriptor
-    key_scale: torch.Tensor
-    key_center: torch.Tensor
-    value_scale_multiplier: torch.Tensor
-    value_log_scale: torch.Tensor
-    value_mean: torch.Tensor
-    key_length: int
-    is_causal: bool
-    execution_plan: PiperAttentionExecutionPlan
-    padded_kv: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedPiperQuery:
-    """Prepared Q with its unpadded logical shape and original floating dtype.
-
-    With fused query quantization, ``data`` is the floating-point Q, ``scale`` is None, and
-    ``softmax_scale`` is applied when the Gluon kernel quantizes each tile.
-    """
-
-    data: torch.Tensor
-    scale: torch.Tensor | None
-    descriptor: TensorDescriptor | None
-    shape: tuple[int, int, int, int]
-    dtype: torch.dtype
-    global_row_offset: int = 0
-    softmax_scale: float = 0.0
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedPiperAttention:
-    """Prepared K/V and Q with one reusable output for full attention."""
-
-    context: _PreparedPiperContext
-    query: _PreparedPiperQuery
-    output: torch.Tensor
-
-
 def _prepare_piper_context(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -1367,6 +1320,7 @@ def _launch_triton_window_into(
 ) -> torch.Tensor:
     batch, heads, _, head_dim = query.shape
     plan = context.execution_plan
+    assert plan is not None
     attention_kernel = cast(Any, _piper_attention_kernel)
     use_query_tensor_descriptor = query.descriptor is not None
     contiguous_output = output.is_contiguous()
@@ -1447,6 +1401,7 @@ def _launch_piper_attention_into(
     """Launch a local Q window into caller-owned BHSD output storage."""
     batch, heads, query_length, head_dim = query.shape
     plan = context.execution_plan
+    assert plan is not None
     rows = resolve_query_window(
         query_length,
         query_start=query_start,

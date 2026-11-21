@@ -24,7 +24,7 @@ from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
-from piper_kernels.attention.sparse_piper_attention._routing_modes import _MEAN_ROUTING
+from piper_kernels.attention.sparse_piper_attention._contracts import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_projection._nvidia import fragments
 from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import NvidiaExecutionPlan
 

@@ -39,6 +39,10 @@ from piper_kernels.attention.kernels.piper._nvidia.fragments import (
     rescale_packed,
     uint8_int8_mma,
 )
+from piper_kernels.attention.kernels.piper.gluon import (
+    advance_tile_max,
+    conservative_value_log_scale_bound,
+)
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
     SIGNED_HADAMARD_MASK,
 )
@@ -57,10 +61,6 @@ _GL_BLOCK = gl.constexpr(_BLOCK_N)
 _GL_TILES_PER_CHUNK = gl.constexpr(_TILES_PER_CHUNK)
 _GL_NUM_WARPS = gl.constexpr(_NUM_WARPS)
 _GL_COPY_BYTES = gl.constexpr(_COPY_BYTES)
-_GL_LOG2_255 = gl.constexpr(7.994353436858858)
-# Pads the analytical maximum so the derived bound stays conservative after
-# integer-to-FP32 rounding; shared with the Triton kernel's derivation.
-_GL_VALUE_LOG_BOUND_CORRECTION = gl.constexpr(0.086085)
 # Sage Q quantization constants, matching the per-thread Triton Q kernel.
 _GL_LOG2_E = gl.constexpr(1.4426950408889634)
 _GL_SCALE_EPSILON = gl.constexpr(1e-7)
@@ -176,26 +176,6 @@ def _copy_key_metadata(base, start_n, key_length, shared, copy_layout: gl.conste
 
 
 @gluon.jit
-def _advance_tile_max(running_max, running_bias, block_max, k_bias):
-    """Update winner-frame running maximum across chunks without round-tripping."""
-    has_block = block_max != -float("inf")
-    has_running = running_max != -float("inf")
-    raw_delta = (block_max - running_max) + (k_bias - running_bias)
-    delta = gl.where(
-        has_block,
-        gl.where(has_running, raw_delta, float("inf")),
-        -float("inf"),
-    )
-    tile_wins = delta > 0.0
-    next_max = gl.where(tile_wins, block_max, running_max)
-    next_bias = gl.where(tile_wins, k_bias, running_bias)
-    decay = gl.exp2(-gl.abs(delta))
-    old_weight = gl.where(tile_wins, decay, 1.0)
-    current_weight = gl.where(tile_wins, 1.0, decay)
-    return next_max, next_bias, old_weight, current_weight
-
-
-@gluon.jit
 def _probability_tile(
     query,
     key_shared,
@@ -245,9 +225,7 @@ def _probability_tile(
     # Both scales are uniform per thread, so their product is formed once per row.
     scores = integer_scores.to(gl.float32) * (query_scale[:, None] * key_scale[None, :])
     # A conservative log2 bound of each V scale, read from its multiplier's bits.
-    log_scale = multiplier.to(gl.int32, bitcast=True).to(gl.float32) * (1.0 / 8388608.0) - (
-        127.0 + _GL_LOG2_255 - _GL_VALUE_LOG_BOUND_CORRECTION
-    )
+    log_scale = conservative_value_log_scale_bound(multiplier)
     shifted = scores + log_scale[None, :]
     if masked:
         valid = valid_keys[None, :]
@@ -257,7 +235,7 @@ def _probability_tile(
     # Each K64 tile normalizes in its chunk's unbiased frame; only the winning
     # running maximum and its chunk bias are retained across chunk boundaries.
     block_max = gl.max(shifted, axis=1)
-    next_max, next_bias, old_weight, current_weight = _advance_tile_max(
+    next_max, next_bias, old_weight, current_weight = advance_tile_max(
         running_max,
         running_bias,
         block_max,

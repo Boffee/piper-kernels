@@ -10,7 +10,7 @@ import triton.language as tl
 from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.runtime import device_context
 
-from ._plan import MinmaxScoreSchedule
+from ._contracts import MinmaxScoreSchedule
 
 _DEFAULT_SCORE_SCHEDULE = MinmaxScoreSchedule(32, 64, 16)
 

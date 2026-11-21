@@ -28,7 +28,7 @@ from lib.timing import DeviceTimings, measure_device, synchronized_wall_benchmar
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
-from piper_kernels.attention.sparse_piper_attention._routing_modes import routing_mode_from_name
+from piper_kernels.attention.sparse_piper_attention._contracts import routing_mode_from_name
 from piper_kernels.fusions.convrot_int8_sparse_piper import _backend, key, query, value
 from piper_kernels.linear.convrot.int8._backend import select_preparation_backend
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor

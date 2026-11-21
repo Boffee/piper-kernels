@@ -8,7 +8,7 @@ import torch
 
 from . import _backend
 from ._budget import _UINT16_ROUTE_CAPACITY, _ResolvedRouteLayout
-from .coarse import coarse_attention
+from .coarse import _coarse_attention_unchecked
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +160,8 @@ class PackedRouteAndCoarseBuilder:
         query_block_offset: int,
     ) -> None:
         """Route over each score prefix without retaining the full coarse matrix."""
-        if scores.ndim != 4:
-            raise ValueError("coarse route scores must use rank-four block tensors")
+        if scores.ndim != 4 or scores.shape[-1] != self._pooled_value.shape[2]:
+            raise ValueError("coarse route scores must match pooled V block dimensions")
         if isinstance(query_block_offset, bool) or not isinstance(query_block_offset, int):
             raise TypeError("coarse score query-block offset must be an integer")
         query_block_count = scores.shape[2]
@@ -177,9 +177,8 @@ class PackedRouteAndCoarseBuilder:
             scores[..., : self._sparse_key_blocks],
             query_block_offset=query_block_offset,
         )
-        self._coarse_output[:, :, query_block_offset:query_block_stop] = coarse_attention(
-            scores,
-            self._pooled_value,
+        self._coarse_output[:, :, query_block_offset:query_block_stop] = (
+            _coarse_attention_unchecked(scores, self._pooled_value)
         )
         self._written_query_ranges.append((query_block_offset, query_block_stop))
 

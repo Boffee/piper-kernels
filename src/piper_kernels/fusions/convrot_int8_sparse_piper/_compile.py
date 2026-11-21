@@ -7,9 +7,9 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
-from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
-from piper_kernels.attention.sparse_piper_attention._routing_modes import (
+from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
+    SUPPORTED_DTYPES,
     is_valid_routing_mode,
 )
 from piper_kernels.fusions.attention import _head_slices as head_slices

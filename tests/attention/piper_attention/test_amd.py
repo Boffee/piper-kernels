@@ -183,16 +183,16 @@ def test_preparation_retains_per_token_scales_and_compact_gqa_storage(head_dim, 
         prepared.context.key,
         prepared.context.value,
         prepared.context.key_scale,
-        prepared.context.multiplier,
-        prepared.context.log_scale,
+        prepared.context.value_scale_multiplier,
+        prepared.context.value_log_scale,
     ):
         assert tensor.shape[1] == 2
     centered = value.float() - value.float().mean(2, keepdim=True)
     scale = centered.abs().amax(-1) / 127 + 1e-7
     torch.testing.assert_close(
-        prepared.context.multiplier[..., :65], scale * 255, rtol=2e-6, atol=1e-7
+        prepared.context.value_scale_multiplier[..., :65], scale * 255, rtol=2e-6, atol=1e-7
     )
-    assert prepared.context.multiplier.shape == (2, 2, 128)
+    assert prepared.context.value_scale_multiplier.shape == (2, 2, 128)
     tokens = torch.arange(64, device="cuda")
     packed_tokens = (tokens & ~24) | ((tokens & 8) << 1) | ((tokens & 16) >> 1)
     unpacked = (

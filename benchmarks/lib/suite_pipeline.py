@@ -21,7 +21,7 @@ from piper_kernels import SparsePiperAttention, compile_options, piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _backend as dense_attention_backend
 from piper_kernels.attention.sparse_piper_attention import _backend as sparse_attention_backend
-from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
+from piper_kernels.attention.sparse_piper_attention._contracts import _MINMAX_ROUTING
 
 from .cases import PipelineCase
 from .inputs import normal_tensor, sample_indices

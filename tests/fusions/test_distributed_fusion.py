@@ -46,7 +46,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.piper_attention import _quantized_dispatch as dense_quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
+from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_piper import _backend as dense_fusion_backend
 from piper_kernels.fusions.convrot_int8_piper import _distributed_compile as dense_dist_compile
 from piper_kernels.fusions.convrot_int8_piper import distributed_output as dense_distributed_output

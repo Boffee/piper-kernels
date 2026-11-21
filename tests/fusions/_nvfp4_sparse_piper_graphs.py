@@ -10,8 +10,10 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import compile_options
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sparse_piper_attention._profile import _SparsePiperRatioProfile
-from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
+from piper_kernels.attention.sparse_piper_attention._contracts import (
+    _MINMAX_ROUTING,
+    _SparsePiperRatioProfile,
+)
 
 
 def _placeholder(

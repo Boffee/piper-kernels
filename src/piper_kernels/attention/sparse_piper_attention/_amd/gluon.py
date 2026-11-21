@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -27,18 +25,14 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
     softmax_fragment,
     split_columns,
 )
+from piper_kernels.attention.kernels.piper.gluon import (
+    load_tile_column,
+    store_tile_column,
+)
 from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
 
-from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, validate_attention_launch
+from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, _ContextLauncher, _ValidatedAttentionLaunch
 from .._prepared import _PreparedSparsePiperContext, _PreparedSparsePiperQuery
-from ._parameters import (
-    INVERSE_MULTIPLIER,
-    KEY_SCALE,
-    LOG_MULTIPLIER,
-    LOG_MULTIPLIER_OVER_255,
-    PARAMETER_COUNT,
-    prepare_parameters,
-)
 
 # Launch attributes shared by every sparse RDNA4 kernel compile.
 _LLVM_FN_ATTRS = (
@@ -48,6 +42,43 @@ _LLVM_FN_ATTRS = (
 )
 _PAIRS_PER_CHUNK = gl.constexpr(8)
 _TILES_PER_CHUNK = gl.constexpr(16)
+
+# One FP32 record per K64 tile, shared by the table writer and attention reader.
+_KEY_SCALE = gl.constexpr(0)
+_LOG_MULTIPLIER = gl.constexpr(1)
+_LOG_MULTIPLIER_OVER_255 = gl.constexpr(2)
+_INVERSE_MULTIPLIER = gl.constexpr(3)
+_PARAMETER_COUNT = gl.constexpr(4)
+
+
+@gluon.jit(do_not_specialize=("count",))
+def _prepare_parameters(key_scale_ptr, multiplier_ptr, table_ptr, count):
+    """Fold per-K64 K/V scales into one FP32 record table without recompiling per count."""
+    index = gl.program_id(0).to(gl.int64) * 256 + gl.arange(
+        0, 256, gl.BlockedLayout([1], [32], [4], [0])
+    )
+    scale = gl.load(key_scale_ptr + index, index < count, 0)
+    multiplier = gl.load(multiplier_ptr + index, index < count, 1)
+    record = table_ptr + index * _PARAMETER_COUNT
+    gl.store(record + _KEY_SCALE, scale, index < count)
+    gl.store(record + _LOG_MULTIPLIER, gl.log2(multiplier), index < count)
+    gl.store(record + _LOG_MULTIPLIER_OVER_255, gl.log2(multiplier * (1.0 / 255.0)), index < count)
+    gl.store(record + _INVERSE_MULTIPLIER, 1.0 / multiplier, index < count)
+
+
+def prepare_parameters(context: _PreparedSparsePiperContext) -> torch.Tensor:
+    """Fold immutable K/V scales once; V already has its final physical format."""
+    with device_context(context.key.device):
+        parameters = torch.empty(
+            (*context.key_scale.shape, _PARAMETER_COUNT.value),
+            device=context.key.device,
+            dtype=torch.float32,
+        )
+        count = context.key_scale.numel()
+        _prepare_parameters[((count + 255) // 256,)](
+            context.key_scale, context.value_scale_multiplier, parameters, count, num_warps=4
+        )
+    return parameters
 
 
 def _requires_64bit_query_offsets(
@@ -64,26 +95,6 @@ def _requires_64bit_context_offsets(
 ) -> bool:
     """Return whether local K/V byte offsets exceed unsigned 32-bit range."""
     return storage_sequence_length * head_dim > (1 << 32)
-
-
-_TILE_COLUMN_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 1], [16, 2], [4, 1], [0, 1]))
-
-
-@gluon.jit
-def _load_tile_column(shared, column_index, row_layout: gl.constexpr):
-    columns = gl.full([64, 1], column_index, gl.int32, _TILE_COLUMN_LAYOUT)
-    values = shared.gather(columns, 1).reshape([64])
-    return gl.convert_layout(values, gl.SliceLayout(0, row_layout))[None, :]
-
-
-@gluon.jit
-def _store_tile_column(shared, values, column_index):
-    row_1d_layout: gl.constexpr = gl.SliceLayout(1, _TILE_COLUMN_LAYOUT)
-    shared.scatter(
-        gl.convert_layout(values.reshape([64]), row_1d_layout)[:, None],
-        gl.full([64, 1], column_index, gl.int32, _TILE_COLUMN_LAYOUT),
-        1,
-    )
 
 
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_ARGUMENTS)
@@ -177,7 +188,7 @@ def _sparse_piper_attention_kernel(
     numerator = gl.zeros([1, 64, head_dim], gl.float32, MMA_LAYOUT)
     denominator = gl.zeros([1, 64], gl.float32, row_layout)
     running_max = gl.full([1, 64], -float("inf"), gl.float32, row_layout)
-    parameters = parameters_ptr + kv_batch_head * sequence_tiles * PARAMETER_COUNT
+    parameters = parameters_ptr + kv_batch_head * sequence_tiles * _PARAMETER_COUNT
     key_center_head = key_center_ptr + kv_batch_head * sequence_tiles * (2 * head_dim)
     key_center_scale_head = key_center_scale_ptr + kv_batch_head * sequence_tiles * 2
     value_mean_head = value_mean_ptr + kv_batch_head * sequence_tiles * head_dim
@@ -247,12 +258,16 @@ def _sparse_piper_attention_kernel(
                 use_64bit_context_offsets,
                 head_dim,
             )
-            k_bias_0 = _load_tile_column(tile_scratch_shared, 2 * pair_in_chunk, row_layout)
-            k_bias_1 = _load_tile_column(tile_scratch_shared, 2 * pair_in_chunk + 1, row_layout)
-            parameters_0 = parameters + tile_0 * PARAMETER_COUNT
-            parameters_1 = parameters + tile_1 * PARAMETER_COUNT
-            key_scale_0 = gl.load(parameters_0 + KEY_SCALE)
-            key_scale_1 = gl.load(parameters_1 + KEY_SCALE)
+            k_bias_0 = load_tile_column(
+                tile_scratch_shared, 2 * pair_in_chunk, gl.SliceLayout(0, row_layout)
+            )[None, :]
+            k_bias_1 = load_tile_column(
+                tile_scratch_shared, 2 * pair_in_chunk + 1, gl.SliceLayout(0, row_layout)
+            )[None, :]
+            parameters_0 = parameters + tile_0 * _PARAMETER_COUNT
+            parameters_1 = parameters + tile_1 * _PARAMETER_COUNT
+            key_scale_0 = gl.load(parameters_0 + _KEY_SCALE)
+            key_scale_1 = gl.load(parameters_1 + _KEY_SCALE)
             scale_0 = query_scale * key_scale_0[:, None]
             scale_1 = query_scale * key_scale_1[:, None]
             if mask_block_lengths:
@@ -301,8 +316,8 @@ def _sparse_piper_attention_kernel(
                 scale_0 = gl.where(scale_0 == 0, 1.0, scale_0)
                 scale_1 = gl.where(scale_1 == 0, 1.0, scale_1)
             scores_0, scores_1 = split_columns(scores)
-            offset_0 = gl.load(parameters_0 + LOG_MULTIPLIER_OVER_255)
-            offset_1 = gl.load(parameters_1 + LOG_MULTIPLIER_OVER_255)
+            offset_0 = gl.load(parameters_0 + _LOG_MULTIPLIER_OVER_255)
+            offset_1 = gl.load(parameters_1 + _LOG_MULTIPLIER_OVER_255)
             maximum_0 = gl.convert_layout(gl.max(scores_0, 2), row_layout)
             maximum_1 = gl.convert_layout(gl.max(scores_1, 2), row_layout)
             block_max = gl.maximum(
@@ -316,10 +331,10 @@ def _sparse_piper_attention_kernel(
             scores_00, scores_01 = split_columns(scores_0)
             scores_10, scores_11 = split_columns(scores_1)
             chunks = (scores_00, scores_01, scores_10, scores_11)
-            inverse_0 = gl.load(parameters_0 + INVERSE_MULTIPLIER)
-            inverse_1 = gl.load(parameters_1 + INVERSE_MULTIPLIER)
-            log_0 = gl.load(parameters_0 + LOG_MULTIPLIER)
-            log_1 = gl.load(parameters_1 + LOG_MULTIPLIER)
+            inverse_0 = gl.load(parameters_0 + _INVERSE_MULTIPLIER)
+            inverse_1 = gl.load(parameters_1 + _INVERSE_MULTIPLIER)
+            log_0 = gl.load(parameters_0 + _LOG_MULTIPLIER)
+            log_1 = gl.load(parameters_1 + _LOG_MULTIPLIER)
             packed, sums = (), ()
             for fragment in gl.static_range(4):
                 words, total = softmax_fragment(
@@ -340,9 +355,9 @@ def _sparse_piper_attention_kernel(
             probabilities = concat_columns(
                 concat_columns(packed[0], packed[1]), concat_columns(packed[2], packed[3])
             )
-            _store_tile_column(tile_scratch_shared, mass_0, 2 * pair_in_chunk)
-            _store_tile_column(tile_scratch_shared, mass_1, 2 * pair_in_chunk + 1)
-            _store_tile_column(pair_max_shared, block_max, pair_in_chunk)
+            store_tile_column(tile_scratch_shared, mass_0, 2 * pair_in_chunk)
+            store_tile_column(tile_scratch_shared, mass_1, 2 * pair_in_chunk + 1)
+            store_tile_column(pair_max_shared, block_max, pair_in_chunk)
             numerator = pv_tiles(
                 probabilities,
                 value_ptr + kv_batch_head * storage_sequence_length * head_dim,
@@ -406,35 +421,14 @@ def bind_context(context: _PreparedSparsePiperContext) -> _ContextLauncher:
     """Own final K/V storage and folded scales for any number of local Q launches."""
     if context.routes_per_query == 0:
         raise ValueError("AMD sparse Piper does not implement skip_dense_routing")
-    return _ContextLauncher(context, prepare_parameters(context))
+    parameters = prepare_parameters(context)
 
-
-@dataclass(frozen=True, slots=True)
-class _ContextLauncher:
-    context: _PreparedSparsePiperContext
-    parameters: torch.Tensor
-
-    def __call__(
-        self,
+    def _launch(
+        bound_context: _PreparedSparsePiperContext,
         query_state: _PreparedSparsePiperQuery,
         output: torch.Tensor,
-        *,
-        query_block_offset: int = 0,
-        query_block_count: int | None = None,
-        coarse_output: torch.Tensor | None = None,
-        coarse_gate: torch.Tensor | None = None,
+        launch: _ValidatedAttentionLaunch,
     ) -> None:
-        """Execute a query window against the bound global context."""
-        context = self.context
-        launch = validate_attention_launch(
-            context,
-            query_state,
-            output,
-            query_block_offset,
-            query_block_count,
-            coarse_output,
-            coarse_gate,
-        )
         use_64bit_query_offsets = _requires_64bit_query_offsets(
             launch.query_storage_sequence_length,
             launch.head_dim,
@@ -447,19 +441,19 @@ class _ContextLauncher:
             grid = (launch.query_block_count, launch.heads, launch.batch)
             _sparse_piper_attention_kernel[grid](
                 query_state.data,
-                context.key,
-                context.value,
+                bound_context.key,
+                bound_context.value,
                 query_state.scale,
-                context.key_center,
-                context.key_center_scale,
-                self.parameters,
-                context.value_mean,
+                bound_context.key_center,
+                bound_context.key_center_scale,
+                parameters,
+                bound_context.value_mean,
                 launch.coarse_output,
                 launch.coarse_gate,
                 launch.block_lengths,
                 query_state.routes,
-                context.head_keep_blocks,
-                context.route_head_offsets,
+                bound_context.head_keep_blocks,
+                bound_context.route_head_offsets,
                 output,
                 launch.query_block_offset,
                 launch.global_query_block_offset,
@@ -473,7 +467,7 @@ class _ContextLauncher:
                 *launch.coarse_strides,
                 *launch.gate_strides,
                 launch.heads,
-                launch.heads // context.key.shape[1],
+                launch.heads // bound_context.key.shape[1],
                 launch.head_dim,
                 use_64bit_query_offsets,
                 use_64bit_context_offsets,
@@ -484,3 +478,5 @@ class _ContextLauncher:
                 num_stages=1,
                 llvm_fn_attrs=_LLVM_FN_ATTRS,
             )
+
+    return _ContextLauncher(context, _launch)

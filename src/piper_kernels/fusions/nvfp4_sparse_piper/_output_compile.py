@@ -10,8 +10,10 @@ from torch.fx.node import Argument
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
-from piper_kernels.attention.sparse_piper_attention._dtype import SUPPORTED_DTYPES
-from piper_kernels.attention.sparse_piper_attention._routing_modes import _MINMAX_ROUTING
+from piper_kernels.attention.sparse_piper_attention._contracts import (
+    _MINMAX_ROUTING,
+    SUPPORTED_DTYPES,
+)
 from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
 from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
