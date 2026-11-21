@@ -36,11 +36,13 @@ def gelu_tanh(
     inner = _GELU_TANH_SCALE_COEFFICIENT * (
         values + _GELU_TANH_CUBIC_COEFFICIENT * values * values * values
     )
-    if accelerator_backend == "cuda":  # noqa: SIM108 - discard target-specific assembly
-        tanh_inner = _tanh_approx(inner)
+    if accelerator_backend == "hip":
+        # Identity 0.5 * x * (1 + tanh(u)) == x / (1 + exp(-2u)); avoids slow OCML libdevice.tanh.
+        result = values / (1.0 + tl.exp(-2.0 * inner))  # pyright: ignore[reportOperatorIssue]
     else:
-        tanh_inner = libdevice.tanh(inner)
-    return 0.5 * values * (1.0 + tanh_inner)  # pyright: ignore[reportOperatorIssue]
+        tanh_inner = _tanh_approx(inner) if accelerator_backend == "cuda" else libdevice.tanh(inner)
+        result = 0.5 * values * (1.0 + tanh_inner)  # pyright: ignore[reportOperatorIssue]
+    return result
 
 
 @triton.jit
