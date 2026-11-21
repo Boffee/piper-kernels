@@ -199,7 +199,7 @@ def _sparse_piper_attention_kernel(
     vector_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[0]
     )
-    # compute_chunk_key_biases fills all 16 columns before the pair loop; each
+    # compute_chunk_key_biases fills valid bias columns before the pair loop; each
     # pair reads its two bias columns before writing its two tile-mass columns
     # within each warp's disjoint 16-row slice, cutting LDS below 7 WGs/WGP.
     tile_scratch_shared = gl.allocate_shared_memory(
@@ -239,6 +239,7 @@ def _sparse_piper_attention_kernel(
             tiles_shared,
             tile_scratch_shared,
             query_scale,
+            num_valid_tiles,
             use_64bit_context_offsets,
             head_dim,
         )

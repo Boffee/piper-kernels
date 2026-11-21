@@ -227,10 +227,11 @@ def compute_chunk_key_biases(
     tiles_shared,
     key_bias_shared,
     query_scale,
+    num_valid_tiles,
     use_64bit_context_offsets: gl.constexpr,
     head_dim: gl.constexpr,
 ):
-    """Precompute Q64 @ H(K_center)^T * Q_scale score biases for 16 tiles into LDS."""
+    """Precompute Q64 @ H(K_center)^T * Q_scale score biases for up to 16 tiles into LDS."""
     offset_type: gl.constexpr = gl.int64 if use_64bit_context_offsets else gl.uint32
     lane = gl.arange(0, 128, gl.SliceLayout(0, VECTOR_LAYOUT)) % 32
     column_in_mma = lane % 16
@@ -242,27 +243,30 @@ def compute_chunk_key_biases(
     ]
 
     for half in gl.static_range(2):
-        tile_slot = half * 8 + column_in_mma // 2
-        tile_index = tiles_shared.gather(tile_slot, 0).to(offset_type)[None, :]
-        row_offset = (tile_index * (2 * head_dim) + center_term[None, :] * head_dim).to(offset_type)
-        acc = None
-        for k_pair in gl.static_range(head_dim // 32):
-            offset = (row_offset + k_pair * 32 + (lane[None, :] // 16) * 16).to(offset_type)
-            pair_words = (key_center_ptr + offset).to(gl.pointer_type(gl.uint64))
-            acc = int8_wmma(query[2 * k_pair], gl.load(pair_words), acc, 0)
-            acc = int8_wmma(query[2 * k_pair + 1], gl.load(pair_words + 1), acc, 0)
-        recovered = _recover_scores(_matrix_fragment(acc).to(gl.float32, bitcast=True), False)
-        column = gl.arange(0, 16, scale_layout)
-        column_tile_index = tiles_shared.gather(half * 8 + column // 2, 0).to(offset_type)
-        center_scales = gl.load(
-            key_center_scale_ptr + column_tile_index * 2 + (column % 2).to(offset_type)
-        )
-        weighted = recovered * center_scales[None, None, :]
-        dots = gl.convert_layout(
-            gl.sum(weighted.reshape([1, 64, 8, 2]), axis=3).reshape([64, 8]),
-            store_layout,
-        )
-        key_bias_shared.slice(half * 8, 8, dim=1).store(dots * row_query_scale)
+        if half == 0 or num_valid_tiles > 8:
+            tile_slot = half * 8 + column_in_mma // 2
+            tile_index = tiles_shared.gather(tile_slot, 0).to(offset_type)[None, :]
+            row_offset = (tile_index * (2 * head_dim) + center_term[None, :] * head_dim).to(
+                offset_type
+            )
+            acc = None
+            for k_pair in gl.static_range(head_dim // 32):
+                offset = (row_offset + k_pair * 32 + (lane[None, :] // 16) * 16).to(offset_type)
+                pair_words = (key_center_ptr + offset).to(gl.pointer_type(gl.uint64))
+                acc = int8_wmma(query[2 * k_pair], gl.load(pair_words), acc, 0)
+                acc = int8_wmma(query[2 * k_pair + 1], gl.load(pair_words + 1), acc, 0)
+            recovered = _recover_scores(_matrix_fragment(acc).to(gl.float32, bitcast=True), False)
+            column = gl.arange(0, 16, scale_layout)
+            column_tile_index = tiles_shared.gather(half * 8 + column // 2, 0).to(offset_type)
+            center_scales = gl.load(
+                key_center_scale_ptr + column_tile_index * 2 + (column % 2).to(offset_type)
+            )
+            weighted = recovered * center_scales[None, None, :]
+            dots = gl.convert_layout(
+                gl.sum(weighted.reshape([1, 64, 8, 2]), axis=3).reshape([64, 8]),
+                store_layout,
+            )
+            key_bias_shared.slice(half * 8, 8, dim=1).store(dots * row_query_scale)
 
 
 @gluon.jit
