@@ -7,7 +7,7 @@ from _compile_capture import TargetCapturePass
 from piper_kernels import compile_options
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels.linear.convrot.int8 import _backend, _functional, _ops, reference
-from piper_kernels.weights.convrot.int8 import _update
+from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor, _update
 from piper_kernels.weights.convrot.int8 import _update_reference as int8_update_reference
 from piper_kernels.weights.convrot.int8 import triton as int8_update_ops
 
@@ -255,3 +255,94 @@ def test_compiled_static_sharing_and_scale_mutation(monkeypatch, scales):
                 original = actual[0]
             else:
                 assert not torch.equal(original, actual[0])
+
+
+@pytest.mark.parametrize("case", ["coalesce", "distinct-dtype", "external-consumer"])
+def test_compiled_convrot_int8_coalesces_duplicate_input_casts(case):
+    value, weight, scale, bias = _operands()
+
+    target_dtype = torch.float16 if case == "distinct-dtype" else torch.bfloat16
+    graph = torch.fx.Graph()
+    source = graph.placeholder("source")
+    source.meta["val"] = value
+    weight_node = graph.placeholder("weight")
+    weight_node.meta["val"] = weight
+    scale_node = graph.placeholder("scale")
+    scale_node.meta["val"] = scale
+    bias_node = graph.placeholder("bias")
+    bias_node.meta["val"] = bias.to(torch.bfloat16)
+
+    cast_first = graph.call_function(
+        torch.ops.prims.convert_element_type.default, (source, torch.bfloat16)
+    )
+    cast_first.meta["val"] = value.to(torch.bfloat16)
+    cast_second = graph.call_function(
+        torch.ops.prims.convert_element_type.default, (source, target_dtype)
+    )
+    cast_second.meta["val"] = value.to(target_dtype)
+
+    first = graph.call_function(
+        torch.ops.piper_kernels.convrot_int8_linear.default,
+        (cast_first, weight_node, scale_node, bias_node, 16),
+    )
+    first.meta["val"] = torch.empty((2, 3, 7), dtype=torch.bfloat16)
+    second = graph.call_function(
+        torch.ops.piper_kernels.convrot_int8_linear.default,
+        (cast_second, weight_node, scale_node, None, 16),
+    )
+    second.meta["val"] = torch.empty((2, 3, 7), dtype=target_dtype)
+    graph.output((first, second, cast_first) if case == "external-consumer" else (first, second))
+
+    passes = compile_options()["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=True)
+    graph.lint()
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    should_coalesce = case == "coalesce"
+    assert targets.count(torch.ops.prims.convert_element_type.default) == (
+        1 if should_coalesce else 2
+    )
+    assert targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == (
+        1 if should_coalesce else 0
+    )
+    assert targets.count(torch.ops.piper_kernels.convrot_int8_linear_prepared.default) == (
+        2 if should_coalesce else 0
+    )
+    assert targets.count(torch.ops.piper_kernels.convrot_int8_linear.default) == (
+        0 if should_coalesce else 2
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+def test_gpu_autocast_convrot_int8_projections_share_preparation():
+    torch.manual_seed(91)
+    source = torch.randn(32, 256, device="cuda", dtype=torch.bfloat16)
+    weights = [
+        ConvRotInt8Tensor.from_hp(
+            torch.randn(128, 256, device="cuda", dtype=torch.bfloat16), group_size=256
+        )
+        for _ in range(3)
+    ]
+
+    def projections(x):
+        return tuple(torch.nn.functional.linear(x, weight) for weight in weights)
+
+    capture = TargetCapturePass()
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+        expected = projections(source)
+        torch._dynamo.reset()
+        actual = torch.compile(
+            projections,
+            fullgraph=True,
+            options=capture.wrap_options(compile_options()),
+        )(source)
+
+    assert all(result.dtype is torch.float16 for result in actual)
+    for result, ref in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, ref, rtol=0, atol=0)
+    assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_prepare_input.default) == 1
+    assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_linear_prepared.default) == 3
+    assert torch.ops.piper_kernels.convrot_int8_linear.default not in capture.targets

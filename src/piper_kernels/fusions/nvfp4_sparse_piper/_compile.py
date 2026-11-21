@@ -456,6 +456,7 @@ def _fold_projection(graph: torch.fx.Graph) -> bool:
 def fold_sparse_attention(graph: torch.fx.Graph) -> bool:
     """Fold NVFP4 / ConvRot NVFP4 sparse-Piper projections and output projections."""
     changed = projection_views.normalize_projection_views(graph)
+    changed = linear_compile_fx.coalesce_input_casts(graph) or changed
     changed = _fold_projection(graph) or changed
     changed = _output_compile._fold_attention_output(graph) or changed
     return changed

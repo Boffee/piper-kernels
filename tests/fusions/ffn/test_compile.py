@@ -125,6 +125,34 @@ def test_convrot_int8_compile_folds_ffn(
 
 @pytest.mark.gpu
 @_GPU
+@pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16])
+def test_convrot_int8_compile_folds_autocast_swiglu_ffn(
+    bias_dtype: torch.dtype | None,
+) -> None:
+    torch.manual_seed(512)
+    model = Int8SwiGluFfn(dtype=torch.bfloat16, bias_dtype=bias_dtype).eval()
+    source = torch.randn(2, 257, model.input_features, dtype=torch.bfloat16, device="cuda")
+    capture = TargetCapturePass()
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+        torch._dynamo.reset()
+        expected = torch.compile(model, fullgraph=True, options=compile_options())(source)
+        torch._dynamo.reset()
+        actual = torch.compile(
+            model,
+            fullgraph=True,
+            options=capture.wrap_options(compile_options(ffn=True)),
+        )(source)
+
+    assert isinstance(expected, torch.Tensor)
+    assert isinstance(actual, torch.Tensor)
+    assert actual.dtype is torch.float16
+    assert relative_l2(actual, expected) < 0.01
+    assert capture.targets.count(torch.ops.piper_kernels.convrot_int8_ffn.default) == 1
+    assert torch.ops.piper_kernels.convrot_int8_linear.default not in capture.targets
+
+
+@pytest.mark.gpu
+@_GPU
 @pytest.mark.parametrize("activation", ["gelu_tanh", "swiglu"])
 @pytest.mark.parametrize(
     "failure", ["projection-escapes", "noncontiguous", "empty", "different-input"]
@@ -943,3 +971,53 @@ def test_schema_bound_gated_updates_accept_kwargs_and_check_alpha(
 
     assert ("piper_kernels.convrot_int8_ffn_update_.default" in target_names) is should_fold_update
     assert ("piper_kernels.convrot_int8_ffn.default" in target_names) is not should_fold_update
+
+
+@pytest.mark.parametrize("external_consumer", [False, True])
+def test_nvfp4_swiglu_coalesces_duplicate_autocast_inputs(external_consumer: bool) -> None:
+    """Identical input casts feeding NVFP4 SwiGLU projections must coalesce and fold FFN."""
+    aten = torch.ops.aten
+    prims = torch.ops.prims
+    rows, features = 16, 128
+    shape = (rows, features)
+    with FakeTensorMode():
+        graph = torch.fx.Graph()
+        raw = graph.placeholder("raw")
+        raw.meta["val"] = torch.empty(shape, dtype=torch.float32, device="meta")
+        cast_val = _fx_call(
+            graph,
+            prims.convert_element_type.default,
+            shape,
+            torch.bfloat16,
+            "meta",
+            a=raw,
+            dtype=torch.bfloat16,
+        )
+        cast_gate = _fx_call(
+            graph,
+            prims.convert_element_type.default,
+            shape,
+            torch.bfloat16,
+            "meta",
+            a=raw,
+            dtype=torch.bfloat16,
+        )
+        val = _add_nvfp4_meta_linear_node(graph, "val", cast_val, rows, features)
+        gate = _add_nvfp4_meta_linear_node(graph, "gate", cast_gate, rows, features)
+        silu = _fx_call(graph, aten.silu.default, shape, torch.bfloat16, "meta", self=gate)
+        activated = _fx_call(
+            graph, aten.mul.Tensor, shape, torch.bfloat16, "meta", self=val, other=silu
+        )
+        down = _add_nvfp4_meta_linear_node(graph, "down", activated, rows, features)
+        graph.output((down, cast_val) if external_consumer else down)
+        fold_ffns(graph)
+        graph.lint()
+        target_names = [str(node.target) for node in graph.nodes if node.op == "call_function"]
+
+    assert target_names.count("prims.convert_element_type.default") == (
+        2 if external_consumer else 1
+    )
+    assert target_names.count("piper_kernels.nvfp4_ffn.default") == (0 if external_consumer else 1)
+    assert target_names.count("piper_kernels.nvfp4_linear.default") == (
+        3 if external_consumer else 0
+    )

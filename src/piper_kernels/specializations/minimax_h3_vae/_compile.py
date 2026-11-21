@@ -18,23 +18,9 @@ from . import _ops  # noqa: F401 - registers the prepared H3 linear
 type _LinearShape = tuple[int, int, int]
 type _MatmulSchedule = tuple[int, int, int, int, int]
 
-# Rows, output features, input features. These schedules apply only to the fixed
-# 256x256 H3 VAE tile on exact SM120. The first shape covers the attention
-# projection linears; this pass never replaces the attention operator itself.
-_SM120_MATMUL_SCHEDULES: dict[_LinearShape, _MatmulSchedule] = {
-    (1_797, 2_048, 2_048): (128, 128, 128, 4, 2),
-    (1_797, 16_384, 2_048): (128, 128, 64, 8, 3),
-    (1_797, 2_048, 8_192): (128, 128, 128, 4, 2),
-    (3_594, 2_048, 2_048): (128, 128, 64, 8, 3),
-    (3_594, 16_384, 2_048): (128, 128, 64, 8, 3),
-    (3_594, 2_048, 8_192): (128, 128, 64, 8, 3),
-    (7_188, 2_048, 2_048): (128, 128, 128, 4, 2),
-    (7_188, 16_384, 2_048): (128, 128, 64, 8, 3),
-    (7_188, 2_048, 8_192): (128, 128, 128, 4, 2),
-}
-
-# The narrow N128 tile helps the small square projection. For the two down
-# projections, gfx1201's ordinary wide-K GEMM is faster than this override.
+# Rows, output features, input features. SM120 defers to the default Gluon TMA
+# plan, leaving only measured RDNA4 N128 Triton overrides for the fixed 256x256
+# H3 VAE tile (for gfx1201 down projections, the ordinary wide-K GEMM is faster).
 _RDNA4_N128_ARCHITECTURES: dict[_LinearShape, tuple[str, ...]] = {
     (1_797, 2_048, 2_048): ("gfx1200", "gfx1201"),
     (1_797, 2_048, 8_192): ("gfx1200",),
@@ -78,8 +64,6 @@ def _schedule_for(
     *,
     target: AcceleratorTarget,
 ) -> _MatmulSchedule | None:
-    if target.is_cuda_capability(12, 0):
-        return _SM120_MATMUL_SCHEDULES.get(shape)
     if target.is_amd_hip and target.is_architecture(*_RDNA4_N128_ARCHITECTURES.get(shape, ())):
         return (128, 128, 64, 8, 2)
     return None

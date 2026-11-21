@@ -10,6 +10,13 @@ from torch.fx.node import Argument
 
 _aten = torch.ops.aten
 _prims = torch.ops.prims
+SEMANTIC_LINEAR_NAMES = frozenset(
+    {
+        "piper_kernels::convrot_int8_linear",
+        "piper_kernels::nvfp4_linear",
+        "piper_kernels::convrot_nvfp4_linear",
+    }
+)
 
 
 def schema_name(node: object) -> str | None:
@@ -179,10 +186,47 @@ def ordered_tuple_output_producer(
     return producer
 
 
+def coalesce_input_casts(graph: torch.fx.Graph) -> bool:
+    """Share identical input dtype casts consumed exclusively as semantic linear inputs.
+
+    Post-AOT graphs represent input mutations as distinct values. Match exact
+    source/dtype identity and keep casts with external consumers independent,
+    so this does not change externally visible storage aliasing.
+    """
+    casts: dict[tuple[torch.fx.Node, torch.dtype], torch.fx.Node] = {}
+    changed = False
+    for node in list(graph.nodes):
+        converted = convert_dtype(node)
+        if converted is None or not node.users:
+            continue
+        source, dtype = converted
+        if any(
+            schema_name(user) not in SEMANTIC_LINEAR_NAMES
+            or (user_bound := bind_arguments(user)) is None
+            or user_bound.get("input") is not node
+            or sum(arg is node for arg in user_bound.values()) != 1
+            for user in node.users
+        ):
+            continue
+        key = (source, dtype)
+        previous = casts.get(key)
+        if previous is None:
+            casts[key] = node
+        else:
+            node.replace_all_uses_with(previous)
+            graph.erase_node(node)
+            changed = True
+    if changed:
+        graph.lint()
+    return changed
+
+
 __all__ = [
+    "SEMANTIC_LINEAR_NAMES",
     "binary_args",
     "bind_arguments",
     "bind_call",
+    "coalesce_input_casts",
     "convert_dtype",
     "emit_tuple_result",
     "is_scalar",

@@ -15,7 +15,6 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 
 from piper_kernels import compile_options
 from piper_kernels.linear.nvfp4 import _ops as _nvfp4_ops  # noqa: F401 - registers custom ops
-from piper_kernels.linear.nvfp4._compile_fx import coalesce_input_casts
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 
@@ -176,9 +175,9 @@ def test_compile_options_install_idempotent_pass() -> None:
 @pytest.mark.parametrize("difference", [None, "source", "dtype", "external-consumer"])
 def test_input_cast_sharing_preserves_source_dtype_and_external_storage(difference):
     graph = torch.fx.Graph()
-    source = _placeholder(graph, "source", torch.empty(17, 256, device="meta"))
+    source = _placeholder(graph, "source", torch.empty(17, 256, device="meta", dtype=torch.float32))
     other_source = (
-        _placeholder(graph, "other", torch.empty(17, 256, device="meta"))
+        _placeholder(graph, "other", torch.empty(17, 256, device="meta", dtype=torch.float32))
         if difference == "source"
         else source
     )
@@ -198,9 +197,21 @@ def test_input_cast_sharing_preserves_source_dtype_and_external_storage(differen
         outputs.append(_linear(graph, cast, qdata, scale, global_scale, None))
     graph.output((*outputs, casts[0]) if difference == "external-consumer" else tuple(outputs))
 
-    coalesce_input_casts(graph)
+    _run_compile_pass(graph)
 
-    assert (outputs[0].args[0] is outputs[1].args[0]) == (difference is None)
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    assert targets.count(torch.ops.prims.convert_element_type.default) == (
+        1 if difference is None else 2
+    )
+    assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == (
+        1 if difference is None else 0
+    )
+    assert targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == (
+        2 if difference is None else 0
+    )
+    assert targets.count(torch.ops.piper_kernels.nvfp4_linear.default) == (
+        0 if difference is None else 2
+    )
     graph.lint()
 
 

@@ -441,6 +441,7 @@ _HEAD_SLICING = head_slices.HeadSlicing(
 def fold_sparse_attention(graph: torch.fx.Graph) -> bool:
     """Fold ConvRot INT8 projections, output projections, residuals, and collectives."""
     changed = projection_views.normalize_projection_views(graph)
+    changed = linear_compile_fx.coalesce_input_casts(graph) or changed
     changed = _fold_sparse_piper_projection(graph) or changed
     changed = _output_compile._fold_attention_output(graph) or changed
     post_changed = residual_fold.fold_residual_adds(

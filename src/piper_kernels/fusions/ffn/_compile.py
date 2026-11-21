@@ -26,17 +26,10 @@ from piper_kernels.linear import _projection_views as projection_views
 _aten = torch.ops.aten
 
 _CONVROT_INT8_LINEAR = "piper_kernels::convrot_int8_linear"
-_NVFP4_LINEAR = "piper_kernels::nvfp4_linear"
 _CONVROT_NVFP4_LINEAR = "piper_kernels::convrot_nvfp4_linear"
 _CONVROT_INT8_FFN = "piper_kernels::convrot_int8_ffn"
 _NVFP4_FFN = "piper_kernels::nvfp4_ffn"
-_SEMANTIC_LINEAR_NAMES = frozenset(
-    {
-        _CONVROT_INT8_LINEAR,
-        _NVFP4_LINEAR,
-        _CONVROT_NVFP4_LINEAR,
-    }
-)
+_NVFP4_LINEAR = "piper_kernels::nvfp4_linear"
 
 type _Format = Literal["convrot_int8", "nvfp4"]
 
@@ -77,7 +70,7 @@ def _parse_projection(node: object) -> _BoundProjection | None:
     if not isinstance(node, torch.fx.Node):
         return None
     name = linear_fx.schema_name(node)
-    if name not in _SEMANTIC_LINEAR_NAMES:
+    if name not in linear_fx.SEMANTIC_LINEAR_NAMES:
         return None
     bound = linear_fx.bind_arguments(node)
     if bound is None or not isinstance(bound.get("input"), torch.fx.Node):
@@ -867,9 +860,8 @@ def fold_ffns(graph: torch.fx.Graph) -> bool:
     if not (has_convrot_int8 or has_nvfp4):
         return False
 
-    projection_views.normalize_projection_views(graph)
-
-    changed = False
+    changed = projection_views.normalize_projection_views(graph)
+    changed = linear_fx.coalesce_input_casts(graph) or changed
     for node in list(graph.nodes):
         down = _parse_projection(node)
         if down is None:
