@@ -16,7 +16,8 @@ GLUON_BLOCK_M = 2 * TILE_ROWS
 GLUON_BLOCK_K = 64
 GLUON_NUM_WARPS = 8
 GLUON_GROUP_M = 8
-# Avoid signed zero-crossing WMMA clock drops across >=4096-feature reductions (linear/_amd/README).
+# Avoid signed zero-crossing WMMA clock drops across >=4096-feature reductions
+# (see linear/convrot/int8/_amd/policy.py:matmul_accumulator_seed).
 GLUON_ACCUMULATOR_SEED = 0x155555
 GLUON_ACCUMULATOR_SEED_MIN_K = 4096
 GLUON_ROTARY_DIMS: dict[int, tuple[int, ...]] = {

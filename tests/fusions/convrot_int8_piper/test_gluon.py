@@ -17,7 +17,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.convrot_int8_piper import key, query, value
 from piper_kernels.fusions.convrot_int8_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_piper._nvidia import dispatch, gluon, policy
-from piper_kernels.fusions.convrot_int8_projection._nvidia import _tma
+from piper_kernels.linear.convrot.int8._nvidia import gluon_tma
 
 _SM89_TARGET = AcceleratorTarget("cuda", "sm89")
 _SM120_TARGET = AcceleratorTarget("cuda", "sm120")
@@ -317,7 +317,7 @@ def test_sm120_tma_launches_use_descriptors_and_skip_empty_batches(monkeypatch, 
     monkeypatch.setattr(gluon.piper_quantization, "prepare_chunk_centered_key", Mock())
     descriptors = [object(), object()]
     descriptor_builder = Mock(side_effect=descriptors)
-    monkeypatch.setattr(_tma, "build_matrix_descriptor", descriptor_builder)
+    monkeypatch.setattr(gluon_tma, "build_matrix_descriptor", descriptor_builder)
     tma_plan = policy.select_execution_plan(
         _SM120_TARGET,
         operation=operation,

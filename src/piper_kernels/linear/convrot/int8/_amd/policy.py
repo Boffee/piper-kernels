@@ -1,21 +1,57 @@
-"""Conservative AMD support and measured RDNA4 ConvRot INT8 launch policy."""
+"""Conservative AMD support, execution plans, and measured RDNA4 launch policy.
+
+Supports HIP architectures covered by offline compilation tests on Linux and
+Windows (``gfx942``, ``gfx1100``, ``gfx1151``, ``gfx1200``, ``gfx1201``), with
+hardware correctness and performance measurements on RX 9070 XT (``gfx1201``).
+Unknown targets fall back to the portable reference path.
+
+Preparation chooses up to three group-aligned power-of-two segments, fusing
+rotation and quantization through 16,384 input features before falling back to a
+split path. On ``gfx1201``, short batches with known ``out_features`` use
+single-row-tile schedules (``(32, 128, 64)`` / 4 warps for ``1..32`` rows and
+``(64, 128, 64)`` / 4 warps for ``33..64`` rows) so uncached weights stream once
+while doubling N parallelism. Above 64 rows, GEMMs use ``(128, 256, 64)`` tiles
+(8 warps, 2 stages, ``group_m=8``), switching to ``(128, 128, 128)`` when
+``in_features`` is a multiple of 8,192 and the launch fills at least two
+workgroups per WGP (64 tiles).
+"""
 
 import sys
+from dataclasses import dataclass
 
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from .._plan import LinearExecutionPlan
-from ._plan import AmdExecutionPlan
 
 # gfx1201 has hardware correctness/performance coverage; the remaining targets
 # have offline compilation coverage. Unknown architectures use the reference.
 _SUPPORTED_ARCHITECTURES = ("gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201")
 
+# Maximum feature width fused into a single rotation-and-quantization kernel.
+_MAX_FUSED_PREPARATION_WIDTH = 16384
 
 # Two output workgroups per WGP on gfx1201.
 _MIN_GFX1201_MATMUL_TILES = 64
+
+
+@dataclass(frozen=True, slots=True)
+class AmdExecutionPlan(LinearExecutionPlan):
+    """AMD-owned launch constraints, including wave32 preparation with 32 warps."""
+
+    def __post_init__(self) -> None:
+        LinearExecutionPlan.__post_init__(self)
+        for name in ("fused_num_warps", "rotation_num_warps", "quantization_num_warps"):
+            if getattr(self, name) not in (1, 2, 4, 8, 16, 32):
+                raise ValueError(f"AMD {name} must be a power of two from 1 through 32")
+        if self.matmul_num_warps not in (4, 8):
+            raise ValueError("AMD matmul_num_warps must be 4 or 8")
+        for name in ("matmul_block_m", "matmul_block_n", "matmul_block_k"):
+            if getattr(self, name) not in (16, 32, 64, 128, 256):
+                raise ValueError(f"AMD {name} must be a power of two from 16 through 256")
+        if self.matmul_num_stages not in (1, 2, 3, 4):
+            raise ValueError("AMD matmul_num_stages must be 1, 2, 3, or 4")
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
@@ -25,6 +61,11 @@ def supports_target(target: AcceleratorTarget) -> bool:
         and target.is_amd_hip
         and target.is_architecture(*_SUPPORTED_ARCHITECTURES)
     )
+
+
+def supports_fused_preparation(in_features: int) -> bool:
+    """Return whether AMD fuses rotation and quantization for ``in_features``."""
+    return 0 < in_features <= _MAX_FUSED_PREPARATION_WIDTH
 
 
 def preparation_blocks(row_width: int) -> tuple[int, int, int]:
@@ -57,10 +98,14 @@ def matmul_group_m(plan: LinearExecutionPlan) -> int:
 
 
 def matmul_accumulator_seed(target: AcceleratorTarget, in_features: int, output_tiles: int) -> int:
-    """Keep high accumulator bits stable in long signed INT8 reductions on gfx1201."""
-    # Center partial sums away from the signed zero crossing. On a stock RX
-    # 9070 XT this sustains a higher matrix clock. Remove the seed in INT32
-    # before scaling. Each INT8 product contributes at most 128 squared.
+    """Return the ``0x155555`` zero-crossing seed for long INT8 reductions on gfx1201.
+
+    For reductions of 4,096+ features with at least 64 output tiles on ``gfx1201``,
+    seeding INT32 accumulators with ``0x155555`` centers partial sums away from the
+    signed zero crossing, sustaining a higher matrix clock on a stock RX 9070 XT.
+    The kernel subtracts the seed in INT32 before FP32 scaling; each INT8 product
+    contributes at most ``128 * 128``, bounding the safe reduction width.
+    """
     seed = 0x155555
     if (
         target.is_architecture("gfx1201")
@@ -130,7 +175,12 @@ def supports_residual_epilogue(
     in_features: int,
     out_features: int,
 ) -> bool:
-    """Return whether aligned RDNA4 16-bit GEMMs fuse the residual epilogue."""
+    """Return whether aligned RDNA4 16-bit GEMMs fuse the residual epilogue.
+
+    FP32 outputs, short batches (``rows <= 64``), unaligned dimensions, and
+    offsets exceeding signed 32-bit SRD range fall back to a materialized
+    projection plus standalone ``apply_residual_add``.
+    """
     return (
         logical_dtype in (torch.float16, torch.bfloat16)
         and (plan.matmul_block_n, plan.matmul_block_k) in ((128, 128), (256, 64))
@@ -193,7 +243,7 @@ def select_execution_plan(
         elif 33 <= rows <= 64:
             block_m, block_n, block_k, matmul_warps = 64, 128, 64, 4
     return AmdExecutionPlan(
-        fuse_rotation_quantization=block_size <= 16384,
+        fuse_rotation_quantization=supports_fused_preparation(in_features),
         fused_num_warps=fused_num_warps,
         rotation_num_warps=4,
         quantization_num_warps=4,

@@ -44,7 +44,7 @@ _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
     "benchmarks/benchmark_sparse_piper_scores.py": 5,
     "benchmarks/lib/attention_providers.py": 8,
     "benchmarks/lib/convrot.py": 3,
-    "benchmarks/lib/convrot_int8_providers.py": 4,
+    "benchmarks/lib/convrot_int8_providers.py": 3,
     "benchmarks/lib/environment.py": 1,
     "benchmarks/lib/sparse_piper.py": 1,
     "benchmarks/lib/suite_attention.py": 10,
@@ -57,7 +57,7 @@ _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
 
 # Legacy private piper_kernels import totals in tests/ (lower as tests decouple).
 _MAX_TEST_PRIVATE_IMPORT_FILES = 162
-_MAX_TEST_PRIVATE_IMPORTS = 695
+_MAX_TEST_PRIVATE_IMPORTS = 688
 
 _PASS_BASE_NAMES = frozenset(
     {

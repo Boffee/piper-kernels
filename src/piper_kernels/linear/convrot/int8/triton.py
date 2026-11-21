@@ -419,7 +419,16 @@ def int8_residual_matmul_kernel(
     residual_has_reusable_update: tl.constexpr,
     residual_python_indexing: tl.constexpr,
 ):
-    """Project and add a validated residual without a materialized projection."""
+    """Project and add a validated residual without a materialized projection.
+
+    Rounds the projection to its logical 16-bit dtype before FP32 residual
+    arithmetic, preserving the materialized projection's rounding boundary while
+    keeping the tile compact before residual loads. On RTX 5090 (SM120),
+    retaining FP32 in the 128x256 Triton tile spilled registers and regressed
+    attention blocks by up to ~1.6% and FFNs by 1-5% (splitting the Triton
+    epilogue removed spills but stayed slower); keep this rounding unless a
+    different schedule demonstrates a measured win across workloads.
+    """
     result, offsets_m, offsets_n, _, tile_aligned = _project_tile(
         input_ptr,
         weight_ptr,

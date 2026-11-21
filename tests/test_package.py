@@ -74,7 +74,6 @@ import torch
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops
-from piper_kernels.linear.convrot.int8._generic import dispatch as generic_dispatch
 from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels._distributed import _fx as distributed_fx
 assert hasattr(distributed_fx, "has_c10d_collectives")
@@ -94,7 +93,7 @@ assert result.shape == (2, 7)
 assert _backend.select_linear_backend(torch.ones(1)) is None
 assert "triton" not in sys.modules
 assert hasattr(torch.ops.piper_kernels, "convrot_int8_prepare_input")
-assert generic_dispatch._triton_backend is None
+assert _generic._triton_backend is None
 from piper_kernels.fusions.convrot_int8_projection._validation import validate_qk_projection_inputs
 assert validate_qk_projection_inputs(
     torch.ones(1, 64, 32, dtype=torch.int8),
