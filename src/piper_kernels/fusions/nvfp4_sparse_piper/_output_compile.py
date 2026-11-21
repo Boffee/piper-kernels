@@ -14,7 +14,7 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MINMAX_ROUTING,
     SUPPORTED_DTYPES,
 )
-from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
+from piper_kernels.fusions.attention import _sparse_compile as sparse_piper_compile
 from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.nvfp4 import _compile_fx

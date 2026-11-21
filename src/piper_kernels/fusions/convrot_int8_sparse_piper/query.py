@@ -8,10 +8,10 @@ from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     validate_routing_mode,
 )
+from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.fusions.convrot_int8_projection._validation import (
     validate_qk_projection_inputs,
 )
-from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
 
 from . import _backend
 from ._interfaces import ProjectionBackend

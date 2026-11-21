@@ -18,8 +18,8 @@ from piper_kernels._distributed import _peer_exchange as peer_exchange
 from piper_kernels._residual import ResidualAdd
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
+from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
-from piper_kernels.fusions.sparse_piper import _output as output_common
 from piper_kernels.weights.convrot.int8._quantization import validate_activation_scale
 
 from . import _backend as fusion_backend

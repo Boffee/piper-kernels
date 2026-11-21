@@ -13,16 +13,17 @@ from piper_kernels.attention.kernels.sparse_piper import layout as sparse_layout
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS
 from piper_kernels.attention.sparse_piper_attention import _contracts as _dtype
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
-from piper_kernels.fusions.projected_qk import _compile as projected_qk_compile
-from piper_kernels.fusions.projected_qk._compile import (
-    integer_scalar_argument,
-    integer_scalar_metadata,
-    static_int,
-)
 from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear._compile_fx import (
     ordered_tuple_output_producer as ordered_tuple_output_producer,  # noqa: PLC0414 - shared export
+)
+
+from . import _projected_qk_compile as projected_qk_compile
+from ._projected_qk_compile import (
+    integer_scalar_argument,
+    integer_scalar_metadata,
+    static_int,
 )
 
 _aten = torch.ops.aten

@@ -6,8 +6,9 @@ from typing import Literal
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
-
-type ProjectionOperation = Literal["query", "key", "value"]
+from piper_kernels.fusions.convrot_int8_projection._plan import (
+    ProjectionOperation as ProjectionOperation,  # noqa: PLC0414
+)
 
 TILE_ROWS = 64
 QUERY_SCALE_ROWS = 32

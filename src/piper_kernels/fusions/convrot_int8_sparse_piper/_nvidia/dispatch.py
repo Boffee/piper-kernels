@@ -6,7 +6,7 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
-from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import (
+from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import (
     NvidiaExecutionPlan,
     ProjectionOperation,
 )

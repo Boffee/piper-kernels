@@ -2,8 +2,8 @@
 
 import torch
 
+from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.fusions.convrot_int8_projection._validation import validate_qk_projection_inputs
-from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
 
 
 def validate_qk_inputs(  # noqa: PLR0913

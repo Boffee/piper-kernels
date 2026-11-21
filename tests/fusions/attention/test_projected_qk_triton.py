@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from piper_kernels.fusions.projected_qk.triton import rmsnorm_rope_tile
+from piper_kernels.fusions.attention.triton import rmsnorm_rope_tile
 
 
 @triton.jit

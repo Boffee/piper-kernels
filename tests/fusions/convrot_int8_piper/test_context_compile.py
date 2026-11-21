@@ -92,10 +92,10 @@ def test_context_launches_compile_for_rdna4(monkeypatch, head_dim, operation):
 def test_amd_dense_policy_and_gluon_eligibility_contracts():
     amd_gluon = _backend._amd_projection
     with FakeTensorMode():
-        q_in = torch.empty((1, 256, 256), device="cuda:1", dtype=torch.int8)
-        w_d64_even = torch.empty((4 * 64, 256), device="cuda:1", dtype=torch.int8)
-        w_d64_odd = torch.empty((3 * 64, 256), device="cuda:1", dtype=torch.int8)
-        w_d128 = torch.empty((3 * 128, 256), device="cuda:1", dtype=torch.int8)
+        q_in = torch.empty((1, 256, 256), device="cuda:0", dtype=torch.int8)
+        w_d64_even = torch.empty((4 * 64, 256), device="cuda:0", dtype=torch.int8)
+        w_d64_odd = torch.empty((3 * 64, 256), device="cuda:0", dtype=torch.int8)
+        w_d128 = torch.empty((3 * 128, 256), device="cuda:0", dtype=torch.int8)
 
         assert (
             amd_gluon.default_execution_plan(
@@ -140,8 +140,8 @@ def test_amd_dense_policy_and_gluon_eligibility_contracts():
         )
         # Signed 32-bit byte-offset check for BF16 key storage: 8_388_608 * 128 * 2 == 2**31,
         # while FP32 rotary indexing (8_388_608 * 32 + 64) * 4 stays under 2**31 for query.
-        q_large = torch.empty((1, 8_388_608, 64), device="cuda:1", dtype=torch.int8)
-        w_small = torch.empty((2 * 64, 64), device="cuda:1", dtype=torch.int8)
+        q_large = torch.empty((1, 8_388_608, 64), device="cuda:0", dtype=torch.int8)
+        w_small = torch.empty((2 * 64, 64), device="cuda:0", dtype=torch.int8)
         assert (
             amd_gluon.default_execution_plan(
                 q_large,

@@ -120,6 +120,9 @@ assert validate_qk_projection_inputs(
     name="Q",
 ) == (1, 64, 1)
 assert "piper_kernels.fusions.convrot_int8_projection.triton" not in sys.modules
+assert "piper_kernels.fusions.attention.triton" not in sys.modules
+assert "piper_kernels.fusions.attention._projected_qk_compile" not in sys.modules
+assert "piper_kernels.linear._compile_fx" not in sys.modules
 assert "triton" not in sys.modules
 prepared, scales = _ops.prepare_input(torch.ones(2, 32), 16)
 assert prepared.shape == (2, 32) and scales.shape == (2,)

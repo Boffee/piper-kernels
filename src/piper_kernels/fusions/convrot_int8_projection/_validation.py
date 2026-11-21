@@ -3,7 +3,7 @@
 import torch
 
 from piper_kernels._validation import validate_positive_finite_float
-from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
+from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.linear import _bias
 
 _SUPPORTED_NORM_DTYPES = (torch.float16, torch.bfloat16, torch.float32)

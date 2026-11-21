@@ -15,7 +15,7 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MINMAX_ROUTING,
     validate_routing_mode,
 )
-from piper_kernels.fusions.projected_qk._validation import resolve_head_dim
+from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.linear.nvfp4._chunking import (
     DEFAULT_CHUNK_ROWS,
     PreparedProjection,

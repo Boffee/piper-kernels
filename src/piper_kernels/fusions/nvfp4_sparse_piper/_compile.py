@@ -14,7 +14,7 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     SUPPORTED_DTYPES,
     is_valid_routing_mode,
 )
-from piper_kernels.fusions.sparse_piper import _compile as sparse_piper_compile
+from piper_kernels.fusions.attention import _sparse_compile as sparse_piper_compile
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views

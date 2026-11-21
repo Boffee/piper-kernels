@@ -1,6 +1,9 @@
 """Immutable execution choices for shared ConvRot INT8 projections."""
 
 from dataclasses import dataclass
+from typing import Literal
+
+type ProjectionOperation = Literal["query", "key", "value"]
 
 
 @dataclass(frozen=True, slots=True)

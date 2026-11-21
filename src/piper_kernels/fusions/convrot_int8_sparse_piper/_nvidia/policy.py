@@ -5,7 +5,7 @@ from dataclasses import replace
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy as attention_policy
 from piper_kernels.fusions.convrot_int8_projection._nvidia import policy as projection_policy
-from piper_kernels.fusions.convrot_int8_projection._nvidia._plan import (
+from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import (
     NvidiaExecutionPlan,
     ProjectionOperation,
 )
