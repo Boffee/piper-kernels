@@ -94,12 +94,23 @@ scratch spills, LDS) on a small canary set before sweeping.
 
 ## Checks
 
-Target **Triton 3.9** (PyTorch 2.15) during development and validation (verify
-`triton.__version__` before running tests or benchmarks). In the default CUDA
-environment:
+- **Documentation only.** Check edited links, heading anchors, and named symbols.
+  Run examples whose executable steps changed.
+- **Operator or kernel.** Exercise the affected path on its target. For a regression,
+  follow [Fixing kernel bugs](../AGENTS.md#fixing-kernel-bugs).
+- **Compiler rewrite.** Inspect the compiled graph to confirm which operations
+  fused or stayed separate. Compare the result with the equivalent eager operation.
+  The [FFN rewrite tests](../tests/fusions/ffn/test_compile.py) show both checks.
+- **Performance claim.** Compare full-operator latency and output quality before
+  and after the change on the same workload and GPU. Use the
+  [benchmark guide](../benchmarks/README.md#measurements-and-outcomes).
+
+For code changes, use the [CUDA](environments.md#cuda) or [ROCm](environments.md#rocm)
+setup for your target. With PyTorch 2.15, verify that `triton.__version__` is
+3.9.x before testing or benchmarking. In the default CUDA development environment,
+run the repository checks below.
 
 ```shell
-uv sync --dev
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
@@ -107,10 +118,9 @@ uv run pyright
 uv build
 ```
 
-GPU tests carry the `gpu` marker; pre-commit hides CUDA and runs portable tests, and
-[CI](../.github/workflows/ci.yml) validates portable behavior without GPU kernels. See
-[environments](environments.md) for worker/thread variables, compiler caches, and
-[ROCm regressions](environments.md#rocm-regressions).
+GPU tests carry the `gpu` marker. Pre-commit and [CI](../.github/workflows/ci.yml)
+run portable checks with CUDA hidden. For RDNA4 hardware validation, use the
+[ROCm regression runner](environments.md#rocm-regressions).
 
 ### Writing tests
 
@@ -138,16 +148,18 @@ instead. Gate broad compile sweeps on a small canary subset parallelized across 
 workers, and keep offline compile matrices to minimal distinct codegen paths rather than
 Cartesian target/flag products (avoiding multiplying identical-ISA targets such as
 `gfx1200` and `gfx1201` across every option flag when one covers variant codegen).
+
 ## Commits and pull requests
 
 Use standard Git commits (imperative subject `<= 72` chars without `feat:` prefixes,
 72-column body explaining why; never commit artifacts, caches, or checkpoints).
 
-PRs lead with the problem, then cover **Change** (design, what was removed, and
-surface-area impact on `src/`/`tests/`/`benchmarks/`: net files and LOC, any new custom
-ops/passes with justification, and removed/lowered ratchet entries; cleanup PRs must
-reduce net LOC and files), **Compatibility**, and **Validation** (commands, hardware,
-unvalidated targets/OS paths).
+Lead with the problem and explain the design, caller impact, and validation.
+For changes under `src/`, `tests/`, or `benchmarks/`, report net files and lines,
+what was removed, and any architecture ceilings or allowlist entries lowered or
+removed. Explain why any new custom operator or compiler pass is needed.
+Report the checks and hardware used and any affected targets or OS paths left
+unvalidated.
 
 Add 1–2-sentence caller-impact entries to `CHANGELOG.md` under `## [Unreleased]`
 (`Added`/`Changed`/`Fixed`, `Breaking:` when breaking) for observable API, behavior,
