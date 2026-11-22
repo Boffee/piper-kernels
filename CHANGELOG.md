@@ -57,6 +57,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   sparse attention-output pipelines via single-stream single-slot execution (with minor
   FP32 differences within `1e-6` / INT8 tolerances and a one-time ROCm Triton kernel
   recompile).
+- Replaced standalone RDNA4 Triton operand preparation for `SparsePiperAttention` (Q/K/V)
+  and dense `piper_attention` (Q) with vectorized 8-warp Gluon kernels using coalesced
+  128-bit loads and wave32 lane-swizzled signed Hadamard rotations. Measured 1.63-2.15x
+  faster standalone `SparsePiperAttention` operand preparation and 1.20-1.24x faster
+  dense `piper_attention` query preparation on RX 9070 XT across BF16 and FP16 sequence
+  configurations (with minor 1-LSB INT8 rounding differences on sparse keys).
 - Improved RTX 5090 (SM120) execution speed and reduced scratch memory across sparse Piper
   routing/attention, D128 Q/K/V projections, and large ConvRot INT8 linear, FFN, and
   fused residual projections (with minor rounding differences within INT8 tolerances).

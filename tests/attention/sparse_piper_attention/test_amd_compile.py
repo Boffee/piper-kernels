@@ -168,3 +168,150 @@ def test_prepare_parameters_compiles_with_runtime_count():
         options={"num_warps": 4},
     )
     assert compiled.asm["hsaco"]
+
+
+def _compile_preparation(
+    architecture,
+    kind,
+    *,
+    head_dim=128,
+    input_dtype="bf16",
+    emit_summaries=False,
+    mask_block_lengths=False,
+    mask_rows=False,
+    mask_heads=False,
+    aligned_16b=True,
+):
+    kernels = {
+        "query": amd_gluon._prepare_query_kernel,
+        "key": amd_gluon._prepare_key_kernel,
+        "value": amd_gluon._prepare_value_kernel,
+    }
+    kernel = kernels[kind]
+    constants = {
+        "head_dim": head_dim,
+        "mask_block_lengths": mask_block_lengths,
+        "mask_rows": mask_rows,
+        "mask_heads": mask_heads,
+        "aligned_16b": aligned_16b,
+    }
+    if "emit_summaries" in kernel.arg_names:
+        constants["emit_summaries"] = emit_summaries
+
+    pointer_types = {
+        "query_ptr": f"*{input_dtype}",
+        "key_ptr": f"*{input_dtype}",
+        "value_ptr": f"*{input_dtype}",
+        "query_int8_ptr": "*i8",
+        "key_int8_ptr": "*i8",
+        "key_center_ptr": "*i8",
+        "value_int8_ptr": "*i8",
+        "block_lengths_ptr": "*i32",
+        "value_mean_ptr": "*bf16",
+    }
+    signature = {}
+    for name in kernel.arg_names:
+        if name in constants:
+            continue
+        if name in pointer_types:
+            signature[name] = pointer_types[name]
+        elif name.endswith("_ptr"):
+            signature[name] = "*fp32"
+        elif name == "softmax_scale":
+            signature[name] = "fp32"
+        else:
+            signature[name] = "i32"
+
+    input_ptr_name = f"{kind}_ptr"
+    attrs = {
+        (kernel.arg_names.index(name),): [["tt.divisibility", 16]]
+        for name, arg_type in signature.items()
+        if arg_type.startswith("*") and (aligned_16b or name != input_ptr_name)
+    }
+    return kernel, triton.compile(
+        GluonASTSource(kernel, signature, constexprs=constants, attrs=attrs),
+        target=GPUTarget("hip", architecture, 32),
+        options={
+            "num_warps": 8,
+            "num_stages": 1,
+            "llvm_fn_attrs": amd_gluon.amd_quantization.PREP_LLVM_FN_ATTRS,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "emit_summaries"),
+    [
+        ("query", False),
+        ("query", True),
+        ("key", False),
+        ("key", True),
+        ("value", False),
+    ],
+)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("input_dtype", ["bf16", "fp16"])
+@pytest.mark.parametrize("mask_block_lengths", [False, True])
+def test_vectorized_preparation_compiles_for_rdna4(
+    kind,
+    emit_summaries,
+    head_dim,
+    input_dtype,
+    mask_block_lengths,
+):
+    kernel, compiled = _compile_preparation(
+        "gfx1201",
+        kind,
+        head_dim=head_dim,
+        input_dtype=input_dtype,
+        emit_summaries=emit_summaries,
+        mask_block_lengths=mask_block_lengths,
+        mask_rows=mask_block_lengths,
+        mask_heads=False,
+        aligned_16b=True,
+    )
+    assert compiled.asm["hsaco"]
+    assert compiled.metadata.global_scratch_size == 0
+    assert re.search(r"amdhsa_private_segment_fixed_size\s+0\b", compiled.asm["amdgcn"])
+    assert "global_load_b128" in compiled.asm["amdgcn"]
+    if rocm_fences_only_lds():
+        assert "global_inv" not in compiled.asm["amdgcn"]
+    if kind in ("query", "key"):
+        assert "ds_swizzle_b32" in compiled.asm["amdgcn"]
+        assert "s_wait_dscnt" in compiled.asm["amdgcn"]
+    expected_runtime_args = (
+        "logical_sequence_length",
+        "storage_tiles",
+        "stride_b",
+        "stride_h",
+        "stride_n",
+        "heads",
+        "heads_inner",
+    )
+    for name in expected_runtime_args:
+        assert name in kernel.do_not_specialize
+    if kind == "query":
+        assert "%softmax_scale: f32" in compiled.asm["ttgir"]
+    elif kind == "key":
+        assert "sparse_key_blocks" in kernel.do_not_specialize
+
+
+@pytest.mark.parametrize("kind", ["query", "key", "value"])
+@pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201"])
+def test_vectorized_preparation_odd_heads_unaligned_and_fp32_smoke(kind, architecture):
+    _kernel, compiled = _compile_preparation(
+        architecture,
+        kind,
+        head_dim=64,
+        input_dtype="fp32",
+        emit_summaries=(kind != "value"),
+        mask_block_lengths=False,
+        mask_rows=True,
+        mask_heads=True,
+        aligned_16b=False,
+    )
+    assert compiled.asm["hsaco"]
+    assert compiled.metadata.global_scratch_size == 0
+    assert re.search(r"amdhsa_private_segment_fixed_size\s+0\b", compiled.asm["amdgcn"])
+    if rocm_fences_only_lds():
+        assert "global_inv" not in compiled.asm["amdgcn"]

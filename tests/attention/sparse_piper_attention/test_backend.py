@@ -75,6 +75,7 @@ def test_attention_selection_uses_operand_target(target, kind, head_dim):
     if kind == "amd":
         assert selected.value_format is ValueFormat.AMD_WMMA
         assert selected.skip_dense_routing is False
+        assert selected.prepare is _backend.amd_gluon.prepare_operands
         assert selected.bind is _backend.amd_gluon.bind_context
     else:
         assert selected.value_format is ValueFormat.TRANSPOSED

@@ -149,7 +149,7 @@ def test_independent_preparation_keeps_quantization_policy_without_allocating_ou
         )
     )
     monkeypatch.setattr(backend._quantization, "prepare_chunk_centered_key", key_quantization)
-    monkeypatch.setattr(backend.qk_quantization, "prepare_query", query_quantization)
+    monkeypatch.setattr(backend.amd_quantization, "prepare_query", query_quantization)
     monkeypatch.setattr(backend, "prepare_value", value_quantization)
     monkeypatch.setattr(torch, "empty", Mock(side_effect=AssertionError("allocated an output")))
     context = backend.prepare_context(key, value, is_causal=False)
@@ -165,7 +165,7 @@ def test_independent_preparation_keeps_quantization_policy_without_allocating_ou
     assert prepared_query.global_row_offset == global_row_offset
     key_quantization.assert_called_once_with(key, grouped=True, storage_key_length=128)
     value_quantization.assert_called_once_with(value, storage_length=128)
-    query_quantization.assert_called_once_with(query, 0.125, grouped=True, storage_query_length=128)
+    query_quantization.assert_called_once_with(query, 0.125, storage_sequence_length=128)
 
 
 def test_benchmark_wrapper_allocates_output_during_preparation_and_reuses_it(monkeypatch):

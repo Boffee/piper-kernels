@@ -24,8 +24,22 @@ from triton.experimental.gluon.language.amd import cdna3, rdna4
 
 from piper_kernels._triton.amd_compiler_workarounds import LDS_ONLY_FENCE_ATTRS
 from piper_kernels.attention.kernels.piper._amd.fragments import AMDWMMALayout
-from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
-    SIGNED_HADAMARD_MASK,
+from piper_kernels.attention.kernels.piper._amd.quantization import (
+    GL_D64_NORM,
+    GL_D128_NORM,
+    GL_INT8_RANGE,  # noqa: F401 - re-exported for downstream fusion kernels
+    GL_LOG2_E,
+    GL_P_UINT8_RANGE,  # noqa: F401 - re-exported for downstream fusion kernels
+    GL_QUERY_SCALE_ROWS,
+    GL_SCALE_EPSILON,  # noqa: F401 - re-exported for downstream fusion kernels
+    GL_TILE_ROWS,
+    GL_TILE_ROWS_F32,  # noqa: F401 - re-exported for downstream fusion kernels
+    GL_VALUE_MEAN_SCALE_FLOOR,  # noqa: F401 - re-exported for downstream fusion kernels
+    VALUE_STORE_LAYOUT,
+    compute_hadamard_signs,
+    compute_int8_scale,
+    mask_query_group_scales,
+    round_to_int8,
 )
 
 from .policy import (
@@ -33,8 +47,6 @@ from .policy import (
     GLUON_ACCUMULATOR_SEED_MIN_K,
     GLUON_BLOCK_K,
     GLUON_BLOCK_M,
-    QUERY_SCALE_ROWS,
-    TILE_ROWS,
 )
 
 # ---------------------------------------------------------------------------
@@ -96,26 +108,10 @@ POST_EXCHANGE_HALF_LAYOUT = gl.constexpr(
         shape=[64, 128],
     )
 )
-VALUE_STORE_LAYOUT = gl.constexpr(gl.BlockedLayout([1, 8], [4, 8], [8, 1], [1, 0]))
-
 GL_BLOCK_M = gl.constexpr(GLUON_BLOCK_M)
 GL_BLOCK_K = gl.constexpr(GLUON_BLOCK_K)
-GL_TILE_ROWS = gl.constexpr(TILE_ROWS)
-GL_TILE_ROWS_F32 = gl.constexpr(float(TILE_ROWS))
-GL_QUERY_SCALE_ROWS = gl.constexpr(QUERY_SCALE_ROWS)
 _GL_SEED = gl.constexpr(GLUON_ACCUMULATOR_SEED)
 _GL_SEED_MIN_K = gl.constexpr(GLUON_ACCUMULATOR_SEED_MIN_K)
-_GL_HADAMARD_W0 = gl.constexpr(SIGNED_HADAMARD_MASK[0])
-_GL_HADAMARD_W1 = gl.constexpr(SIGNED_HADAMARD_MASK[1])
-_GL_HADAMARD_W2 = gl.constexpr(SIGNED_HADAMARD_MASK[2])
-_GL_HADAMARD_W3 = gl.constexpr(SIGNED_HADAMARD_MASK[3])
-GL_LOG2_E = gl.constexpr(1.4426950408889634)
-GL_INT8_RANGE = gl.constexpr(127.0)
-GL_SCALE_EPSILON = gl.constexpr(1e-7)
-GL_VALUE_MEAN_SCALE_FLOOR = gl.constexpr(2.0**-80)
-GL_P_UINT8_RANGE = gl.constexpr(255.0)
-GL_D128_NORM = gl.constexpr(0.08838834764831845)
-GL_D64_NORM = gl.constexpr(0.125)
 
 DO_NOT_SPECIALIZE = (
     "logical_sequence_length",
@@ -200,32 +196,6 @@ def exchange_lanes_x16(values):
         is_pure=True,
         pack=1,
     )
-
-
-@gluon.jit
-def round_to_int8(values):
-    rounded = values + 0.5 * gl.where(values >= 0, 1.0, -1.0)
-    return gl.maximum(-GL_INT8_RANGE, gl.minimum(GL_INT8_RANGE, rounded)).to(gl.int8)
-
-
-@gluon.jit
-def compute_int8_scale(maximum):
-    return maximum / GL_INT8_RANGE + GL_SCALE_EPSILON
-
-
-@gluon.jit
-def compute_hadamard_signs(column_offsets):
-    word_group = column_offsets // 32
-    words = gl.where(
-        word_group == 0,
-        _GL_HADAMARD_W0,
-        gl.where(
-            word_group == 1,
-            _GL_HADAMARD_W1,
-            gl.where(word_group == 2, _GL_HADAMARD_W2, _GL_HADAMARD_W3),
-        ),
-    ).to(gl.uint32)
-    return gl.where(((words >> (column_offsets % 32).to(gl.uint32)) & 1) != 0, 1.0, -1.0)
 
 
 @gluon.jit
@@ -612,28 +582,6 @@ def store_head_major(
     else:
         offsets = (tile_index * GL_TILE_ROWS + rows[:, None]) * 128 + columns[None, :]
     cdna3.buffer_store(tile, base_ptr, offsets)
-
-
-@gluon.jit
-def mask_query_group_scales(
-    raw_scale,
-    group_offsets,
-    seq_first_row,
-    query_sequence_end,
-    block_length,
-    scale_factor: gl.constexpr,
-    mask_rows: gl.constexpr,
-    mask_block_lengths: gl.constexpr,
-    two_heads: gl.constexpr,
-):
-    """Keep positive denominators while zeroing stored Q32 scales for empty groups."""
-    if not mask_rows:
-        return raw_scale, raw_scale * scale_factor
-    group_valid = (seq_first_row + group_offsets * GL_QUERY_SCALE_ROWS) < query_sequence_end
-    if mask_block_lengths:
-        group_valid = group_valid & (group_offsets * GL_QUERY_SCALE_ROWS < block_length)
-    valid_mask = group_valid[:, None] if two_heads else group_valid
-    return gl.where(valid_mask, raw_scale, 1.0), gl.where(valid_mask, raw_scale * scale_factor, 0.0)
 
 
 @gluon.jit

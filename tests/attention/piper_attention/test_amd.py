@@ -281,6 +281,7 @@ def test_dynamic_fullgraph_and_live_graph_capture(head_dim, causal):
 
 def test_dynamic_lengths_and_equivalent_gqa_shapes_reuse_kernel_specializations():
     backend._dense_piper_kernel.device_caches.clear()
+    backend._prepare_query_kernel.device_caches.clear()
     backend._prepare_value_kernel.device_caches.clear()
 
     with torch.inference_mode():
@@ -297,6 +298,12 @@ def test_dynamic_lengths_and_equivalent_gqa_shapes_reuse_kernel_specializations(
         torch.cuda.synchronize()
 
     assert sum(len(cache[0]) for cache in backend._dense_piper_kernel.device_caches.values()) == 1
+    # Even heads (6) and odd heads (3) compile once per head-mask parity for D64.
+    assert (
+        1
+        <= sum(len(cache[0]) for cache in backend._prepare_query_kernel.device_caches.values())
+        <= 2
+    )
     assert sum(len(cache[0]) for cache in backend._prepare_value_kernel.device_caches.values()) == 1
 
 
@@ -314,6 +321,18 @@ def test_quality_against_sdpa(head_dim, causal, dtype):
 
 def test_empty_batch():
     query = torch.empty(0, 2, 3, 64, device="cuda", dtype=torch.float16)
+    prepared_query = backend.prepare_query(query, 64**-0.5)
+    assert prepared_query.data.shape == (0, 2, 64, 64)
+    assert prepared_query.scale is not None
+    assert prepared_query.scale.shape == (0, 2, 2)
+    assert prepared_query.shape == (0, 2, 3, 64)
+    zero_len_query = torch.empty(2, 3, 0, 64, device="cuda", dtype=torch.bfloat16)
+    q_int8, q_scale = backend.amd_quantization.prepare_query(
+        zero_len_query, 64**-0.5, storage_sequence_length=64
+    )
+    assert q_int8.shape == (2, 3, 64, 64)
+    assert torch.count_nonzero(q_int8) == 0
+    assert torch.count_nonzero(q_scale) == 0
     output = piper_attention(query, query, query)
     assert output.shape == query.shape
     assert output.is_contiguous()
@@ -410,3 +429,48 @@ def test_three_chunk_negligible_middle_bias_preserves_weights(
         atol=0.01,
         rtol=0.01,
     )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd", "unaligned"])
+@pytest.mark.parametrize(
+    ("heads", "length"), [(1, 1), (3, 31), (3, 63), (6, 64), (6, 65), (3, 193)]
+)
+def test_prepare_query_and_attention_edge_layouts(head_dim, dtype, layout, heads, length):
+    torch.manual_seed(1201 + head_dim + heads + length)
+    if layout == "bhsd":
+        query = torch.randn((2, heads, length, head_dim), device="cuda", dtype=dtype)
+    elif layout == "bshd":
+        query = torch.randn((2, length, heads, head_dim), device="cuda", dtype=dtype).transpose(
+            1, 2
+        )
+    else:
+        stride_elem = head_dim + 1
+        flat = torch.randn((1 + 2 * length * heads * stride_elem,), device="cuda", dtype=dtype)
+        query = flat[1:].view(2, length, heads, stride_elem)[..., :head_dim].transpose(1, 2)
+        assert query.data_ptr() % 16 != 0
+    key = torch.randn((2, 1 if heads % 2 else 2, length + 17, head_dim), device="cuda", dtype=dtype)
+    value = torch.randn_like(key)
+    scale = 0.19
+    prepared_query = backend.prepare_query(query, scale)
+    storage_tiles = (length + 63) // 64
+    assert prepared_query.data.shape == (2, heads, storage_tiles * 64, head_dim)
+    assert prepared_query.scale is not None
+    assert prepared_query.scale.shape == (2, heads, storage_tiles * 2)
+    assert torch.count_nonzero(prepared_query.data[:, :, length:]) == 0
+    if 0 < (length % 64) <= 32:
+        assert (prepared_query.scale[:, :, -1] == 0).all()
+
+    actual = piper_attention(query, key, value, scale=scale)
+    if layout != "bhsd":
+        torch.testing.assert_close(
+            actual,
+            piper_attention(query.contiguous(), key, value, scale=scale),
+            atol=0,
+            rtol=0,
+        )
+    expected = reference_piper_attention(
+        query, key, value, scale=scale, is_causal=False, qk_quantization="per_warp"
+    )
+    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
