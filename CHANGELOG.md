@@ -15,6 +15,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Replaced the `torch.compile` dynamic activation-scale paths in standard NVFP4 linear
+  preparation (`piper_kernels.linear.nvfp4.triton.prepare_dynamic` / `dynamic_scale`) and
+  FFNs with native Triton amax/quantization kernels (`ffn-video-high-swiglu` `338.7 ms` ->
+  `48.6 ms`, `ffn-decoder-high-swiglu` `28.8 ms` -> `2.6 ms` on RTX 5090), and shared one
+  preallocated NVFP4 activation-preparation workspace across chunks (`ffn-video-high-gelu`
+  scratch `~615 MiB` -> `473 MiB`).
 - **Breaking:** Unified all post-grad and pre-grad Inductor rewrites into a single
   phase-ordered compiler pipeline exposed through `piper_kernels.compile_options(options=None, *, linear=True, ffn=False, attention=False, attention_output=False, residual_updates=False, conv3d=False)`
   with feature-flag-hashed FX cache keys, replacing all individual

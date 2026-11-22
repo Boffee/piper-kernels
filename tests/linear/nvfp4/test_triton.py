@@ -3,6 +3,7 @@
 import pytest
 import torch
 from _accelerators import exact_sm120_available
+from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
 )
@@ -181,22 +182,152 @@ def test_static_preparation_out_preserves_logical_shapes() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
-def test_dynamic_plain_preparation_preserves_noncontiguous_logical_order() -> None:
+@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
+def test_dynamic_plain_preparation_preserves_noncontiguous_logical_order(
+    activation_fn: str | None,
+) -> None:
     torch.manual_seed(505)
+    features = 160 if activation_fn == "swiglu" else 80
     input = torch.randn(  # noqa: A001
         2,
         3,
-        80,
+        features,
         device="cuda",
         dtype=torch.bfloat16,
     ).transpose(0, 1)
     assert not input.is_contiguous()
 
-    expected = nvfp4_ops._compiled_prepare_dynamic(input.contiguous(), None)
-    actual = nvfp4_ops._compiled_prepare_dynamic(input, None)
+    expected = nvfp4_ops.prepare_input(input.contiguous(), None, True, activation_fn=activation_fn)
+    actual = nvfp4_ops.prepare_input(input, None, True, activation_fn=activation_fn)
 
     for expected_tensor, actual_tensor in zip(expected, actual, strict=True):
         assert torch.equal(actual_tensor, expected_tensor)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("rows", [127, 128, 129])
+@pytest.mark.parametrize("high_first", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_dynamic_activation_preparation_matches_fp32_reference_and_reuses_out(
+    activation_fn: str | None,
+    rows: int,
+    high_first: bool,
+    dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(509)
+    output_features = 80
+    input_features = output_features * (2 if activation_fn == "swiglu" else 1)
+    source = torch.randn(rows, input_features, device="cuda", dtype=dtype)
+    if activation_fn is None:
+        expected_scale = per_tensor_amax_to_scale(source.abs().amax())
+    elif activation_fn == "gelu_tanh":
+        expected_scale = per_tensor_amax_to_scale(
+            F.gelu(source.float(), approximate="tanh").abs().amax()
+        )
+    else:
+        value, gate = source.chunk(2, dim=-1)
+        expected_scale = per_tensor_amax_to_scale(
+            (value.float() * F.silu(gate.float())).abs().amax()
+        )
+
+    scale_out = torch.full((), -1.0, device="cuda", dtype=torch.float32)
+    returned_scale = nvfp4_triton.dynamic_scale(
+        source,
+        activation_fn=activation_fn,
+        out=scale_out,
+    )
+    assert returned_scale is scale_out
+    torch.testing.assert_close(returned_scale, expected_scale, rtol=1e-6, atol=0)
+
+    qdata, scale, global_scale = nvfp4_triton.prepare_dynamic(
+        source,
+        activation_fn=activation_fn,
+        high_first=high_first,
+    )
+    torch.testing.assert_close(global_scale, expected_scale, rtol=1e-6, atol=0)
+    static_qdata, static_scale, _ = nvfp4_triton.prepare_static(
+        source,
+        global_scale,
+        activation_fn=activation_fn,
+        high_first=high_first,
+    )
+    assert torch.equal(qdata, static_qdata)
+    assert torch.equal(scale, static_scale)
+
+    qdata_storage = torch.full(
+        (rows + 8, output_features // 2), 0xA5, device="cuda", dtype=torch.uint8
+    )
+    scale_rows, scale_cols = _layout.scale_shape(rows, output_features)
+    scale_storage = torch.full(
+        (int(scale_rows) * int(scale_cols) + 16,),
+        0x55,
+        device="cuda",
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    reused_qdata, reused_scale, reused_global = nvfp4_triton.prepare_dynamic(
+        source,
+        activation_fn=activation_fn,
+        out=(qdata_storage, scale_storage),
+        high_first=high_first,
+    )
+    assert reused_qdata.data_ptr() == qdata_storage.data_ptr()
+    assert reused_scale.data_ptr() == scale_storage.data_ptr()
+    assert torch.equal(reused_qdata, qdata)
+    assert torch.equal(reused_scale, scale)
+    assert torch.equal(reused_global, global_scale)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_dynamic_scale_validation_rejects_invalid_inputs_without_mutation() -> None:
+    with pytest.raises(ValueError, match="unsupported input activation"):
+        nvfp4_triton.dynamic_scale(torch.ones(2, 16, device="cuda"), activation_fn="relu")
+    with pytest.raises(ValueError, match="nonempty tensor"):
+        nvfp4_triton.dynamic_scale(torch.empty(0, 16, device="cuda"), activation_fn="gelu_tanh")
+    with pytest.raises(ValueError, match="floating tensor"):
+        nvfp4_triton.dynamic_scale(
+            torch.ones(2, 16, device="cuda", dtype=torch.int8), activation_fn="swiglu"
+        )
+    with pytest.raises(ValueError, match="equal feature partitions"):
+        nvfp4_triton.dynamic_scale(torch.ones(2, 17, device="cuda"), activation_fn="swiglu")
+
+    bad_out = torch.tensor([7.0], device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="contiguous FP32 scalar"):
+        nvfp4_triton.dynamic_scale(
+            torch.ones(2, 32, device="cuda"),
+            activation_fn="swiglu",
+            out=bad_out,
+        )
+    assert torch.equal(bad_out, torch.tensor([7.0], device="cuda", dtype=torch.float32))
+
+    for bad_shape, act in (((2, 10), None), ((2, 20), None), ((2, 20), "swiglu")):
+        with pytest.raises(ValueError, match="divisible by 16"):
+            nvfp4_triton.prepare_dynamic(
+                torch.ones(bad_shape, device="cuda"),
+                activation_fn=act,
+            )
+
+    with pytest.raises(ValueError, match="requires CUDA"):
+        nvfp4_triton.dynamic_scale(torch.ones(2, 32, device="cpu"), activation_fn="swiglu")
+    with pytest.raises(ValueError, match="requires CUDA"):
+        nvfp4_triton.prepare_dynamic(torch.ones(2, 16, device="cpu"))
+
+    bad_qdata = torch.empty((2, 9), device="cuda", dtype=torch.uint8)
+    untouched_scale = torch.full(
+        (32 * 16,),
+        0x55,
+        device="cuda",
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="NVFP4 activation storage is incompatible"):
+        nvfp4_triton.prepare_dynamic(
+            torch.ones(2, 32, device="cuda"),
+            activation_fn="swiglu",
+            out=(bad_qdata, untouched_scale),
+        )
+    assert torch.all(untouched_scale.view(torch.uint8) == 0x55)
 
 
 @pytest.mark.gpu
