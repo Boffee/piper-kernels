@@ -18,16 +18,17 @@ from piper_kernels.weights.nvfp4 import _layout
 from piper_kernels.weights.nvfp4.triton import (
     _decode_fp4,
     _decode_fp4_code,
-    dynamic_scale,
     encode_nvfp4_blocks,
     pack_e2m1_pairs,
     swizzled_scale_offsets,
 )
+from piper_kernels.weights.nvfp4.triton import dynamic_scale as _weights_dynamic_scale
 
 _NVFP4_BLOCK_SIZE = _layout.BLOCK_SIZE
 _NVFP4_QDATA_BLOCK_SIZE = _layout.QDATA_BLOCK_SIZE
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(_NVFP4_BLOCK_SIZE)
 _NVFP4_QDATA_BLOCK_SIZE_TL = tl.constexpr(_NVFP4_QDATA_BLOCK_SIZE)
+_ACTIVATION_AMAX_BLOCK_SIZE = 4_096
 _PREPARE_BLOCKS = 32
 _BIAS_BLOCK_SIZE = 1_024
 _MEAN_BLOCK_M = 256
@@ -208,6 +209,128 @@ def prepare_static_out(
         out=out,
         high_first=high_first,
     )
+
+
+@triton.jit
+def _activation_amax_partial_kernel(
+    input_ptr,
+    partial_ptr,
+    elements,
+    output_features: tl.constexpr,
+    activation_fn: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Reduce one tile of activated values into a block-level FP32 amax."""
+    offsets = tl.program_id(0).to(tl.int64) * block_size + tl.arange(0, block_size)
+    valid = offsets < elements
+    if activation_fn == "swiglu":
+        input_offsets = (offsets // output_features) * (2 * output_features) + (
+            offsets % output_features
+        )
+        values = tl.load(input_ptr + input_offsets, mask=valid, other=0.0).to(tl.float32)
+        gate = tl.load(input_ptr + input_offsets + output_features, mask=valid, other=0.0).to(
+            tl.float32
+        )
+        values = triton_input_activations.swiglu(values, gate)
+    else:
+        values = tl.load(input_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+        values = triton_input_activations.gelu_tanh(
+            values,
+            "cuda",  # pyright: ignore[reportArgumentType]
+        )
+    values = tl.where(valid, values, 0.0)
+    tl.store(partial_ptr + tl.program_id(0), tl.max(tl.abs(values), axis=0))
+
+
+def _validate_activated_input(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    activation_fn: str | None,
+) -> tuple[int, int]:
+    if input.ndim == 0 or input.numel() < 1:
+        raise ValueError("dynamic NVFP4 scale requires a nonempty tensor")
+    if not input.is_floating_point():
+        raise ValueError("dynamic NVFP4 scale requires a floating tensor")
+    if input.device.type != "cuda":
+        raise ValueError("NVFP4 Triton preparation requires CUDA")
+    width = input_activations.input_activation_width(activation_fn)
+    input_features = int(input.shape[-1])
+    if input_features < 1 or input_features % width:
+        raise ValueError("NVFP4 input activation requires equal feature partitions")
+    output_features = input_features // width
+    rows = int(input.numel() // input_features)
+    return rows, output_features
+
+
+def dynamic_scale(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    *,
+    activation_fn: str | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reduce a logical or activated tensor to its exact NVFP4 global scale."""
+    input_activations.validate_input_activation(activation_fn)
+    if activation_fn is None:
+        return _weights_dynamic_scale(input, out=out)
+    rows, output_features = _validate_activated_input(input, activation_fn)
+    if out is not None and (
+        out.shape != ()
+        or out.dtype is not torch.float32
+        or out.device != input.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("dynamic NVFP4 scale output must be a contiguous FP32 scalar")
+    contiguous_input = input.contiguous()
+    elements = rows * output_features
+    partial_count = int(triton.cdiv(elements, _ACTIVATION_AMAX_BLOCK_SIZE))
+    partial = torch.empty(partial_count, device=contiguous_input.device, dtype=torch.float32)
+    with device_context(contiguous_input.device):
+        _activation_amax_partial_kernel[(partial_count,)](
+            contiguous_input,
+            partial,
+            elements,
+            output_features=output_features,
+            activation_fn=activation_fn,
+            block_size=_ACTIVATION_AMAX_BLOCK_SIZE,
+            num_warps=8,
+        )
+        return _weights_dynamic_scale(partial, out=out)
+
+
+def prepare_dynamic(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    activation_fn: str | None = None,
+    *,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    high_first: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply an optional activation, then prepare exact dynamic NVFP4 storage."""
+    input_activations.validate_input_activation(activation_fn)
+    rows, output_features = _validate_activated_input(input, activation_fn)
+    if output_features < _NVFP4_BLOCK_SIZE or output_features % _NVFP4_BLOCK_SIZE:
+        raise ValueError(
+            f"NVFP4 dynamic preparation requires output features divisible by {_NVFP4_BLOCK_SIZE}"
+        )
+    output_storage = (
+        None
+        if out is None
+        else prepare_activation_storage(
+            input,
+            rows,
+            output_features,
+            out,
+            initialize_padding=False,
+        )
+    )
+    contiguous_input = input.contiguous()
+    per_tensor_scale = dynamic_scale(contiguous_input, activation_fn=activation_fn)
+    qdata, scale = _prepare_static_storage(
+        contiguous_input,
+        per_tensor_scale,
+        activation_fn=activation_fn,
+        out=output_storage,
+        high_first=high_first,
+    )
+    return qdata, scale, per_tensor_scale
 
 
 def add_bias_out(
@@ -603,6 +726,7 @@ __all__ = [
     "encode_nvfp4_blocks",
     "linear_mean",
     "pack_e2m1_pairs",
+    "prepare_dynamic",
     "prepare_static",
     "prepare_static_out",
     "swizzled_scale_offsets",

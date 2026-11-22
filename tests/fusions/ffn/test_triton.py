@@ -644,10 +644,102 @@ def test_direct_op_runs_under_dynamic_fullgraph_compile(
 
 @pytest.mark.gpu
 @_SM120
+@pytest.mark.parametrize("group_size", [None, 16], ids=["standard", "convrot"])
+@pytest.mark.parametrize("activation", ["gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize(
+    ("input_features", "intermediate_features", "output_features"),
+    [(160, 224, 192), (224, 160, 192)],
+    ids=["wider-intermediate", "wider-input"],
+)
+def test_nvfp4_multi_chunk_padded_scale_reuse_matches_materialized(
+    group_size: int | None,
+    activation: Activation,
+    dynamic: bool,
+    input_features: int,
+    intermediate_features: int,
+    output_features: int,
+) -> None:
+    operands = make_nvfp4_operands(
+        activation,
+        rows=2 * 128 + 17,
+        input_features=input_features,
+        intermediate_features=intermediate_features,
+        output_features=output_features,
+        up_dynamic=dynamic,
+        down_dynamic=dynamic,
+        up_group_size=group_size,
+        down_group_size=group_size,
+        bias_dtype=torch.bfloat16,
+        seed=977 + input_features + output_features,
+    )
+    expected = materialized_nvfp4(operands)
+    actual = nvfp4_ffn.nvfp4_ffn_op(**operands.arguments(128))
+    assert actual.dtype is torch.bfloat16
+    assert relative_l2(actual, expected) < (0.12 if dynamic else 0.08)
+
+
+@pytest.mark.gpu
+@_SM120
+@pytest.mark.parametrize("group_size", [None, 16], ids=["standard", "convrot"])
+@pytest.mark.parametrize("activation", ["gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+def test_nvfp4_multi_chunk_ffn_reuses_activation_storage(
+    group_size: int | None,
+    activation: Activation,
+    dynamic: bool,
+) -> None:
+    chunk_rows = 4_096
+    rows = 2 * chunk_rows
+    width = 512
+    intermediate = 8_192
+    operands = make_nvfp4_operands(
+        activation,
+        rows=rows,
+        input_features=width,
+        intermediate_features=intermediate,
+        output_features=width,
+        up_dynamic=dynamic,
+        down_dynamic=dynamic,
+        up_group_size=group_size,
+        down_group_size=group_size,
+        bias_dtype=None,
+        seed=983,
+    )
+    kwargs = operands.arguments(chunk_rows)
+    with torch.inference_mode():
+        warm = nvfp4_ffn.nvfp4_ffn_op(**kwargs)
+        torch.cuda.synchronize()
+        del warm
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        actual = nvfp4_ffn.nvfp4_ffn_op(**kwargs)
+        torch.cuda.synchronize()
+        peak_extra = torch.cuda.max_memory_allocated() - baseline
+
+    output_bytes = actual.numel() * actual.element_size()
+    projection_bytes = (
+        chunk_rows * (2 if activation == "swiglu" else 1) * intermediate * actual.element_size()
+    )
+    shared_qdata_bytes = chunk_rows * (intermediate // 2)
+    shared_scale_bytes = ((chunk_rows + 127) // 128 * 32) * ((intermediate + 63) // 64 * 16)
+    overhead_margin = 512 * 1024 + torch.backends.cuda.cublaslt_workspace_size()
+    assert (
+        peak_extra
+        <= output_bytes
+        + projection_bytes
+        + shared_qdata_bytes
+        + shared_scale_bytes
+        + overhead_margin
+    )
+
+
+@pytest.mark.gpu
+@_SM120
 @pytest.mark.parametrize("activation", ["gelu_tanh", "swiglu"])
 @pytest.mark.parametrize("rows", [1, 127, 1536])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_nvfp4_compiled_activation_scale_matches_fp32_reference(
+def test_nvfp4_activation_dynamic_scale_matches_fp32_reference(
     activation: Activation, rows: int, dtype: torch.dtype
 ) -> None:
     torch.manual_seed(961)
@@ -661,11 +753,27 @@ def test_nvfp4_compiled_activation_scale_matches_fp32_reference(
         value, gate = projections.chunk(2, dim=-1)
         expected = per_tensor_amax_to_scale((value.float() * F.silu(gate.float())).abs().amax())
     torch.testing.assert_close(
-        nvfp4_ffn._standard_dynamic_scale(projections, activation),
+        nvfp4_backend.dynamic_scale(projections, activation_fn=activation),
         expected,
         rtol=1e-6,
         atol=0,
     )
+    zero_scale = nvfp4_backend.dynamic_scale(
+        torch.zeros_like(projections),
+        activation_fn=activation,
+    )
+    assert torch.equal(zero_scale, torch.zeros((), device="cuda", dtype=torch.float32))
+    if dtype is torch.float16 and activation == "swiglu" and rows == 127:
+        overflow_safe = torch.full((rows, width), 512.0, device="cuda", dtype=dtype)
+        expected_fp32 = per_tensor_amax_to_scale(
+            (512.0 * F.silu(torch.tensor(512.0, device="cuda"))).abs()
+        )
+        torch.testing.assert_close(
+            nvfp4_backend.dynamic_scale(overflow_safe, activation_fn="swiglu"),
+            expected_fp32,
+            rtol=1e-6,
+            atol=0,
+        )
 
 
 def _assert_prepared_equal(actual, expected) -> None:
@@ -758,3 +866,76 @@ def test_convrot_nvfp4_swiglu_triton_preparation_zero_copy_and_overflow_safe(
             assert torch.isfinite(act[1].float()).all()
             assert torch.isfinite(act[2])
             assert act[2] > 0
+
+
+@pytest.mark.gpu
+@_SM120
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize(
+    ("shape", "group", "high_first"),
+    [
+        ((17, 80), 16, False),  # <= 32 MiB reuse path with non-64-aligned width & padded rows
+        ((1_025, 8_192), 256, True),  # > 32 MiB recompute path with padded rows
+    ],
+)
+def test_convrot_nvfp4_swiglu_triton_preparation_reuses_dirty_out_storage(
+    dynamic: bool,
+    shape: tuple[int, int],
+    group: int,
+    high_first: bool,
+) -> None:
+    torch.manual_seed(945)
+    rows, features = shape
+    projections = torch.randn(rows, 2 * features, device="cuda", dtype=torch.bfloat16)
+    per_tensor_scale = None if dynamic else torch.tensor(0.01, device="cuda")
+    scale_elements = ((rows + 127) // 128 * 32) * ((features + 63) // 64 * 16)
+    qdata_buffer = torch.full(
+        (rows + 8, features // 2),
+        0xA5,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    scale_buffer = torch.full(
+        (scale_elements + 32,),
+        0x55,
+        device="cuda",
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+
+    with torch.inference_mode():
+        expected = ffn_triton.prepare_convrot_nvfp4_swiglu(
+            projections,
+            per_tensor_scale,
+            dynamic,
+            group,
+            high_first,
+        )
+        actual = ffn_triton.prepare_convrot_nvfp4_swiglu(
+            projections,
+            per_tensor_scale,
+            dynamic,
+            group,
+            high_first,
+            out=(qdata_buffer, scale_buffer),
+        )
+    assert actual[0].data_ptr() == qdata_buffer.data_ptr()
+    assert actual[1].data_ptr() == scale_buffer.data_ptr()
+    _assert_prepared_equal(actual, expected)
+
+    bad_qdata = torch.empty((rows, features // 2 + 1), device="cuda", dtype=torch.uint8)
+    untouched_scale = torch.full(
+        (scale_elements,),
+        0x55,
+        device="cuda",
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="NVFP4 activation storage is incompatible"):
+        ffn_triton.prepare_convrot_nvfp4_swiglu(
+            projections,
+            per_tensor_scale,
+            dynamic,
+            group,
+            high_first,
+            out=(bad_qdata, untouched_scale),
+        )
+    assert torch.all(untouched_scale.view(torch.uint8) == 0x55)

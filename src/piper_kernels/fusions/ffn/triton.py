@@ -104,6 +104,8 @@ def prepare_convrot_nvfp4_swiglu(
     dynamic_activation_scale: bool,
     group_size: int,
     high_first: bool,
+    *,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Read the runner's adjacent ``[value | gate]`` workspace without copying either half.
 
@@ -123,6 +125,13 @@ def prepare_convrot_nvfp4_swiglu(
         or not per_tensor_scale.is_contiguous()
     ):
         raise ValueError("ConvRot NVFP4 scale must be a contiguous FP32 scalar on the input device")
+    output_storage = (
+        None
+        if out is None
+        else prepare_activation_storage(
+            contiguous_input, rows, features, out, initialize_padding=False
+        )
+    )
     with device_context(projections.device):
         if dynamic_activation_scale:
             row_amax = torch.empty(rows, device=projections.device, dtype=torch.float32)
@@ -143,7 +152,11 @@ def prepare_convrot_nvfp4_swiglu(
                 )
                 global_scale = nvfp4_dynamic_scale(row_amax)
                 qdata, scale = nvfp4_backend._prepare_static_storage(
-                    rotated, global_scale, activation_fn=None, high_first=high_first
+                    rotated,
+                    global_scale,
+                    activation_fn=None,
+                    out=output_storage,
+                    high_first=high_first,
                 )
                 return qdata, scale, global_scale
             chunk_count = sum(chunk > 0 for chunk in chunks)
@@ -165,7 +178,7 @@ def prepare_convrot_nvfp4_swiglu(
             )
             per_tensor_scale = nvfp4_dynamic_scale(row_amax)
         assert per_tensor_scale is not None
-        qdata, scale = prepare_activation_storage(contiguous_input, rows, features)
+        qdata, scale = prepare_activation_storage(contiguous_input, rows, features, output_storage)
         block_size = 1_024
         _swiglu_quantize_kernel[(triton.cdiv(rows * features, block_size),)](
             contiguous_input,

@@ -11,46 +11,13 @@ from . import _projection, _validation, reference
 from . import triton as nvfp4_triton
 
 
-def _prepare_dynamic_swiglu_tensors(
-    input: torch.Tensor,  # noqa: A002
-    high_first: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return reference.prepare_input(input, None, True, "swiglu", high_first)
-
-
-def _prepare_dynamic_gelu_tanh_tensors(
-    input: torch.Tensor,  # noqa: A002
-    high_first: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return reference.prepare_input(input, None, True, "gelu_tanh", high_first)
-
-
-_compiled_prepare_dynamic_swiglu = torch.compile(_prepare_dynamic_swiglu_tensors, fullgraph=True)
-_compiled_prepare_dynamic_gelu_tanh = torch.compile(
-    _prepare_dynamic_gelu_tanh_tensors,
-    fullgraph=True,
-)
-
-
 def _compiled_prepare_dynamic(
     input: torch.Tensor,  # noqa: A002
     activation_fn: str | None,
     high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prepare dynamic activations without generalizing across unrelated layouts."""
-    if activation_fn is None:
-        per_tensor_scale = nvfp4_triton.dynamic_scale(input)
-        qdata, scale = nvfp4_triton._prepare_static_storage(
-            input,
-            per_tensor_scale,
-            activation_fn=None,
-            high_first=high_first,
-        )
-        return qdata, scale, per_tensor_scale
-    if activation_fn == "swiglu":
-        return _compiled_prepare_dynamic_swiglu(input, high_first)
-    assert activation_fn == "gelu_tanh"
-    return _compiled_prepare_dynamic_gelu_tanh(input, high_first)
+    """Prepare dynamic activations directly in Triton."""
+    return nvfp4_triton.prepare_dynamic(input, activation_fn, high_first=high_first)
 
 
 def _prepare_compiled(

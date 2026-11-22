@@ -10,14 +10,11 @@ ops; ConvRot calls import rotation validation or kernels lazily.
 
 from __future__ import annotations
 
-import functools
 import math
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
 import torch
-from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels._input_activations import (
     InputActivation,
@@ -287,56 +284,6 @@ def validate_ffn(
     return shape.rows, intermediate_features, output_features
 
 
-@functools.cache
-def _compiled_standard_dynamic_scale(
-    activation_fn: InputActivation,
-    dtype: torch.dtype,
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale  # noqa: PLC0415
-
-    # Separate functions per (activation_fn, dtype) keep distinct Dynamo code objects
-    # so mixed FP16/BF16, inference_mode/no_grad, and single-row workloads stay well
-    # under Dynamo's recompile limit.
-    if activation_fn == "gelu_tanh":
-        if dtype is torch.float16:
-
-            def _gelu_fp16(projections: torch.Tensor) -> torch.Tensor:
-                return per_tensor_amax_to_scale(
-                    F.gelu(projections.float(), approximate="tanh").abs().amax()
-                )
-
-            return torch.compile(_gelu_fp16, fullgraph=True, dynamic=True)
-
-        def _gelu_bf16(projections: torch.Tensor) -> torch.Tensor:
-            return per_tensor_amax_to_scale(
-                F.gelu(projections.float(), approximate="tanh").abs().amax()
-            )
-
-        return torch.compile(_gelu_bf16, fullgraph=True, dynamic=True)
-
-    if dtype is torch.float16:
-
-        def _swiglu_fp16(projections: torch.Tensor) -> torch.Tensor:
-            value, gate = projections.chunk(2, dim=-1)
-            return per_tensor_amax_to_scale((value.float() * F.silu(gate.float())).abs().amax())
-
-        return torch.compile(_swiglu_fp16, fullgraph=True, dynamic=True)
-
-    def _swiglu_bf16(projections: torch.Tensor) -> torch.Tensor:
-        value, gate = projections.chunk(2, dim=-1)
-        return per_tensor_amax_to_scale((value.float() * F.silu(gate.float())).abs().amax())
-
-    return torch.compile(_swiglu_bf16, fullgraph=True, dynamic=True)
-
-
-def _standard_dynamic_scale(
-    projections: torch.Tensor,
-    activation_fn: InputActivation,
-) -> torch.Tensor:
-    with torch.no_grad():
-        return _compiled_standard_dynamic_scale(activation_fn, projections.dtype)(projections)
-
-
 def _source_dynamic_scale(input: torch.Tensor, group_size: int | None) -> torch.Tensor:  # noqa: A002
     if group_size is None:
         from piper_kernels.weights.nvfp4 import triton as nvfp4_primitives  # noqa: PLC0415
@@ -381,31 +328,29 @@ def _prepare_activated_chunk(
     activation_per_tensor_scale: torch.Tensor | None,
     dynamic_activation_scale: bool,
     group_size: int | None,
+    out: tuple[torch.Tensor, torch.Tensor],
     *,
     high_first: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if group_size is None:
         from piper_kernels.linear.nvfp4 import triton as nvfp4_backend  # noqa: PLC0415
 
-        per_tensor_scale = (
-            _standard_dynamic_scale(projections, activation_fn)
-            if dynamic_activation_scale
-            else activation_per_tensor_scale
-        )
-        if per_tensor_scale is None:
-            return nvfp4_backend.prepare_static(
+        if dynamic_activation_scale:
+            return nvfp4_backend.prepare_dynamic(
                 projections,
-                None,
-                activation_fn=activation_fn,
+                activation_fn,
+                out=out,
                 high_first=high_first,
             )
+        assert activation_per_tensor_scale is not None
         qdata, scale = nvfp4_backend._prepare_static_storage(
             projections,
-            per_tensor_scale,
+            activation_per_tensor_scale,
             activation_fn=activation_fn,
+            out=out,
             high_first=high_first,
         )
-        return qdata, scale, per_tensor_scale
+        return qdata, scale, activation_per_tensor_scale
 
     if activation_fn == "swiglu":
         from . import triton as ffn_triton  # noqa: PLC0415
@@ -416,6 +361,7 @@ def _prepare_activated_chunk(
             dynamic_activation_scale,
             group_size,
             high_first,
+            out=out,
         )
 
     from piper_kernels.linear.convrot.nvfp4 import triton as convrot_backend  # noqa: PLC0415
@@ -425,22 +371,20 @@ def _prepare_activated_chunk(
             projections,
             group_size,
             "gelu_tanh",
+            out=out,
             high_first=high_first,
         )
     validated_input = convrot_backend._validate_input(projections, group_size, "gelu_tanh")
-    per_tensor_scale = (
-        projections.new_ones((), dtype=torch.float32)
-        if activation_per_tensor_scale is None
-        else activation_per_tensor_scale
-    )
+    assert activation_per_tensor_scale is not None
     qdata, scale = convrot_backend._prepare_static_storage(
         validated_input,
-        per_tensor_scale,
+        activation_per_tensor_scale,
         group_size,
+        out,
         activation_fn="gelu_tanh",
         high_first=high_first,
     )
-    return qdata, scale, per_tensor_scale
+    return qdata, scale, activation_per_tensor_scale
 
 
 def _project_affine_chunk(
@@ -506,8 +450,6 @@ def run_chunked_ffn(
     if residual_add is not None:
         validate_residual_add(input, residual_add, output_features)
 
-    from piper_kernels.linear.nvfp4._storage import prepare_activation_storage  # noqa: PLC0415
-
     leading_shape = input.shape[:-1]
     input_features = input.shape[-1]
     input_2d = input.view(rows, input_features)
@@ -516,6 +458,11 @@ def run_chunked_ffn(
         same_tensor_storage(source_per_tensor_scales[0], per_tensor_scale)
         for per_tensor_scale in source_per_tensor_scales[1:]
     )
+    down_activation_scale = (
+        input.new_ones((), dtype=torch.float32)
+        if not down.dynamic_activation_scale and down.activation_per_tensor_scale is None
+        else down.activation_per_tensor_scale
+    )
     output = (
         torch.empty((*leading_shape, output_features), device=input.device, dtype=input.dtype)
         if residual_add is None
@@ -523,11 +470,33 @@ def run_chunked_ffn(
     )
     output_2d = output.view(rows, output_features)
     workspace_rows = min(rows, chunk_rows)
-    source_storage = prepare_activation_storage(
-        input,
-        workspace_rows,
-        input_features,
-        initialize_padding=False,
+    qdata_buffer = torch.empty(
+        workspace_rows * (max(input_features, intermediate_features) // 2),
+        device=input.device,
+        dtype=torch.uint8,
+    )
+    source_scale_elements = math.prod(
+        cast(tuple[int, int], nvfp4_layout.scale_shape(workspace_rows, input_features))
+    )
+    activated_scale_elements = math.prod(
+        cast(tuple[int, int], nvfp4_layout.scale_shape(workspace_rows, intermediate_features))
+    )
+    scale_buffer = torch.empty(
+        max(source_scale_elements, activated_scale_elements),
+        device=input.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    source_storage = (
+        qdata_buffer[: workspace_rows * (input_features // 2)].view(
+            workspace_rows, input_features // 2
+        ),
+        scale_buffer,
+    )
+    activated_storage = (
+        qdata_buffer[: workspace_rows * (intermediate_features // 2)].view(
+            workspace_rows, intermediate_features // 2
+        ),
+        scale_buffer,
     )
     projection_workspace = torch.empty(
         (workspace_rows, len(sources) * intermediate_features),
@@ -581,9 +550,10 @@ def run_chunked_ffn(
         down_qdata, down_scale, down_per_tensor_scale = _prepare_activated_chunk(
             projections,
             activation_fn,
-            down.activation_per_tensor_scale,
+            down_activation_scale,
             down.dynamic_activation_scale,
             down.group_size,
+            activated_storage,
             high_first=down.high_first,
         )
         if residual_add is None:
