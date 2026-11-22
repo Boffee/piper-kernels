@@ -30,9 +30,9 @@ for architecture, validation, and tests.
    (no implicit content checks or readbacks, validate before mutating, never retry
    partial mutations, restore device state on failure).
 7. **Remove what a refactor supersedes.** Prefer fewer lines and files. Removing
-   duplicated logic within one file counts as cleanup. Justify any net growth in
-   lines or files. When adding a variant, generalize the shared path and remove
-   the superseded implementation in the same PR.
+   duplicated logic within one file counts as cleanup. For cleanup or architecture
+   changes, justify any net growth in lines or files. When adding a variant,
+   generalize the shared path and remove the superseded implementation in the same PR.
 8. **Test contracts, not private plumbing:** Assert observable behavior and compiler
    invariants in shared parametrized suites—never hardcoded tile tuples, private-global
    monkeypatches, or `src/` AST checks outside
@@ -41,8 +41,10 @@ for architecture, validation, and tests.
 
 ## Fixing kernel bugs
 
-1. Reproduce the failure through the public operator with the affected inputs and
-   target. Confirm which backend ran. A passing fallback can hide a broken GPU kernel.
+1. For a runtime bug, call the public operator with the failing inputs on the
+   affected hardware and confirm which backend ran. A passing fallback can hide
+   a broken GPU kernel. For a compilation failure, reproduce it with the affected
+   compiler target and report whether you also tested the fix on hardware.
 2. For a numerical error, compare with the portable reference for the same
    quantized operation. For a mutation bug, check what changed in caller-owned
    storage and what should have stayed untouched.

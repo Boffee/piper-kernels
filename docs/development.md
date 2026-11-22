@@ -101,8 +101,8 @@ scratch spills, LDS) on a small canary set before sweeping.
 - **Compiler rewrite.** Inspect the compiled graph to confirm which operations
   fused or stayed separate. Compare the result with the equivalent eager operation.
   The [FFN rewrite tests](../tests/fusions/ffn/test_compile.py) show both checks.
-- **Performance claim.** Compare full-operator latency and output quality before
-  and after the change on the same workload and GPU. Use the
+- **Performance claim.** Measure the claimed metric before and after the change
+  on the same workload and hardware. Verify output quality using the
   [benchmark guide](../benchmarks/README.md#measurements-and-outcomes).
 
 For code changes, use the [CUDA](environments.md#cuda) or [ROCm](environments.md#rocm)
@@ -154,12 +154,13 @@ Cartesian target/flag products (avoiding multiplying identical-ISA targets such 
 Use standard Git commits (imperative subject `<= 72` chars without `feat:` prefixes,
 72-column body explaining why; never commit artifacts, caches, or checkpoints).
 
-Lead with the problem and explain the design, caller impact, and validation.
-For changes under `src/`, `tests/`, or `benchmarks/`, report net files and lines,
-what was removed, and any architecture ceilings or allowlist entries lowered or
-removed. Explain why any new custom operator or compiler pass is needed.
-Report the checks and hardware used and any affected targets or OS paths left
-unvalidated.
+Lead with the problem, the design, and the caller impact. Report the checks and
+hardware used and any affected targets or OS paths left unvalidated.
+
+For cleanup or architecture PRs, say what was removed and report the net change
+in files and lines under `src/`, `tests/`, and `benchmarks/`. In any PR that
+changes an architecture ceiling or allowlist entry, identify the change. Explain
+why any new custom operator or compiler pass is needed.
 
 Add 1–2-sentence caller-impact entries to `CHANGELOG.md` under `## [Unreleased]`
 (`Added`/`Changed`/`Fixed`, `Breaking:` when breaking) for observable API, behavior,
