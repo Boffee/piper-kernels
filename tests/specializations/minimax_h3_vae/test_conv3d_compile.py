@@ -5,9 +5,9 @@ import torch
 from _compile_capture import TargetCapturePass
 from torch.nn import functional
 
+from piper_kernels import compile_options
 from piper_kernels.conv3d.convrot.int8 import ConvRotInt8Conv3d, group_norm_silu_conv3d
 from piper_kernels.specializations.minimax_h3_vae import (
-    minimax_h3_vae_convrot_int8_compile_options,
     minimax_h3_vae_convrot_int8_conv3d_compile_options,
 )
 from piper_kernels.specializations.minimax_h3_vae.conv3d._compile import fuse_conv3d
@@ -217,13 +217,11 @@ def test_compile_options_preserve_existing_pre_grad_pass_and_are_idempotent():
 
 
 def test_encoder_and_decoder_options_are_independent_and_composable():
-    decoder = minimax_h3_vae_convrot_int8_compile_options()
+    decoder = compile_options()
     encoder = minimax_h3_vae_convrot_int8_conv3d_compile_options()
     assert "pre_grad_custom_pass" not in decoder
     assert "post_grad_custom_pre_pass" not in encoder
-    assert minimax_h3_vae_convrot_int8_conv3d_compile_options(decoder) == (
-        minimax_h3_vae_convrot_int8_compile_options(encoder)
-    )
+    assert minimax_h3_vae_convrot_int8_conv3d_compile_options(decoder) == compile_options(encoder)
     assert decoder["post_grad_custom_pre_pass"]
     assert isinstance(encoder["pre_grad_custom_pass"], tuple)
     assert len(encoder["pre_grad_custom_pass"]) == 1

@@ -21,9 +21,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   `*_compile_options` helpers (`convrot_int8_compile_options`, `nvfp4_compile_options`,
   `convrot_nvfp4_compile_options`, `ffn_compile_options`,
   `convrot_int8_piper_compile_options`, `convrot_int8_sparse_piper_compile_options`,
-  `nvfp4_sparse_piper_compile_options`, `residual_updates_compile_options`, and
-  `convrot_int8_conv3d_compile_options`). MiniMax-H3 specialization helpers remain in
-  `piper_kernels.specializations.minimax_h3_vae` and hook into the unified pipeline.
+  `nvfp4_sparse_piper_compile_options`, `residual_updates_compile_options`,
+  `convrot_int8_conv3d_compile_options`, and
+  `minimax_h3_vae_convrot_int8_compile_options`—retiring the SM120 and RDNA4 H3 VAE
+  decoder linear schedule overrides in favor of `piper_kernels.compile_options(...)`).
+  The MiniMax-H3 encoder Conv3D helper
+  `minimax_h3_vae_convrot_int8_conv3d_compile_options` remains in
+  `piper_kernels.specializations.minimax_h3_vae` and hooks into the unified pipeline.
   NVFP4 / ConvRot NVFP4 sparse-Piper attention fusion now also matches semantic linears
   (such as cross-attention query projections or `linear=False`).
 - **Breaking:** Consolidated all format- and activation-specific FFN fusion packages
@@ -56,8 +60,6 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Improved RTX 5090 (SM120) execution speed and reduced scratch memory across sparse Piper
   routing/attention, D128 Q/K/V projections, and large ConvRot INT8 linear, FFN, and
   fused residual projections (with minor rounding differences within INT8 tolerances).
-- `minimax_h3_vae_convrot_int8_compile_options` now defers to SM120's default Gluon TMA
-  plan while preserving its measured RDNA4 schedules.
 
 ### Fixed
 

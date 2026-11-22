@@ -19,12 +19,10 @@ from piper_kernels._inductor_options import (
     GraphPassHook,
     _PiperPostGradPass,
     _PiperPreGradPass,
-    add_post_grad_hook,
     add_pre_grad_hook,
     compute_compile_pass_uuid,
 )
 from piper_kernels.specializations.minimax_h3_vae import (
-    minimax_h3_vae_convrot_int8_compile_options,
     minimax_h3_vae_convrot_int8_conv3d_compile_options,
 )
 
@@ -87,9 +85,9 @@ def test_compile_pass_uuid_changes_with_any_package_source(tmp_path: Path) -> No
 
 
 def test_distinct_feature_combinations_produce_distinct_uuids() -> None:
-    seen: dict[tuple[bool, bool, bool, bool, bool, bool], bytes] = {}
-    for linear, ffn, attention, attention_output, residual_updates, h3 in itertools.product(
-        (False, True), repeat=6
+    seen: dict[tuple[bool, bool, bool, bool, bool], bytes] = {}
+    for linear, ffn, attention, attention_output, residual_updates in itertools.product(
+        (False, True), repeat=5
     ):
         opts = compile_options(
             linear=linear,
@@ -98,16 +96,13 @@ def test_distinct_feature_combinations_produce_distinct_uuids() -> None:
             attention_output=attention_output,
             residual_updates=residual_updates,
         )
-        if h3:
-            opts = minimax_h3_vae_convrot_int8_compile_options(opts)
         passes = opts.get("post_grad_custom_pre_pass")
         effective = (
-            linear or h3,
+            linear,
             ffn,
             attention or attention_output,
             attention_output,
             residual_updates,
-            h3,
         )
         if not any(effective):
             assert passes is None
@@ -170,17 +165,6 @@ def test_uuid_and_options_are_invariant_to_composition_call_order() -> None:
             assert len(entry) == 1
         assert passes[1][0].uuid() == passes[0][0].uuid() == passes[2][0].uuid()  # type: ignore[index]
 
-    h3_before = compile_options(
-        minimax_h3_vae_convrot_int8_compile_options(), ffn=True, residual_updates=True
-    )
-    h3_after = minimax_h3_vae_convrot_int8_compile_options(
-        compile_options(ffn=True, residual_updates=True)
-    )
-    assert h3_before == h3_after
-    assert h3_before["post_grad_custom_pre_pass"][0].uuid() == (  # type: ignore[index]
-        h3_after["post_grad_custom_pre_pass"][0].uuid()  # type: ignore[index]
-    )
-
 
 def test_compile_options_compose_without_mutating_or_duplicating() -> None:
     def existing_before(_graph: torch.fx.Graph) -> None:
@@ -235,13 +219,6 @@ def test_compile_options_compose_without_mutating_or_duplicating() -> None:
 def test_hooks_deduplicate_and_order_deterministically() -> None:
     hook_a = GraphPassHook("a", lambda _g: None)
     hook_b = GraphPassHook("b", lambda _g: None)
-
-    ab_post = add_post_grad_hook(add_post_grad_hook(None, hook_a), hook_b)
-    ba_post = add_post_grad_hook(add_post_grad_hook(None, hook_b), hook_a)
-    assert ab_post == ba_post
-    assert ab_post["post_grad_custom_pre_pass"][0].uuid() == (  # type: ignore[index]
-        ba_post["post_grad_custom_pre_pass"][0].uuid()  # type: ignore[index]
-    )
 
     ab_pre = add_pre_grad_hook(add_pre_grad_hook(None, hook_a), hook_b)
     ba_pre = add_pre_grad_hook(add_pre_grad_hook(None, hook_b), hook_a)
