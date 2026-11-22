@@ -63,6 +63,7 @@ def _expected_specialization_count(cases) -> int:
 
 
 class _AttentionGeometry(TypedDict, total=False):
+    batch: int
     head_dim: int
     sequence_length: int
     sparse_key_blocks: int
@@ -88,11 +89,14 @@ class _SparseProjectionAttention(torch.nn.Module):
         *,
         strided_rope: bool = False,
         routing: str = "minmax",
+        batch: int | None = None,
         head_dim: int | None = None,
         sequence_length: int | None = None,
         sparse_key_blocks: int | None = None,
     ) -> None:
         super().__init__()
+        if batch is not None:
+            self.batch = batch
         if head_dim is not None:
             self.head_dim = head_dim
             self.rotary_dim = head_dim * 3 // 4

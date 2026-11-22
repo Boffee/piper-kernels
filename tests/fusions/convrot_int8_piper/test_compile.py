@@ -4,13 +4,13 @@ import operator
 
 import pytest
 import torch
+from _accelerators import mock_cuda_target
 from _compile_capture import TargetCapturePass
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.node import map_arg
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import compile_options, piper_attention
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.fusions.convrot_int8_piper import (
     _backend,
@@ -28,12 +28,12 @@ from piper_kernels.linear.convrot.int8 import _ops
 from .test_query import _qk_quantization
 
 
-def _semantic_graph(*, dtype=torch.bfloat16, affine=True, permute=True):
+def _semantic_graph(*, dtype=torch.bfloat16, affine=True, permute=True, device="cpu"):
     graph = torch.fx.Graph()
 
     def placeholder(name, shape, tensor_dtype=dtype):
         node = graph.placeholder(name)
-        node.meta["val"] = torch.empty(shape, dtype=tensor_dtype)
+        node.meta["val"] = torch.empty(shape, device=device, dtype=tensor_dtype)
         return node
 
     def call(target, *args):
@@ -574,8 +574,8 @@ def test_qkv_dynamic_fullgraph_and_live_graph_capture(causal):
         torch.testing.assert_close(captured, expected, atol=0, rtol=0)
 
 
-def _qkv_semantic_graph():
-    graph = _semantic_graph()
+def _qkv_semantic_graph(*, device="cpu"):
+    graph = _semantic_graph(device=device)
     attention = next(
         node
         for node in graph.nodes
@@ -601,8 +601,8 @@ def _qkv_semantic_graph():
         )
         value = graph.call_function(torch.ops.aten.permute.default, args=(shaped, [0, 2, 1, 3]))
         with FakeTensorMode():
-            shaped.meta["val"] = torch.empty((2, 65, 4, 64), dtype=torch.bfloat16)
-            value.meta["val"] = torch.empty((2, 4, 65, 64), dtype=torch.bfloat16)
+            shaped.meta["val"] = torch.empty((2, 65, 4, 64), device=device, dtype=torch.bfloat16)
+            value.meta["val"] = torch.empty((2, 4, 65, 64), device=device, dtype=torch.bfloat16)
     attention.args = (transformed, copies[transformed], value, 0.125, False)
     graph.lint()
     return graph
@@ -615,11 +615,9 @@ def _qkv_semantic_graph():
 def test_qkv_fake_rewrite_shares_preparation_without_hardware_execution(
     monkeypatch, architecture, query_scales, key_scales
 ):
-    graph = _qkv_semantic_graph()
+    graph = _qkv_semantic_graph(device="cuda:0")
     monkeypatch.setattr(_backend, "select_projection_backend", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda _device: AcceleratorTarget("cuda", architecture)
-    )
+    mock_cuda_target(monkeypatch, (12, 0) if architecture == "sm120" else (8, 9))
     _compile.fold_attention_projections(graph)
     granularity = "per_thread" if architecture == "sm89" else "per_warp"
     for operation, scales in (("query", query_scales), ("key", key_scales)):

@@ -1,10 +1,10 @@
 """RDNA4 prepared operands and output ownership can be checked without hardware."""
 
-from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels.attention.piper_attention._amd import gluon as backend
 
@@ -16,11 +16,12 @@ def _prepared(
     key_length=97,
     global_row_offset=0,
     causal=False,
+    device="meta",
 ):
     query_storage = (query_length + 63) // 64 * 64
     key_storage = (key_length + 63) // 64 * 64
     key_chunks = (key_length + 1023) // 1024
-    with torch.device("meta"):
+    with torch.device(device):
         context = backend.PreparedContext(
             key=torch.empty((batch, 2, key_storage, 64), dtype=torch.int8),
             value=torch.empty((batch, 2, key_storage // 64, 64, 64), dtype=torch.int8),
@@ -58,7 +59,6 @@ def test_launch_reuses_operands_and_logical_metadata_with_independent_outputs(mo
     outputs = [torch.empty(query.shape, dtype=query.dtype, device="meta") for _ in range(2)]
     kernel = _RecordingKernel()
     monkeypatch.setattr(backend, "_dense_piper_kernel", kernel)
-    monkeypatch.setattr(backend, "device_context", lambda _device: nullcontext())
     for output in outputs:
         assert backend.launch_attention_into(context, query, output) is output
     assert len(kernel.calls) == 2
@@ -88,22 +88,25 @@ def test_launch_reuses_operands_and_logical_metadata_with_independent_outputs(mo
     "invalid", ["shape", "dtype", "device", "feature_stride", "overlap", "layout"]
 )
 def test_launch_rejects_incompatible_output_metadata_before_kernel_entry(monkeypatch, invalid):
-    context, query = _prepared()
-    shape = query.shape if invalid != "shape" else (2, 6, 128, 64)
-    output = torch.empty(
-        shape,
-        dtype=torch.float16 if invalid == "dtype" else query.dtype,
-        device="cpu" if invalid == "device" else "meta",
-        layout=torch.sparse_coo if invalid == "layout" else torch.strided,
-    )
-    if invalid == "feature_stride":
-        output = torch.empty((2, 6, 65, 128), dtype=query.dtype, device="meta")[..., ::2]
-    elif invalid == "overlap":
-        output = torch.empty((1, 6, 65, 64), dtype=query.dtype, device="meta").expand(query.shape)
+    with FakeTensorMode():
+        context, query = _prepared(device="cuda:0")
+        shape = query.shape if invalid != "shape" else (2, 6, 128, 64)
+        output = torch.empty(
+            shape,
+            dtype=torch.float16 if invalid == "dtype" else query.dtype,
+            device="cpu" if invalid == "device" else "cuda:0",
+            layout=torch.sparse_coo if invalid == "layout" else torch.strided,
+        )
+        if invalid == "feature_stride":
+            output = torch.empty((2, 6, 65, 128), dtype=query.dtype, device="cuda:0")[..., ::2]
+        elif invalid == "overlap":
+            output = torch.empty((1, 6, 65, 64), dtype=query.dtype, device="cuda:0").expand(
+                query.shape
+            )
     kernel = _RecordingKernel()
     guard = Mock(side_effect=AssertionError("invalid output entered a device context"))
     monkeypatch.setattr(backend, "_dense_piper_kernel", kernel)
-    monkeypatch.setattr(backend, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
     with pytest.raises(ValueError, match="Piper Attention output"):
         backend.launch_attention_into(context, query, output)
     assert not kernel.calls
@@ -111,12 +114,13 @@ def test_launch_rejects_incompatible_output_metadata_before_kernel_entry(monkeyp
 
 
 def test_empty_batch_returns_output_without_device_or_kernel_entry(monkeypatch):
-    context, query = _prepared(batch=0)
-    output = torch.empty(query.shape, dtype=query.dtype, device="meta")
+    with FakeTensorMode():
+        context, query = _prepared(batch=0, device="cuda:0")
+        output = torch.empty(query.shape, dtype=query.dtype, device="cuda:0")
     kernel = _RecordingKernel()
     guard = Mock(side_effect=AssertionError("empty batch entered a device context"))
     monkeypatch.setattr(backend, "_dense_piper_kernel", kernel)
-    monkeypatch.setattr(backend, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
     assert backend.launch_attention_into(context, query, output) is output
     assert not kernel.calls
     guard.assert_not_called()
@@ -147,7 +151,6 @@ def test_independent_preparation_keeps_quantization_policy_without_allocating_ou
     monkeypatch.setattr(backend._quantization, "prepare_chunk_centered_key", key_quantization)
     monkeypatch.setattr(backend.qk_quantization, "prepare_query", query_quantization)
     monkeypatch.setattr(backend, "prepare_value", value_quantization)
-    monkeypatch.setattr(backend, "device_context", lambda _device: nullcontext())
     monkeypatch.setattr(torch, "empty", Mock(side_effect=AssertionError("allocated an output")))
     context = backend.prepare_context(key, value, is_causal=False)
     prepared_query = backend.prepare_query(query, 0.125, global_row_offset=global_row_offset)
@@ -214,7 +217,6 @@ def test_query_windows_pass_local_and_global_offsets_and_output_strides(
             ].transpose(1, 2)
     kernel = _RecordingKernel()
     monkeypatch.setattr(backend, "_dense_piper_kernel", kernel)
-    monkeypatch.setattr(backend, "device_context", lambda _device: nullcontext())
     monkeypatch.setattr(torch, "empty", Mock(side_effect=AssertionError("allocated during launch")))
     assert (
         backend.launch_attention_into(context, query, output, query_start=start, query_rows=rows)
@@ -232,9 +234,10 @@ def test_query_windows_pass_local_and_global_offsets_and_output_strides(
     [(-64, ValueError), (1, ValueError), (63, ValueError), (True, TypeError), (1.5, TypeError)],
 )
 def test_query_preparation_rejects_invalid_origins_before_device_entry(monkeypatch, origin, error):
-    query = torch.empty((2, 6, 65, 64), dtype=torch.bfloat16, device="meta")
+    with FakeTensorMode():
+        query = torch.empty((2, 6, 65, 64), dtype=torch.bfloat16, device="cuda:0")
     guard = Mock(side_effect=AssertionError("invalid origin entered a device context"))
-    monkeypatch.setattr(backend, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
     with pytest.raises(error, match="global_row_offset"):
         backend.prepare_query(query, 0.125, global_row_offset=origin)
     guard.assert_not_called()
@@ -254,10 +257,11 @@ def test_query_preparation_rejects_invalid_origins_before_device_entry(monkeypat
 def test_launch_rejects_invalid_windows_before_device_entry(
     monkeypatch, origin, start, rows, causal
 ):
-    context, query = _prepared(global_row_offset=origin, causal=causal)
-    output = torch.empty(query.shape, dtype=query.dtype, device="meta")
+    with FakeTensorMode():
+        context, query = _prepared(global_row_offset=origin, causal=causal, device="cuda:0")
+        output = torch.empty(query.shape, dtype=query.dtype, device="cuda:0")
     guard = Mock(side_effect=AssertionError("invalid window entered a device context"))
-    monkeypatch.setattr(backend, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
     with pytest.raises(ValueError, match=r"query|global_row_offset|causal"):
         backend.launch_attention_into(context, query, output, query_start=start, query_rows=rows)
     guard.assert_not_called()

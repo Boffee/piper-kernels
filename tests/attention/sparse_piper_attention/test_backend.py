@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+from _accelerators import forbid_triton_driver
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
@@ -489,7 +491,7 @@ def test_radix_route_dispatch_selects_single_load_or_tiled_kernel(
     tiled_launch = Mock()
     tiled_kernel = MagicMock()
     tiled_kernel.__getitem__.return_value = tiled_launch
-    monkeypatch.setattr(routes_triton, "device_context", lambda _device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "device", lambda _device=None: nullcontext())
     monkeypatch.setattr(
         routes_triton, "_single_load_radix_select_packed_routes_kernel", single_kernel
     )
@@ -624,17 +626,17 @@ def _bind_mock(context, launch):
     return launch
 
 
-def _quantized_context_arguments(head_dim=128):
+def _quantized_context_arguments(head_dim=128, *, device="cpu"):
     return {
-        "key": torch.zeros(1, 1, 128, head_dim, dtype=torch.int8),
-        "key_scale": torch.ones(1, 1, 2),
-        "key_center": torch.zeros(1, 1, 2, 2, head_dim, dtype=torch.int8),
-        "key_center_scale": torch.ones(1, 1, 2, 2),
-        "key_summary": torch.zeros(1, 1, 2, head_dim),
-        "key_aux": torch.zeros(1, 1, 2, head_dim),
-        "value": torch.zeros(1, 1, head_dim, 128, dtype=torch.int8),
-        "value_scale_multiplier": torch.ones(1, 1, 2, 1),
-        "value_mean": torch.zeros(1, 1, 2, head_dim, dtype=torch.bfloat16),
+        "key": torch.zeros(1, 1, 128, head_dim, device=device, dtype=torch.int8),
+        "key_scale": torch.ones(1, 1, 2, device=device),
+        "key_center": torch.zeros(1, 1, 2, 2, head_dim, device=device, dtype=torch.int8),
+        "key_center_scale": torch.ones(1, 1, 2, 2, device=device),
+        "key_summary": torch.zeros(1, 1, 2, head_dim, device=device),
+        "key_aux": torch.zeros(1, 1, 2, head_dim, device=device),
+        "value": torch.zeros(1, 1, head_dim, 128, device=device, dtype=torch.int8),
+        "value_scale_multiplier": torch.ones(1, 1, 2, 1, device=device),
+        "value_mean": torch.zeros(1, 1, 2, head_dim, device=device, dtype=torch.bfloat16),
         "ratio_profile": _SparsePiperRatioProfile(_normalize_head_keep_ratios((0.5,))),
         "sparse_key_blocks": 2,
         "logical_sequence_length": 128,
@@ -835,7 +837,6 @@ def test_tma_reuses_context_descriptors_across_query_windows(monkeypatch):
     kernel = MagicMock()
     monkeypatch.setattr(native, "_descriptor", describe)
     monkeypatch.setattr(native, "_sparse_piper_attention_kernel", kernel)
-    monkeypatch.setattr(native, "device_context", lambda device: nullcontext())
     monkeypatch.setattr(native, "install_uint8_int8_dot_hook", lambda: None)
     launch = native.bind_tma_context(prepared.context)
     assert describe.call_count == 2
@@ -866,8 +867,8 @@ def test_backend_rejects_mismatched_producer_format_before_binding():
     bind.assert_not_called()
 
 
-def _prepared_attention(head_dim, routes_per_query):
-    arguments = _quantized_context_arguments(head_dim)
+def _prepared_attention(head_dim, routes_per_query, *, device="cpu"):
+    arguments = _quantized_context_arguments(head_dim, device=device)
     context = _prepare_sparse_piper_context_from_quantized(
         arguments["key"],
         arguments["key_scale"],
@@ -876,17 +877,17 @@ def _prepared_attention(head_dim, routes_per_query):
         arguments["value"],
         arguments["value_scale_multiplier"],
         arguments["value_mean"],
-        torch.tensor([2], dtype=torch.int32),
-        torch.tensor([0, 2], dtype=torch.int32),
+        torch.tensor([2], device=device, dtype=torch.int32),
+        torch.tensor([0, 2], device=device, dtype=torch.int32),
         sparse_key_blocks=2,
         value_format=ValueFormat.TRANSPOSED,
         routes_per_query=routes_per_query,
         logical_sequence_length=128,
     )
     query = _prepare_sparse_piper_query_from_quantized(
-        torch.zeros(1, 1, 128, head_dim, dtype=torch.int8),
-        torch.ones(1, 1, 4),
-        torch.zeros(1, 2, routes_per_query, dtype=torch.uint16),
+        torch.zeros(1, 1, 128, head_dim, device=device, dtype=torch.int8),
+        torch.ones(1, 1, 4, device=device),
+        torch.zeros(1, 2, routes_per_query, device=device, dtype=torch.uint16),
         context,
     )
     return _PreparedSparsePiperAttention(Mock(context=context), query)
@@ -905,13 +906,13 @@ def test_shared_preparation_accepts_empty_routes_and_rejects_negative_counts(hea
 @pytest.mark.parametrize("binder", ["bind_tma_context", "bind_async_copy_context"])
 def test_nvidia_rejects_d128_empty_routes_before_device_execution(monkeypatch, binder):
     native = _backend.nvidia_gluon
-    prepared = _prepared_attention(128, 0)
+    with FakeTensorMode():
+        prepared = _prepared_attention(128, 0, device="cuda:0")
+        output = torch.empty(1, 1, 128, 128, device="cuda:0", dtype=torch.bfloat16)
     enter_device = Mock(side_effect=AssertionError("unsupported mode reached device execution"))
-    monkeypatch.setattr(native, "device_context", enter_device)
+    monkeypatch.setattr(torch.cuda, "device", enter_device)
     with pytest.raises(ValueError, match="skip_dense_routing requires NVIDIA D64"):
-        getattr(native, binder)(prepared.context)(
-            prepared.query, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
-        )
+        getattr(native, binder)(prepared.context)(prepared.query, output)
     enter_device.assert_not_called()
 
 
@@ -938,12 +939,12 @@ def test_async_copy_rejects_uncopyable_storage_before_device_execution(
         prepared = replace(
             prepared, launch=Mock(context=replace(prepared.context, **{operand: replacement}))
         )
-    enter_device = Mock(side_effect=AssertionError("unsupported storage reached device execution"))
-    monkeypatch.setattr(native, "device_context", enter_device)
-    with pytest.raises(ValueError, match="16-byte-aligned"):
-        native.bind_async_copy_context(prepared.context)(
-            prepared.query, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
-        )
+    with forbid_triton_driver("unsupported storage reached device execution") as enter_device:
+        monkeypatch.setattr(torch.cuda, "device", enter_device)
+        with pytest.raises(ValueError, match="16-byte-aligned"):
+            native.bind_async_copy_context(prepared.context)(
+                prepared.query, torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)
+            )
     enter_device.assert_not_called()
 
 
@@ -956,13 +957,14 @@ def test_amd_rejects_unsupported_context_before_parameters_or_launch(
     monkeypatch, head_dim, route_count, message
 ):
     native = _backend.amd_gluon
-    prepared = _prepared_attention(head_dim, route_count)
+    with FakeTensorMode():
+        prepared = _prepared_attention(head_dim, route_count, device="cuda:0")
     parameters = Mock(
         side_effect=AssertionError("unsupported context reached parameter preparation")
     )
     enter_device = Mock(side_effect=AssertionError("unsupported context reached device execution"))
     monkeypatch.setattr(native, "prepare_parameters", parameters)
-    monkeypatch.setattr(native, "device_context", enter_device)
+    monkeypatch.setattr(torch.cuda, "device", enter_device)
     with pytest.raises(ValueError, match=message):
         native.bind_context(prepared.context)
     parameters.assert_not_called()

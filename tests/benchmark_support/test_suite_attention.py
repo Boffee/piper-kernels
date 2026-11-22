@@ -1,11 +1,12 @@
+import sys
+
 import pytest
 import torch
+from _accelerators import mock_cuda_target, mock_rocm_target
 from lib import suite_attention
 from lib.cases import AttentionCase
 from lib.inputs import sample_indices
 from lib.suite_attention import implementations, make_inputs, sampled_dense_reference
-
-from piper_kernels._triton.targets import AcceleratorTarget
 
 
 def _case(**changes):
@@ -56,10 +57,13 @@ def test_sage_gqa_is_unsupported_even_on_capable_hardware(monkeypatch):
 def test_provider_listing_uses_native_dispatch_capability_without_changing_case(
     monkeypatch, backend, architecture
 ):
-    target = AcceleratorTarget(backend, architecture)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda _: target)
+    if backend == "cuda":
+        mock_cuda_target(monkeypatch, (12, 0))
+    else:
+        mock_rocm_target(monkeypatch, architecture)
+        monkeypatch.setattr(sys, "platform", "linux")
     case = _case(kv_heads=4)
-    providers = implementations(case, torch.device("cpu"))
+    providers = implementations(case, torch.device("cuda:0"))
     assert providers[1].unsupported_reason is None
     assert (providers[2].unsupported_reason is None) == (backend == "cuda")
     assert case.sequence == 193

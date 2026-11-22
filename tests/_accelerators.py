@@ -1,8 +1,10 @@
 """Accelerator gates and public hardware-probe mocks shared by tests."""
 
 import sys
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -68,19 +70,51 @@ def mock_rocm_target(monkeypatch: pytest.MonkeyPatch, architecture: str = "gfx12
     )
 
 
+def forbid_device_probes(
+    monkeypatch: pytest.MonkeyPatch, message: str = "unexpected hardware probe"
+) -> Mock:
+    """Fail if code probes PyTorch's CUDA/ROCm device capability or properties."""
+    probe = Mock(side_effect=AssertionError(message))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", probe)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", probe)
+    return probe
+
+
+@contextmanager
+def forbid_triton_driver(message: str = "unexpected Triton driver access") -> Iterator[Mock]:
+    """Fail if code accesses Triton's active driver, including cached JIT references."""
+    import triton  # noqa: PLC0415 - keep tests._accelerators importable without Triton
+
+    guard = Mock(side_effect=AssertionError(message))
+    driver = triton.runtime.driver
+    previous = getattr(driver, "_active", None)
+    driver.set_active(
+        SimpleNamespace(
+            get_current_device=guard,
+            get_active_torch_device=guard,
+            get_current_target=guard,
+        )
+    )
+    try:
+        yield guard
+    finally:
+        driver.set_active(previous)
+
+
 def mock_triton_driver(
     monkeypatch: pytest.MonkeyPatch,
     *,
     backend: str,
     arch: object,
     device_type: str = "cuda",
+    device_index: int = 0,
 ) -> None:
     """Stub Triton's active compiler driver and CUDA device guard without a real GPU."""
     import triton  # noqa: PLC0415 - keep tests._accelerators importable without Triton
 
     monkeypatch.setattr(torch.cuda, "device", lambda _device=None: nullcontext())
     driver = SimpleNamespace(
-        get_active_torch_device=lambda: torch.device(device_type, 0),
+        get_active_torch_device=lambda: torch.device(device_type, device_index),
         get_current_target=lambda: SimpleNamespace(backend=backend, arch=arch),
     )
     monkeypatch.setattr(triton.runtime, "driver", SimpleNamespace(active=driver))

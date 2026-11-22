@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 import triton
-from _accelerators import rocm_fences_only_lds
+from _accelerators import mock_cuda_target, mock_rocm_target, rocm_fences_only_lds
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
@@ -35,7 +35,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
     query,
     value,
 )
-from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import gluon as amd_gluon
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy as amd_policy
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
@@ -621,12 +620,10 @@ def _capture_projection(
     if target is None:
         target = AcceleratorTarget("cuda", "sm120")
     if target.is_nvidia_cuda:
-        monkeypatch.setattr(torch.version, "hip", None)
-        monkeypatch.setattr(
-            torch.cuda,
-            "get_device_capability",
-            lambda _device, capability=target.cuda_capability: capability,
-        )
+        mock_cuda_target(monkeypatch, target.cuda_capability)
+    elif target.is_amd_hip:
+        mock_rocm_target(monkeypatch, target.architecture)
+        monkeypatch.setattr(sys, "platform", "linux")
     functions = {
         "query": _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel,
         "key": _kernels._convrot_project_rmsnorm_rope_quantize_sparse_key_kernel,
@@ -637,7 +634,7 @@ def _capture_projection(
     monkeypatch.setattr(_kernels, function.__name__, kernel)
     monkeypatch.setattr(_backend, "require_projection_backend", Mock(return_value=implementation))
     guard = Mock(side_effect=lambda device: nullcontext())
-    monkeypatch.setattr(projection, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
     with FakeTensorMode():
         operands = _operands(
             sequence=sequence,

@@ -214,7 +214,7 @@ def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, 
     kernel = MagicMock()
     monkeypatch.setattr(gluon, function.__name__, kernel)
     guard = Mock(side_effect=lambda device: nullcontext())
-    monkeypatch.setattr(gluon, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
     sequence, window = 448, (64, 300)
     rows = window[1] if operation == "query" else sequence
     storage = padded_sequence_length(rows)
@@ -251,7 +251,7 @@ def test_sm120_tma_launches_use_descriptors_and_skip_empty_batches(monkeypatch, 
     function = getattr(gluon, f"_{operation}_kernel")
     kernel = MagicMock()
     monkeypatch.setattr(gluon, function.__name__, kernel)
-    monkeypatch.setattr(gluon, "device_context", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "device", lambda _device=None: nullcontext())
     descriptors = [object(), object()]
     descriptor_builder = Mock(side_effect=descriptors)
     monkeypatch.setattr(gluon_tma, "build_matrix_descriptor", descriptor_builder)
