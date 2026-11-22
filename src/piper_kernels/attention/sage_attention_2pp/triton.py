@@ -23,7 +23,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 
 from . import _policy
-from ._plan import SageAttention2ppExecutionPlan
+from ._policy import SageAttention2ppExecutionPlan
 
 # Triton 3.7 requires globals referenced inside JIT functions to be constexpr.
 _BLOCK_N = tl.constexpr(64)

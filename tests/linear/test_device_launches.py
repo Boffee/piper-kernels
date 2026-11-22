@@ -13,7 +13,7 @@ from piper_kernels._residual import ResidualAdd, ReusableUpdate
 from piper_kernels._residual import triton as residual_kernels
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import triton as sage
-from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
+from piper_kernels.attention.sage_attention_2pp._policy import SageAttention2ppExecutionPlan
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.convrot.int8 import _backend, _generic
 from piper_kernels.linear.convrot.int8._generic import triton as generic

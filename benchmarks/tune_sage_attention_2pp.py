@@ -38,7 +38,7 @@ from lib.tuning import (
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention_2pp_backend
-from piper_kernels.attention.sage_attention_2pp._plan import SageAttention2ppExecutionPlan
+from piper_kernels.attention.sage_attention_2pp._policy import SageAttention2ppExecutionPlan
 
 
 @dataclass(frozen=True, slots=True)

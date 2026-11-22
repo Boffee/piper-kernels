@@ -46,7 +46,7 @@ from .._validation import (
 )
 from . import gluon_async_copy as _gluon_async_copy
 from . import policy as _policy
-from ._plan import PiperAttentionExecutionPlan
+from .policy import PiperAttentionExecutionPlan
 
 _BLOCK_N = 64
 _TL_CENTER_CHUNK = tl.constexpr(_quantization.CENTER_CHUNK)

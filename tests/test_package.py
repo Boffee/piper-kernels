@@ -71,6 +71,8 @@ builtins.__import__ = without_triton
 importlib.util.find_spec = find_spec
 
 import torch
+orig_cap = torch.cuda.get_device_capability
+orig_prop = torch.cuda.get_device_properties
 torch.cuda.get_device_capability = lambda *_a: (_ for _ in ()).throw(AssertionError("probe"))
 torch.cuda.get_device_properties = lambda *_a: (_ for _ in ()).throw(AssertionError("probe"))
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -124,11 +126,21 @@ assert "piper_kernels.fusions.attention.triton" not in sys.modules
 assert "piper_kernels.fusions.attention._projected_qk_compile" not in sys.modules
 assert "piper_kernels.linear._compile_fx" not in sys.modules
 assert "triton" not in sys.modules
+from piper_kernels.attention.piper_attention._nvidia import policy as piper_nvidia_policy
+from piper_kernels.attention.sage_attention_2pp import _policy as sage_policy
+assert piper_nvidia_policy.PiperAttentionExecutionPlan is not None
+assert sage_policy.SageAttention2ppExecutionPlan is not None
+assert "triton" not in sys.modules
 prepared, scales = _ops.prepare_input(torch.ones(2, 32), 16)
 assert prepared.shape == (2, 32) and scales.shape == (2,)
 weight.add_(torch.ones(7, 32))
 weight.addmm_(torch.ones(7, 2), torch.ones(2, 32))
 assert torch.isfinite(weight.dequantize()).all()
+assert "triton" not in sys.modules
+torch.cuda.get_device_capability = orig_cap
+torch.cuda.get_device_properties = orig_prop
+from piper_kernels.weights.nvfp4 import _update as nvfp4_update
+assert nvfp4_update._triton_backend is None
 assert "triton" not in sys.modules
 """
     subprocess.run([sys.executable, "-c", script], check=True)

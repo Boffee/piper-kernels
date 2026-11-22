@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights._update import (
     narrow_rounding_seed,
     validate_add_operands,
@@ -13,9 +14,23 @@ from piper_kernels.weights._update import (
     validate_real_scalar,
 )
 from piper_kernels.weights.nvfp4 import _layout
-from piper_kernels.weights.nvfp4._backend import supports_triton, triton_backend
 
 from . import _update_reference as reference
+
+try:
+    from . import triton as _triton_backend
+except ModuleNotFoundError as error:
+    if error.name != "triton":
+        raise
+    _triton_backend = None
+
+
+def _supports_triton(input: torch.Tensor) -> bool:  # noqa: A002
+    """Return whether the fused NVFP4 update backend can execute on this device."""
+    return _triton_backend is not None and AcceleratorTarget.from_device(
+        input.device
+    ).cuda_capability_at_least(10)
+
 
 if TYPE_CHECKING:
     from piper_kernels.weights.nvfp4.tensor import PiperNVFP4Tensor
@@ -127,9 +142,9 @@ def addmm_(
     if beta_float == 1 and alpha_float == 0:
         return
 
-    if supports_triton(weight.qdata):
-        assert triton_backend is not None
-        triton_backend.addmm_(
+    if _supports_triton(weight.qdata):
+        assert _triton_backend is not None
+        _triton_backend.addmm_(
             weight.qdata,
             weight.scale,
             weight.per_tensor_scale,
@@ -173,9 +188,9 @@ def add_(
     if beta_float == 1 and alpha_float == 0:
         return
 
-    if supports_triton(weight.qdata):
-        assert triton_backend is not None
-        triton_backend.add_(
+    if _supports_triton(weight.qdata):
+        assert _triton_backend is not None
+        _triton_backend.add_(
             weight.qdata,
             weight.scale,
             weight.per_tensor_scale,

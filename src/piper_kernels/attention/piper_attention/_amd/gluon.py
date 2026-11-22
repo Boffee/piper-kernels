@@ -57,7 +57,6 @@ from .._validation import (
     validate_output_buffer,
     validate_query_offset,
 )
-from .triton import prepare_value
 
 # Launch attributes shared by every dense RDNA4 kernel compile.
 _LLVM_FN_ATTRS = (
@@ -66,6 +65,8 @@ _LLVM_FN_ATTRS = (
     *amd_compiler_workarounds.LDS_ONLY_FENCE_ATTRS,
 )
 _GL_TILES_PER_CHUNK = gl.constexpr(_quantization._TILES_PER_CHUNK)
+# Retained for compiler/provider diagnostics.
+_prepare_value_kernel = _quantization._quantize_value_k1024_kernel
 
 
 @gluon.jit
@@ -264,6 +265,22 @@ def _dense_piper_kernel(  # noqa: PLR0915
         output_ptr + offsets + features[None, None, :],
         output,
         output_rows[None, :, None] < query_rows,
+    )
+
+
+def prepare_value(
+    value: torch.Tensor,
+    *,
+    storage_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Center V per 1024-token chunk, quantize per token, and pack RDNA4 WMMA tiles."""
+    return _quantization.prepare_chunk_centered_value(
+        value,
+        storage_key_length=storage_length,
+        store_log_scale=True,
+        scale_storage_length=storage_length,
+        pack_wmma=True,
+        log_scale_dtype=torch.float32,
     )
 
 

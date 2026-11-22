@@ -40,7 +40,7 @@ from lib.tuning import (
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention_backend
-from piper_kernels.attention.piper_attention._nvidia._plan import (
+from piper_kernels.attention.piper_attention._nvidia.policy import (
     ATTENTION_KERNELS,
     PiperAttentionExecutionPlan,
 )

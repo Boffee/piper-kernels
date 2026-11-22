@@ -8,7 +8,6 @@ from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import dispatch
 from piper_kernels.attention.piper_attention._amd import gluon as backend
-from piper_kernels.attention.piper_attention._amd import triton as preparation
 from piper_kernels.attention.piper_attention._amd.policy import supports_target
 from piper_kernels.attention.piper_attention.reference import reference_piper_attention
 
@@ -284,7 +283,7 @@ def test_dynamic_fullgraph_and_live_graph_capture(head_dim, causal):
 
 def test_dynamic_lengths_and_equivalent_gqa_shapes_reuse_kernel_specializations():
     backend._dense_piper_kernel.device_caches.clear()
-    preparation._prepare_value_kernel.device_caches.clear()
+    backend._prepare_value_kernel.device_caches.clear()
 
     with torch.inference_mode():
         for query_length, key_length, heads, kv_heads in (
@@ -300,10 +299,7 @@ def test_dynamic_lengths_and_equivalent_gqa_shapes_reuse_kernel_specializations(
         torch.cuda.synchronize()
 
     assert sum(len(cache[0]) for cache in backend._dense_piper_kernel.device_caches.values()) == 1
-    assert (
-        sum(len(cache[0]) for cache in preparation._prepare_value_kernel.device_caches.values())
-        == 1
-    )
+    assert sum(len(cache[0]) for cache in backend._prepare_value_kernel.device_caches.values()) == 1
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])

@@ -11,7 +11,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia import triton as backend
-from piper_kernels.attention.piper_attention._nvidia._plan import PiperAttentionExecutionPlan
+from piper_kernels.attention.piper_attention._nvidia.policy import PiperAttentionExecutionPlan
 from piper_kernels.attention.piper_attention._validation import validate_output_buffer
 
 _QUERY_SHAPE = (2, 6, 65, 64)

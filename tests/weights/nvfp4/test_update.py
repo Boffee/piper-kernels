@@ -9,7 +9,6 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor, _layout
-from piper_kernels.weights.nvfp4._backend import triton_backend
 
 _CUDA_AVAILABLE = torch.cuda.is_available() and AcceleratorTarget.from_device(
     torch.device("cuda")
@@ -380,10 +379,11 @@ def test_compiled_update_preserves_mutation(operation, group_size):
 @pytest.mark.gpu
 @pytest.mark.skipif(not _CUDA_AVAILABLE, reason="requires Blackwell CUDA")
 def test_update_custom_op_fake_and_aot_dispatch(operation, group_size, two_level):
+    from piper_kernels.weights.nvfp4 import triton as triton_backend  # noqa: PLC0415
+
     weight = _weight(group_size, two_level=two_level)
     operands = _operands(weight, operation, strided=True)
     coefficients = (0.25, 0.375) if operation == "addmm" else (0.375,)
-    assert triton_backend is not None
 
     result = torch.library.opcheck(
         getattr(triton_backend, f"{operation}_"),

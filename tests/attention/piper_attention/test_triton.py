@@ -24,7 +24,6 @@ from piper_kernels.attention.piper_attention import _quantization, _quantized_di
 from piper_kernels.attention.piper_attention._nvidia import gluon_async_copy as _gluon_async_copy
 from piper_kernels.attention.piper_attention._nvidia import policy as _policy
 from piper_kernels.attention.piper_attention._nvidia import triton as _backend
-from piper_kernels.attention.piper_attention._nvidia._plan import PiperAttentionExecutionPlan
 from piper_kernels.attention.piper_attention._nvidia.triton import (
     _launch_piper_attention,
     _prepare_piper_attention,
@@ -54,14 +53,16 @@ def _sqnr_db(actual: torch.Tensor, reference: torch.Tensor) -> float:
     return float(10 * torch.log10(signal_energy / error_energy))
 
 
-def _on_triton(plan: PiperAttentionExecutionPlan) -> PiperAttentionExecutionPlan:
+def _on_triton(
+    plan: _policy.PiperAttentionExecutionPlan,
+) -> _policy.PiperAttentionExecutionPlan:
     """Return the same recurrence on the Triton kernel, dropping Gluon-only choices."""
     return replace(
         plan, attention_kernel="triton", max_registers=None, fuse_query_quantization=False
     )
 
 
-def _triton_plan(query: torch.Tensor, is_causal: bool) -> PiperAttentionExecutionPlan:
+def _triton_plan(query: torch.Tensor, is_causal: bool) -> _policy.PiperAttentionExecutionPlan:
     """Return the production plan for Triton-kernel controls, even where Gluon is default."""
     return _on_triton(default_execution_plan(query, is_causal))
 
@@ -344,7 +345,7 @@ def test_optimized_causal_traversal_matches_fully_masked_loop(
 def _sm89_plans(
     query: torch.Tensor,
     is_causal: bool,
-) -> tuple[PiperAttentionExecutionPlan, PiperAttentionExecutionPlan]:
+) -> tuple[_policy.PiperAttentionExecutionPlan, _policy.PiperAttentionExecutionPlan]:
     """Return the SM89 Gluon plan and the Triton plan with the same recurrence."""
     gluon_plan = default_execution_plan(
         query,
