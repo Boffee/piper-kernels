@@ -11,12 +11,18 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 import triton
-from _accelerators import mock_cuda_target, mock_rocm_target, rocm_fences_only_lds
+from _accelerators import (
+    forbid_device_probes,
+    mock_cuda_target,
+    mock_rocm_target,
+    rocm_fences_only_lds,
+)
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 from triton.experimental.gluon._runtime import GluonASTSource
 
+from piper_kernels import compile_options
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._contracts import (
@@ -601,6 +607,90 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
         is supported
     )
     select.assert_called_once_with(query_node.meta["val"])
+
+
+@pytest.mark.parametrize(
+    ("case", "group_size", "bad_bias"),
+    [
+        ("valid", 16, False),
+        ("invalid-group-size", 0, False),
+        ("invalid-bias", 16, True),
+    ],
+)
+def test_output_compiler_rejects_invalid_metadata_before_backend_selection(
+    monkeypatch, case, group_size, bad_bias
+):
+    graph = torch.fx.Graph()
+    with FakeTensorMode():
+        operand_specs = (
+            ("query", (1, 2, 128, 128), torch.int8),
+            ("query_scale", (1, 2, 4), torch.float32),
+            ("query_summary", (1, 2, 2, 128), torch.float32),
+            ("key", (1, 2, 128, 128), torch.int8),
+            ("key_scale", (1, 2, 2), torch.float32),
+            ("key_center", (1, 2, 2, 2, 128), torch.int8),
+            ("key_center_scale", (1, 2, 2, 2), torch.float32),
+            ("key_summary", (1, 2, 2, 128), torch.float32),
+            ("key_aux", (1, 2, 2, 128), torch.float32),
+            ("value", (1, 2, 128, 128), torch.int8),
+            ("value_scale_multiplier", (1, 2, 2, 1), torch.float32),
+            ("value_mean", (1, 2, 2, 128), torch.bfloat16),
+        )
+        operands = []
+        for name, shape, dtype in operand_specs:
+            node = graph.placeholder(name)
+            node.meta["val"] = torch.empty(shape, dtype=dtype, device="cuda:0")
+            operands.append(node)
+        profile = graph.placeholder("ratio_profile")
+        profile.meta["val"] = _SparsePiperRatioProfile((5_000, 10_000))
+        attention = graph.call_function(
+            torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
+            args=(*operands, profile, 2, 128, _MINMAX_ROUTING),
+        )
+        attention.meta["val"] = torch.empty((1, 128, 2, 128), dtype=torch.bfloat16, device="cuda:0")
+        reshaped = graph.call_function(
+            torch.ops.aten.reshape.default,
+            args=(attention, (1, 128, 256)),
+        )
+        reshaped.meta["val"] = torch.empty((1, 128, 256), dtype=torch.bfloat16, device="cuda:0")
+        weight = graph.placeholder("weight")
+        weight.meta["val"] = torch.empty((384, 256), dtype=torch.int8, device="cuda:0")
+        scale = graph.placeholder("scale")
+        scale.meta["val"] = torch.empty((384, 1), dtype=torch.float32, device="cuda:0")
+        bias = None
+        if bad_bias:
+            bias = graph.placeholder("bias")
+            bias.meta["val"] = torch.empty((383,), dtype=torch.float32, device="cuda:0")
+        projected = graph.call_function(
+            torch.ops.piper_kernels.convrot_int8_linear.default,
+            (reshaped, weight, scale, bias, group_size),
+        )
+        projected.meta["val"] = torch.empty((1, 128, 384), dtype=torch.bfloat16, device="cuda:0")
+        graph.output(projected)
+
+    if case == "valid":
+        mock_cuda_target(monkeypatch, (12, 0))
+    else:
+        forbid_device_probes(monkeypatch)
+
+    passes = compile_options(linear=False, ffn=False, attention=True)["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=True)
+
+    targets = [node.target for node in graph.nodes if node.op == "call_function"]
+    attention_op = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default
+    fused_op = torch.ops.piper_kernels.convrot_int8_sparse_piper_attention_output.default
+    linear_op = torch.ops.piper_kernels.convrot_int8_linear.default
+    if case == "valid":
+        assert targets.count(fused_op) == 1
+        assert attention_op not in targets
+        assert linear_op not in targets
+    else:
+        assert fused_op not in targets
+        assert targets.count(attention_op) == 1
+        assert targets.count(linear_op) == 1
+    graph.lint()
 
 
 def _capture_projection(

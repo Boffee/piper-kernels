@@ -38,9 +38,13 @@ _ROUTING_MODE_BY_NAME = {
 _ROUTING_NAME_BY_MODE = {mode: name for name, mode in _ROUTING_MODE_BY_NAME.items()}
 
 
-def is_valid_routing_mode(routing_mode: int) -> bool:
+def is_valid_routing_mode(routing_mode: object) -> bool:
     """Return whether a value names a supported static routing policy."""
-    return routing_mode in _ROUTING_NAME_BY_MODE
+    return (
+        not isinstance(routing_mode, bool)
+        and isinstance(routing_mode, int)
+        and routing_mode in _ROUTING_NAME_BY_MODE
+    )
 
 
 def validate_routing_mode(routing_mode: int) -> None:

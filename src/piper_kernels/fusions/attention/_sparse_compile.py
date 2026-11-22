@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -112,6 +113,36 @@ class ReshapedQuantizedAttentionMatch:
             args.get("sparse_query_blocks"),
         )
 
+    def defer_gate[GateT: tuple[Argument, ...]](
+        self,
+        extract_gate: Callable[[object], GateT | None],
+    ) -> tuple[tuple[Argument, ...], GateT | None]:
+        """Extract a prepared gate and clear the materialized gate slot when deferred."""
+        args = self.bounded_arguments
+        gate = extract_gate(args[1])
+        return (args, None) if gate is None else ((args[0], None, *args[2:]), gate)
+
+    def match_projected_query(self, target: object) -> dict[str, Argument] | None:
+        """Recover the bound projected-Q producer matching this attention call."""
+        args = self.attention_args
+        return match_projected_query_producer(
+            args["query"],
+            args["query_scale"],
+            args["query_summary"],
+            target,
+            routing_mode=args["routing_mode"],
+            block_lengths=args.get("block_lengths"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedAttentionOutput:
+    """Validated format-independent metadata for quantized attention -> reshape -> linear."""
+
+    query: torch.Tensor
+    projected: torch.Tensor
+    input_features: int
+
 
 def same_dimension(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
     """Compare two static or symbolic dimensions structurally."""
@@ -178,7 +209,7 @@ def sparse_projection_metadata(
     return query_values, key_values, value_values
 
 
-def optional_attention_layout_arguments[ArgumentT](
+def _optional_attention_layout_arguments[ArgumentT](
     block_lengths: ArgumentT | None,
     sparse_query_blocks: ArgumentT | None,
     force_tile_ids: ArgumentT | None = None,
@@ -365,20 +396,6 @@ def match_reshaped_quantized_attention(
     )
 
 
-def unwrap_shape_only_views(value: object) -> torch.fx.Node | None:
-    """Return the first non-view producer beneath contiguous reshape/view calls."""
-    if not isinstance(value, torch.fx.Node):
-        return None
-    node = value
-    while node.op == "call_function" and node.target in _SHAPE_ONLY_VIEW_TARGETS:
-        bound = linear_fx.bind_arguments(node)
-        if bound is None or not isinstance(bound.get("self"), torch.fx.Node):
-            return None
-        node = bound["self"]
-        assert isinstance(node, torch.fx.Node)
-    return node
-
-
 def valid_sparse_piper_coarse_residual(matched: SparsePiperProjectionMatch) -> bool:
     """Validate projection-independent operands for a matched coarse residual."""
     if matched.routing_mode != matched.coarse_routing_mode:
@@ -411,26 +428,22 @@ def valid_sparse_piper_coarse_residual(matched: SparsePiperProjectionMatch) -> b
     )
 
 
-def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
+def emit_quantized_sparse_piper_attention(
     graph: torch.fx.Graph,
+    matched: SparsePiperProjectionMatch,
     attention_arguments: tuple[Argument, ...],
     *,
-    ratio_profile: Argument,
-    sparse_key_blocks: Argument,
     logical_sequence_length: Argument,
-    routing_mode: Argument,
-    block_lengths: Argument | None = None,
-    sparse_query_blocks: Argument | None = None,
-    coarse_gate: Argument | None = None,
-    coarse_scale: Argument | None = None,
-    coarse_key_blocks: Argument | None = None,
-    output_dtype: torch.dtype = torch.bfloat16,
-    force_tile_ids: Argument | None = None,
-    force_tile_counts: Argument | None = None,
+    coarse_gate: Argument | None,
+    output_dtype: torch.dtype,
 ) -> torch.fx.Node:
     """Emit the shared fine or coarse quantized sparse-attention call."""
-    force_arguments = (force_tile_ids, force_tile_counts) if force_tile_ids is not None else ()
-    coarse_arguments = coarse_gate, coarse_scale, coarse_key_blocks
+    force_arguments = (
+        (matched.force_tile_ids, matched.force_tile_counts)
+        if matched.force_tile_ids is not None
+        else ()
+    )
+    coarse_arguments = coarse_gate, matched.coarse_scale, matched.coarse_key_blocks
     with_coarse = any(argument is not None for argument in coarse_arguments)
     if with_coarse:
         if any(argument is None for argument in coarse_arguments):
@@ -440,14 +453,14 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
             args=(
                 *attention_arguments,
                 coarse_gate,
-                ratio_profile,
-                sparse_key_blocks,
+                matched.ratio_profile,
+                matched.sparse_key_blocks,
                 logical_sequence_length,
-                routing_mode,
-                coarse_scale,
-                coarse_key_blocks,
-                block_lengths,
-                sparse_query_blocks,
+                matched.routing_mode,
+                matched.coarse_scale,
+                matched.coarse_key_blocks,
+                matched.block_lengths,
+                matched.sparse_query_blocks,
                 *force_arguments,
             ),
             kwargs={"output_dtype": output_dtype},
@@ -456,13 +469,13 @@ def emit_quantized_sparse_piper_attention(  # noqa: PLR0913
         torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
         args=(
             *attention_arguments,
-            ratio_profile,
-            sparse_key_blocks,
+            matched.ratio_profile,
+            matched.sparse_key_blocks,
             logical_sequence_length,
-            routing_mode,
-            *optional_attention_layout_arguments(
-                block_lengths,
-                sparse_query_blocks,
+            matched.routing_mode,
+            *_optional_attention_layout_arguments(
+                matched.block_lengths,
+                matched.sparse_query_blocks,
                 *force_arguments,
             ),
         ),
@@ -605,24 +618,165 @@ def _valid_ratio_profile(profile_node: object, heads: int) -> bool:
     return isinstance(profile, _SparsePiperRatioProfile) and profile.num_heads == heads
 
 
+def validate_reshaped_attention_output(
+    linear_node: torch.fx.Node,
+    reshaped_match: ReshapedQuantizedAttentionMatch,
+) -> ValidatedAttentionOutput | None:
+    """Validate format-independent metadata for one quantized attention output match."""
+    query_arg = reshaped_match.attention_args["query"]
+    if not isinstance(query_arg, torch.fx.Node):
+        return None
+    query = preparation_sharing.tensor_metadata(query_arg)
+    attention = preparation_sharing.tensor_metadata(reshaped_match.attention_node)
+    reshaped = preparation_sharing.tensor_metadata(reshaped_match.reshape_node)
+    projected = preparation_sharing.tensor_metadata(linear_node)
+    if query is None or attention is None or reshaped is None or projected is None:
+        return None
+    shape = reshaped_match.attention_shape
+    if (
+        query.ndim != 4
+        or query.dtype is not torch.int8
+        or attention.ndim != 4
+        or attention.dtype not in _dtype.SUPPORTED_DTYPES
+        or reshaped_match.attention_args.get("output_dtype", torch.bfloat16) is not attention.dtype
+        or reshaped.ndim != 3
+        or reshaped.dtype is not attention.dtype
+        or projected.ndim != 3
+        or projected.dtype is not attention.dtype
+        or not isinstance(shape, (list, tuple))
+        or len(shape) != 3
+    ):
+        return None
+    batch, sequence_length = attention.shape[:2]
+    heads = static_int(attention.shape[2])
+    head_dim = static_int(attention.shape[3])
+    if heads is None or heads < 1 or head_dim not in SUPPORTED_HEAD_DIMS:
+        return None
+    input_features = heads * head_dim
+    if (
+        not same_dimension(query.shape[0], batch)
+        or query.shape[1] != heads
+        or query.shape[3] != head_dim
+        or not same_dimension(reshaped.shape[0], batch)
+        or not same_dimension(reshaped.shape[1], sequence_length)
+        or reshaped.shape[2] != input_features
+        or not same_dimension(projected.shape[0], batch)
+        or not same_dimension(projected.shape[1], sequence_length)
+        or any(
+            value.device != query.device
+            or value.layout is not torch.strided
+            or not value.is_contiguous()
+            for value in (query, attention, reshaped, projected)
+        )
+    ):
+        return None
+    return ValidatedAttentionOutput(query, projected, input_features)
+
+
+def match_projected_query_producer(
+    query: object,
+    query_scale: object,
+    query_summary: object,
+    target: object,
+    *,
+    routing_mode: object,
+    block_lengths: object,
+) -> dict[str, Argument] | None:
+    """Recover one shared quantized projected-Q producer matching routing and layout."""
+    producer = ordered_tuple_output_producer((query, query_scale, query_summary), target)
+    query_value = (
+        preparation_sharing.tensor_metadata(query) if isinstance(query, torch.fx.Node) else None
+    )
+    if producer is None or query_value is None or query_value.ndim != 4:
+        return None
+    bound = linear_fx.bind_arguments(producer)
+    if bound is None:
+        return None
+    head_dim = bound.get("head_dim")
+    if (
+        (head_dim is not None and head_dim != query_value.shape[-1])
+        or bound.get("routing_mode", _dtype._MINMAX_ROUTING) != routing_mode
+        or bound.get("block_lengths") is not block_lengths
+    ):
+        return None
+    return bound
+
+
+def unwrap_reshaped_producer(value: object) -> torch.fx.Node | None:
+    """Return the first non-view producer reached through at least one shape-only view."""
+    if not isinstance(value, torch.fx.Node):
+        return None
+    node = value
+    while node.op == "call_function" and node.target in _SHAPE_ONLY_VIEW_TARGETS:
+        bound = linear_fx.bind_arguments(node)
+        if bound is None or not isinstance(bound.get("self"), torch.fx.Node):
+            return None
+        node = bound["self"]
+        assert isinstance(node, torch.fx.Node)
+    return None if node is value else node
+
+
+def replace_matched_nodes(
+    graph: torch.fx.Graph,
+    original: torch.fx.Node,
+    replacement: torch.fx.Node,
+    *extra_erased: torch.fx.Node,
+    in_place_output: torch.fx.Node | None = None,
+) -> None:
+    """Rewire ``original`` to ``replacement`` (or ``in_place_output``) and erase replaced nodes."""
+    if in_place_output is None:
+        replacement.meta = original.meta.copy()
+        replacement.meta.pop("eager_input_vals", None)
+        original.replace_all_uses_with(replacement)
+    else:
+        replacement.meta["val"] = None
+        original.replace_all_uses_with(in_place_output)
+    graph.erase_node(original)
+    for node in extra_erased:
+        graph.erase_node(node)
+
+
+def fold_matched_nodes[MatchT](
+    graph: torch.fx.Graph,
+    match: Callable[[torch.fx.Node], MatchT | None],
+    replace: Callable[[torch.fx.Graph, MatchT], None],
+) -> bool:
+    """Match and replace non-overlapping FX regions, pruning dead code when modified."""
+    changed = False
+    for node in list(graph.nodes):
+        matched = match(node)
+        if matched is None:
+            continue
+        replace(graph, matched)
+        changed = True
+    if changed:
+        graph.eliminate_dead_code()
+        graph.lint()
+    return changed
+
+
 __all__ = [
     "QUANTIZED_ATTENTION_ARGUMENT_NAMES",
     "ReshapedQuantizedAttentionMatch",
     "SparsePiperProjectionMatch",
+    "ValidatedAttentionOutput",
     "attention_head_dim",
     "emit_quantized_sparse_piper_attention",
+    "fold_matched_nodes",
     "integer_scalar_argument",
     "integer_scalar_metadata",
+    "match_projected_query_producer",
     "match_reshaped_quantized_attention",
     "match_sparse_piper_projection",
-    "optional_attention_layout_arguments",
     "optional_tensor_metadata",
     "ordered_tuple_output_producer",
+    "replace_matched_nodes",
     "same_dimension",
     "sparse_projection_metadata",
     "static_int",
-    "unwrap_shape_only_views",
+    "unwrap_reshaped_producer",
     "valid_sparse_piper_attention",
     "valid_sparse_piper_coarse_residual",
+    "validate_reshaped_attention_output",
     "view_shape_argument",
 ]
