@@ -1,6 +1,6 @@
 """Portable activations that a linear backend can absorb during input preparation."""
 
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 
@@ -9,7 +9,8 @@ type InputActivation = Literal["gelu_tanh", "swiglu"]
 GELU_TANH_CUBIC_COEFFICIENT = 0.044715
 GELU_TANH_SCALE_COEFFICIENT = 0.7978845608028654
 
-_SUPPORTED_INPUT_ACTIVATIONS = (None, "gelu_tanh", "swiglu")
+_INPUT_ACTIVATIONS = ("gelu_tanh", "swiglu")
+_SUPPORTED_INPUT_ACTIVATIONS = (None, *_INPUT_ACTIVATIONS)
 
 
 def validate_input_activation(activation_fn: str | None) -> None:
@@ -19,6 +20,15 @@ def validate_input_activation(activation_fn: str | None) -> None:
             "unsupported input activation "
             f"{activation_fn!r}; expected 'gelu_tanh', 'swiglu', or None"
         )
+
+
+def parse_input_activation(activation_fn: str, *, name: str = "FFN") -> InputActivation:
+    """Validate and narrow a required input-activation name."""
+    if activation_fn not in _INPUT_ACTIVATIONS:
+        raise ValueError(
+            f"{name} activation_fn must be 'gelu_tanh' or 'swiglu', got {activation_fn!r}"
+        )
+    return cast(InputActivation, activation_fn)
 
 
 def input_activation_width(activation_fn: str | None) -> int:
@@ -47,5 +57,6 @@ __all__ = [
     "InputActivation",
     "apply_input_activation",
     "input_activation_width",
+    "parse_input_activation",
     "validate_input_activation",
 ]
