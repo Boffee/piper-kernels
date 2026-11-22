@@ -21,7 +21,11 @@ from dataclasses import dataclass
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels._triton.targets import (
+    RDNA4_MIN_FULL_GRID_TILES,
+    AcceleratorTarget,
+    rdna4_int8_accumulator_seed,
+)
 
 from .._plan import LinearExecutionPlan
 
@@ -32,8 +36,7 @@ _SUPPORTED_ARCHITECTURES = ("gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"
 # Maximum feature width fused into a single rotation-and-quantization kernel.
 _MAX_FUSED_PREPARATION_WIDTH = 16384
 
-# Two output workgroups per WGP on gfx1201.
-_MIN_GFX1201_MATMUL_TILES = 64
+_MIN_GFX1201_MATMUL_TILES = RDNA4_MIN_FULL_GRID_TILES
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,22 +101,8 @@ def matmul_group_m(plan: LinearExecutionPlan) -> int:
 
 
 def matmul_accumulator_seed(target: AcceleratorTarget, in_features: int, output_tiles: int) -> int:
-    """Return the ``0x155555`` zero-crossing seed for long INT8 reductions on gfx1201.
-
-    For reductions of 4,096+ features with at least 64 output tiles on ``gfx1201``,
-    seeding INT32 accumulators with ``0x155555`` centers partial sums away from the
-    signed zero crossing, sustaining a higher matrix clock on a stock RX 9070 XT.
-    The kernel subtracts the seed in INT32 before FP32 scaling; each INT8 product
-    contributes at most ``128 * 128``, bounding the safe reduction width.
-    """
-    seed = 0x155555
-    if (
-        target.is_architecture("gfx1201")
-        and output_tiles >= _MIN_GFX1201_MATMUL_TILES
-        and 4096 <= in_features <= (2**31 - 1 - seed) // (128 * 128)
-    ):
-        return seed
-    return 0
+    """Return the ``0x155555`` zero-crossing seed for long INT8 reductions on gfx1201."""
+    return rdna4_int8_accumulator_seed(target, in_features, output_tiles)
 
 
 def _supports_rdna4_128m_fast_path(

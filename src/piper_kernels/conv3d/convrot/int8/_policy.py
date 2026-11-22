@@ -15,7 +15,11 @@ from typing import NamedTuple
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels._triton.targets import (
+    RDNA4_MIN_FULL_GRID_TILES,
+    AcceleratorTarget,
+    rdna4_int8_accumulator_seed,
+)
 
 type Padding = tuple[int, int, int, int, int, int]
 
@@ -53,6 +57,7 @@ class ConvolutionExecutionPlan:
     use_weight_descriptor: bool
     # Fence only LDS at barriers; an RDNA workaround in _triton.amd_compiler_workarounds.
     lds_only_fences: bool = False
+    accumulator_seed: int = 0
 
 
 _BASE_CONVOLUTION = ConvolutionSchedule(64, 128, 128, 4, 3)
@@ -156,13 +161,31 @@ def _nvidia_preparation_schedule(
     return _PREPARE_DEFAULT
 
 
-def _amd_convolution_schedule(channels: int, outputs: int, rows: int) -> ConvolutionSchedule:
-    # RX 9070 XT synthetic H3-style sweeps: larger row tiles amortize the
-    # implicit 3-D gather at high resolution; smaller tiles keep enough work
-    # in flight for deeper, low-resolution convolutions.
-    if channels <= 128 and outputs >= 128 and rows >= 8192:
-        return ConvolutionSchedule(128, 128, 128, 8, 2)
-    if channels <= 256 and outputs >= 128 and rows >= 1024:
+def _tile_count(rows: int, outputs: int, block_m: int, block_n: int) -> int:
+    return ((rows + block_m - 1) // block_m) * ((outputs + block_n - 1) // block_n)
+
+
+def _amd_convolution_schedule(outputs: int, rows: int) -> ConvolutionSchedule:
+    # Fill at least two workgroups per WGP (64 tiles) across 32-WGP RDNA4 while
+    # requiring 256-column outputs to be divisible so BN=256 never wastes a half tile.
+    if (
+        rows >= 128
+        and outputs >= 256
+        and outputs % 256 == 0
+        and _tile_count(rows, outputs, 128, 256) >= RDNA4_MIN_FULL_GRID_TILES
+    ):
+        return ConvolutionSchedule(128, 256, 64, 8, 2)
+    if (
+        rows >= 128
+        and outputs >= 128
+        and _tile_count(rows, outputs, 128, 128) >= RDNA4_MIN_FULL_GRID_TILES
+    ):
+        return ConvolutionSchedule(128, 128, 64, 8, 2)
+    if (
+        rows >= 64
+        and outputs >= 128
+        and _tile_count(rows, outputs, 64, 128) >= RDNA4_MIN_FULL_GRID_TILES
+    ):
         return ConvolutionSchedule(64, 128, 128, 4, 2)
     if outputs >= 64 and rows >= 128:
         return ConvolutionSchedule(64, 64, 64, 4, 2)
@@ -212,15 +235,21 @@ def select_execution_plan(
             ),
         )
     if _supports_amd(target):
+        schedule = (
+            _amd_convolution_schedule(outputs, output_rows)
+            if convolution_schedule is None
+            else convolution_schedule
+        )
         return ConvolutionExecutionPlan(
             preparation=_amd_preparation_schedule(channels),
-            convolution=(
-                _amd_convolution_schedule(channels, outputs, output_rows)
-                if convolution_schedule is None
-                else convolution_schedule
-            ),
+            convolution=schedule,
             use_weight_descriptor=False,
             lds_only_fences=True,
+            accumulator_seed=rdna4_int8_accumulator_seed(
+                target,
+                27 * channels,
+                _tile_count(output_rows, outputs, schedule.block_m, schedule.block_n),
+            ),
         )
     raise ValueError(f"ConvRot INT8 convolution has no native policy for {target}")
 

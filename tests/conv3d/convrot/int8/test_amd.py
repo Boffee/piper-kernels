@@ -1,5 +1,7 @@
 """RDNA4 preparation, exact integer accumulation, and graph-capture regressions."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 from torch.nn import functional
@@ -164,6 +166,91 @@ def test_native_dispatch_and_graph_capture_use_live_scale(monkeypatch, fused, ch
     graph.replay()
     torch.testing.assert_close(captured, run(), atol=0, rtol=0)
     assert not torch.equal(before, captured)
+
+
+@pytest.mark.parametrize(("channels", "fused_epilogue"), [(256, False), (512, True)])
+def test_wide_seeded_convolution_matches_exact_integer_accumulation(channels, fused_epilogue):
+    torch.manual_seed(29)
+    batch, frames, height, width, outputs = 1, 2, 64, 64, 256
+    prepared = torch.randint(
+        -128, 128, (batch, frames, height, width, channels), device="cuda", dtype=torch.int8
+    )
+    weight = torch.randint(-128, 128, (outputs, 3, 3, 3, channels), device="cuda", dtype=torch.int8)
+    # Power-of-two scales avoid non-dyadic FP32 rounding ties across 2M FP16 outputs.
+    input_scale = torch.tensor(1.0 / 256.0, device="cuda")
+    weight_scale = torch.full((outputs, 1), 1.0 / 256.0, device="cuda")
+    bias = None
+    residual = None
+    if fused_epilogue:
+        bias = torch.full((outputs,), 0.25, device="cuda", dtype=torch.float16)
+        residual = torch.full(
+            (batch, outputs, frames, height, width), 0.5, device="cuda", dtype=torch.float16
+        )
+    pads = _CAUSAL_PADDING["reflect"]
+    production_plan = _policy.default_execution_plan(
+        prepared.permute(0, 4, 1, 2, 3),
+        weight,
+        (1, 1, 1),
+        group_norm=False,
+        padding=pads,
+    )
+    wide_seeded_plan = replace(
+        production_plan,
+        convolution=_policy.ConvolutionSchedule(128, 256, 64, 8, 2),
+        accumulator_seed=0x155555,
+    )
+    wide_unseeded_plan = replace(wide_seeded_plan, accumulator_seed=0)
+    kwargs = {
+        "padding": pads,
+        "spatial_reflection": True,
+        "residual": residual,
+    }
+    seeded = shared._conv3d_prepared(
+        prepared,
+        weight,
+        weight_scale,
+        bias,
+        input_scale,
+        (1, 1, 1),
+        execution_plan=wide_seeded_plan,
+        **kwargs,
+    )
+    unseeded = shared._conv3d_prepared(
+        prepared,
+        weight,
+        weight_scale,
+        bias,
+        input_scale,
+        (1, 1, 1),
+        execution_plan=wide_unseeded_plan,
+        **kwargs,
+    )
+    production = shared._conv3d_prepared(
+        prepared,
+        weight,
+        weight_scale,
+        bias,
+        input_scale,
+        (1, 1, 1),
+        execution_plan=production_plan,
+        **kwargs,
+    )
+    torch.testing.assert_close(seeded, unseeded, atol=0, rtol=0)
+    padded = functional.pad(
+        prepared.permute(0, 4, 1, 2, 3).float(), (1, 1, 1, 1, 0, 0), mode="reflect"
+    )
+    padded = functional.pad(padded, (0, 0, 0, 0, 2, 0)).to(torch.int8)
+    windows = padded.unfold(2, 3, 1).unfold(3, 3, 1).unfold(4, 3, 1)
+    matrix = windows.permute(0, 2, 3, 4, 5, 6, 7, 1).reshape(-1, 27 * channels)
+    expected = torch._int_mm(matrix, weight.flatten(1).T).float() * input_scale * weight_scale.T
+    expected = expected.view(batch, frames, height, width, outputs).permute(0, 4, 1, 2, 3)
+    if bias is not None:
+        expected = expected + bias.view(1, outputs, 1, 1, 1).float()
+    if residual is not None:
+        expected = expected + residual.float()
+    expected = expected.half()
+    torch.testing.assert_close(seeded, expected, atol=0, rtol=0)
+    torch.testing.assert_close(production, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("fused", [False, True])

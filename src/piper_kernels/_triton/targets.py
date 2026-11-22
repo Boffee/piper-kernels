@@ -4,6 +4,11 @@ from dataclasses import dataclass
 
 import torch
 
+RDNA4_INT8_ACCUMULATOR_SEED = 0x155555
+RDNA4_INT8_ACCUMULATOR_SEED_MIN_REDUCTION = 4096
+# Two output workgroups per WGP on 32-WGP RDNA4.
+RDNA4_MIN_FULL_GRID_TILES = 64
+
 
 def _normalize_architecture(architecture: object | None) -> str | None:
     """Return a canonical architecture name without optional feature suffixes."""
@@ -107,3 +112,26 @@ class AcceleratorTarget:
     def supports_fp8_fp16_mma(self) -> bool:
         """Return whether FP8 tensor-core inputs with FP16 accumulation are available."""
         return self.cuda_capability_at_least(8, 9)
+
+
+def rdna4_int8_accumulator_seed(
+    target: AcceleratorTarget, reduction_width: int, output_tiles: int
+) -> int:
+    """Return the ``0x155555`` zero-crossing seed for long INT8 reductions on gfx1201.
+
+    For reductions of 4,096+ INT8 elements across a full grid (>= 64 output tiles) on
+    ``gfx1201``, seeding INT32 accumulators with ``0x155555`` centers partial sums away
+    from the signed zero crossing, sustaining higher matrix clock frequency on a stock
+    RX 9070 XT. Kernels subtract the seed in INT32 before scaling; each INT8 product
+    contributes at most ``128 * 128``, bounding the overflow-safe reduction width.
+    """
+    seed = RDNA4_INT8_ACCUMULATOR_SEED
+    if (
+        target.is_architecture("gfx1201")
+        and output_tiles >= RDNA4_MIN_FULL_GRID_TILES
+        and RDNA4_INT8_ACCUMULATOR_SEED_MIN_REDUCTION
+        <= reduction_width
+        <= (2**31 - 1 - seed) // (128 * 128)
+    ):
+        return seed
+    return 0

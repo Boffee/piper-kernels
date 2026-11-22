@@ -1,6 +1,7 @@
 """Convolution dispatch and unified target launch policy contracts."""
 
 import builtins
+import math
 import sys
 from functools import partial
 from unittest.mock import Mock
@@ -252,14 +253,88 @@ def test_amd_preparation_bounds_rotation_tile_and_never_uses_descriptors(channel
     assert not RDNA4(channels=channels, outputs=256, output_height=256).use_weight_descriptor
 
 
-@pytest.mark.parametrize(
-    ("channels", "outputs", "rows", "expected"),
-    [
-        (128, 128, 8192, (128, 128, 128, 8, 2)),
-        (256, 256, 3072, (64, 128, 128, 4, 2)),
-        (512, 512, 768, (64, 64, 64, 4, 2)),
-        (64, 7, 18, (32, 64, 64, 4, 2)),
-    ],
-)
-def test_amd_convolution_uses_measured_tiles(channels, outputs, rows, expected):
-    assert RDNA4(channels=channels, outputs=outputs, output_rows=rows).convolution == expected
+def test_amd_convolution_schedule_contracts():
+    for channels in (64, 128, 256, 512, 1024):
+        for outputs in (32, 64, 128, 256, 384, 512, 1024, 16384):
+            for rows in (18, 64, 192, 1024, 3072, 8192, 40960):
+                plan = RDNA4(channels=channels, outputs=outputs, output_rows=rows)
+                schedule = plan.convolution
+                assert plan.lds_only_fences
+                assert not plan.use_weight_descriptor
+                assert schedule.num_stages == 2
+                assert schedule.num_warps in (4, 8)
+                if schedule.block_n == 256:
+                    assert outputs % 256 == 0
+                if schedule.block_m == 128:
+                    assert (
+                        math.ceil(rows / schedule.block_m) * math.ceil(outputs / schedule.block_n)
+                        >= 64
+                    )
+                if rows < 128:
+                    assert schedule.block_m <= 64
+                if outputs < 64 or rows < 64:
+                    assert schedule.block_n == 64
+
+
+def test_convolution_accumulator_seed_contracts():
+    gfx1201 = AcceleratorTarget("hip", "gfx1201")
+    gfx1200 = AcceleratorTarget("hip", "gfx1200")
+    tile_64 = _policy.ConvolutionSchedule(64, 64, 64, 4, 2)
+    wide_tile = _policy.ConvolutionSchedule(128, 256, 64, 8, 2)
+    # 64-tile minimum and 4096-element reduction minimum checked with explicit schedules.
+    assert (
+        _plan(
+            gfx1201, channels=256, outputs=64, output_rows=4032, convolution_schedule=tile_64
+        ).accumulator_seed
+        == 0
+    )
+    assert (
+        _plan(
+            gfx1201, channels=256, outputs=64, output_rows=4096, convolution_schedule=tile_64
+        ).accumulator_seed
+        == 0x155555
+    )
+    assert (
+        _plan(
+            gfx1201, channels=256, outputs=256, output_rows=4096, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0
+    )
+    assert (
+        _plan(
+            gfx1201, channels=256, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0x155555
+    )
+    assert (
+        _plan(
+            gfx1201, channels=128, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0
+    )
+    assert (
+        _plan(
+            gfx1201, channels=152, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0x155555
+    )
+    # Only gfx1201 uses the zero-crossing seed.
+    assert _plan(gfx1200, channels=256, outputs=256, output_rows=8192).accumulator_seed == 0
+    assert (
+        _plan(
+            gfx1200, channels=256, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0
+    )
+    assert (
+        SM120(
+            channels=256, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0
+    )
+    assert (
+        SM8X(
+            channels=256, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0
+    )
