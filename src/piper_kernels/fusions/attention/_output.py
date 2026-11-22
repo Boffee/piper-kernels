@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+from piper_kernels._triton.targets import AcceleratorTarget
+
 DEFAULT_QUERY_CHUNK_ROWS = 8192
 
 type AttentionProjector = Callable[[torch.Tensor], torch.Tensor]
@@ -85,37 +87,52 @@ def run_chunked_attention_output(  # noqa: PLR0912, PLR0913, PLR0915
     project_attention: AttentionProjector | None = None,
     out: torch.Tensor | None = None,
     reuse_output_for_attention: bool = False,
+    overlap_streams: bool | None = None,
 ) -> torch.Tensor:
     """Run validated row windows through attention and its output projection.
 
     Attention chunks use [batch, rows, heads, head_dim] storage. The caller owns
     attention semantics, supported dtypes, positive dimensions, and chunk alignment.
     Launchers receive global row coordinates and an optional auxiliary input in
-    the same layout. Supply at most one auxiliary source. An auxiliary producer
-    fills bounded buffers; its consumer must enqueue all reads on the attention
-    stream before returning.
+    the same layout. Supply at most one auxiliary source. When overlapping streams,
+    an auxiliary producer fills bounded ping-pong buffers; its consumer must enqueue
+    all reads on the attention stream before returning.
 
-    Chunk projectors fill the final output rows. Multiple chunks overlap projection
-    on a consumer stream; a single chunk uses the current stream. Include every
-    tensor retained by the chunk projector in projector_tensors.
+    Chunk projectors fill the final output rows. By default, multiple chunks overlap
+    attention and projection on side streams on NVIDIA CUDA (`overlap_streams=None`),
+    while AMD HIP, CPU, single-chunk inputs, and `overlap_streams=False` run
+    sequentially on the current stream with single-slot attention and auxiliary
+    buffers. Pass `overlap_streams=True` to force side-stream overlap for multi-chunk
+    runs. Include every tensor retained by the chunk projector in projector_tensors.
 
     With reuse_output_for_attention, a sufficiently wide final output supplies
     each attention window's temporary storage. For each batch element, the chunk
     projector must read the entire window into separate storage before writing
-    its output rows. Narrow outputs retain the two bounded attention buffers.
+    its output rows. Narrow outputs retain bounded attention buffers.
 
     A whole-output projector materializes attention first, for example to derive a
     global activation scale. It owns its output allocation; out applies only to
     chunk projection.
     """
+    if overlap_streams and device.type != "cuda":
+        raise ValueError("stream overlap requires a CUDA or HIP device")
     batch, sequence_length, heads, head_dim = attention_shape
     chunk_ranges = [
         (start, min(query_chunk_rows, sequence_length - start))
         for start in range(0, sequence_length, query_chunk_rows)
     ]
     chunk_count = len(chunk_ranges)
-    pipeline_auxiliary = (
+    use_stream_overlap = (
         project_attention is None
+        and chunk_count > 1
+        and (
+            AcceleratorTarget.from_device(device).is_nvidia_cuda
+            if overlap_streams is None
+            else overlap_streams
+        )
+    )
+    pipeline_auxiliary = (
+        use_stream_overlap
         and project_auxiliary_chunk is not None
         and chunk_count >= auxiliary_pipeline_min_chunks
     )
@@ -170,7 +187,9 @@ def run_chunked_attention_output(  # noqa: PLR0912, PLR0913, PLR0915
     attention_buffers = (
         None
         if reuse_output_for_attention and output_features >= heads * head_dim
-        else torch.empty((min(2, chunk_count), *chunk_shape), device=device, dtype=output_dtype)
+        else torch.empty(
+            (2 if use_stream_overlap else 1, *chunk_shape), device=device, dtype=output_dtype
+        )
     )
 
     def attention_window(slot: int, start: int, rows: int) -> torch.Tensor:
@@ -181,11 +200,11 @@ def run_chunked_attention_output(  # noqa: PLR0912, PLR0913, PLR0915
         storage = output[:, start : start + rows].view(batch, rows * output_features)
         return storage[:, : rows * heads * head_dim].view(batch, rows, heads, head_dim)
 
-    if chunk_count == 1:
-        start, rows = chunk_ranges[0]
-        attention_chunk = attention_window(0, start, rows)
-        launch_chunk(attention_chunk, start, rows, get_auxiliary_chunk(start, rows))
-        project_chunk(attention_chunk, output, start, rows)
+    if not use_stream_overlap:
+        for start, rows in chunk_ranges:
+            attention_chunk = attention_window(0, start, rows)
+            launch_chunk(attention_chunk, start, rows, get_auxiliary_chunk(start, rows))
+            project_chunk(attention_chunk, output, start, rows)
         return output
 
     with torch.cuda.device(device):

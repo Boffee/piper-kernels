@@ -328,7 +328,7 @@ def test_h3_chunked_output_matches_materialized_boundary_with_bounded_workspace(
 
     monkeypatch.setattr(query, "_launch_query_projection_range", track_query)
     monkeypatch.setattr(amd_attention, "prepare_parameters", track_parameters)
-    # Reuse each ping-pong slot many times, starting from a caller's side stream.
+    # Reuse the bounded attention slot across many windows on a caller's side stream.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     before = torch.cuda.memory_allocated()
