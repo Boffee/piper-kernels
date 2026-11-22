@@ -250,7 +250,7 @@ def test_gluon_launches_full_tiles_then_one_masked_tail(monkeypatch, operation, 
         project_value_chunk_means,
     )
     guard = Mock(side_effect=lambda device: nullcontext())
-    monkeypatch.setattr(gluon, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
     encode_key = Mock()
     monkeypatch.setattr(gluon.piper_quantization, "prepare_chunk_centered_key", encode_key)
     sequence, window = 448, (128, 300)
@@ -312,7 +312,7 @@ def test_sm120_tma_launches_use_descriptors_and_skip_empty_batches(monkeypatch, 
     function = getattr(gluon, f"_{operation}_kernel")
     kernel = MagicMock()
     monkeypatch.setattr(gluon, function.__name__, kernel)
-    monkeypatch.setattr(gluon, "device_context", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "device", lambda _device=None: nullcontext())
     monkeypatch.setattr(gluon.shared_projection, "project_value_chunk_means", Mock())
     monkeypatch.setattr(gluon.piper_quantization, "prepare_chunk_centered_key", Mock())
     descriptors = [object(), object()]

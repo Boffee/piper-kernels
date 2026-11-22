@@ -11,7 +11,6 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._residual import ResidualAdd, ReusableUpdate
 from piper_kernels._residual import triton as residual_kernels
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sage_attention_2pp import triton as sage
 from piper_kernels.attention.sage_attention_2pp._policy import SageAttention2ppExecutionPlan
 from piper_kernels.gguf import GGUFQuantizationType
@@ -33,9 +32,26 @@ def launches(monkeypatch):
     # FakeTensor may initialize its real device even without launching kernels.
     # Use cuda:0 for storage so this also runs on single-GPU hosts; simulate a
     # different caller device through the mocked runtime.
-    state = SimpleNamespace(
-        current=1, calls=[], queries=[], fail=False, backend="cuda", streams={0: 17, 1: 23}
-    )
+    class _LaunchState:
+        def __init__(self) -> None:
+            self.current = 1
+            self.calls: list[str] = []
+            self.queries: list[int] = []
+            self.fail = False
+            self.streams = {0: 17, 1: 23}
+            self._backend = "cuda"
+
+        @property
+        def backend(self) -> str:
+            return self._backend
+
+        @backend.setter
+        def backend(self, value: str) -> None:
+            self._backend = value
+            monkeypatch.setattr(torch.version, "hip", "7.0" if value == "hip" else None)
+
+    state = _LaunchState()
+    state.backend = "cuda"
 
     @contextmanager
     def guard(device):
@@ -47,12 +63,11 @@ def launches(monkeypatch):
             state.current = previous
 
     monkeypatch.setattr(torch.cuda, "device", guard)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (12, 0))
     monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        lambda device: AcceleratorTarget(
-            state.backend, "gfx1201" if state.backend == "hip" else "sm120"
-        ),
+        torch.cuda,
+        "get_device_properties",
+        lambda _device=None: SimpleNamespace(gcnArchName="gfx1201"),
     )
 
     def target():
@@ -161,12 +176,9 @@ def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation, m
 @pytest.mark.parametrize("width", [128, 768])
 @pytest.mark.parametrize("fail", [False, True])
 @pytest.mark.parametrize("backend", ["cuda", "hip"])
-def test_fused_int8_merge_restores_device_after_all_passes(
-    launches, width, fail, backend, monkeypatch
-):
+def test_fused_int8_merge_restores_device_after_all_passes(launches, width, fail, backend):
     launches.fail = fail
     launches.backend = backend
-    monkeypatch.setattr(torch.version, "hip", "test" if backend == "hip" else None)
     for name in ("merge_lora_tiles_kernel", "reduce_row_scales_kernel"):
         launches.watch(int8_weight_triton, name)
     with FakeTensorMode():

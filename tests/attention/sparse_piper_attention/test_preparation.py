@@ -2,10 +2,11 @@
 
 import re
 import sys
-from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes, mock_cuda_target, mock_rocm_target
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels._grid import select_block_grid
@@ -42,18 +43,28 @@ def test_select_block_grid_respects_strides_and_cuda_grid_y_limit():
 def test_fused_preparation_selection(monkeypatch, target, head_dim, rows, fused):
     if _backend.preparation is None:
         pytest.skip("requires Triton")
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    query = torch.empty(1, 4, rows, head_dim, device="meta", dtype=torch.bfloat16)
-    key = torch.empty(1, 2, rows, head_dim, device="meta", dtype=torch.bfloat16)
+    device = "cuda:0"
+    if target.is_nvidia_cuda:
+        mock_cuda_target(monkeypatch, target.cuda_capability)
+    elif target.is_amd_hip:
+        mock_rocm_target(monkeypatch, target.architecture)
+        monkeypatch.setattr(sys, "platform", "linux")
+    else:
+        device = "cpu"
+    with FakeTensorMode():
+        query = torch.empty(1, 4, rows, head_dim, device=device, dtype=torch.bfloat16)
+        key = torch.empty(1, 2, rows, head_dim, device=device, dtype=torch.bfloat16)
     selected = _backend.use_fused_operand_preparation(query, key, _contracts._MINMAX_ROUTING)
     assert selected is fused
     assert _backend.use_fused_operand_preparation(query, key, _contracts._MEAN_ROUTING) is False
 
 
 def test_fused_preparation_rejects_unsupported_metadata_before_probing(monkeypatch):
-    monkeypatch.setattr(AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("probe")))
-    query = torch.empty(1, 2, 2048, 128, device="meta", dtype=torch.bfloat16)
-    for key in (query.float(), query[..., ::2], torch.empty_like(query, device="cpu")):
+    forbid_device_probes(monkeypatch, "probe")
+    with FakeTensorMode():
+        query = torch.empty(1, 2, 2048, 128, device="cuda:0", dtype=torch.bfloat16)
+        invalid_keys = (query.float(), query[..., ::2], torch.empty_like(query, device="cpu"))
+    for key in invalid_keys:
         assert (
             _backend.use_fused_operand_preparation(query, key, _contracts._MINMAX_ROUTING) is False
         )

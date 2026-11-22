@@ -5,9 +5,9 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes
 
 from piper_kernels._input_activations import apply_input_activation
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import _backend, _generic, _ops, reference
 from piper_kernels.linear.convrot.int8._generic import triton as generic_triton
 from piper_kernels.weights.convrot._rotation import rotate_groups
@@ -33,9 +33,7 @@ def test_generic_update_selection_does_not_query_architecture(monkeypatch, devic
     value = SimpleNamespace(device=torch.device(device), shape=(2, 256), numel=lambda: 512)
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
     monkeypatch.setattr(_backend, "_amd_backend", None)
-    monkeypatch.setattr(
-        AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("architecture queried"))
-    )
+    forbid_device_probes(monkeypatch, "architecture queried")
     assert int8_updates._use_triton(value)
     assert _backend.select_preparation_backend(value) is _generic
 

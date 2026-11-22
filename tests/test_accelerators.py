@@ -9,8 +9,11 @@ import pytest
 import torch
 from _accelerators import (
     exact_sm120_available,
+    forbid_device_probes,
+    forbid_triton_driver,
     mock_cuda_target,
     mock_rocm_target,
+    mock_triton_driver,
     rocm_fences_only_lds,
 )
 
@@ -49,6 +52,30 @@ def test_mock_rocm_target_does_not_enable_rocm_only_fence_assertion_on_cuda(monk
     mock_rocm_target(monkeypatch, "gfx1201")
     if not on_rocm_build:
         assert not rocm_fences_only_lds()
+
+
+def test_forbid_device_probes_and_triton_driver_mock(monkeypatch):
+    probe = forbid_device_probes(monkeypatch, "no probe")
+    with pytest.raises(AssertionError, match="no probe"):
+        torch.cuda.get_device_capability(torch.device("cuda:0"))
+    with pytest.raises(AssertionError, match="no probe"):
+        torch.cuda.get_device_properties(torch.device("cuda:0"))
+    assert probe.call_count == 2
+
+    triton = pytest.importorskip("triton")
+    import triton.runtime.jit as triton_jit  # noqa: PLC0415
+
+    with forbid_triton_driver("no triton") as guard:
+        with pytest.raises(AssertionError, match="no triton"):
+            triton_jit.driver.active.get_current_device()
+        assert guard.call_count == 1
+
+    mock_triton_driver(monkeypatch, backend="cuda", arch=120, device_index=1)
+    assert triton.runtime.driver.active.get_active_torch_device() == torch.device("cuda:1")
+    target = triton.runtime.driver.active.get_current_target()
+    assert (target.backend, target.arch) == ("cuda", 120)
+    with torch.cuda.device(torch.device("cuda:1")):
+        pass
 
 
 def test_accelerators_helper_is_importable_without_triton() -> None:

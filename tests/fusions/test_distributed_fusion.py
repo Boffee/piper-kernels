@@ -16,6 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _accelerators import mock_triton_driver
 from _compile_capture import FunctionalTargetCapturePass
 from torch import nn
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -180,11 +181,7 @@ def _add_sequence_reduce_scatter(
 
 @pytest.fixture
 def fake_triton_device(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        distributed_fx.runtime,
-        "supports_device",
-        lambda device: device.type == "cuda",
-    )
+    mock_triton_driver(monkeypatch, backend="cuda", arch=120)
 
 
 @pytest.mark.parametrize("batch", [1, 2])

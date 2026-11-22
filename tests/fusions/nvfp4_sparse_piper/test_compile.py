@@ -74,6 +74,7 @@ class _SparseAttentionConfig(TypedDict, total=False):
     group_size: int | None
     head_dim: int
     sequence_length: int
+    sparse_key_blocks: int
 
 
 class _SparseOutputConfig(_SparseAttentionConfig, total=False):
@@ -100,6 +101,7 @@ class _SparseProjectionAttention(torch.nn.Module):
         group_size: int | None = None,
         head_dim: int | None = None,
         sequence_length: int | None = None,
+        sparse_key_blocks: int | None = None,
     ) -> None:
         super().__init__()
         self.batch = batch
@@ -109,6 +111,8 @@ class _SparseProjectionAttention(torch.nn.Module):
             self.rotary_dim = head_dim * 3 // 4
         if sequence_length is not None:
             self.sequence_length = sequence_length
+        if sparse_key_blocks is not None:
+            self.sparse_key_blocks = sparse_key_blocks
         calibration = torch.full(
             (1, self.sequence_length, self.input_features),
             3.0,

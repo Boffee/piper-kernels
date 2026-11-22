@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
 
@@ -231,15 +232,15 @@ def test_context_fake_paths_do_not_probe_hardware(monkeypatch, batch):
         raise AssertionError("fake execution must not probe hardware")
 
     monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", forbidden)
+    forbid_device_probes(monkeypatch, "fake execution must not probe hardware")
     with FakeTensorMode():
-        operands = list(_operands("cpu"))
-        operands[0] = torch.empty((batch, 65, 272), dtype=torch.int8)
-        operands[1] = torch.empty((batch, 65))
+        operands = list(_operands("cuda:0"))
+        operands[0] = torch.empty((batch, 65, 272), device="cuda:0", dtype=torch.int8)
+        operands[1] = torch.empty((batch, 65), device="cuda:0")
         k, ks, kc = key._project_key_op(*operands, 1e-6, head_dim=64, qk_quantization="per_warp")
         v, mult, logs, mean = value._project_value_op(*operands[:4], head_dim=64, is_causal=True)
-        q = torch.empty((batch, 6, 128, 64), dtype=torch.int8)
-        qs = torch.empty((batch, 6, 4))
+        q = torch.empty((batch, 6, 128, 64), device="cuda:0", dtype=torch.int8)
+        qs = torch.empty((batch, 6, 4), device="cuda:0")
         out = dispatch._piper_attention_from_quantized_op(
             q, qs, k, ks, kc, v, mult, logs, mean, 65, 65, True, torch.bfloat16
         )

@@ -20,7 +20,7 @@ from .nvfp4_sparse_piper import test_compile as nvfp4_cases
 @pytest.mark.parametrize("cudagraphs", [False, True])
 @pytest.mark.parametrize("weight_format", ["convrot_int8", "nvfp4", "convrot_nvfp4"])
 def test_sparse_projection_and_output_reuse_graph_across_profiles(
-    weight_format: str, cudagraphs: bool, monkeypatch: pytest.MonkeyPatch
+    weight_format: str, cudagraphs: bool
 ) -> None:
     torch.manual_seed(300)
     attention_kernel = int8_cases._reset_attention_kernel_cache()
@@ -29,13 +29,16 @@ def test_sparse_projection_and_output_reuse_graph_across_profiles(
     else:
         model_type = nvfp4_cases._SparseProjectionAttentionOutput
     options = compile_options(attention=True)
-    monkeypatch.setattr(model_type, "sequence_length", 1024)
-    monkeypatch.setattr(model_type, "sparse_key_blocks", 12)
     if weight_format == "convrot_int8":
-        model = model_type().eval()
+        model = model_type(sequence_length=1024, sparse_key_blocks=12).eval()
     else:
         group_size = None if weight_format == "nvfp4" else 64
-        model = model_type(dynamic=False, group_size=group_size).eval()
+        model = model_type(
+            dynamic=False,
+            group_size=group_size,
+            sequence_length=1024,
+            sparse_key_blocks=12,
+        ).eval()
     inputs = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",

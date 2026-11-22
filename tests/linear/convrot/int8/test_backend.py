@@ -1,17 +1,17 @@
 """Implementation selection preserves ConvRot INT8 dispatch and fallback contracts."""
 
 import sys
-from contextlib import nullcontext
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, call
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes, mock_cuda_target, mock_triton_driver
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels._residual import ResidualAdd, ReusableUpdate
-from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import _backend, _functional
 from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
@@ -80,7 +80,6 @@ def test_select_backend_preserves_supported_targets(monkeypatch, target, platfor
 )
 def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, m, n, k):
     kernel_backend = backend.kernels
-    monkeypatch.setattr(kernel_backend, "device_context", lambda device: nullcontext())
     kernel = MagicMock()
     gluon_kernel = MagicMock()
     tma_kernel = MagicMock()
@@ -144,7 +143,6 @@ def test_nvidia_planner_needs_no_device_properties_with_explicit_target(
 def test_triton_tail_scheduling_is_independent_of_bias_rounding(
     monkeypatch, specialize_m, explicit_bias_fma
 ):
-    monkeypatch.setattr(nvidia_kernels, "device_context", lambda device: nullcontext())
     kernel = MagicMock()
     monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", kernel)
     monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
@@ -187,7 +185,6 @@ def test_nvidia_launch_grouping_follows_the_plan(
     monkeypatch, architecture, rows, n, tile, group_m, paired
 ):
     target = AcceleratorTarget("cuda", architecture)
-    monkeypatch.setattr(nvidia_kernels, "device_context", lambda device: nullcontext())
     kernel = MagicMock()
     monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", kernel)
     monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
@@ -233,7 +230,6 @@ def test_sm8x_wide_projections_launch_the_gluon_kernel(
     monkeypatch, rows, n, block_m, num_warps, paired
 ):
     target = AcceleratorTarget("cuda", "sm89")
-    monkeypatch.setattr(nvidia_kernels, "device_context", lambda device: nullcontext())
     kernel = MagicMock()
     gluon_kernel = MagicMock()
     monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", kernel)
@@ -265,7 +261,6 @@ def test_sm8x_wide_projections_launch_the_gluon_kernel(
 @pytest.mark.parametrize("k", [1024, 1032])
 def test_sm120_large_projections_launch_tma_or_fall_back_to_grouped_triton(monkeypatch, paired, k):
     target = AcceleratorTarget("cuda", "sm120")
-    monkeypatch.setattr(nvidia_kernels, "device_context", lambda device: nullcontext())
     triton_kernel = MagicMock()
     tma_kernel = MagicMock()
     monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", triton_kernel)
@@ -302,7 +297,6 @@ def test_sm120_large_projections_launch_tma_or_fall_back_to_grouped_triton(monke
 @pytest.mark.parametrize("k", [256, 264])
 def test_sm120_large_residual_launches_tma_or_falls_back_when_unaligned(monkeypatch, k):
     target = AcceleratorTarget("cuda", "sm120")
-    monkeypatch.setattr(nvidia_kernels, "device_context", lambda device: nullcontext())
     triton_residual = MagicMock()
     tma_residual = MagicMock()
     monkeypatch.setattr(nvidia_kernels, "int8_residual_matmul_kernel", triton_residual)
@@ -337,10 +331,8 @@ def test_sm120_large_residual_launches_tma_or_falls_back_when_unaligned(monkeypa
 
 
 def test_auxiliary_operations_keep_their_own_support_rules(monkeypatch):
-    monkeypatch.setattr(
-        torch.cuda, "get_device_capability", Mock(side_effect=AssertionError("capability probe"))
-    )
-    monkeypatch.setattr(runtime, "supports_device", lambda device: True)
+    forbid_device_probes(monkeypatch, "capability probe")
+    mock_triton_driver(monkeypatch, backend="cuda", arch=120)
     value = SimpleNamespace(device=torch.device("cuda"), shape=(2, 256), numel=lambda: 512)
 
     assert int8_gguf.select_gguf_converter(value) is int8_weight_triton.convert_gguf_out
@@ -480,19 +472,40 @@ def test_validated_operations_call_the_selected_implementation(monkeypatch, oper
     monkeypatch.setattr(implementation, operation, execute, raising=False)
 
     if operation == "linear":
-        qdata = torch.zeros(7, 32, dtype=torch.int8)
-        scale = torch.ones(7, 1)
-        activation = torch.zeros(3, 64)
-        bias = torch.ones(7)
-        expected_output = torch.ones(3, 7)
-        execute.return_value = expected_output
-        monkeypatch.setattr(_backend, "_nvidia_backend", implementation)
-        monkeypatch.setattr(
-            AcceleratorTarget, "from_device", lambda _device: AcceleratorTarget("cuda", "sm120")
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        class RecordCustomOp(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                resolved_kwargs = dict(kwargs or {})
+                if func is torch.ops.piper_kernels.convrot_int8_linear.default:
+                    calls.append((args, resolved_kwargs))
+                return func(*args, **resolved_kwargs)
+
+        with FakeTensorMode():
+            qdata = torch.zeros(7, 32, device="cuda:0", dtype=torch.int8)
+            scale = torch.ones(7, 1, device="cuda:0")
+            activation = torch.zeros(3, 64, device="cuda:0")
+            bias = torch.ones(7, device="cuda:0")
+            expected_output = torch.ones(3, 7, device="cuda:0")
+            execute.return_value = expected_output
+            monkeypatch.setattr(_backend, "_nvidia_backend", implementation)
+            mock_cuda_target(monkeypatch, (12, 0))
+            with RecordCustomOp():
+                _functional.linear(
+                    activation, qdata, scale, torch.float32, 16, bias, activation_fn="swiglu"
+                )
+        assert len(calls) == 1
+        call_args, call_kwargs = calls[0]
+        assert len(call_args) == 6
+        assert all(
+            actual is expected
+            for actual, expected in zip(
+                call_args[:4], (activation, qdata, scale, bias), strict=True
+            )
         )
-        actual = _functional.linear(
-            activation, qdata, scale, torch.float32, 16, bias, activation_fn="swiglu"
-        )
+        assert call_args[4:] == (16, "swiglu")
+        assert call_kwargs == {}
+        actual = _functional._ops.linear._init_fn(*call_args, **call_kwargs)
         assert actual is expected_output
         execute.assert_called_once_with(activation, qdata, scale, bias, 16, "swiglu", None)
         return

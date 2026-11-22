@@ -2,13 +2,15 @@
 
 import pytest
 import torch
+from _accelerators import mock_cuda_target
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels.attention.piper_attention import _quantization as piper_quantization
 from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention_backend
 
 
-def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    query = torch.randn(1, 2, 16, 64, dtype=torch.float16)
+def _inputs(device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    query = torch.randn(1, 2, 16, 64, device=device, dtype=torch.float16)
     return query, torch.randn_like(query), torch.randn_like(query)
 
 
@@ -38,8 +40,8 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
         events.append("preprocessing")
         raise PreprocessingReachedError
 
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (8, 0))
-    monkeypatch.setattr(piper_attention_backend, "device_context", DeviceGuard)
+    mock_cuda_target(monkeypatch, (8, 0))
+    monkeypatch.setattr(torch.cuda, "device", DeviceGuard)
     monkeypatch.setattr(
         piper_attention_backend,
         "install_uint8_int8_dot_hook",
@@ -50,7 +52,8 @@ def test_native_mixed_int8_hook_uses_query_device_before_preprocessing(
         "prepare_chunk_centered_key",
         stop_at_preprocessing,
     )
-    query, key, value = _inputs()
+    with FakeTensorMode():
+        query, key, value = _inputs("cuda:0")
     plan = piper_attention_backend.default_execution_plan(
         query,
         True,

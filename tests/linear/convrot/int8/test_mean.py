@@ -1,13 +1,13 @@
 """Prepared-input mean is shared math, independent of matrix accelerator support."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes, forbid_triton_driver, mock_triton_driver
 
-from piper_kernels._triton import runtime
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import _backend, _ops
 from piper_kernels.linear.convrot.int8._generic import mean
 
@@ -16,22 +16,33 @@ from piper_kernels.linear.convrot.int8._generic import mean
 def test_mean_selection_does_not_require_a_matrix_backend(monkeypatch, supported):
     monkeypatch.setattr(_backend, "_nvidia_backend", None)
     monkeypatch.setattr(_backend, "_amd_backend", None)
-    probe = Mock(return_value=supported)
-    monkeypatch.setattr(runtime, "supports_device", probe)
-    monkeypatch.setattr(
-        AcceleratorTarget, "from_device", Mock(side_effect=AssertionError("target"))
+    forbid_device_probes(monkeypatch, "target")
+    mock_triton_driver(
+        monkeypatch,
+        backend="cuda",
+        arch=120 if supported else 60,
+        device_index=1,
     )
+    guard = Mock(side_effect=lambda _device=None: nullcontext())
+    monkeypatch.setattr(torch.cuda, "device", guard)
     input = SimpleNamespace(device=torch.device("cuda:1"))  # noqa: A001
     assert _backend.select_dequantized_mean(input) is (
         mean.dequantized_input_mean if supported else None
     )
-    probe.assert_called_once_with(input.device)
+    guard.assert_called_once_with(input.device)
 
 
 def test_missing_mean_implementation_does_not_probe_hardware(monkeypatch):
+    pytest.importorskip("triton")
     monkeypatch.setattr(_backend, "_mean_backend", None)
-    monkeypatch.setattr(runtime, "supports_device", Mock(side_effect=AssertionError("probe")))
-    assert _backend.select_dequantized_mean(torch.empty(1)) is None
+    probe = forbid_device_probes(monkeypatch, "probe")
+    monkeypatch.setattr(torch.cuda, "device", probe)
+    with forbid_triton_driver("probe") as driver_probe:
+        assert (
+            _backend.select_dequantized_mean(SimpleNamespace(device=torch.device("cuda:0"))) is None
+        )
+    driver_probe.assert_not_called()
+    probe.assert_not_called()
 
 
 @pytest.mark.gpu

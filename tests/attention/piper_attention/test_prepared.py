@@ -7,6 +7,7 @@ from unittest.mock import Mock, call
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -34,7 +35,14 @@ class _RecordingKernel:
 
 
 def _prepared(
-    dtype=torch.bfloat16, *, query_length=65, key_length=97, block_m=64, heads=6, kv_heads=2
+    dtype=torch.bfloat16,
+    *,
+    query_length=65,
+    key_length=97,
+    block_m=64,
+    heads=6,
+    kv_heads=2,
+    device="meta",
 ):
     plan = PiperAttentionExecutionPlan(
         block_m=block_m,
@@ -43,7 +51,7 @@ def _prepared(
         use_tensor_descriptors=False,
     )
     key_chunks = (key_length + 1023) // 1024
-    with torch.device("meta"):
+    with torch.device(device):
         context = backend._PreparedPiperContext(
             key=torch.empty((2, kv_heads, key_length, 64), dtype=torch.int8),
             value=torch.empty((2, kv_heads, 64, key_length), dtype=torch.int8),
@@ -111,12 +119,13 @@ def test_output_validator_accepts_strided_views_without_tensor_operations(device
 def test_launch_reuses_caller_outputs_and_logical_query_metadata_without_allocations(
     monkeypatch, dtype
 ):
-    context, query = _prepared(dtype)
-    outputs = [_offset_output("meta", dtype) for _ in range(2)]
+    with FakeTensorMode():
+        context, query = _prepared(dtype, device="cuda:0")
+        outputs = [_offset_output("cuda:0", dtype) for _ in range(2)]
     kernel = _RecordingKernel()
     guard = Mock(return_value=nullcontext())
     monkeypatch.setattr(backend, "_piper_attention_kernel", kernel)
-    monkeypatch.setattr(backend, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
 
     with _NoTensorOperations():
         for output in outputs:
@@ -176,7 +185,6 @@ def test_query_tail_specialization_uses_key_mask_and_output_layout_without_tenso
         output = output.transpose(1, 2)
     kernel = _RecordingKernel()
     monkeypatch.setattr(backend, "_piper_attention_kernel", kernel)
-    monkeypatch.setattr(backend, "device_context", lambda device: nullcontext())
     with _NoTensorOperations():
         backend._launch_piper_attention_into(context, query, output)
     assert kernel.calls[0][2]["aligned_queries"] is aligned
@@ -211,7 +219,6 @@ def test_strided_schedule_uses_only_output_and_query_metadata(
         output = output[:, :rows].transpose(1, 2)
     kernel = _RecordingKernel()
     monkeypatch.setattr(backend, "_piper_attention_kernel", kernel)
-    monkeypatch.setattr(backend, "device_context", lambda device: nullcontext())
     with _NoTensorOperations():
         backend._launch_piper_attention_into(context, query, output)
     assert kernel.calls[0][2]["query_group_size"] == group
@@ -222,23 +229,24 @@ def test_strided_schedule_uses_only_output_and_query_metadata(
     "invalid", ["shape", "dtype", "device", "feature_stride", "overlap", "broadcast", "layout"]
 )
 def test_incompatible_output_metadata_rejected_before_device_or_kernel_entry(monkeypatch, invalid):
-    context, query = _prepared()
-    output = torch.empty(
-        (2, 6, 128, 64) if invalid == "shape" else query.shape,
-        dtype=torch.float32 if invalid == "dtype" else query.dtype,
-        device="cpu" if invalid == "device" else "meta",
-        layout=torch.sparse_coo if invalid == "layout" else torch.strided,
-    )
-    if invalid == "feature_stride":
-        output = torch.empty((2, 6, 65, 128), device="meta", dtype=query.dtype)[..., ::2]
-    elif invalid == "overlap":
-        output = output.as_strided(query.shape, (6 * 65 * 64, 65 * 64, 32, 1))
-    elif invalid == "broadcast":
-        output = output[:1].expand(query.shape)
+    with FakeTensorMode():
+        context, query = _prepared(device="cuda:0")
+        output = torch.empty(
+            (2, 6, 128, 64) if invalid == "shape" else query.shape,
+            dtype=torch.float32 if invalid == "dtype" else query.dtype,
+            device="cpu" if invalid == "device" else "cuda:0",
+            layout=torch.sparse_coo if invalid == "layout" else torch.strided,
+        )
+        if invalid == "feature_stride":
+            output = torch.empty((2, 6, 65, 128), device="cuda:0", dtype=query.dtype)[..., ::2]
+        elif invalid == "overlap":
+            output = output.as_strided(query.shape, (6 * 65 * 64, 65 * 64, 32, 1))
+        elif invalid == "broadcast":
+            output = output[:1].expand(query.shape)
     kernel = _RecordingKernel()
     guard = Mock(side_effect=AssertionError("invalid output entered a device context"))
     monkeypatch.setattr(backend, "_piper_attention_kernel", kernel)
-    monkeypatch.setattr(backend, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
 
     with _NoTensorOperations(), pytest.raises(ValueError, match="Piper Attention output"):
         backend._launch_piper_attention_into(context, query, output)
@@ -264,7 +272,6 @@ def test_window_launch_keeps_local_query_and_global_causal_coordinates(
     output = output[:, 3 : output_rows + 3].transpose(1, 2)
     kernel = _RecordingKernel()
     monkeypatch.setattr(backend, "_piper_attention_kernel", kernel)
-    monkeypatch.setattr(backend, "device_context", lambda _device: nullcontext())
 
     with _NoTensorOperations():
         actual = backend._launch_piper_attention_into(
@@ -309,14 +316,15 @@ def test_window_launch_keeps_local_query_and_global_causal_coordinates(
 def test_invalid_window_rejected_before_device_or_tensor_operations(
     monkeypatch, start, rows, origin, causal, error
 ):
-    context, query = _prepared(query_length=193, key_length=257)
-    context = replace(context, is_causal=causal)
-    query = replace(query, global_row_offset=origin)
-    output = torch.empty((2, 6, 1, 64), device="meta", dtype=query.dtype)
+    with FakeTensorMode():
+        context, query = _prepared(query_length=193, key_length=257, device="cuda:0")
+        context = replace(context, is_causal=causal)
+        query = replace(query, global_row_offset=origin)
+        output = torch.empty((2, 6, 1, 64), device="cuda:0", dtype=query.dtype)
     kernel = _RecordingKernel()
     guard = Mock(side_effect=AssertionError("invalid window entered a device context"))
     monkeypatch.setattr(backend, "_piper_attention_kernel", kernel)
-    monkeypatch.setattr(backend, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
 
     window_error = (
         "Piper Attention (query_start|query_rows|global_row_offset|query window|causal query)"
@@ -332,10 +340,11 @@ def test_invalid_window_rejected_before_device_or_tensor_operations(
 
 @pytest.mark.parametrize("origin", [-128, 64, True])
 def test_query_preparation_rejects_unaligned_origin_before_tensor_operations(monkeypatch, origin):
-    context, query = _prepared(block_m=128)
-    floating_query = torch.empty(query.shape, device="meta", dtype=query.dtype)
+    with FakeTensorMode():
+        context, query = _prepared(block_m=128, device="cuda:0")
+        floating_query = torch.empty(query.shape, device="cuda:0", dtype=query.dtype)
     guard = Mock(side_effect=AssertionError("invalid query origin entered a device context"))
-    monkeypatch.setattr(backend, "device_context", guard)
+    monkeypatch.setattr(torch.cuda, "device", guard)
 
     with _NoTensorOperations(), pytest.raises((TypeError, ValueError), match="global_row_offset"):
         backend._prepare_piper_query(

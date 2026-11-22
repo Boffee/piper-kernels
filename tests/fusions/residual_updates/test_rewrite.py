@@ -2,10 +2,11 @@
 
 import pytest
 import torch
+from _accelerators import mock_triton_driver
 from _compile_capture import FunctionalTargetCapturePass
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import compile_options
-from piper_kernels._triton import runtime
 from piper_kernels.fusions.residual_updates import _compile as residual_compile
 from piper_kernels.fusions.residual_updates._graph import RESIDUAL_ADD
 
@@ -14,7 +15,7 @@ _AUTO_FUNCTIONALIZED = torch.ops.higher_order.auto_functionalized
 
 
 def _metadata(*shape, dtype=torch.bfloat16):
-    return torch.empty(shape, device="meta", dtype=dtype)
+    return torch.empty(shape, device="cuda:0", dtype=dtype)
 
 
 def _node(graph, target, args, value):
@@ -29,27 +30,30 @@ def _copy_back_graph(
     """``hidden.copy_(...)`` of ``updates`` gated sums, from ``hidden`` unless ``scaled``."""
     graph = torch.fx.Graph()
     names = ("hidden", "gate", "indices", *(f"update{index}" for index in range(updates)))
-    values = (
-        _metadata(1, 8, 16),
-        _metadata(3, 16),
-        _metadata(8, dtype=torch.int64),
-        *(_metadata(1, 8, 16, dtype=update_dtype) for _ in range(updates)),
-    )
-    hidden, gate, indices, *update_inputs = (graph.placeholder(name) for name in names)
-    for placeholder, value in zip((hidden, gate, indices, *update_inputs), values, strict=True):
-        placeholder.meta["val"] = value
-    total = _node(graph, _aten.mul.Tensor, (hidden, 2), _metadata(1, 8, 16)) if scaled else hidden
-    for update in update_inputs:
-        selected = (
-            _node(graph, _aten.index.Tensor, (gate, [indices]), _metadata(8, 16))
-            if python_indexing
-            else _node(graph, _aten.index_select.default, (gate, 0, indices), _metadata(8, 16))
+    with FakeTensorMode():
+        values = (
+            _metadata(1, 8, 16),
+            _metadata(3, 16),
+            _metadata(8, dtype=torch.int64),
+            *(_metadata(1, 8, 16, dtype=update_dtype) for _ in range(updates)),
         )
-        factors = (selected, update) if gate_first else (update, selected)
-        product = _node(graph, _aten.mul.Tensor, factors, _metadata(1, 8, 16))
-        total = _node(graph, _aten.add.Tensor, (total, product), _metadata(1, 8, 16))
-    graph.call_function(_aten.copy_.default, (hidden, total))
-    graph.output(None)
+        hidden, gate, indices, *update_inputs = (graph.placeholder(name) for name in names)
+        for placeholder, value in zip((hidden, gate, indices, *update_inputs), values, strict=True):
+            placeholder.meta["val"] = value
+        total = (
+            _node(graph, _aten.mul.Tensor, (hidden, 2), _metadata(1, 8, 16)) if scaled else hidden
+        )
+        for update in update_inputs:
+            selected = (
+                _node(graph, _aten.index.Tensor, (gate, [indices]), _metadata(8, 16))
+                if python_indexing
+                else _node(graph, _aten.index_select.default, (gate, 0, indices), _metadata(8, 16))
+            )
+            factors = (selected, update) if gate_first else (update, selected)
+            product = _node(graph, _aten.mul.Tensor, factors, _metadata(1, 8, 16))
+            total = _node(graph, _aten.add.Tensor, (total, product), _metadata(1, 8, 16))
+        graph.call_function(_aten.copy_.default, (hidden, total))
+        graph.output(None)
     return graph, hidden
 
 
@@ -63,7 +67,7 @@ def _adds(graph):
 def test_gated_sums_from_the_copied_input_become_chained_adds(
     monkeypatch, updates, python_indexing, gate_first
 ):
-    monkeypatch.setattr(runtime, "supports_device", lambda device: True)
+    mock_triton_driver(monkeypatch, backend="cuda", arch=120)
     graph, hidden = _copy_back_graph(
         updates, python_indexing=python_indexing, gate_first=gate_first
     )
@@ -93,7 +97,7 @@ def test_gated_sums_from_the_copied_input_become_chained_adds(
     ids=["device-without-triton", "update-dtype-differs", "sums-start-elsewhere"],
 )
 def test_sums_stay_unless_each_can_add_into_the_copied_input(monkeypatch, supported, graph_options):
-    monkeypatch.setattr(runtime, "supports_device", lambda device: supported)
+    mock_triton_driver(monkeypatch, backend="cuda", arch=120 if supported else 60)
     graph, _ = _copy_back_graph(2, **graph_options)
 
     residual_compile.fold_residual_updates(graph)

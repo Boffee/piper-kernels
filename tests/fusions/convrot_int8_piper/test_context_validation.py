@@ -2,9 +2,10 @@
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _quantized_dispatch as dispatch
 from piper_kernels.fusions.convrot_int8_piper import _backend, key, value
 
@@ -28,17 +29,17 @@ def _inputs(*, batch=2, device="cpu"):
     return [x, xs, w, ws]
 
 
-def _native_inputs(*, batch=2):
-    q = torch.empty(batch, 4, 128, 64, dtype=torch.int8)
-    qs = torch.empty(batch, 4, 4)
-    k = torch.empty(batch, 2, 128, 64, dtype=torch.int8)
-    ks = torch.empty(batch, 2, 2)
-    kc = torch.empty(batch, 2, 1, 64)
-    v = torch.empty(batch, 2, 64, 128, dtype=torch.int8)
+def _native_inputs(*, batch=2, device="cpu"):
+    q = torch.empty(batch, 4, 128, 64, device=device, dtype=torch.int8)
+    qs = torch.empty(batch, 4, 4, device=device)
+    k = torch.empty(batch, 2, 128, 64, device=device, dtype=torch.int8)
+    ks = torch.empty(batch, 2, 2, device=device)
+    kc = torch.empty(batch, 2, 1, 64, device=device)
+    v = torch.empty(batch, 2, 64, 128, device=device, dtype=torch.int8)
     mult, logs, mean = (
-        torch.empty(batch, 2, 128),
-        torch.empty(batch, 2, 128),
-        torch.empty(batch, 2, 1, 64),
+        torch.empty(batch, 2, 128, device=device),
+        torch.empty(batch, 2, 128, device=device),
+        torch.empty(batch, 2, 1, 64, device=device),
     )
     return [q, qs, k, ks, kc, v, mult, logs, mean, 65, 97, False, torch.bfloat16]
 
@@ -169,29 +170,40 @@ def test_fake_outputs_only_and_empty_execution_skips_target(monkeypatch, batch):
         raise AssertionError("metadata path probed hardware")
 
     monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", forbidden)
-    operands = _inputs(batch=batch)
-    cos = torch.empty(65, 48)
-    norm = torch.empty(64, requires_grad=True)
-    with torch.no_grad(), _OutputOnly():
-        prepared_key = key._project_key_op_fake(
-            *operands, norm, cos, cos, 1e-5, head_dim=64, qk_quantization="per_warp"
-        )
-        prepared_value = value._project_value_op_fake(*operands, head_dim=64, is_causal=False)
-        assert prepared_key[0].shape == (batch, 2, 128, 64)
-        assert prepared_key[2].shape == (batch, 2, 1, 64)
-        assert prepared_value[0].shape == (batch, 2, 64, 128)
-        assert prepared_value[3].shape == (batch, 2, 1, 64)
-    native = _native_inputs(batch=batch)
-    with _OutputOnly():
-        assert dispatch._piper_attention_from_quantized_fake(*native).shape == (batch, 4, 65, 64)
-    if batch == 0:
-        with torch.no_grad():
-            assert (
-                key._project_key_op(
-                    *operands, norm, cos, cos, 1e-5, head_dim=64, qk_quantization="per_warp"
-                )[0].numel()
-                == 0
+    forbid_device_probes(monkeypatch, "metadata path probed hardware")
+    with FakeTensorMode():
+        operands = _inputs(batch=batch, device="cuda:0")
+        cos = torch.empty(65, 48, device="cuda:0")
+        norm = torch.empty(64, device="cuda:0", requires_grad=True)
+        with torch.no_grad(), _OutputOnly():
+            prepared_key = key._project_key_op_fake(
+                *operands, norm, cos, cos, 1e-5, head_dim=64, qk_quantization="per_warp"
             )
-            assert value._project_value_op(*operands, head_dim=64, is_causal=False)[0].numel() == 0
-            assert dispatch._piper_attention_from_quantized_op(*native).numel() == 0
+            prepared_value = value._project_value_op_fake(*operands, head_dim=64, is_causal=False)
+            assert prepared_key[0].shape == (batch, 2, 128, 64)
+            assert prepared_key[2].shape == (batch, 2, 1, 64)
+            assert prepared_value[0].shape == (batch, 2, 64, 128)
+            assert prepared_value[3].shape == (batch, 2, 1, 64)
+        native = _native_inputs(batch=batch, device="cuda:0")
+        with _OutputOnly():
+            assert dispatch._piper_attention_from_quantized_fake(*native).shape == (
+                batch,
+                4,
+                65,
+                64,
+            )
+        if batch == 0:
+            with torch.no_grad():
+                assert (
+                    key._project_key_op._init_fn(
+                        *operands, norm, cos, cos, 1e-5, head_dim=64, qk_quantization="per_warp"
+                    )[0].numel()
+                    == 0
+                )
+                assert (
+                    value._project_value_op._init_fn(*operands, head_dim=64, is_causal=False)[
+                        0
+                    ].numel()
+                    == 0
+                )
+                assert dispatch._piper_attention_from_quantized_op._init_fn(*native).numel() == 0

@@ -2,8 +2,9 @@
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes, mock_cuda_target
+from torch._subclasses.fake_tensor import FakeTensorMode
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.convrot_int8_piper import _backend, output
 
 from .test_context_validation import _MetadataOnly, _OutputOnly
@@ -41,21 +42,24 @@ def test_output_rejects_invalid_metadata_without_tensor_operations(invalid):
 
 @pytest.mark.parametrize("batch", [0, 2])
 def test_output_fake_allocates_only_final_output_and_empty_batch_skips_hardware(monkeypatch, batch):
-    args = list(_arguments(device="meta", sequence=65))
-    for index in (0, 1, 10, 11, 12, 13, 14, 15, 16):
-        args[index] = args[index][:batch]
+    mock_cuda_target(monkeypatch, (12, 0))
 
     def forbidden(*args, **kwargs):
         raise AssertionError("metadata path probed hardware")
 
-    monkeypatch.setattr(AcceleratorTarget, "from_device", forbidden)
-    monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
-    with _OutputOnly():
-        result = output._projected_query_attention_output_op_fake(*args, head_dim=64)
-    assert result.shape == (batch, 65, 80)
-    assert result.dtype is torch.bfloat16
-    if batch == 0:
-        # Call the implementation directly so a meta tensor cannot bypass it.
+    with FakeTensorMode():
+        args = list(_arguments(device="cuda:0", sequence=65))
+        for index in (0, 1, 10, 11, 12, 13, 14, 15, 16):
+            args[index] = args[index][:batch]
+
+        forbid_device_probes(monkeypatch, "metadata path probed hardware")
+        monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
         with _OutputOnly():
-            result = output._projected_query_attention_output_op._init_fn(*args, head_dim=64)
-        assert result.shape == (0, 65, 80)
+            result = output._projected_query_attention_output_op_fake(*args, head_dim=64)
+        assert result.shape == (batch, 65, 80)
+        assert result.dtype is torch.bfloat16
+        if batch == 0:
+            # Call the implementation directly so FakeTensorMode does not bypass it.
+            with _OutputOnly():
+                result = output._projected_query_attention_output_op._init_fn(*args, head_dim=64)
+            assert result.shape == (0, 65, 80)

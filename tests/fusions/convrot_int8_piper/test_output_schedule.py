@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes, mock_cuda_target, mock_rocm_target
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.convrot_int8_piper import _schedule
 from piper_kernels.fusions.convrot_int8_piper._schedule import (
     _balanced_query_chunk_rows,
@@ -107,13 +107,16 @@ def test_wave_windows_stay_bounded_and_never_increase_predicted_waves(maximum, p
 @pytest.mark.parametrize("architecture", ["sm89", "sm120", "sm121", "gfx1201"])
 def test_output_schedule_reads_only_applicable_device_metadata(monkeypatch, architecture):
     device = torch.device("cuda:3")
-    target = AcceleratorTarget(
-        backend="hip" if architecture.startswith("gfx") else "cuda", architecture=architecture
-    )
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda actual: target)
+    if architecture == "gfx1201":
+        mock_rocm_target(monkeypatch, "gfx1201")
+    else:
+        capabilities = {"sm89": (8, 9), "sm120": (12, 0), "sm121": (12, 1)}
+        mock_cuda_target(monkeypatch, capabilities[architecture])
 
     def properties(actual):
         assert actual == device
+        if architecture == "gfx1201":
+            return SimpleNamespace(gcnArchName="gfx1201")
         assert architecture == "sm120", "unmeasured target queried CUDA occupancy metadata"
         return SimpleNamespace(multi_processor_count=170)
 
@@ -124,11 +127,8 @@ def test_output_schedule_reads_only_applicable_device_metadata(monkeypatch, arch
 
 @pytest.mark.parametrize(("sequence", "causal"), [(8192, False), (32769, True)])
 def test_single_window_and_causal_schedules_do_not_probe_hardware(monkeypatch, sequence, causal):
-    def forbidden(*args, **kwargs):
-        raise AssertionError("unnecessary hardware probe")
-
-    monkeypatch.setattr(AcceleratorTarget, "from_device", forbidden)
+    forbid_device_probes(monkeypatch, "unnecessary hardware probe")
     actual = _schedule.select_query_chunk_rows(
-        (2, 8, sequence, 128), torch.device("meta"), 16384, is_causal=causal
+        (2, 8, sequence, 128), torch.device("cuda:0"), 16384, is_causal=causal
     )
     assert actual == _balanced_query_chunk_rows(sequence, 16384)

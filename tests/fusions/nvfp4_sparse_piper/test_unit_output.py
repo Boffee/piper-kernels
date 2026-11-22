@@ -60,12 +60,12 @@ def test_compile_fuses_unit_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(1033)
-    monkeypatch.setattr(_SparseProjectionAttentionOutput, "sequence_length", 384)
     monkeypatch.setattr(_output, "DEFAULT_QUERY_CHUNK_ROWS", 128)
     model = _SparseProjectionAttentionOutput(
         dynamic=True,
         output_dynamic=False,
         group_size=group_size,
+        sequence_length=384,
     ).eval()
     hidden_states = torch.randn(
         (model.batch, model.sequence_length, model.input_features),

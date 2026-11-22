@@ -55,8 +55,7 @@ def test_static_sparse_attention_preserves_independent_projection_scales(
     torch._dynamo.reset()
     torch.manual_seed(1081)
     monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", chunk_rows)
-    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 320)
-    model = _ProjectedGateCoarseSparseAttentionOutput(routing=routing).eval()
+    model = _ProjectedGateCoarseSparseAttentionOutput(routing=routing, sequence_length=320).eval()
     model.set_projection_bias(torch.bfloat16)
     preparations = _set_scales(model, mode)
     hidden_states = torch.randn(1, 320, model.input_features, device="cuda", dtype=torch.bfloat16)
@@ -110,11 +109,10 @@ def test_static_sparse_attention_preserves_independent_projection_scales(
 
 
 @pytest.mark.parametrize("projection", ["query", "key", "value", "output"])
-def test_static_sparse_scales_can_change_without_recompilation(monkeypatch, projection):
+def test_static_sparse_scales_can_change_without_recompilation(projection):
     torch._dynamo.reset()
     torch.manual_seed(1082)
-    monkeypatch.setattr(_SparseProjectionAttentionOutput, "sequence_length", 257)
-    model = _SparseProjectionAttentionOutput().eval()
+    model = _SparseProjectionAttentionOutput(sequence_length=257).eval()
     for name, value in zip(
         ("query", "key", "value", "output"), (0.03, 0.04, 0.05, 0.06), strict=True
     ):
@@ -189,9 +187,9 @@ def test_chunk_preparation_preserves_batches_rope_tails_and_scale_updates(
     torch._dynamo.reset()
     torch.manual_seed(1086)
     monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", 64)
-    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", sequence)
-    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "batch", 2)
-    model = _ProjectedGateCoarseSparseAttentionOutput(routing="minmax").eval()
+    model = _ProjectedGateCoarseSparseAttentionOutput(
+        routing="minmax", batch=2, sequence_length=sequence
+    ).eval()
     model.set_projection_bias(torch.float32)
     _set_scales(model, mode)
     hidden = torch.randn(2, sequence, model.input_features, device="cuda", dtype=torch.bfloat16)
@@ -250,9 +248,7 @@ def test_chunk_preparation_reuses_only_exclusive_intermediate_storage(monkeypatc
     torch.manual_seed(1087)
     sequence = 257
     monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", 64)
-    monkeypatch.setattr(IntermediateInput, "sequence_length", sequence)
-    monkeypatch.setattr(IntermediateInput, "batch", 2)
-    model = IntermediateInput(routing="minmax").eval()
+    model = IntermediateInput(routing="minmax", batch=2, sequence_length=sequence).eval()
     _set_scales(model, "distinct")
     hidden = torch.randn(2, sequence, model.input_features, device="cuda", dtype=torch.bfloat16)
     force_tiles = (

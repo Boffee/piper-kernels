@@ -8,6 +8,8 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import mock_cuda_target
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import _ops, _policy, reference
@@ -53,11 +55,9 @@ def test_target_policy_selection(monkeypatch, target, supported, platform):
 
 
 def test_missing_triton_uses_reference(monkeypatch):
-    monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        lambda device: AcceleratorTarget("cuda", "sm120"),
-    )
+    mock_cuda_target(monkeypatch, (12, 0))
+    with FakeTensorMode():
+        operand = torch.empty(0, device="cuda:0")
     monkeypatch.delitem(sys.modules, "piper_kernels.conv3d.convrot.int8.triton", raising=False)
     original_import = builtins.__import__
 
@@ -67,7 +67,7 @@ def test_missing_triton_uses_reference(monkeypatch):
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", without_triton)
-    assert _ops._select_native_backend(torch.empty(0)) is None
+    assert _ops._select_native_backend(operand) is None
 
 
 @pytest.mark.parametrize("fused", [False, True])
