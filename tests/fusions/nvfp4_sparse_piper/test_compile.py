@@ -6,7 +6,7 @@ from typing import TypedDict, Unpack
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available, mock_cuda_target
+from _accelerators import exact_sm120_available, forbid_device_probes, mock_cuda_target
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -904,7 +904,7 @@ def test_output_fold_fails_closed_for_invalid_group_size(
         with_sparse_query_blocks=False,
         group_size=32,
     )
-    mock_cuda_target(monkeypatch, (12, 0))
+    forbid_device_probes(monkeypatch)
 
     assert not _fold_attention_output(graph)
     targets = [node.target for node in graph.nodes if node.op == "call_function"]

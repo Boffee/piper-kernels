@@ -44,6 +44,15 @@ class _MatchedNvfp4Projection:
     group_size: int | None = None
 
 
+type _MatchedProjection = tuple[
+    sparse_piper_compile.SparsePiperProjectionMatch,
+    _MatchedNvfp4Projection,
+    _MatchedNvfp4Projection,
+    _MatchedNvfp4Projection,
+    int,
+]
+
+
 def _parse_prepared_projection(  # noqa: PLR0911
     node: torch.fx.Node,
     *,
@@ -186,22 +195,16 @@ def _parse_projection(
     return _parse_semantic_projection(node, head_dim=head_dim, name=name)
 
 
-def _valid_projections(  # noqa: PLR0911
-    matched: sparse_piper_compile.SparsePiperProjectionMatch,
-) -> tuple[_MatchedNvfp4Projection, _MatchedNvfp4Projection, _MatchedNvfp4Projection, int] | None:
-    routing_mode = matched.routing_mode
-    if (
-        isinstance(routing_mode, bool)
-        or not isinstance(routing_mode, int)
-        or not is_valid_routing_mode(routing_mode)
-    ):
+def _match_projection(node: torch.fx.Node) -> _MatchedProjection | None:  # noqa: PLR0911
+    matched = sparse_piper_compile.match_sparse_piper_projection(node)
+    if matched is None or not is_valid_routing_mode(matched.routing_mode):
         return None
     head_dim = sparse_piper_compile.attention_head_dim(matched.output_node)
     if head_dim is None:
         return None
     parsed = tuple(
-        _parse_projection(node, head_dim=head_dim, name=f"sparse_{prefix} compiler projection")
-        for prefix, node in (
+        _parse_projection(proj_node, head_dim=head_dim, name=f"sparse_{prefix} compiler projection")
+        for prefix, proj_node in (
             ("q", matched.query_projection),
             ("k", matched.key_projection),
             ("v", matched.value_projection),
@@ -238,7 +241,7 @@ def _valid_projections(  # noqa: PLR0911
         and not sparse_piper_compile.valid_sparse_piper_coarse_residual(matched)
     ):
         return None
-    return q_proj, k_proj, v_proj, head_dim
+    return matched, q_proj, k_proj, v_proj, head_dim
 
 
 def _emit_prepared_storage(
@@ -294,11 +297,10 @@ def _prepare_semantic_coarse_gate(
     preparations: dict[tuple[object, ...], _compile_fx.PreparedInputNodes],
 ) -> Argument:
     """Lower a semantic coarse gate to prepared form so output folding can defer it."""
-    if not isinstance(coarse_gate, torch.fx.Node):
+    linear_node = sparse_piper_compile.unwrap_reshaped_producer(coarse_gate)
+    if linear_node is None:
         return coarse_gate
-    linear_node = sparse_piper_compile.unwrap_shape_only_views(coarse_gate)
-    if linear_node is None or linear_node is coarse_gate:
-        return coarse_gate
+    assert isinstance(coarse_gate, torch.fx.Node)
     parsed = _parse_semantic_projection(
         linear_node, head_dim=head_dim, name="NVFP4 sparse coarse gate"
     )
@@ -337,14 +339,8 @@ def _prepare_semantic_coarse_gate(
     return reshaped
 
 
-def _replace_projection(
-    graph: torch.fx.Graph,
-    matched: sparse_piper_compile.SparsePiperProjectionMatch,
-    q_proj: _MatchedNvfp4Projection,
-    k_proj: _MatchedNvfp4Projection,
-    v_proj: _MatchedNvfp4Projection,
-    head_dim: int,
-) -> None:
+def _replace_projection(graph: torch.fx.Graph, match: _MatchedProjection) -> None:
+    matched, q_proj, k_proj, v_proj, head_dim = match
     original = matched.output_node
     sequence_length = q_proj.sequence_length
     heads = q_proj.heads
@@ -415,42 +411,17 @@ def _replace_projection(
         )
         replacement = sparse_piper_compile.emit_quantized_sparse_piper_attention(
             graph,
+            matched,
             (*query_nodes, *key_nodes, *value_nodes),
-            ratio_profile=matched.ratio_profile,
-            sparse_key_blocks=matched.sparse_key_blocks,
             logical_sequence_length=logical_sequence_length,
-            routing_mode=matched.routing_mode,
-            block_lengths=matched.block_lengths,
-            sparse_query_blocks=matched.sparse_query_blocks,
-            force_tile_ids=matched.force_tile_ids,
-            force_tile_counts=matched.force_tile_counts,
             coarse_gate=prepared_coarse_gate,
-            coarse_scale=matched.coarse_scale,
-            coarse_key_blocks=matched.coarse_key_blocks,
             output_dtype=output_value.dtype,
         )
-    replacement.meta = original.meta.copy()
-    replacement.meta.pop("eager_input_vals", None)
-    original.replace_all_uses_with(replacement)
-    graph.erase_node(original)
+    sparse_piper_compile.replace_matched_nodes(graph, original, replacement)
 
 
 def _fold_projection(graph: torch.fx.Graph) -> bool:
-    changed = False
-    for node in list(graph.nodes):
-        matched = sparse_piper_compile.match_sparse_piper_projection(node)
-        if matched is None:
-            continue
-        validated = _valid_projections(matched)
-        if validated is None:
-            continue
-        q_proj, k_proj, v_proj, head_dim = validated
-        _replace_projection(graph, matched, q_proj, k_proj, v_proj, head_dim)
-        changed = True
-    if changed:
-        graph.eliminate_dead_code()
-        graph.lint()
-    return changed
+    return sparse_piper_compile.fold_matched_nodes(graph, _match_projection, _replace_projection)
 
 
 def fold_sparse_attention(graph: torch.fx.Graph) -> bool:

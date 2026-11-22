@@ -11,7 +11,12 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import torch
 import triton
-from _accelerators import mock_cuda_target, mock_rocm_target, rocm_fences_only_lds
+from _accelerators import (
+    forbid_device_probes,
+    mock_cuda_target,
+    mock_rocm_target,
+    rocm_fences_only_lds,
+)
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
@@ -601,6 +606,45 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
         is supported
     )
     select.assert_called_once_with(query_node.meta["val"])
+
+
+@pytest.mark.parametrize(("group_size", "bad_bias"), [(0, False), (16, True)])
+def test_output_compiler_rejects_invalid_metadata_before_backend_selection(
+    monkeypatch, group_size, bad_bias
+):
+    graph = torch.fx.Graph()
+    with FakeTensorMode():
+        query_node = graph.placeholder("query")
+        query_node.meta["val"] = torch.empty((1, 2, 128, 128), dtype=torch.int8, device="cuda:0")
+        attention = graph.placeholder("attention")
+        attention.meta["val"] = torch.empty((1, 128, 2, 128), dtype=torch.bfloat16, device="cuda:0")
+        weight = graph.placeholder("weight")
+        weight.meta["val"] = torch.empty((384, 256), dtype=torch.int8, device="cuda:0")
+        scale = graph.placeholder("scale")
+        scale.meta["val"] = torch.empty((384, 1), dtype=torch.float32, device="cuda:0")
+        bias = None
+        if bad_bias:
+            bias = graph.placeholder("bias")
+            bias.meta["val"] = torch.empty((383,), dtype=torch.float32, device="cuda:0")
+        reshaped = graph.call_function(torch.reshape, (attention, (1, 128, 256)))
+        reshaped.meta["val"] = torch.empty((1, 128, 256), dtype=torch.bfloat16, device="cuda:0")
+        projected = graph.call_function(
+            torch.ops.piper_kernels.convrot_int8_linear.default,
+            (reshaped, weight, scale, bias, group_size),
+        )
+        projected.meta["val"] = torch.empty((1, 128, 384), dtype=torch.bfloat16, device="cuda:0")
+    reshaped_match = _compile.sparse_piper_compile.ReshapedQuantizedAttentionMatch(
+        reshape_node=reshaped,
+        attention_node=attention,
+        attention_shape=[1, 128, 256],
+        attention_args={"query": query_node},
+        is_coarse=False,
+        force_kwargs={},
+    )
+    forbid_device_probes(monkeypatch)
+    assert not _output_compile._valid_attention_output(
+        projected, reshaped_match, weight, scale, bias, group_size, None
+    )
 
 
 def _capture_projection(

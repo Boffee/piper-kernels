@@ -89,8 +89,8 @@ def _semantic_gate_projection(
     group_size: int,
 ) -> _SemanticGateProjection | None:
     """Match a reshaped ConvRot INT8 gate derived from the shared sparse input."""
-    linear = sparse_piper_compile.unwrap_shape_only_views(gate)
-    if linear is None or linear is gate:
+    linear = sparse_piper_compile.unwrap_reshaped_producer(gate)
+    if linear is None:
         return None
     parsed = _parse_int8_projection(linear)
     if parsed is None or parsed.input is not sparse_input or parsed.group_size != group_size:
@@ -119,12 +119,7 @@ def _valid_sparse_piper_projection(  # noqa: PLR0911, PLR0912
     k_proj: _BoundInt8Projection,
     v_proj: _BoundInt8Projection,
 ) -> bool:
-    routing_mode = matched.routing_mode
-    if (
-        isinstance(routing_mode, bool)
-        or not isinstance(routing_mode, int)
-        or not is_valid_routing_mode(routing_mode)
-    ):
+    if not is_valid_routing_mode(matched.routing_mode):
         return False
     if (
         k_proj.input is not q_proj.input
@@ -352,24 +347,13 @@ def _replace_sparse_piper_projection(
         )
         replacement = sparse_piper_compile.emit_quantized_sparse_piper_attention(
             graph,
+            matched,
             (*query_nodes, *key_nodes, *value_nodes),
-            ratio_profile=matched.ratio_profile,
-            sparse_key_blocks=matched.sparse_key_blocks,
             logical_sequence_length=logical_sequence_length,
-            routing_mode=matched.routing_mode,
-            block_lengths=matched.block_lengths,
-            sparse_query_blocks=matched.sparse_query_blocks,
-            force_tile_ids=matched.force_tile_ids,
-            force_tile_counts=matched.force_tile_counts,
             coarse_gate=prepared_coarse_gate,
-            coarse_scale=matched.coarse_scale,
-            coarse_key_blocks=matched.coarse_key_blocks,
             output_dtype=original.meta["val"].dtype,
         )
-    replacement.meta = original.meta.copy()
-    replacement.meta.pop("eager_input_vals", None)
-    original.replace_all_uses_with(replacement)
-    graph.erase_node(original)
+    sparse_piper_compile.replace_matched_nodes(graph, original, replacement)
 
 
 def _fold_sparse_piper_projection(graph: torch.fx.Graph) -> bool:
