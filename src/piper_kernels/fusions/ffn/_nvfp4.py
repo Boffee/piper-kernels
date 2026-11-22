@@ -19,8 +19,12 @@ from typing import cast
 import torch
 from torch.nn import functional as F  # noqa: N812
 
-from piper_kernels._input_activations import InputActivation, input_activation_width
-from piper_kernels._residual import ResidualAdd, ReusableUpdate, validate_residual_add
+from piper_kernels._input_activations import (
+    InputActivation,
+    input_activation_width,
+    parse_input_activation,
+)
+from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
@@ -117,14 +121,6 @@ def _validate_rotation_group(
         )
 
 
-def _parse_activation(activation_fn: str) -> InputActivation:
-    if activation_fn not in ("gelu_tanh", "swiglu"):
-        raise ValueError(
-            f"NVFP4 FFN activation_fn must be 'gelu_tanh' or 'swiglu', got {activation_fn!r}"
-        )
-    return cast(InputActivation, activation_fn)
-
-
 def _build_operands(
     up_weight_qdata: torch.Tensor,
     up_weight_scale: torch.Tensor,
@@ -152,7 +148,7 @@ def _build_operands(
     gate_group_size: int | None,
     gate_high_first: bool,
 ) -> tuple[InputActivation, tuple[LinearOperands, ...], LinearOperands]:
-    activation = _parse_activation(activation_fn)
+    activation = parse_input_activation(activation_fn, name="NVFP4 FFN")
     up = LinearOperands(
         up_weight_qdata,
         up_weight_scale,
@@ -200,35 +196,6 @@ def _build_operands(
         gate_high_first,
     )
     return activation, (up, gate), down
-
-
-def _build_residual_add(
-    output: torch.Tensor,
-    base: torch.Tensor | None,
-    update_gate: torch.Tensor | None,
-    ffn_gate: torch.Tensor,
-    gate_indices: torch.Tensor,
-    python_indexing: bool,
-) -> ResidualAdd:
-    if (base is None) != (update_gate is None):
-        raise ValueError(
-            "NVFP4 FFN update base and update_gate must both be provided or both omitted"
-        )
-    if base is None:
-        return ResidualAdd(
-            base=output,
-            gate=ffn_gate,
-            gate_indices=gate_indices,
-            python_indexing=python_indexing,
-        )
-    assert update_gate is not None
-    return ResidualAdd(
-        base=base,
-        gate=ffn_gate,
-        gate_indices=gate_indices,
-        python_indexing=python_indexing,
-        reusable=ReusableUpdate(output, update_gate),
-    )
 
 
 def validate_ffn(
@@ -453,18 +420,19 @@ def _prepare_activated_chunk(
 
     from piper_kernels.linear.convrot.nvfp4 import triton as convrot_backend  # noqa: PLC0415
 
+    if dynamic_activation_scale:
+        return convrot_backend.prepare_dynamic(
+            projections,
+            group_size,
+            "gelu_tanh",
+            high_first=high_first,
+        )
     validated_input = convrot_backend._validate_input(projections, group_size, "gelu_tanh")
     per_tensor_scale = (
-        convrot_backend._prepare_dynamic_scale(
-            validated_input,
-            group_size,
-            activation_fn="gelu_tanh",
-        )
-        if dynamic_activation_scale
+        projections.new_ones((), dtype=torch.float32)
+        if activation_per_tensor_scale is None
         else activation_per_tensor_scale
     )
-    if per_tensor_scale is None:
-        per_tensor_scale = projections.new_ones((), dtype=torch.float32)
     qdata, scale = convrot_backend._prepare_static_storage(
         validated_input,
         per_tensor_scale,
@@ -544,12 +512,9 @@ def run_chunked_ffn(
     input_features = input.shape[-1]
     input_2d = input.view(rows, input_features)
     source_per_tensor_scales = _source_per_tensor_scales(input, sources)
-    shared_input_preparation = all(source.dynamic_activation_scale for source in sources) or (
-        all(not source.dynamic_activation_scale for source in sources)
-        and all(
-            same_tensor_storage(source_per_tensor_scales[0], per_tensor_scale)
-            for per_tensor_scale in source_per_tensor_scales[1:]
-        )
+    shared_input_preparation = all(
+        same_tensor_storage(source_per_tensor_scales[0], per_tensor_scale)
+        for per_tensor_scale in source_per_tensor_scales[1:]
     )
     output = (
         torch.empty((*leading_shape, output_features), device=input.device, dtype=input.dtype)
@@ -592,40 +557,26 @@ def run_chunked_ffn(
         stop = min(start + chunk_rows, rows)
         chunk_row_count = stop - start
         projections = projection_workspace[:chunk_row_count]
-        first_input_qdata, first_input_scale = _prepare_source_chunk(
-            input_2d[start:stop],
-            source_per_tensor_scales[0],
-            source_group_size,
-            source_storage,
-            high_first=source_high_first,
-        )
-        _project_affine_chunk(
-            first_input_qdata,
-            first_input_scale,
-            source_per_tensor_scales[0],
-            sources[0],
-            chunk_row_count,
-            projections[:, :intermediate_features],
-        )
-        if len(sources) == 2:
-            second_input_qdata, second_input_scale = (
-                (first_input_qdata, first_input_scale)
-                if shared_input_preparation
-                else _prepare_source_chunk(
+        prepared_source: tuple[torch.Tensor, torch.Tensor] | None = None
+        for index, (source, per_tensor_scale) in enumerate(
+            zip(sources, source_per_tensor_scales, strict=True)
+        ):
+            if prepared_source is None or not shared_input_preparation:
+                prepared_source = _prepare_source_chunk(
                     input_2d[start:stop],
-                    source_per_tensor_scales[1],
+                    per_tensor_scale,
                     source_group_size,
                     source_storage,
                     high_first=source_high_first,
                 )
-            )
+            offset = index * intermediate_features
             _project_affine_chunk(
-                second_input_qdata,
-                second_input_scale,
-                source_per_tensor_scales[1],
-                sources[1],
+                prepared_source[0],
+                prepared_source[1],
+                per_tensor_scale,
+                source,
                 chunk_row_count,
-                projections[:, intermediate_features:],
+                projections[:, offset : offset + intermediate_features],
             )
         down_qdata, down_scale, down_per_tensor_scale = _prepare_activated_chunk(
             projections,
@@ -636,27 +587,21 @@ def run_chunked_ffn(
             high_first=down.high_first,
         )
         if residual_add is None:
-            _project_affine_chunk(
-                down_qdata,
-                down_scale,
-                down_per_tensor_scale,
-                down,
-                chunk_row_count,
-                output_2d[start:stop],
-            )
-            continue
-        assert projected_workspace is not None
-        assert apply_residual is not None
-        projected = projected_workspace[:chunk_row_count]
+            down_target = output_2d[start:stop]
+        else:
+            assert projected_workspace is not None
+            down_target = projected_workspace[:chunk_row_count]
         _project_affine_chunk(
             down_qdata,
             down_scale,
             down_per_tensor_scale,
             down,
             chunk_row_count,
-            projected,
+            down_target,
         )
-        apply_residual(projected, residual_add, start)
+        if residual_add is not None:
+            assert apply_residual is not None
+            apply_residual(down_target, residual_add, start)
     return output
 
 
@@ -855,13 +800,14 @@ def nvfp4_ffn_update_op(
         gate_group_size,
         gate_high_first,
     )
-    residual_add = _build_residual_add(
+    residual_add = ResidualAdd.from_update(
         output,
         base,
         update_gate,
         ffn_gate,
         gate_indices,
         python_indexing,
+        name="NVFP4 FFN",
     )
     run_chunked_ffn(input, sources, down, activation, chunk_rows, residual_add=residual_add)
 
@@ -930,13 +876,14 @@ def _nvfp4_ffn_update_op_fake(
         gate_high_first,
     )
     output_features = validate_ffn(input, sources, down, activation, chunk_rows)[2]
-    residual_add = _build_residual_add(
+    residual_add = ResidualAdd.from_update(
         output,
         base,
         update_gate,
         ffn_gate,
         gate_indices,
         python_indexing,
+        name="NVFP4 FFN",
     )
     validate_residual_add(input, residual_add, output_features)
 

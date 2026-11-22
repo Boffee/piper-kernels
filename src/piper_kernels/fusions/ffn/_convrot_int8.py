@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import cast
 
 import torch
 
-from piper_kernels._input_activations import InputActivation, input_activation_width
-from piper_kernels._residual import ResidualAdd, ReusableUpdate, validate_residual_add
+from piper_kernels._input_activations import (
+    InputActivation,
+    input_activation_width,
+    parse_input_activation,
+)
+from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels.linear import _bias
 from piper_kernels.linear._storage import same_tensor_storage
 from piper_kernels.linear.convrot.int8 import _backend
@@ -101,14 +104,6 @@ def _validate_bias(
     _bias.validate_dtype(bias, f"chunked ConvRot INT8 {name}")
 
 
-def _parse_activation(activation_fn: str) -> InputActivation:
-    if activation_fn not in ("gelu_tanh", "swiglu"):
-        raise ValueError(
-            f"ConvRot INT8 FFN activation_fn must be 'gelu_tanh' or 'swiglu', got {activation_fn!r}"
-        )
-    return cast(InputActivation, activation_fn)
-
-
 def _build_operands(
     up_weight_qdata: torch.Tensor,
     up_weight_scale: torch.Tensor,
@@ -127,7 +122,7 @@ def _build_operands(
     gate_input_scale: torch.Tensor | None,
     down_input_scale: torch.Tensor | None,
 ) -> tuple[InputActivation, tuple[LinearOperands, ...], LinearOperands]:
-    activation = _parse_activation(activation_fn)
+    activation = parse_input_activation(activation_fn, name="ConvRot INT8 FFN")
     up = LinearOperands(
         up_weight_qdata,
         up_weight_scale,
@@ -174,35 +169,6 @@ def _build_operands(
         gate_input_scale,
     )
     return activation, (up, gate), down
-
-
-def _build_residual_add(
-    output: torch.Tensor,
-    base: torch.Tensor | None,
-    update_gate: torch.Tensor | None,
-    ffn_gate: torch.Tensor,
-    gate_indices: torch.Tensor,
-    python_indexing: bool,
-) -> ResidualAdd:
-    if (base is None) != (update_gate is None):
-        raise ValueError(
-            "ConvRot INT8 FFN update base and update_gate must both be provided or both omitted"
-        )
-    if base is None:
-        return ResidualAdd(
-            base=output,
-            gate=ffn_gate,
-            gate_indices=gate_indices,
-            python_indexing=python_indexing,
-        )
-    assert update_gate is not None
-    return ResidualAdd(
-        base=base,
-        gate=ffn_gate,
-        gate_indices=gate_indices,
-        python_indexing=python_indexing,
-        reusable=ReusableUpdate(output, update_gate),
-    )
 
 
 def validate_ffn(
@@ -361,38 +327,23 @@ def run_chunked_ffn(
                 second_projection=second_projection,
             )
         else:
-            first, second = sources
-            backend.prepare_input(
-                input_2d[start:stop],
-                first.group_size,
-                input_scale=first.input_scale,
-                out=(prepared_input, prepared_scale),
-            )
-            backend.linear_prepared(
-                prepared_input,
-                prepared_scale,
-                first.weight_qdata,
-                first.weight_scale,
-                first.bias,
-                input.dtype,
-                out=projections[:, :intermediate_features],
-            )
-            # Reuse the bounded preparation buffers for the second source.
-            backend.prepare_input(
-                input_2d[start:stop],
-                second.group_size,
-                input_scale=second.input_scale,
-                out=(prepared_input, prepared_scale),
-            )
-            backend.linear_prepared(
-                prepared_input,
-                prepared_scale,
-                second.weight_qdata,
-                second.weight_scale,
-                second.bias,
-                input.dtype,
-                out=projections[:, intermediate_features:],
-            )
+            for index, source in enumerate(sources):
+                backend.prepare_input(
+                    input_2d[start:stop],
+                    source.group_size,
+                    input_scale=source.input_scale,
+                    out=(prepared_input, prepared_scale),
+                )
+                offset = index * intermediate_features
+                backend.linear_prepared(
+                    prepared_input,
+                    prepared_scale,
+                    source.weight_qdata,
+                    source.weight_scale,
+                    source.bias,
+                    input.dtype,
+                    out=projections[:, offset : offset + intermediate_features],
+                )
 
         prepared_activation = prepared_storage[: chunk_row_count * intermediate_features].view(
             chunk_row_count,
@@ -572,13 +523,14 @@ def convrot_int8_ffn_update_op(
         gate_input_scale,
         down_input_scale,
     )
-    residual_add = _build_residual_add(
+    residual_add = ResidualAdd.from_update(
         output,
         base,
         update_gate,
         ffn_gate,
         gate_indices,
         python_indexing,
+        name="ConvRot INT8 FFN",
     )
     run_chunked_ffn(input, sources, down, activation, chunk_rows, residual_add=residual_add)
 
@@ -629,13 +581,14 @@ def _convrot_int8_ffn_update_op_fake(
         down_input_scale,
     )
     output_features = validate_ffn(input, sources, down, activation, chunk_rows)[2]
-    residual_add = _build_residual_add(
+    residual_add = ResidualAdd.from_update(
         output,
         base,
         update_gate,
         ffn_gate,
         gate_indices,
         python_indexing,
+        name="ConvRot INT8 FFN",
     )
     validate_residual_add(input, residual_add, output_features)
 

@@ -9,6 +9,7 @@ format extras and Triton lazily imported.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -224,6 +225,31 @@ def _valid_convrot_int8_bias(
     )
 
 
+def _valid_ffn_io(
+    input_value: torch.Tensor,
+    output_value: torch.Tensor,
+    output_features: int | torch.SymInt,
+    promoted_dtype: torch.dtype | None,
+) -> bool:
+    rows = math.prod(input_value.shape[:-1])
+    return bool(
+        (promoted_dtype is None or promoted_dtype is input_value.dtype)
+        and input_value.ndim > 0
+        and not (isinstance(rows, int) and rows < 1)
+        and input_value.dtype in (torch.float16, torch.bfloat16)
+        and input_value.layout is torch.strided
+        and input_value.is_contiguous()
+        and output_value.dtype is input_value.dtype
+        and output_value.device == input_value.device
+        and output_value.ndim == input_value.ndim
+        and all(
+            _dimension_matches(out_dim, in_dim)
+            for out_dim, in_dim in zip(output_value.shape[:-1], input_value.shape[:-1], strict=True)
+        )
+        and _dimension_matches(output_value.shape[-1], output_features)
+    )
+
+
 def _valid_convrot_int8_ffn(  # noqa: PLR0911
     sources: tuple[_BoundProjection, ...],
     down: _BoundProjection,
@@ -231,10 +257,6 @@ def _valid_convrot_int8_ffn(  # noqa: PLR0911
 ) -> bool:
     from piper_kernels.linear.convrot.int8 import _backend, _compile_fx  # noqa: PLC0415
 
-    if any(p.format != "convrot_int8" for p in (*sources, down)):
-        return False
-    if any(source.input_node is not sources[0].input_node for source in sources[1:]):
-        return False
     input_value = _node_metadata(sources[0].input_node)
     output_value = _node_metadata(down.node)
     projections = (*sources, down)
@@ -246,38 +268,26 @@ def _valid_convrot_int8_ffn(  # noqa: PLR0911
         or any(value is None for value in (*weights, *scales))
     ):
         return False
-    if promoted_dtype is not None and promoted_dtype is not input_value.dtype:
-        return False
     concrete_weights = cast(tuple[torch.Tensor, ...], weights)
     concrete_scales = cast(tuple[torch.Tensor, ...], scales)
-    rows = math.prod(input_value.shape[:-1])
     if any(
         not _compile_fx.valid_input_scale(p.args["input_scale"], input_value.device)
         for p in projections
     ):
         return False
-    if (
-        input_value.ndim == 0
-        or (isinstance(rows, int) and rows < 1)
-        or input_value.dtype not in (torch.float16, torch.bfloat16)
-        or input_value.layout is not torch.strided
-        or not input_value.is_contiguous()
-        or any(
-            weight.ndim != 2
-            or weight.dtype is not torch.int8
-            or weight.device != input_value.device
-            or weight.layout is not torch.strided
-            or not weight.is_contiguous()
-            for weight in concrete_weights
-        )
-        or any(
-            scale.dtype is not torch.float32
-            or scale.device != input_value.device
-            or scale.layout is not torch.strided
-            or not scale.is_contiguous()
-            for scale in concrete_scales
-        )
-        or _backend.select_linear_backend(input_value) is None
+    if any(
+        weight.ndim != 2
+        or weight.dtype is not torch.int8
+        or weight.device != input_value.device
+        or weight.layout is not torch.strided
+        or not weight.is_contiguous()
+        for weight in concrete_weights
+    ) or any(
+        scale.dtype is not torch.float32
+        or scale.device != input_value.device
+        or scale.layout is not torch.strided
+        or not scale.is_contiguous()
+        for scale in concrete_scales
     ):
         return False
 
@@ -289,19 +299,12 @@ def _valid_convrot_int8_ffn(  # noqa: PLR0911
     intermediate_features = source_weights[0].shape[0]
     output_features = down_weight.shape[0]
     if (
-        not _dimension_matches(input_value.shape[-1], input_features)
+        not _valid_ffn_io(input_value, output_value, output_features, promoted_dtype)
+        or not _dimension_matches(input_value.shape[-1], input_features)
         or any(not _shape_matches(source_weights[0], source) for source in source_weights[1:])
         or not _dimension_matches(down_weight.shape[1], intermediate_features)
         or any(scale.shape != (intermediate_features, 1) for scale in source_scales)
         or down_scale.shape != (output_features, 1)
-        or output_value.dtype is not input_value.dtype
-        or output_value.device != input_value.device
-        or output_value.ndim != input_value.ndim
-        or any(
-            not _dimension_matches(out_dim, in_dim)
-            for out_dim, in_dim in zip(output_value.shape[:-1], input_value.shape[:-1], strict=True)
-        )
-        or not _dimension_matches(output_value.shape[-1], output_features)
     ):
         return False
 
@@ -320,12 +323,15 @@ def _valid_convrot_int8_ffn(  # noqa: PLR0911
         or (isinstance(intermediate_features, int) and intermediate_features % down_group)
     ):
         return False
-    return all(
-        _valid_convrot_int8_bias(p.args["bias"], features=features, input_value=input_value)
-        for p, features in (
-            *((source, intermediate_features) for source in sources),
-            (down, output_features),
+    return (
+        all(
+            _valid_convrot_int8_bias(p.args["bias"], features=features, input_value=input_value)
+            for p, features in (
+                *((source, intermediate_features) for source in sources),
+                (down, output_features),
+            )
         )
+        and _backend.select_linear_backend(input_value) is not None
     )
 
 
@@ -363,61 +369,48 @@ def _parse_nvfp4_projections(
     return tuple(parsed)
 
 
-def _valid_nvfp4_convrot_groups(
-    parsed: tuple[tuple[object, int | None], ...],
-) -> bool:
-    if not any(group is not None for _linear, group in parsed):
-        return True
-    from piper_kernels.linear.convrot.nvfp4 import (  # noqa: PLC0415
-        _compile_fx as convrot_nvfp4_compile_fx,
-    )
-    from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx  # noqa: PLC0415
-
-    return all(
-        convrot_nvfp4_compile_fx.validated_semantic_linear(
-            convrot_nvfp4_compile_fx.SemanticLinearNodes(
-                cast(nvfp4_compile_fx.SemanticLinearNodes, linear), group
-            ),
-            f"ConvRot NVFP4 FFN compiler projection {index}",
-        )
-        is not None
-        for index, (linear, group) in enumerate(parsed)
-        if group is not None
-    )
-
-
 def _valid_nvfp4_ffn(
     sources: tuple[_BoundProjection, ...],
     down: _BoundProjection,
     promoted_dtype: torch.dtype | None,
 ) -> bool:
     from piper_kernels.linear.nvfp4 import _compile_fx as nvfp4_compile_fx  # noqa: PLC0415
+    from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation  # noqa: PLC0415
 
-    if any(p.format != "nvfp4" for p in (*sources, down)):
-        return False
-    if any(source.input_node is not sources[0].input_node for source in sources[1:]):
-        return False
     parsed = _parse_nvfp4_projections((*sources, down))
     if parsed is None:
         return False
     source_groups = tuple(group for _linear, group in parsed[:-1])
-    if any(group != source_groups[0] for group in source_groups[1:]) or not (
-        _valid_nvfp4_convrot_groups(parsed)
-    ):
+    if any(group != source_groups[0] for group in source_groups[1:]):
         return False
 
-    linears = tuple(cast(nvfp4_compile_fx.SemanticLinearNodes, linear) for linear, _ in parsed)
-    validated_sources = tuple(
-        nvfp4_compile_fx.validated_semantic_linear(
-            linear,
-            f"NVFP4 FFN compiler source projection {index}",
+    convrot_compile_fx = None
+    if any(group is not None for _linear, group in parsed):
+        from piper_kernels.linear.convrot.nvfp4 import (  # noqa: PLC0415
+            _compile_fx as convrot_compile_fx,
         )
-        for index, linear in enumerate(linears[:-1])
+
+    def validate(
+        index: int,
+        linear: object,
+        group: int | None,
+    ) -> tuple[torch.Tensor, nvfp4_validation.LinearShape] | None:
+        semantic = cast(nvfp4_compile_fx.SemanticLinearNodes, linear)
+        if group is not None:
+            assert convrot_compile_fx is not None
+            return convrot_compile_fx.validated_semantic_linear(
+                convrot_compile_fx.SemanticLinearNodes(semantic, group),
+                f"ConvRot NVFP4 FFN compiler projection {index}",
+            )
+        return nvfp4_compile_fx.validated_semantic_linear(
+            semantic,
+            f"NVFP4 FFN compiler projection {index}",
+        )
+
+    validated_sources = tuple(
+        validate(index, linear, group) for index, (linear, group) in enumerate(parsed[:-1])
     )
-    validated_down = nvfp4_compile_fx.validated_semantic_linear(
-        linears[-1],
-        "NVFP4 FFN compiler down projection",
-    )
+    validated_down = validate(len(parsed) - 1, *parsed[-1])
     output_value = _node_metadata(down.node)
     if (
         validated_down is None
@@ -428,12 +421,11 @@ def _valid_nvfp4_ffn(
     source_values = tuple(v for v in validated_sources if v is not None)
     input_value, source_shape = source_values[0]
     down_input, down_shape = validated_down
-    source_linears = linears[:-1]
+    source_linears = tuple(
+        cast(nvfp4_compile_fx.SemanticLinearNodes, linear) for linear, _ in parsed[:-1]
+    )
     return bool(
-        (promoted_dtype is None or promoted_dtype is input_value.dtype)
-        and input_value.dtype in (torch.float16, torch.bfloat16)
-        and input_value.layout is torch.strided
-        and input_value.is_contiguous()
+        _valid_ffn_io(input_value, output_value, down_shape.output_features, promoted_dtype)
         and all(value.dtype is input_value.dtype for value, _shape in source_values[1:])
         and down_input.dtype is input_value.dtype
         and all(
@@ -450,14 +442,6 @@ def _valid_nvfp4_ffn(
         )
         and _dimension_matches(down_shape.input_features, source_shape.output_features)
         and all(linear.high_first == source_linears[0].high_first for linear in source_linears[1:])
-        and output_value.dtype is input_value.dtype
-        and output_value.device == input_value.device
-        and output_value.ndim == input_value.ndim
-        and all(
-            _dimension_matches(out_dim, in_dim)
-            for out_dim, in_dim in zip(output_value.shape[:-1], input_value.shape[:-1], strict=True)
-        )
-        and _dimension_matches(output_value.shape[-1], down_shape.output_features)
     )
 
 
@@ -580,30 +564,13 @@ def _match_gated_updates(
     return None
 
 
-def _emit_convrot_int8_ffn(
-    graph: torch.fx.Graph,
+def _int8_ffn_args(
     sources: tuple[_BoundProjection, ...],
     down: _BoundProjection,
     activation_fn: input_activations.InputActivation,
-    gated: _GatedUpdatesMatch | None,
-) -> None:
-    from . import _convrot_int8  # noqa: PLC0415
-
+) -> tuple[tuple[Argument, ...], tuple[Argument, ...]]:
     up = sources[0]
     gate = sources[1] if len(sources) == 2 else None
-    input_val = _node_metadata(up.input_node)
-    up_weight_val = _node_metadata(up.args["weight_qdata"])
-    down_weight_val = _node_metadata(down.args["weight_qdata"])
-    assert input_val is not None
-    assert up_weight_val is not None
-    assert down_weight_val is not None
-    chunk_rows = _convrot_int8.default_chunk_rows(
-        input_val,
-        up_weight_val,
-        down_weight_val,
-        activation_fn,
-        adds_residual=gated is not None,
-    )
     common = (
         up.input_node,
         up.args["weight_qdata"],
@@ -625,10 +592,87 @@ def _emit_convrot_int8_ffn(
         None if gate is None else gate.args["input_scale"],
         down.args["input_scale"],
     )
+    return common, trailing
+
+
+def _nvfp4_projection_args(projection: _BoundProjection) -> tuple[Argument, ...]:
+    group_size = (
+        projection.args["group_size"] if projection.schema_name == _CONVROT_NVFP4_LINEAR else None
+    )
+    return (
+        projection.args["weight_qdata"],
+        projection.args["weight_scale"],
+        projection.args["weight_per_tensor_scale"],
+        projection.args["activation_per_tensor_scale"],
+        projection.args["bias"],
+        projection.args["dynamic_activation_scale"],
+        group_size,
+        projection.args["high_first"],
+    )
+
+
+def _nvfp4_ffn_args(
+    sources: tuple[_BoundProjection, ...],
+    down: _BoundProjection,
+    activation_fn: input_activations.InputActivation,
+) -> tuple[tuple[Argument, ...], tuple[Argument, ...]]:
+    up = sources[0]
+    gate = sources[1] if len(sources) == 2 else None
+    common = (
+        up.input_node,
+        *_nvfp4_projection_args(up),
+        *_nvfp4_projection_args(down),
+        activation_fn,
+    )
+    trailing: tuple[Argument, ...] = (
+        (None, None, None, None, None, False, None, False)
+        if gate is None
+        else _nvfp4_projection_args(gate)
+    )
+    return common, trailing
+
+
+def _emit_ffn(
+    graph: torch.fx.Graph,
+    sources: tuple[_BoundProjection, ...],
+    down: _BoundProjection,
+    activation_fn: input_activations.InputActivation,
+    gated: _GatedUpdatesMatch | None,
+) -> None:
+    up = sources[0]
+    input_val = _node_metadata(up.input_node)
+    up_weight_val = _node_metadata(up.args["weight_qdata"])
+    down_weight_val = _node_metadata(down.args["weight_qdata"])
+    assert input_val is not None
+    assert up_weight_val is not None
+    assert down_weight_val is not None
+    if down.format == "convrot_int8":
+        from . import _convrot_int8  # noqa: PLC0415
+
+        plain_op = torch.ops.piper_kernels.convrot_int8_ffn.default
+        update_op = torch.ops.piper_kernels.convrot_int8_ffn_update_.default
+        default_chunk_rows = _convrot_int8.default_chunk_rows
+        common, trailing = _int8_ffn_args(sources, down, activation_fn)
+    else:
+        from . import _nvfp4  # noqa: PLC0415
+
+        plain_op = torch.ops.piper_kernels.nvfp4_ffn.default
+        update_op = torch.ops.piper_kernels.nvfp4_ffn_update_.default
+        default_chunk_rows = _nvfp4.default_chunk_rows
+        common, trailing = _nvfp4_ffn_args(sources, down, activation_fn)
+
+    chunk_rows = default_chunk_rows(
+        input_val,
+        up_weight_val,
+        down_weight_val,
+        activation_fn,
+        adds_residual=gated is not None,
+    )
+
     if gated is not None:
         with graph.inserting_before(gated.output_node):
             mutation = graph.call_function(
-                torch.ops.piper_kernels.convrot_int8_ffn_update_.default,
+                update_op,
                 args=(
                     *common,
                     gated.reusable_update,
@@ -648,7 +692,7 @@ def _emit_convrot_int8_ffn(
 
     with graph.inserting_before(down.node):
         replacement = graph.call_function(
-            torch.ops.piper_kernels.convrot_int8_ffn.default,
+            plain_op,
             args=(*common, chunk_rows, *trailing),
         )
     replacement.meta = down.node.meta.copy()
@@ -657,87 +701,46 @@ def _emit_convrot_int8_ffn(
     graph.erase_node(down.node)
 
 
-def _nvfp4_projection_args(projection: _BoundProjection) -> tuple[Argument, ...]:
-    group_size = (
-        projection.args["group_size"] if projection.schema_name == _CONVROT_NVFP4_LINEAR else None
-    )
-    return (
-        projection.args["weight_qdata"],
-        projection.args["weight_scale"],
-        projection.args["weight_per_tensor_scale"],
-        projection.args["activation_per_tensor_scale"],
-        projection.args["bias"],
-        projection.args["dynamic_activation_scale"],
-        group_size,
-        projection.args["high_first"],
-    )
-
-
-def _emit_nvfp4_ffn(
+def _fold_format_residual_adds(
     graph: torch.fx.Graph,
-    sources: tuple[_BoundProjection, ...],
-    down: _BoundProjection,
-    activation_fn: input_activations.InputActivation,
-    gated: _GatedUpdatesMatch | None,
-) -> None:
-    from . import _nvfp4  # noqa: PLC0415
+    plain_op: torch._ops.OpOverload,
+    update_op: torch._ops.OpOverload,
+    default_chunk_rows: Callable[..., int],
+) -> int:
+    from piper_kernels.fusions.residual_updates import _graph as residual_graph  # noqa: PLC0415
 
-    up = sources[0]
-    gate = sources[1] if len(sources) == 2 else None
-    input_val = _node_metadata(up.input_node)
-    up_weight_val = _node_metadata(up.args["weight_qdata"])
-    down_weight_val = _node_metadata(down.args["weight_qdata"])
-    assert input_val is not None
-    assert up_weight_val is not None
-    assert down_weight_val is not None
-    chunk_rows = _nvfp4.default_chunk_rows(
-        input_val,
-        up_weight_val,
-        down_weight_val,
-        activation_fn,
-        adds_residual=gated is not None,
-    )
-    common = (
-        up.input_node,
-        *_nvfp4_projection_args(up),
-        *_nvfp4_projection_args(down),
-        activation_fn,
-    )
-    gate_args: tuple[Argument, ...] = (
-        (None, None, None, None, None, False, None, False)
-        if gate is None
-        else _nvfp4_projection_args(gate)
-    )
-    if gated is not None:
-        with graph.inserting_before(gated.output_node):
-            mutation = graph.call_function(
-                torch.ops.piper_kernels.nvfp4_ffn_update_.default,
-                args=(
-                    *common,
-                    gated.reusable_update,
-                    gated.ffn_gate,
-                    gated.gate_indices,
-                    gated.python_indexing,
-                    chunk_rows,
-                    gated.base,
-                    gated.update_gate,
-                    *gate_args,
-                ),
-            )
-        mutation.meta["val"] = None
-        gated.output_node.replace_all_uses_with(gated.reusable_update)
-        graph.erase_node(gated.output_node)
-        return
-
-    with graph.inserting_before(down.node):
-        replacement = graph.call_function(
-            torch.ops.piper_kernels.nvfp4_ffn.default,
-            args=(*common, chunk_rows, *gate_args),
+    def _compute(
+        graph: torch.fx.Graph,
+        update: torch.fx.Node,
+        add: dict[str, Argument],
+    ) -> torch.fx.Node:
+        values = linear_fx.bind_arguments(update)
+        assert values is not None
+        input_val = _node_metadata(values["input"])
+        up_weight = _node_metadata(values["up_weight_qdata"])
+        down_weight = _node_metadata(values["down_weight_qdata"])
+        assert input_val is not None
+        assert up_weight is not None
+        assert down_weight is not None
+        activation_fn = cast(input_activations.InputActivation, values["activation_fn"])
+        values.update(
+            output=add["base"],
+            base=None,
+            update_gate=None,
+            ffn_gate=add["gate"],
+            gate_indices=add["gate_indices"],
+            python_indexing=add["python_indexing"],
+            chunk_rows=default_chunk_rows(
+                input_val,
+                up_weight,
+                down_weight,
+                activation_fn,
+                adds_residual=True,
+            ),
         )
-    replacement.meta = down.node.meta.copy()
-    replacement.meta.pop("eager_input_vals", None)
-    down.node.replace_all_uses_with(replacement)
-    graph.erase_node(down.node)
+        return residual_graph.call_functional(graph, update_op, values)
+
+    return residual_graph.compute_inside_adds(graph, plain_op, _compute)
 
 
 def _fold_residual_adds(
@@ -752,97 +755,25 @@ def _fold_residual_adds(
     )
     if not has_auto_func:
         return 0
-    from piper_kernels.fusions.residual_updates import _graph as residual_graph  # noqa: PLC0415
-
     replaced = 0
     if has_convrot_int8:
         from . import _convrot_int8  # noqa: PLC0415
 
-        def _compute_int8(
-            graph: torch.fx.Graph,
-            update: torch.fx.Node,
-            add: dict[str, Argument],
-        ) -> torch.fx.Node:
-            values = linear_fx.bind_arguments(update)
-            assert values is not None
-            input_val = _node_metadata(values["input"])
-            up_weight = _node_metadata(values["up_weight_qdata"])
-            down_weight = _node_metadata(values["down_weight_qdata"])
-            assert input_val is not None
-            assert up_weight is not None
-            assert down_weight is not None
-            activation_fn = cast(input_activations.InputActivation, values["activation_fn"])
-            values.update(
-                output=add["base"],
-                base=None,
-                update_gate=None,
-                ffn_gate=add["gate"],
-                gate_indices=add["gate_indices"],
-                python_indexing=add["python_indexing"],
-                chunk_rows=_convrot_int8.default_chunk_rows(
-                    input_val,
-                    up_weight,
-                    down_weight,
-                    activation_fn,
-                    adds_residual=True,
-                ),
-            )
-            return residual_graph.call_functional(
-                graph,
-                torch.ops.piper_kernels.convrot_int8_ffn_update_.default,
-                values,
-            )
-
-        replaced += residual_graph.compute_inside_adds(
+        replaced += _fold_format_residual_adds(
             graph,
             torch.ops.piper_kernels.convrot_int8_ffn.default,
-            _compute_int8,
+            torch.ops.piper_kernels.convrot_int8_ffn_update_.default,
+            _convrot_int8.default_chunk_rows,
         )
-
     if has_nvfp4:
         from . import _nvfp4  # noqa: PLC0415
 
-        def _compute_nvfp4(
-            graph: torch.fx.Graph,
-            update: torch.fx.Node,
-            add: dict[str, Argument],
-        ) -> torch.fx.Node:
-            values = linear_fx.bind_arguments(update)
-            assert values is not None
-            input_val = _node_metadata(values["input"])
-            up_weight = _node_metadata(values["up_weight_qdata"])
-            down_weight = _node_metadata(values["down_weight_qdata"])
-            assert input_val is not None
-            assert up_weight is not None
-            assert down_weight is not None
-            activation_fn = cast(input_activations.InputActivation, values["activation_fn"])
-            values.update(
-                output=add["base"],
-                base=None,
-                update_gate=None,
-                ffn_gate=add["gate"],
-                gate_indices=add["gate_indices"],
-                python_indexing=add["python_indexing"],
-                chunk_rows=_nvfp4.default_chunk_rows(
-                    input_val,
-                    up_weight,
-                    down_weight,
-                    activation_fn,
-                    adds_residual=True,
-                ),
-            )
-            return residual_graph.call_functional(
-                graph,
-                torch.ops.piper_kernels.nvfp4_ffn_update_.default,
-                values,
-            )
-
-        replaced += residual_graph.compute_inside_adds(
+        replaced += _fold_format_residual_adds(
             graph,
             torch.ops.piper_kernels.nvfp4_ffn.default,
-            _compute_nvfp4,
+            torch.ops.piper_kernels.nvfp4_ffn_update_.default,
+            _nvfp4.default_chunk_rows,
         )
-
     return replaced
 
 
@@ -880,16 +811,17 @@ def fold_ffns(graph: torch.fx.Graph) -> bool:
             activation_fn = "swiglu"
             sources = (value_proj, gate_proj)
 
+        if any(source.format != down.format for source in sources):
+            continue
+        if any(source.input_node is not sources[0].input_node for source in sources[1:]):
+            continue
         if down.format == "convrot_int8":
             if not _valid_convrot_int8_ffn(sources, down, promoted_dtype):
                 continue
-            gated = _match_gated_updates(down.node, sources[0].input_node)
-            _emit_convrot_int8_ffn(graph, sources, down, activation_fn, gated)
-        else:
-            if not _valid_nvfp4_ffn(sources, down, promoted_dtype):
-                continue
-            gated = _match_gated_updates(down.node, sources[0].input_node)
-            _emit_nvfp4_ffn(graph, sources, down, activation_fn, gated)
+        elif not _valid_nvfp4_ffn(sources, down, promoted_dtype):
+            continue
+        gated = _match_gated_updates(down.node, sources[0].input_node)
+        _emit_ffn(graph, sources, down, activation_fn, gated)
         changed = True
 
     residual_replaced = _fold_residual_adds(

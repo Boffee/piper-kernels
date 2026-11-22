@@ -49,6 +49,39 @@ class ResidualAdd:
         """Storage that receives the updated rows."""
         return self.base if self.reusable is None else self.reusable.update
 
+    @classmethod
+    def from_update(
+        cls,
+        output: torch.Tensor,
+        base: torch.Tensor | None,
+        update_gate: torch.Tensor | None,
+        gate: torch.Tensor,
+        gate_indices: torch.Tensor,
+        python_indexing: bool,
+        *,
+        name: str = "residual",
+    ) -> ResidualAdd:
+        """Construct an in-place or reusable residual update from optional update operands."""
+        if (base is None) != (update_gate is None):
+            raise ValueError(
+                f"{name} update base and update_gate must both be provided or both omitted"
+            )
+        if base is None:
+            return cls(
+                base=output,
+                gate=gate,
+                gate_indices=gate_indices,
+                python_indexing=python_indexing,
+            )
+        assert update_gate is not None
+        return cls(
+            base=base,
+            gate=gate,
+            gate_indices=gate_indices,
+            python_indexing=python_indexing,
+            reusable=ReusableUpdate(output, update_gate),
+        )
+
 
 def validate_residual_add(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
