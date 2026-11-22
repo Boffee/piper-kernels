@@ -187,26 +187,33 @@ def test_wide_seeded_convolution_matches_exact_integer_accumulation(channels, fu
             (batch, outputs, frames, height, width), 0.5, device="cuda", dtype=torch.float16
         )
     pads = _CAUSAL_PADDING["reflect"]
-    plan = _policy.default_execution_plan(
+    production_plan = _policy.default_execution_plan(
         prepared.permute(0, 4, 1, 2, 3),
         weight,
         (1, 1, 1),
         group_norm=False,
         padding=pads,
     )
-    assert plan.convolution.block_n == 256
-    assert plan.accumulator_seed == 0x155555
-    actual = shared._conv3d_prepared(
+    wide_seeded_plan = replace(
+        production_plan,
+        convolution=_policy.ConvolutionSchedule(128, 256, 64, 8, 2),
+        accumulator_seed=0x155555,
+    )
+    wide_unseeded_plan = replace(wide_seeded_plan, accumulator_seed=0)
+    kwargs = {
+        "padding": pads,
+        "spatial_reflection": True,
+        "residual": residual,
+    }
+    seeded = shared._conv3d_prepared(
         prepared,
         weight,
         weight_scale,
         bias,
         input_scale,
         (1, 1, 1),
-        execution_plan=plan,
-        padding=pads,
-        spatial_reflection=True,
-        residual=residual,
+        execution_plan=wide_seeded_plan,
+        **kwargs,
     )
     unseeded = shared._conv3d_prepared(
         prepared,
@@ -215,12 +222,20 @@ def test_wide_seeded_convolution_matches_exact_integer_accumulation(channels, fu
         bias,
         input_scale,
         (1, 1, 1),
-        execution_plan=replace(plan, accumulator_seed=0),
-        padding=pads,
-        spatial_reflection=True,
-        residual=residual,
+        execution_plan=wide_unseeded_plan,
+        **kwargs,
     )
-    torch.testing.assert_close(actual, unseeded, atol=0, rtol=0)
+    production = shared._conv3d_prepared(
+        prepared,
+        weight,
+        weight_scale,
+        bias,
+        input_scale,
+        (1, 1, 1),
+        execution_plan=production_plan,
+        **kwargs,
+    )
+    torch.testing.assert_close(seeded, unseeded, atol=0, rtol=0)
     padded = functional.pad(
         prepared.permute(0, 4, 1, 2, 3).float(), (1, 1, 1, 1, 0, 0), mode="reflect"
     )
@@ -234,7 +249,8 @@ def test_wide_seeded_convolution_matches_exact_integer_accumulation(channels, fu
     if residual is not None:
         expected = expected + residual.float()
     expected = expected.half()
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(seeded, expected, atol=0, rtol=0)
+    torch.testing.assert_close(production, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("fused", [False, True])

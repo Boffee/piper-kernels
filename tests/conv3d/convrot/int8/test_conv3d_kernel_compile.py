@@ -23,6 +23,7 @@ def _compile_conv3d(
     rows,
     has_bias,
     has_residual,
+    convolution_schedule=None,
 ):
     plan = _policy.select_execution_plan(
         AcceleratorTarget.from_compiler_target(target),
@@ -33,6 +34,7 @@ def _compile_conv3d(
         output_height=17,
         weight_aligned=True,
         group_norm=False,
+        convolution_schedule=convolution_schedule,
     )
     schedule = plan.convolution
     # Cover ordinary valid convolution as well as causal spatial reflection
@@ -139,8 +141,8 @@ def test_amd_seeded_convolution_compile_invariants():
         rows=16384,
         has_bias=False,
         has_residual=False,
+        convolution_schedule=_policy.ConvolutionSchedule(128, 256, 64, 8, 2),
     )
-    assert wide_plan.convolution.block_n == 256
     assert wide_plan.accumulator_seed == 0x155555
     assert "v_wmma_i32" in wide_compiled.asm["amdgcn"]
     assert "0x155555" in wide_compiled.asm["amdgcn"]
@@ -159,14 +161,31 @@ def test_amd_seeded_convolution_compile_invariants():
         rows=16384,
         has_bias=False,
         has_residual=False,
+        convolution_schedule=_policy.ConvolutionSchedule(128, 128, 64, 8, 2),
     )
-    assert medium_plan.convolution.block_n == 128
     assert medium_plan.accumulator_seed == 0x155555
     assert "v_wmma_i32" in medium_compiled.asm["amdgcn"]
     assert "0x155555" in medium_compiled.asm["amdgcn"]
     assert re.search(r"amdhsa_private_segment_fixed_size\s+0\b", medium_compiled.asm["amdgcn"])
     if rocm_fences_only_lds():
         assert "global_inv" not in medium_compiled.asm["amdgcn"]
+
+    _, default_compiled = _compile_conv3d(
+        target,
+        channels=256,
+        outputs=256,
+        rows=16384,
+        has_bias=False,
+        has_residual=False,
+    )
+    assert "v_wmma_i32" in default_compiled.asm["amdgcn"]
+    default_scratch = re.search(
+        r"amdhsa_private_segment_fixed_size\s+(\d+)\b", default_compiled.asm["amdgcn"]
+    )
+    assert default_scratch is not None
+    assert int(default_scratch.group(1)) <= 768
+    if rocm_fences_only_lds():
+        assert "global_inv" not in default_compiled.asm["amdgcn"]
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm requires Linux")

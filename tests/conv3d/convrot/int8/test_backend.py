@@ -274,37 +274,67 @@ def test_amd_convolution_schedule_contracts():
                     assert schedule.block_m <= 64
                 if outputs < 64 or rows < 64:
                     assert schedule.block_n == 64
-    wide = RDNA4(channels=256, outputs=256, output_rows=16384)
-    assert wide.convolution.block_m == 128
-    assert wide.convolution.block_n == 256
 
 
 def test_convolution_accumulator_seed_contracts():
     gfx1201 = AcceleratorTarget("hip", "gfx1201")
     gfx1200 = AcceleratorTarget("hip", "gfx1200")
-    # 27 * 256 = 6912 >= 4096, 8192x256 with 128x256 tiles gives 64 tiles.
-    large = _plan(gfx1201, channels=256, outputs=256, output_rows=8192)
-    assert large.accumulator_seed == 0x155555
-    # Fewer than 64 tiles or shorter reduction (< 4096) disables the seed.
-    assert _plan(gfx1201, channels=256, outputs=64, output_rows=4032).accumulator_seed == 0
-    assert _plan(gfx1201, channels=256, outputs=64, output_rows=4096).accumulator_seed == 0x155555
-    assert _plan(gfx1201, channels=128, outputs=256, output_rows=32768).accumulator_seed == 0
-    # Custom schedule overrides recompute tile count for seed eligibility.
-    enabled = _policy.ConvolutionSchedule(64, 128, 128, 4, 2)
+    tile_64 = _policy.ConvolutionSchedule(64, 64, 64, 4, 2)
+    wide_tile = _policy.ConvolutionSchedule(128, 256, 64, 8, 2)
+    # 64-tile minimum and 4096-element reduction minimum checked with explicit schedules.
     assert (
         _plan(
-            gfx1201, channels=256, outputs=256, output_rows=4096, convolution_schedule=enabled
-        ).accumulator_seed
-        == 0x155555
-    )
-    disabled = _policy.ConvolutionSchedule(128, 256, 64, 8, 2)
-    assert (
-        _plan(
-            gfx1201, channels=256, outputs=256, output_rows=4096, convolution_schedule=disabled
+            gfx1201, channels=256, outputs=64, output_rows=4032, convolution_schedule=tile_64
         ).accumulator_seed
         == 0
     )
+    assert (
+        _plan(
+            gfx1201, channels=256, outputs=64, output_rows=4096, convolution_schedule=tile_64
+        ).accumulator_seed
+        == 0x155555
+    )
+    assert (
+        _plan(
+            gfx1201, channels=256, outputs=256, output_rows=4096, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0
+    )
+    assert (
+        _plan(
+            gfx1201, channels=256, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0x155555
+    )
+    assert (
+        _plan(
+            gfx1201, channels=128, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0
+    )
+    assert (
+        _plan(
+            gfx1201, channels=152, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0x155555
+    )
     # Only gfx1201 uses the zero-crossing seed.
     assert _plan(gfx1200, channels=256, outputs=256, output_rows=8192).accumulator_seed == 0
-    assert SM120(channels=256, outputs=256, output_rows=8192).accumulator_seed == 0
-    assert SM8X(channels=256, outputs=256, output_rows=8192).accumulator_seed == 0
+    assert (
+        _plan(
+            gfx1200, channels=256, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0
+    )
+    assert (
+        SM120(
+            channels=256, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0
+    )
+    assert (
+        SM8X(
+            channels=256, outputs=256, output_rows=8192, convolution_schedule=wide_tile
+        ).accumulator_seed
+        == 0
+    )
