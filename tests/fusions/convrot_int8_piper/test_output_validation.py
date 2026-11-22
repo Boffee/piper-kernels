@@ -37,7 +37,9 @@ def test_output_rejects_invalid_metadata_without_tensor_operations(invalid):
     elif invalid == "grad":
         args[21].requires_grad_()
     with _MetadataOnly(), pytest.raises((ValueError, TypeError, RuntimeError)):
-        output._validate_inputs(*args, head_dim=64, query_chunk_rows=chunk_rows)
+        output._projected_query_attention_output_op_fake(
+            *args, head_dim=64, query_chunk_rows=chunk_rows
+        )
 
 
 @pytest.mark.parametrize("batch", [0, 2])

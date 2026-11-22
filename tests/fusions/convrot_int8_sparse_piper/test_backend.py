@@ -40,7 +40,7 @@ from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy as amd_p
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.fusions.convrot_int8_sparse_piper._layout import resolve_row_block_launches
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import dispatch as nvidia
-from piper_kernels.fusions.nvfp4_sparse_piper import _output as nvfp4_output
+from piper_kernels.fusions.nvfp4_sparse_piper import output as nvfp4_output
 
 
 def _operands(sequence=193, heads=3, head_dim=128, input_features=272, device="cuda:1"):
@@ -331,7 +331,7 @@ def _run_output_fusion(projected_query, operands, storage):
             query=storage, query_scale=storage, query_summary=storage, **arguments
         )
     qdata, scale, weight, weight_scale, norm, cos, sin = operands
-    return output._run_projected_query_attention_output(
+    return output.SparseProjectedQueryOperands(
         query_input=qdata,
         query_input_scale=scale,
         query_weight_qdata=weight,
@@ -342,7 +342,7 @@ def _run_output_fusion(projected_query, operands, storage):
         query_norm_epsilon=1e-6,
         softmax_scale=128**-0.5,
         **arguments,
-    )
+    ).run()
 
 
 @pytest.mark.parametrize(

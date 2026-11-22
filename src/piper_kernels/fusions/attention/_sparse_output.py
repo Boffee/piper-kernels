@@ -350,6 +350,32 @@ def run_chunked_attention_output(
     )
 
 
+def launch_projected_query_chunk(
+    prepared: _PreparedAttentionContext,
+    project_query_chunk: QueryChunkProjector,
+    global_start: int,
+    rows: int,
+    attention_chunk: torch.Tensor,
+    *,
+    coarse_gate: torch.Tensor | None = None,
+) -> None:
+    """Project, route, and launch sparse attention for one sequence window."""
+    query, query_scale, query_summary = project_query_chunk(global_start, rows)
+    local_attention, coarse_output = _quantized_dispatch._prepare_quantized_sparse_piper_query(
+        prepared.quantized_context,
+        query,
+        query_scale,
+        query_summary,
+        global_block_offset=global_start // TILE_ROWS,
+    )
+    _quantized_dispatch._launch_quantized_sparse_piper_attention(
+        local_attention,
+        attention_chunk.transpose(1, 2),
+        coarse_output=coarse_output,
+        coarse_gate=coarse_gate,
+    )
+
+
 def run_chunked_projected_query_attention_output(  # noqa: PLR0913
     prepared: _PreparedAttentionContext,
     output_features: int,
@@ -377,19 +403,12 @@ def run_chunked_projected_query_attention_output(  # noqa: PLR0913
         rows: int,
         gate_chunk: torch.Tensor | None,
     ) -> None:
-        global_start = global_row_offset + start
-        query, query_scale, query_summary = project_query_chunk(global_start, rows)
-        local_attention, coarse_output = _quantized_dispatch._prepare_quantized_sparse_piper_query(
-            prepared.quantized_context,
-            query,
-            query_scale,
-            query_summary,
-            global_block_offset=global_start // TILE_ROWS,
-        )
-        _quantized_dispatch._launch_quantized_sparse_piper_attention(
-            local_attention,
-            attention_chunk.transpose(1, 2),
-            coarse_output=coarse_output,
+        launch_projected_query_chunk(
+            prepared,
+            project_query_chunk,
+            global_row_offset + start,
+            rows,
+            attention_chunk,
             coarse_gate=gate_chunk,
         )
 
@@ -419,6 +438,7 @@ def run_chunked_projected_query_attention_output(  # noqa: PLR0913
 
 __all__ = [
     "DEFAULT_QUERY_CHUNK_ROWS",
+    "launch_projected_query_chunk",
     "new_projected_output",
     "output_sequence_length",
     "prepare_attention",

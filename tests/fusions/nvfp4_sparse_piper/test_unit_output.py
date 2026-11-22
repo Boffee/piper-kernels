@@ -8,7 +8,7 @@ from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 
 from piper_kernels import compile_options
-from piper_kernels.fusions.nvfp4_sparse_piper import _output, output
+from piper_kernels.fusions.nvfp4_sparse_piper import output
 
 from .._accuracy import assert_fusion_output_close
 from .test_compile import _run_explicit_attention_output, _SparseProjectionAttentionOutput
@@ -60,7 +60,7 @@ def test_compile_fuses_unit_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(1033)
-    monkeypatch.setattr(_output, "DEFAULT_QUERY_CHUNK_ROWS", 128)
+    monkeypatch.setattr(output, "_DEFAULT_QUERY_CHUNK_ROWS", 128)
     model = _SparseProjectionAttentionOutput(
         dynamic=True,
         output_dynamic=False,

@@ -178,20 +178,6 @@ def _prepare_optional_gate_projection(
     )
 
 
-def _resolve_projected_gate_input(
-    query_input: torch.Tensor,
-    gate_input: torch.Tensor | None,
-    gate_weight_qdata: torch.Tensor | None,
-    input_group_size: int | None,
-) -> torch.Tensor | None:
-    """Use the Q source once when Q/gate preparation is chunked together."""
-    if input_group_size is None:
-        return gate_input
-    if gate_input is not None:
-        raise ValueError("chunk-prepared ConvRot INT8 Q and gate must share one input")
-    return query_input if gate_weight_qdata is not None else None
-
-
 def _validate_output_projection(
     attention_storage: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -355,7 +341,7 @@ def _run_attention_output(  # noqa: PLR0913, PLR0917
     )
 
 
-def validate_projected_query_input(  # noqa: PLR0913
+def _validate_projected_query_input(  # noqa: PLR0913
     query_input: torch.Tensor,
     query_input_scale: torch.Tensor | None,
     query_weight_qdata: torch.Tensor,
@@ -437,7 +423,7 @@ def validate_projected_query_input(  # noqa: PLR0913
     )
 
 
-def build_query_chunk_projector(  # noqa: PLR0913, PLR0917
+def _build_query_chunk_projector(  # noqa: PLR0913, PLR0917
     query_input: torch.Tensor,
     query_input_scale: torch.Tensor | None,
     query_weight_qdata: torch.Tensor,
@@ -503,151 +489,200 @@ def build_query_chunk_projector(  # noqa: PLR0913, PLR0917
     return project_query_chunk
 
 
-def _run_projected_query_attention_output(  # noqa: PLR0913, PLR0917
-    query_input: torch.Tensor,
-    query_input_scale: torch.Tensor | None,
-    query_weight_qdata: torch.Tensor,
-    query_weight_scale: torch.Tensor,
-    query_norm_weight: torch.Tensor | None,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    query_norm_epsilon: float,
-    softmax_scale: float,
+def prepare_projected_gate_projection(
     key: torch.Tensor,
-    key_scale: torch.Tensor,
-    key_center: torch.Tensor,
-    key_center_scale: torch.Tensor,
-    key_summary: torch.Tensor,
-    key_aux: torch.Tensor,
-    value: torch.Tensor,
-    value_scale_multiplier: torch.Tensor,
-    value_mean: torch.Tensor,
-    ratio_profile: _SparsePiperRatioProfile,
-    sparse_key_blocks: int,
     logical_sequence_length: int,
-    routing_mode: int,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-    query_chunk_rows: int,
-    block_lengths: torch.Tensor | None = None,
-    coarse_gate: torch.Tensor | None = None,
-    coarse_scale: float | None = None,
-    coarse_key_blocks: int | None = None,
-    sparse_query_blocks: int | None = None,
-    gate_projection: _GateProjection | None = None,
-    *,
-    input_group_size: int | None = None,
-    out: torch.Tensor | None = None,
-    output_dtype: torch.dtype = torch.bfloat16,
-    query_bias: torch.Tensor | None = None,
-    output_input_scale: torch.Tensor | None = None,
-    force_tile_ids: torch.Tensor | None = None,
-    force_tile_counts: torch.Tensor | None = None,
-    residual_add: ResidualAdd | None = None,
-    start_head: int = 0,
-    end_head: int | None = None,
-) -> torch.Tensor:
-    """Lifetime-chunk Q through routing, attention, and ConvRot INT8 output.
-
-    With ``input_group_size``, Q/gate inputs are floating-point sources and their
-    scales are optional calibrated scalars. Otherwise they are prepared INT8
-    tensors with FP32 row scales. Preparation workspaces belong to each stream.
-    ``out`` rows may hold attention windows before their projection overwrites them.
-    With a validated ``residual_add`` instead, each window's projection is added
-    into its base rows, which hold live data, so attention uses separate buffers.
-    The operands hold ``ratio_profile``'s query heads ``[start_head, end_head)``.
-    """
-    projection_backend = fusion_backend.require_projection_backend(
-        query_input, head_dim=key.shape[-1]
-    )
-    backend = fusion_backend.require_output_backend(key)
-    prepared = output_common.prepare_attention_context(
+    block_lengths: torch.Tensor | None,
+    query_input: torch.Tensor,
+    gate_input: torch.Tensor | None,
+    gate_input_scale: torch.Tensor | None,
+    gate_weight_qdata: torch.Tensor | None,
+    gate_weight_scale: torch.Tensor | None,
+    gate_bias: torch.Tensor | None,
+    input_group_size: int | None,
+) -> _GateProjection | None:
+    """Resolve and validate an optional coarse gate for projected-query attention."""
+    if input_group_size is None:
+        resolved_gate_input = gate_input
+    elif gate_input is not None:
+        raise ValueError("chunk-prepared ConvRot INT8 Q and gate must share one input")
+    else:
+        resolved_gate_input = query_input if gate_weight_qdata is not None else None
+    return _prepare_optional_gate_projection(
         key,
-        key_scale,
-        key_center,
-        key_center_scale,
-        key_summary,
-        key_aux,
-        value,
-        value_scale_multiplier,
-        value_mean,
-        ratio_profile,
-        sparse_key_blocks,
         logical_sequence_length,
-        routing_mode,
         block_lengths,
-        coarse_gate,
-        coarse_scale,
-        coarse_key_blocks,
-        sparse_query_blocks,
-        has_projected_coarse_gate=gate_projection is not None,
-        force_tile_ids=force_tile_ids,
-        force_tile_counts=force_tile_counts,
-        start_head=start_head,
-        end_head=end_head,
-    )
-    validate_projected_query_input(
-        query_input,
-        query_input_scale,
-        query_weight_qdata,
-        query_weight_scale,
-        key,
-        prepared.sequence_length,
-        query_norm_weight=query_norm_weight,
-        cos=cos,
-        sin=sin,
-        query_norm_epsilon=query_norm_epsilon,
-        softmax_scale=softmax_scale,
-        input_group_size=input_group_size,
-        query_bias=query_bias,
-    )
-    output_features, project_chunk, projector_tensors = _prepare_output_chunk_projector(
-        key,
-        prepared.sequence_length,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        logical_sequence_length,
-        query_chunk_rows,
-        backend=backend,
-        output_dtype=output_dtype,
-        output_input_scale=output_input_scale,
-        residual_add=residual_add,
-    )
-    project_query_chunk = build_query_chunk_projector(
-        query_input,
-        query_input_scale,
-        query_weight_qdata,
-        query_weight_scale,
-        query_norm_weight,
-        cos,
-        sin,
-        query_norm_epsilon,
-        softmax_scale,
-        routing_mode,
-        block_lengths,
-        backend=backend,
-        projection_backend=projection_backend,
-        head_dim=key.shape[-1],
-        input_group_size=input_group_size,
-        query_bias=query_bias,
+        resolved_gate_input,
+        gate_input_scale,
+        gate_weight_qdata,
+        gate_weight_scale,
+        gate_bias,
+        input_group_size,
     )
 
-    return output_common.run_chunked_projected_query_attention_output(
-        prepared,
-        output_features,
-        query_chunk_rows,
-        project_query_chunk,
-        project_chunk,
-        projector_tensors,
-        project_coarse_gate_chunk=(None if gate_projection is None else gate_projection.project),
-        output_dtype=output_dtype,
-        out=out if residual_add is None else residual_add.base,
-        reuse_output_for_attention=residual_add is None,
-    )
+
+@dataclass(frozen=True, slots=True)
+class SparseProjectedQueryOperands:
+    """Shared operands for bounded sparse projected-query attention-output ops."""
+
+    query_input: torch.Tensor
+    query_input_scale: torch.Tensor | None
+    query_weight_qdata: torch.Tensor
+    query_weight_scale: torch.Tensor
+    query_norm_weight: torch.Tensor | None
+    cos: torch.Tensor
+    sin: torch.Tensor
+    query_norm_epsilon: float
+    softmax_scale: float
+    key: torch.Tensor
+    key_scale: torch.Tensor
+    key_center: torch.Tensor
+    key_center_scale: torch.Tensor
+    key_summary: torch.Tensor
+    key_aux: torch.Tensor
+    value: torch.Tensor
+    value_scale_multiplier: torch.Tensor
+    value_mean: torch.Tensor
+    ratio_profile: _SparsePiperRatioProfile
+    sparse_key_blocks: int
+    logical_sequence_length: int
+    routing_mode: int
+    weight_qdata: torch.Tensor
+    weight_scale: torch.Tensor
+    bias: torch.Tensor | None
+    group_size: int
+    query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS
+    block_lengths: torch.Tensor | None = None
+    coarse_gate: torch.Tensor | None = None
+    coarse_scale: float | None = None
+    coarse_key_blocks: int | None = None
+    sparse_query_blocks: int | None = None
+    input_group_size: int | None = None
+    output_dtype: torch.dtype = torch.bfloat16
+    query_bias: torch.Tensor | None = None
+    output_input_scale: torch.Tensor | None = None
+    force_tile_ids: torch.Tensor | None = None
+    force_tile_counts: torch.Tensor | None = None
+
+    def prepare_context(
+        self,
+        *,
+        has_projected_coarse_gate: bool = False,
+        start_head: int = 0,
+        end_head: int | None = None,
+    ) -> tuple[
+        LinearBackend,
+        output_common._PreparedAttentionContext,
+        output_common.QueryChunkProjector,
+    ]:
+        """Validate Q/K/V and build shared sparse context plus bounded query chunk projector."""
+        projection_backend = fusion_backend.require_projection_backend(
+            self.query_input, head_dim=self.key.shape[-1]
+        )
+        backend = fusion_backend.require_output_backend(self.key)
+        prepared = output_common.prepare_attention_context(
+            self.key,
+            self.key_scale,
+            self.key_center,
+            self.key_center_scale,
+            self.key_summary,
+            self.key_aux,
+            self.value,
+            self.value_scale_multiplier,
+            self.value_mean,
+            self.ratio_profile,
+            self.sparse_key_blocks,
+            self.logical_sequence_length,
+            self.routing_mode,
+            self.block_lengths,
+            self.coarse_gate,
+            self.coarse_scale,
+            self.coarse_key_blocks,
+            self.sparse_query_blocks,
+            has_projected_coarse_gate=has_projected_coarse_gate,
+            force_tile_ids=self.force_tile_ids,
+            force_tile_counts=self.force_tile_counts,
+            start_head=start_head,
+            end_head=end_head,
+        )
+        _validate_projected_query_input(
+            self.query_input,
+            self.query_input_scale,
+            self.query_weight_qdata,
+            self.query_weight_scale,
+            self.key,
+            prepared.sequence_length,
+            query_norm_weight=self.query_norm_weight,
+            cos=self.cos,
+            sin=self.sin,
+            query_norm_epsilon=self.query_norm_epsilon,
+            softmax_scale=self.softmax_scale,
+            input_group_size=self.input_group_size,
+            query_bias=self.query_bias,
+        )
+        project_query_chunk = _build_query_chunk_projector(
+            self.query_input,
+            self.query_input_scale,
+            self.query_weight_qdata,
+            self.query_weight_scale,
+            self.query_norm_weight,
+            self.cos,
+            self.sin,
+            self.query_norm_epsilon,
+            self.softmax_scale,
+            self.routing_mode,
+            self.block_lengths,
+            backend=backend,
+            projection_backend=projection_backend,
+            head_dim=self.key.shape[-1],
+            input_group_size=self.input_group_size,
+            query_bias=self.query_bias,
+        )
+        return backend, prepared, project_query_chunk
+
+    def run(
+        self,
+        *,
+        gate_projection: _GateProjection | None = None,
+        out: torch.Tensor | None = None,
+        residual_add: ResidualAdd | None = None,
+        start_head: int = 0,
+        end_head: int | None = None,
+    ) -> torch.Tensor:
+        """Lifetime-chunk Q through routing, attention, and ConvRot INT8 output."""
+        backend, prepared, project_query_chunk = self.prepare_context(
+            has_projected_coarse_gate=gate_projection is not None,
+            start_head=start_head,
+            end_head=end_head,
+        )
+        output_features, project_chunk, projector_tensors = _prepare_output_chunk_projector(
+            self.key,
+            prepared.sequence_length,
+            self.weight_qdata,
+            self.weight_scale,
+            self.bias,
+            self.group_size,
+            self.logical_sequence_length,
+            self.query_chunk_rows,
+            backend=backend,
+            output_dtype=self.output_dtype,
+            output_input_scale=self.output_input_scale,
+            residual_add=residual_add,
+        )
+        return output_common.run_chunked_projected_query_attention_output(
+            prepared,
+            output_features,
+            self.query_chunk_rows,
+            project_query_chunk,
+            project_chunk,
+            projector_tensors,
+            project_coarse_gate_chunk=(
+                None if gate_projection is None else gate_projection.project
+            ),
+            output_dtype=self.output_dtype,
+            out=out if residual_add is None else residual_add.base,
+            reuse_output_for_attention=residual_add is None,
+        )
 
 
 @torch.library.custom_op(
@@ -701,23 +736,19 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     input_group_size: int | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    gate_projection = _prepare_optional_gate_projection(
+    gate_projection = prepare_projected_gate_projection(
         key,
         logical_sequence_length,
         block_lengths,
-        _resolve_projected_gate_input(
-            query_input,
-            gate_input,
-            gate_weight_qdata,
-            input_group_size,
-        ),
+        query_input,
+        gate_input,
         gate_input_scale,
         gate_weight_qdata,
         gate_weight_scale,
         gate_bias,
         input_group_size,
     )
-    return _run_projected_query_attention_output(
+    return SparseProjectedQueryOperands(
         query_input,
         query_input_scale,
         query_weight_qdata,
@@ -750,14 +781,13 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
-        gate_projection,
-        output_dtype=output_dtype,
-        output_input_scale=output_input_scale,
-        query_bias=query_bias,
         input_group_size=input_group_size,
+        output_dtype=output_dtype,
+        query_bias=query_bias,
+        output_input_scale=output_input_scale,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
-    )
+    ).run(gate_projection=gate_projection)
 
 
 @torch.library.custom_op(
@@ -818,23 +848,19 @@ def _projected_query_attention_output_inplace_op(  # noqa: PLR0913, PLR0917
     """
     if input_group_size is None:
         raise ValueError("input reuse requires chunked floating-point input preparation")
-    gate_projection = _prepare_optional_gate_projection(
+    gate_projection = prepare_projected_gate_projection(
         key,
         logical_sequence_length,
         block_lengths,
-        _resolve_projected_gate_input(
-            query_input,
-            gate_input,
-            gate_weight_qdata,
-            input_group_size,
-        ),
+        query_input,
+        gate_input,
         gate_input_scale,
         gate_weight_qdata,
         gate_weight_scale,
         gate_bias,
         input_group_size,
     )
-    _run_projected_query_attention_output(
+    SparseProjectedQueryOperands(
         query_input,
         query_input_scale,
         query_weight_qdata,
@@ -867,15 +893,13 @@ def _projected_query_attention_output_inplace_op(  # noqa: PLR0913, PLR0917
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
-        gate_projection,
-        output_dtype=output_dtype,
-        output_input_scale=output_input_scale,
-        query_bias=query_bias,
         input_group_size=input_group_size,
-        out=query_input,
+        output_dtype=output_dtype,
+        query_bias=query_bias,
+        output_input_scale=output_input_scale,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
-    )
+    ).run(gate_projection=gate_projection, out=query_input)
 
 
 @_projected_query_attention_output_inplace_op.register_fake
@@ -1131,23 +1155,19 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
         force_tile_ids,
         force_tile_counts,
     )
-    gate_projection = _prepare_optional_gate_projection(
+    gate_projection = prepare_projected_gate_projection(
         key,
         logical_sequence_length,
         block_lengths,
-        _resolve_projected_gate_input(
-            query_input,
-            gate_input,
-            gate_weight_qdata,
-            input_group_size,
-        ),
+        query_input,
+        gate_input,
         gate_input_scale,
         gate_weight_qdata,
         gate_weight_scale,
         gate_bias,
         input_group_size,
     )
-    _run_projected_query_attention_output(
+    SparseProjectedQueryOperands(
         query_input,
         query_input_scale,
         query_weight_qdata,
@@ -1180,13 +1200,14 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
-        gate_projection,
-        output_dtype=base.dtype,
-        output_input_scale=output_input_scale,
-        query_bias=query_bias,
         input_group_size=input_group_size,
+        output_dtype=base.dtype,
+        query_bias=query_bias,
+        output_input_scale=output_input_scale,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+    ).run(
+        gate_projection=gate_projection,
         residual_add=residual_add,
         start_head=start_head,
         end_head=end_head,
@@ -1401,9 +1422,6 @@ def _attention_output_op_fake(
 
 
 GateProjection = _GateProjection
-prepare_optional_gate_projection = _prepare_optional_gate_projection
-resolve_projected_gate_input = _resolve_projected_gate_input
 validate_output_projection = _validate_output_projection
-run_projected_query_attention_output = _run_projected_query_attention_output
 
 __all__: list[str] = []

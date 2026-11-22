@@ -6,7 +6,7 @@ from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 
 from piper_kernels import compile_options
-from piper_kernels.fusions.nvfp4_sparse_piper import _output
+from piper_kernels.fusions.nvfp4_sparse_piper import output as nvfp4_output
 
 from ._accuracy import assert_fusion_output_close
 from .nvfp4_sparse_piper import test_compile as nvfp4
@@ -18,7 +18,7 @@ from .nvfp4_sparse_piper import test_compile as nvfp4
 @pytest.mark.parametrize("group_size", [None, 64], ids=["ordinary", "convrot"])
 def test_forced_nvfp4_output_matches_materialized_attention(monkeypatch, group_size):
     torch.manual_seed(1093)
-    monkeypatch.setattr(_output, "DEFAULT_QUERY_CHUNK_ROWS", 128)
+    monkeypatch.setattr(nvfp4_output, "_DEFAULT_QUERY_CHUNK_ROWS", 128)
     model = nvfp4._SparseProjectionAttentionOutput(dynamic=True, group_size=group_size).eval()
     options = compile_options(attention=True)
     hidden = torch.randn(

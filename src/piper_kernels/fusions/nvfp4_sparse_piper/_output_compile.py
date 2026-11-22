@@ -21,10 +21,7 @@ from piper_kernels.linear.nvfp4 import _compile_fx
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops  # noqa: F401 - registers nvfp4_linear
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
-from . import (
-    _output,
-    output,  # noqa: F401 - register output operators
-)
+from . import output
 
 type _PreparedGateProjectionNodes = tuple[
     torch.fx.Node,
@@ -243,7 +240,7 @@ def _valid_attention_output_metadata(  # noqa: PLR0911
     if not weight_global_valid or not bias_valid or not activation_valid:
         return None
     try:
-        _output.validate_optional_group_size(group_size, input_features)
+        output._validate_optional_group_size(group_size, input_features)
         nvfp4_validation.validate_activation_scale(
             activation_scale,
             dynamic_activation_scale,
@@ -334,7 +331,7 @@ def _match_attention_output(linear_node: torch.fx.Node) -> _MatchedAttentionOutp
 def _replace_attention_output(graph: torch.fx.Graph, matched: _MatchedAttentionOutput) -> None:
     """Emit one NVFP4 output operator with a materialized or deferred gate."""
     original = matched.linear_node
-    query_chunk_rows = _output.default_query_chunk_rows(matched.dynamic_activation_scale)
+    query_chunk_rows = output._default_query_chunk_rows(matched.dynamic_activation_scale)
     block_lengths, coarse_gate, coarse_scale, coarse_key_blocks, query_blocks = (
         matched.bounded_arguments
     )
