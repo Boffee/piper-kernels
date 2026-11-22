@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import triton
 import triton.language as tl
@@ -336,60 +338,38 @@ def _quantize_key_with_summary_kernel(
     )
 
 
-def _prepare_query_key_with_summaries(
+_LaunchPreparationKernels = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, float, _PreparedSparsePiperOperands],
+    None,
+]
+
+
+def _launch_triton_fused_qk(
     query: torch.Tensor,
     key: torch.Tensor,
     scale: float,
-    *,
-    storage_sequence_length: int,
-    sparse_key_blocks: int,
-    block_lengths: torch.Tensor | None,
-) -> tuple[
-    qk_quantization.PreparedInt8QueryKey,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Quantize Q/K (K64 tile-centered) and emit min/max K64 summaries in one pass."""
-    batch, heads, sequence_length, head_dim = query.shape
+    operands: _PreparedSparsePiperOperands,
+) -> None:
+    """Launch fused Q/K quantization + min/max summary Triton kernels."""
+    assert operands.query_summary is not None
+    assert operands.key_summary is not None
+    assert operands.key_aux is not None
+    heads = query.shape[1]
     kv_heads = key.shape[1]
+    head_dim = query.shape[-1]
+    sequence_length = operands.logical_sequence_length
+    storage_sequence_length = operands.key.shape[2]
     blocks = storage_sequence_length // _BLOCK_N
-    query_int8 = torch.empty(
-        (batch, heads, storage_sequence_length, head_dim), device=query.device, dtype=torch.int8
-    )
-    query_scale = torch.empty(
-        (batch, heads, storage_sequence_length // QUERY_SCALE_ROWS),
-        device=query.device,
-        dtype=torch.float32,
-    )
-    key_int8 = torch.empty(
-        (batch, kv_heads, storage_sequence_length, head_dim), device=key.device, dtype=torch.int8
-    )
-    key_scale = torch.empty((batch, kv_heads, blocks), device=key.device, dtype=torch.float32)
-    key_center = torch.empty(
-        (batch, kv_heads, blocks, 2, head_dim), device=key.device, dtype=torch.int8
-    )
-    key_center_scale = torch.empty(
-        (batch, kv_heads, blocks, 2), device=key.device, dtype=torch.float32
-    )
-    query_summary = torch.empty(
-        (batch, heads, blocks, head_dim), device=query.device, dtype=torch.float32
-    )
-    key_primary = torch.empty(
-        (batch, kv_heads, sparse_key_blocks, head_dim), device=key.device, dtype=torch.float32
-    )
-    key_aux = torch.empty_like(key_primary)
-    lengths_or_placeholder = block_lengths if block_lengths is not None else key_scale
+    block_lengths = operands.block_lengths
+    lengths_or_placeholder = block_lengths if block_lengths is not None else operands.key_scale
     query_grid, query_heads_inner = select_block_grid(query, blocks)
     key_grid, key_heads_inner = select_block_grid(key, blocks)
     with device_context(query.device):
         _quantize_query_with_summary_kernel[query_grid](
             query,
-            query_int8,
-            query_scale,
-            query_summary,
+            operands.query,
+            operands.query_scale,
+            operands.query_summary,
             lengths_or_placeholder,
             sequence_length,
             storage_sequence_length,
@@ -407,16 +387,16 @@ def _prepare_query_key_with_summaries(
         )
         _quantize_key_with_summary_kernel[key_grid](
             key,
-            key_int8,
-            key_scale,
-            key_center,
-            key_center_scale,
-            key_primary,
-            key_aux,
+            operands.key,
+            operands.key_scale,
+            operands.key_center,
+            operands.key_center_scale,
+            operands.key_summary,
+            operands.key_aux,
             lengths_or_placeholder,
             sequence_length,
             storage_sequence_length,
-            sparse_key_blocks,
+            operands.sparse_key_blocks,
             key.stride(0),
             key.stride(1),
             key.stride(2),
@@ -427,13 +407,37 @@ def _prepare_query_key_with_summaries(
             block_n=_BLOCK_N,
             num_warps=_FUSED_QK_WARPS[head_dim],
         )
-    prepared = qk_quantization.PreparedInt8QueryKey(
-        query=query_int8,
-        key=key_int8,
-        query_scale=query_scale,
-        key_scale=key_scale,
-    )
-    return prepared, key_center, key_center_scale, query_summary, key_primary, key_aux
+
+
+def _launch_triton_value(
+    combined_value: torch.Tensor,
+    value_format: ValueFormat,
+    operands: _PreparedSparsePiperOperands,
+) -> None:
+    """Launch per-K64-tile Triton V mean-centering and packing kernel."""
+    _batch, kv_heads, logical_sequence_length, head_dim = combined_value.shape
+    tile_count = operands.value_scale_multiplier.shape[2]
+    block_lengths = operands.block_lengths
+    value_grid, value_heads_inner = select_block_grid(combined_value, tile_count)
+    with device_context(combined_value.device):
+        _quantize_value_per_tile_kernel[value_grid](
+            combined_value,
+            operands.value_mean,
+            operands.value_scale_multiplier,
+            operands.value,
+            block_lengths if block_lengths is not None else operands.value_scale_multiplier,
+            logical_sequence_length,
+            combined_value.stride(0),
+            combined_value.stride(1),
+            combined_value.stride(2),
+            kv_heads,
+            value_heads_inner,
+            value_format=int(value_format),
+            head_dim=head_dim,
+            block_n=_BLOCK_N,
+            mask_block_lengths=block_lengths is not None,
+            num_warps=4,
+        )
 
 
 def _prepare_sparse_piper_operands(
@@ -447,40 +451,24 @@ def _prepare_sparse_piper_operands(
     sparse_query_blocks: int | None = None,
     emit_summaries: bool = False,
     value_format: ValueFormat = ValueFormat.TRANSPOSED,
+    launch_kernels: _LaunchPreparationKernels | None = None,
 ) -> _PreparedSparsePiperOperands:
-    """Quantize validated Q/K/V, optionally emitting min/max summaries from the Q/K pass.
+    """Allocate sparse-Piper storage once and dispatch backend quantization kernels.
 
-    Mask padded rows in the mean and V kernels. The fused Q/K pass also masks
-    padding, while the separate Q/K quantizer still needs zeroed copies.
+    Mask padded rows in the mean and V kernels. The fused Q/K pass and custom
+    launchers also mask padding, while the separate Triton Q/K quantizer still
+    needs zeroed copies.
     """
     batch, kv_heads, logical_sequence_length, head_dim = combined_key.shape
-    if block_lengths is not None and not emit_summaries:
-        valid_rows = valid_block_rows(block_lengths).reshape(-1)
-        valid_rows = valid_rows[None, None, :, None]
-        query = torch.where(valid_rows, query, 0)
+    heads = query.shape[1]
     tile_count = (logical_sequence_length + _BLOCK_N - 1) // _BLOCK_N
     storage_sequence_length = tile_count * _BLOCK_N
 
-    query_summary = key_summary = key_aux = None
-    if emit_summaries:
-        (
-            prepared_qk,
-            key_center,
-            key_center_scale,
-            query_summary,
-            key_summary,
-            key_aux,
-        ) = _prepare_query_key_with_summaries(
-            query,
-            combined_key,
-            scale,
-            storage_sequence_length=storage_sequence_length,
-            sparse_key_blocks=sparse_key_blocks,
-            block_lengths=block_lengths,
-        )
-        query_int8, query_scale = prepared_qk.query, prepared_qk.query_scale
-        key_int8, key_scale = prepared_qk.key, prepared_qk.key_scale
-    else:
+    if launch_kernels is None and not emit_summaries and batch > 0 and tile_count > 0:
+        if block_lengths is not None:
+            valid_rows = valid_block_rows(block_lengths).reshape(-1)
+            valid_rows = valid_rows[None, None, :, None]
+            query = torch.where(valid_rows, query, 0)
         query_int8, query_scale = qk_quantization.prepare_query(
             query,
             scale,
@@ -494,6 +482,58 @@ def _prepare_sparse_piper_operands(
                 block_lengths=block_lengths,
             )
         )
+        query_summary = key_summary = key_aux = None
+    else:
+        query_int8 = torch.empty(
+            (batch, heads, storage_sequence_length, head_dim),
+            device=query.device,
+            dtype=torch.int8,
+        )
+        query_scale = torch.empty(
+            (batch, heads, storage_sequence_length // QUERY_SCALE_ROWS),
+            device=query.device,
+            dtype=torch.float32,
+        )
+        key_int8 = torch.empty(
+            (batch, kv_heads, storage_sequence_length, head_dim),
+            device=combined_key.device,
+            dtype=torch.int8,
+        )
+        key_scale = torch.empty(
+            (batch, kv_heads, tile_count),
+            device=combined_key.device,
+            dtype=torch.float32,
+        )
+        key_center = torch.empty(
+            (batch, kv_heads, tile_count, 2, head_dim),
+            device=combined_key.device,
+            dtype=torch.int8,
+        )
+        key_center_scale = torch.empty(
+            (batch, kv_heads, tile_count, 2),
+            device=combined_key.device,
+            dtype=torch.float32,
+        )
+        query_summary = (
+            torch.empty(
+                (batch, heads, tile_count, head_dim),
+                device=query.device,
+                dtype=torch.float32,
+            )
+            if emit_summaries
+            else None
+        )
+        key_summary = (
+            torch.empty(
+                (batch, kv_heads, sparse_key_blocks, head_dim),
+                device=combined_key.device,
+                dtype=torch.float32,
+            )
+            if emit_summaries
+            else None
+        )
+        key_aux = torch.empty_like(key_summary) if key_summary is not None else None
+
     value_int8 = torch.empty(
         value_format.shape(batch, kv_heads, storage_sequence_length, head_dim),
         device=combined_value.device,
@@ -509,28 +549,7 @@ def _prepare_sparse_piper_operands(
         device=combined_value.device,
         dtype=torch.bfloat16,
     )
-
-    value_grid, value_heads_inner = select_block_grid(combined_value, tile_count)
-    with device_context(query.device):
-        _quantize_value_per_tile_kernel[value_grid](
-            combined_value,
-            value_mean,
-            value_scale_multiplier,
-            value_int8,
-            block_lengths if block_lengths is not None else value_scale_multiplier,
-            logical_sequence_length,
-            combined_value.stride(0),
-            combined_value.stride(1),
-            combined_value.stride(2),
-            kv_heads,
-            value_heads_inner,
-            value_format=int(value_format),
-            head_dim=head_dim,
-            block_n=_BLOCK_N,
-            mask_block_lengths=block_lengths is not None,
-            num_warps=4,
-        )
-    return _PreparedSparsePiperOperands(
+    operands = _PreparedSparsePiperOperands(
         key=key_int8,
         value=value_int8,
         value_format=value_format,
@@ -549,3 +568,12 @@ def _prepare_sparse_piper_operands(
         key_summary=key_summary,
         key_aux=key_aux,
     )
+    if launch_kernels is not None:
+        if batch > 0 and tile_count > 0:
+            launch_kernels(query, combined_key, combined_value, scale, operands)
+        return operands
+    if emit_summaries and batch > 0 and tile_count > 0:
+        _launch_triton_fused_qk(query, combined_key, scale, operands)
+    if combined_value.numel() > 0 and tile_count > 0:
+        _launch_triton_value(combined_value, value_format, operands)
+    return operands

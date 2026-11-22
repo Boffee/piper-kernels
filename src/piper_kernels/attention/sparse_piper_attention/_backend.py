@@ -94,7 +94,9 @@ _nvidia_async_copy_attention_skip_dense_routing = (
 _amd_attention = (
     AttentionBackend(
         prepare=partial(
-            preparation._prepare_sparse_piper_operands, value_format=ValueFormat.AMD_WMMA
+            preparation._prepare_sparse_piper_operands,
+            value_format=ValueFormat.AMD_WMMA,
+            launch_kernels=amd_gluon.launch_operand_preparation,
         ),
         value_format=ValueFormat.AMD_WMMA,
         bind=amd_gluon.bind_context,
@@ -266,7 +268,9 @@ def use_fused_operand_preparation(
     target = AcceleratorTarget.from_device(query.device) if target is None else target
     if nvidia_policy.uses_tensor_descriptors(target):
         return nvidia_policy.use_sm120_fused_preparation(query.shape[-1], query.shape[2])
-    return nvidia_policy.uses_async_copies(target) or supports_amd_target(target)
+    return nvidia_policy.uses_async_copies(target) or (
+        amd_gluon is not None and supports_amd_target(target)
+    )
 
 
 def select_sequence_summaries(

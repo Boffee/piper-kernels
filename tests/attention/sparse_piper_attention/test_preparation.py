@@ -22,6 +22,9 @@ def test_select_block_grid_respects_strides_and_cuda_grid_y_limit():
     assert select_block_grid(sequence_major, 65_536) == ((65_536, 8, 2), 0)
     assert select_block_grid(head_major, 64) == ((64, 8, 2), 0)
     assert select_block_grid(single_head, 64) == ((64, 1, 2), 0)
+    assert select_block_grid(sequence_major, 65_535, heads_per_program=2) == ((4, 65_535, 2), 1)
+    assert select_block_grid(head_major, 64, heads_per_program=2) == ((64, 4, 2), 0)
+    assert select_block_grid(single_head, 64, heads_per_program=2) == ((64, 1, 2), 0)
 
 
 @pytest.mark.parametrize(
@@ -236,62 +239,6 @@ def test_public_fused_preparation_matches_separate_and_graph(
     monkeypatch.setattr(_backend, "use_fused_operand_preparation", lambda *args: False)
     separate = attention(query, key, value, **options)
     torch.testing.assert_close(fused, separate, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("padded", [False, True])
-@pytest.mark.skipif(sys.platform != "linux", reason="ROCm compilation is Linux-only")
-def test_fused_preparation_compiles_for_rdna4(head_dim, padded):
-    triton = pytest.importorskip("triton")
-    from triton.backends.compiler import GPUTarget  # noqa: PLC0415
-    from triton.compiler import ASTSource  # noqa: PLC0415
-
-    from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat  # noqa: PLC0415
-    from piper_kernels.attention.sparse_piper_attention import (  # noqa: PLC0415
-        triton as preparation,
-    )
-
-    for kernel in (
-        preparation._quantize_query_with_summary_kernel,
-        preparation._quantize_key_with_summary_kernel,
-        preparation._quantize_value_per_tile_kernel,
-    ):
-        constants = {"mask_block_lengths": padded, "head_dim": head_dim}
-        num_warps = preparation._FUSED_QK_WARPS[head_dim]
-        if kernel is preparation._quantize_query_with_summary_kernel:
-            constants.update(
-                softmax_scale=head_dim**-0.5, block_m=64, scale_rows=preparation.QUERY_SCALE_ROWS
-            )
-        elif kernel is preparation._quantize_key_with_summary_kernel:
-            constants.update(block_n=64)
-        else:
-            constants.update(block_n=64, value_format=int(ValueFormat.AMD_WMMA))
-            num_warps = 4
-        signature = {name: "i32" for name in kernel.arg_names if name not in constants}
-        signature.update({name: "*fp32" for name in signature if name.endswith("_ptr")})
-        signature.update({name: "*i8" for name in signature if name.endswith("_int8_ptr")})
-        signature["block_lengths_ptr"] = "*i32"
-        if kernel is preparation._quantize_value_per_tile_kernel:
-            signature.update(
-                value_ptr="*bf16",
-                value_mean_ptr="*bf16",
-                value_scale_ptr="*fp32",
-                output_ptr="*i8",
-            )
-        else:
-            signature["query_ptr" if "query_ptr" in signature else "key_ptr"] = "*bf16"
-        compiled = triton.compile(
-            ASTSource(kernel, signature, constexprs=constants),
-            target=GPUTarget("hip", "gfx1201", 32),
-            options={"num_warps": num_warps},
-        )
-        assert compiled.asm["hsaco"]
-        scratch = re.search(
-            r"\.amdhsa_private_segment_fixed_size\s+(\d+)\b", compiled.asm["amdgcn"]
-        )
-        assert scratch is not None
-        if kernel is preparation._quantize_value_per_tile_kernel:
-            assert int(scratch.group(1)) == 0
 
 
 @pytest.mark.gpu

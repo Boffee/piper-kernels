@@ -33,6 +33,7 @@ from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.attention.kernels.piper._amd import quantization as amd_quantization
 from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
     concat_columns,
@@ -46,7 +47,6 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
     scalar_fma,
 )
 from piper_kernels.attention.kernels.piper.gluon import advance_tile_max
-from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 
 from .. import _quantization
 from .._validation import (
@@ -66,6 +66,7 @@ _LLVM_FN_ATTRS = (
 )
 _GL_TILES_PER_CHUNK = gl.constexpr(_quantization._TILES_PER_CHUNK)
 # Retained for compiler/provider diagnostics.
+_prepare_query_kernel = amd_quantization._prepare_query_kernel
 _prepare_value_kernel = _quantization._quantize_value_k1024_kernel
 
 
@@ -325,13 +326,11 @@ def prepare_query(
     validate_query_offset(global_row_offset, block_rows=64, name="global_row_offset")
     batch, heads, query_length, head_dim = query.shape
     query_storage = triton.cdiv(query_length, 64) * 64
-    with device_context(query.device):
-        query_int8, query_scale = qk_quantization.prepare_query(
-            query,
-            scale,
-            grouped=True,
-            storage_query_length=query_storage,
-        )
+    query_int8, query_scale = amd_quantization.prepare_query(
+        query,
+        scale,
+        storage_sequence_length=query_storage,
+    )
     return PreparedQuery(
         data=query_int8,
         scale=query_scale,

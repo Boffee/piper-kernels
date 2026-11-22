@@ -205,3 +205,260 @@ def test_fused_amd_partial_chunk_bias_boundary_matches_reference(kept, head_dim)
     assert error < 0.015, error.item()
     assert (storage[:8] == -123).all()
     assert (storage[-8:] == -123).all()
+
+
+def _expected_minmax_summaries(
+    q_ref: torch.Tensor,
+    k_ref: torch.Tensor,
+    sparse_key_blocks: int,
+    lengths: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch, heads, sequence, head_dim = q_ref.shape
+    kv_heads = k_ref.shape[1]
+    storage_tiles = (sequence + 63) // 64
+    if lengths is not None:
+        mask = (torch.arange(64, device="cuda")[None, :] < lengths[:, None]).view(
+            1, 1, storage_tiles, 64, 1
+        )
+        q_tiles = q_ref.float().reshape(batch, heads, storage_tiles, 64, head_dim)
+        k_tiles = k_ref.float()[:, :, : sparse_key_blocks * 64].reshape(
+            batch, kv_heads, sparse_key_blocks, 64, head_dim
+        )
+        k_mask = mask[:, :, :sparse_key_blocks]
+        return (
+            torch.where(mask, q_tiles, float("-inf")).amax(dim=3)
+            + torch.where(mask, q_tiles, float("inf")).amin(dim=3),
+            torch.where(k_mask, k_tiles, float("-inf")).amax(dim=3),
+            torch.where(k_mask, k_tiles, float("inf")).amin(dim=3),
+        )
+    q_padded = torch.zeros(
+        (batch, heads, storage_tiles * 64, head_dim), device="cuda", dtype=torch.float32
+    )
+    q_padded[:, :, :sequence] = q_ref.float()
+    q_valid = (torch.arange(storage_tiles * 64, device="cuda") < sequence).view(
+        1, 1, storage_tiles, 64, 1
+    )
+    q_tiles = q_padded.reshape(batch, heads, storage_tiles, 64, head_dim)
+    k_tiles = k_ref.float()[:, :, : sparse_key_blocks * 64].reshape(
+        batch, kv_heads, sparse_key_blocks, 64, head_dim
+    )
+    return (
+        torch.where(q_valid, q_tiles, float("-inf")).amax(dim=3)
+        + torch.where(q_valid, q_tiles, float("inf")).amin(dim=3),
+        k_tiles.amax(dim=3),
+        k_tiles.amin(dim=3),
+    )
+
+
+def _make_sparse_operand(
+    batch: int,
+    head_count: int,
+    sequence: int,
+    head_dim: int,
+    *,
+    dtype: torch.dtype,
+    layout: str,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    if layout == "bhsd":
+        return torch.randn(
+            (batch, head_count, sequence, head_dim),
+            device="cuda",
+            dtype=dtype,
+            generator=generator,
+        )
+    if layout == "bshd":
+        return torch.randn(
+            (batch, sequence, head_count, head_dim),
+            device="cuda",
+            dtype=dtype,
+            generator=generator,
+        ).transpose(1, 2)
+    stride_elem = head_dim + 1
+    flat = torch.randn(
+        (1 + batch * sequence * head_count * stride_elem,),
+        device="cuda",
+        dtype=dtype,
+        generator=generator,
+    )
+    operand = (
+        flat[1:].view(batch, sequence, head_count, stride_elem)[..., :head_dim].transpose(1, 2)
+    )
+    assert (operand.data_ptr() % 16 != 0) or any(
+        (stride * operand.element_size()) % 16 != 0 for stride in operand.stride()[:3]
+    )
+    return operand
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd", "unaligned"])
+def test_amd_prepare_operands_edge_shapes_summaries_and_attention(
+    head_dim,
+    dtype,
+    padded,
+    layout,
+):
+    generator = torch.Generator(device="cuda").manual_seed(3101 + head_dim + int(padded))
+    sequence = 16 * 64 if padded else 16 * 64 + 17
+    storage_tiles = (sequence + 63) // 64
+    sparse_key_blocks = 8 if padded else 9
+    # Cover multi-batch GQA/MQA, odd head counts, and partial last tiles.
+    batch, heads, kv_heads = (2, 3, 1) if head_dim == 64 else (1, 6, 3)
+    q = _make_sparse_operand(
+        batch, heads, sequence, head_dim, dtype=dtype, layout=layout, generator=generator
+    )
+    k = _make_sparse_operand(
+        batch, kv_heads, sequence, head_dim, dtype=dtype, layout=layout, generator=generator
+    )
+    v = _make_sparse_operand(
+        batch, kv_heads, sequence, head_dim, dtype=dtype, layout=layout, generator=generator
+    )
+    k.add_(3.0)
+    lengths = None
+    q_ref, k_ref, v_ref = q.clone(), k.clone(), v.clone()
+    if padded:
+        lengths = torch.tensor(
+            ([64, 17, 1, 32] * 5)[:storage_tiles], device="cuda", dtype=torch.int32
+        )
+        valid = (torch.arange(64, device="cuda")[None, :] < lengths[:, None]).reshape(
+            1, 1, sequence, 1
+        )
+        for operand in (q, k, v):
+            operand.masked_fill_(~valid, float("nan"))
+        q_ref, k_ref, v_ref = (torch.where(valid, t, 0) for t in (q_ref, k_ref, v_ref))
+
+    backend = require_attention_backend(q)
+    opts = {
+        "sparse_key_blocks": sparse_key_blocks,
+        "combined_key": k,
+        "combined_value": v,
+        "block_lengths": lengths,
+    }
+    ops_sum = backend.prepare(q, head_dim**-0.5, emit_summaries=True, **opts)
+    ops_no_sum = backend.prepare(q, head_dim**-0.5, emit_summaries=False, **opts)
+    assert ops_sum.value_format is ValueFormat.AMD_WMMA
+    assert ops_no_sum.query_summary is None
+    assert ops_no_sum.key_summary is None
+    assert ops_no_sum.key_aux is None
+
+    for field in (
+        "query",
+        "query_scale",
+        "key",
+        "key_scale",
+        "key_center",
+        "key_center_scale",
+        "value",
+        "value_scale_multiplier",
+        "value_mean",
+    ):
+        torch.testing.assert_close(
+            getattr(ops_sum, field), getattr(ops_no_sum, field), atol=0, rtol=0, msg=field
+        )
+
+    assert ops_sum.key_summary is not None
+    assert ops_sum.key_summary.shape == (batch, kv_heads, sparse_key_blocks, head_dim)
+    if not padded:
+        assert torch.count_nonzero(ops_sum.query[:, :, sequence:]) == 0
+        assert torch.count_nonzero(ops_sum.key[:, :, sequence:]) == 0
+        assert (ops_sum.query_scale[:, :, -1] == 0).all()
+
+    exp_q_sum, exp_k_sum, exp_k_aux = _expected_minmax_summaries(
+        q_ref, k_ref, sparse_key_blocks, lengths
+    )
+    torch.testing.assert_close(ops_sum.query_summary, exp_q_sum, atol=0, rtol=0)
+    torch.testing.assert_close(ops_sum.key_summary, exp_k_sum, atol=0, rtol=0)
+    torch.testing.assert_close(ops_sum.key_aux, exp_k_aux, atol=0, rtol=0)
+
+    keep_ratios = tuple((0.25, 0.5, 1.0)[i % 3] for i in range(heads))
+    route_layout = _resolve_route_layout(
+        _normalize_head_keep_ratios(keep_ratios), sparse_key_blocks, q.device
+    )
+    routes = packed_routes_from_sequences(
+        q_ref, k_ref[:, :, : sparse_key_blocks * 64], route_layout, _MINMAX_ROUTING, lengths
+    )
+    prepared = ops_sum.with_routes(
+        routes.indices,
+        routes.head_keep_blocks,
+        routes.route_head_offsets,
+        bind=backend.bind_context,
+    )
+    output = torch.empty(
+        (batch, sequence, heads, head_dim), device=q.device, dtype=dtype
+    ).transpose(1, 2)
+    prepared.launch(prepared.query, output)
+    expected = reference_sparse_piper_attention(
+        q_ref.transpose(1, 2),
+        k_ref.transpose(1, 2),
+        v_ref.transpose(1, 2),
+        routes,
+        sparse_key_blocks=sparse_key_blocks,
+        scale=head_dim**-0.5,
+        block_lengths=lengths,
+    )
+    actual = output.transpose(1, 2)
+    if padded:
+        valid_out = (torch.arange(64, device="cuda")[None, :] < lengths[:, None]).reshape(
+            1, sequence, 1, 1
+        )
+        actual, expected = torch.where(valid_out, actual, 0), torch.where(valid_out, expected, 0)
+    assert torch.isfinite(actual).all()
+    error = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert error < 0.015, error.item()
+
+
+def test_amd_prepare_operands_empty_batch_and_single_row_tail():
+    backend = require_attention_backend(
+        torch.empty((1, 2, 64, 64), device="cuda", dtype=torch.bfloat16)
+    )
+    empty_q = torch.empty((0, 3, 65, 64), device="cuda", dtype=torch.bfloat16)
+    empty_kv = torch.empty((0, 1, 65, 64), device="cuda", dtype=torch.bfloat16)
+    empty_ops = backend.prepare(
+        empty_q,
+        64**-0.5,
+        sparse_key_blocks=1,
+        combined_key=empty_kv,
+        combined_value=empty_kv,
+        emit_summaries=True,
+    )
+    assert empty_ops.query.shape == (0, 3, 128, 64)
+    assert empty_ops.key_summary is not None
+    assert empty_ops.key_summary.shape == (0, 1, 1, 64)
+
+    generator = torch.Generator(device="cuda").manual_seed(6565)
+    q = torch.randn((1, 3, 65, 64), device="cuda", dtype=torch.bfloat16, generator=generator)
+    k = torch.randn((1, 1, 65, 64), device="cuda", dtype=torch.bfloat16, generator=generator)
+    v = torch.randn((1, 1, 65, 64), device="cuda", dtype=torch.bfloat16, generator=generator)
+    ops = backend.prepare(
+        q, 64**-0.5, sparse_key_blocks=1, combined_key=k, combined_value=v, emit_summaries=True
+    )
+    assert torch.count_nonzero(ops.query[:, :, 65:]) == 0
+    assert torch.count_nonzero(ops.key[:, :, 65:]) == 0
+    assert (ops.query_scale[:, :, -1] == 0).all()
+    assert torch.isfinite(ops.key_scale).all()
+    assert torch.isfinite(ops.key_center_scale).all()
+    assert torch.isfinite(ops.value_mean).all()
+
+    # Also verify a partial tile crossing into the second Q32 group (seq=1057 -> 33 remainder rows).
+    q_long = torch.randn(
+        (1, 3, 1057, 128), device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    k_long = torch.randn(
+        (1, 1, 1057, 128), device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    v_long = torch.randn(
+        (1, 1, 1057, 128), device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    ops_long = backend.prepare(
+        q_long,
+        128**-0.5,
+        sparse_key_blocks=16,
+        combined_key=k_long,
+        combined_value=v_long,
+        emit_summaries=True,
+    )
+    assert torch.count_nonzero(ops_long.query[:, :, 1057:]) == 0
+    assert torch.count_nonzero(ops_long.key[:, :, 1057:]) == 0
+    assert (ops_long.query_scale[:, :, -1] > 0).all()
