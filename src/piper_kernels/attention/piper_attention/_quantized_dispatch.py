@@ -15,8 +15,8 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
     resolve_qk_quantization,
 )
 
+from . import _backend
 from ._amd import gluon as amd_backend
-from ._amd import policy as amd_policy
 from ._nvidia import policy as nvidia_policy
 from ._nvidia import triton as nvidia_backend
 from ._validation import PreparedContext, PreparedQuery
@@ -27,7 +27,7 @@ def supports_quantized_query(target: AcceleratorTarget) -> bool:
     return (
         target.is_cuda_capability(12)
         or target.is_cuda_capability(8, 9)
-        or amd_policy.supports_target(target)
+        or _backend.supports_amd_target(target)
     )
 
 

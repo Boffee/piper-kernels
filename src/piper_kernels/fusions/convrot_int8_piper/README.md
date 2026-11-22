@@ -135,8 +135,8 @@ attention, and routing-score buffers then halve with the heads, at a small speed
 
 ## Sequence-parallel output collectives
 
-When `attention_output=True`, the unified post-grad pass runs
-[`_distributed_compile.py`](_distributed_compile.py) via the shared
+When `attention_output=True`, the unified post-grad pass runs `fold_distributed_attention_output`
+in [`_compile.py`](_compile.py) via the shared
 [`_distributed_fold.py`](../attention/_distributed_fold.py) helper to rewrite
 `convrot_int8_piper_projected_query_attention_output -> reduce_scatter_tensor` (and an
 exclusive trailing in-place `residual_add_`) into

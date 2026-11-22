@@ -7,19 +7,18 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import _backend
-from piper_kernels.attention.piper_attention._amd import policy
-from piper_kernels.attention.piper_attention.triton import triton_piper_attention
 
 
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201", "gfx942", "gfx1100", "sm120", None])
 @pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
 def test_amd_target_gate(monkeypatch, architecture, platform):
-    monkeypatch.setattr(policy.sys, "platform", platform)
+    monkeypatch.setattr(sys, "platform", platform)
     target = AcceleratorTarget("hip", architecture)
     expected = platform in ("linux", "win32") and architecture in ("gfx1200", "gfx1201")
-    assert policy.supports_target(target) is expected
+    assert _backend.supports_amd_target(target) is expected
     assert _backend.select_backend(target) is (_backend.amd_attention if expected else None)
 
 
@@ -43,6 +42,8 @@ def test_missing_implementation_retains_fallback(monkeypatch):
 
 
 def test_fake_execution_does_not_select_or_launch_backend(monkeypatch):
+    assert piper_attention is not None
+
     def forbidden(*args):
         pytest.fail("fake execution must not inspect hardware or launch kernels")
 
@@ -50,7 +51,7 @@ def test_fake_execution_does_not_select_or_launch_backend(monkeypatch):
     with FakeTensorMode():
         query = torch.empty(2, 193, 6, 128, dtype=torch.bfloat16).transpose(1, 2)
         key = torch.empty(2, 2, 257, 128, dtype=query.dtype)
-        output = triton_piper_attention(query, key, key, 128**-0.5, False)
+        output = torch.ops.piper_kernels.piper_attention.default(query, key, key, 128**-0.5, False)
         assert output.shape == query.shape
         assert output.dtype == query.dtype
         assert output.is_contiguous()

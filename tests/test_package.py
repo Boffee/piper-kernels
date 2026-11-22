@@ -240,7 +240,6 @@ for forbidden in (
     "piper_kernels.fusions.residual_updates._compile",
     "piper_kernels.fusions.convrot_int8_piper._compile",
     "piper_kernels.fusions.convrot_int8_piper._output_compile",
-    "piper_kernels.fusions.convrot_int8_piper._distributed_compile",
     "piper_kernels.fusions.convrot_int8_sparse_piper._compile",
     "piper_kernels.fusions.convrot_int8_sparse_piper._output_compile",
     "piper_kernels.fusions.convrot_int8_sparse_piper._distributed_compile",

@@ -7,7 +7,6 @@ import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend
-from piper_kernels.attention.sparse_piper_attention._amd import policy as amd_policy
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
@@ -27,7 +26,7 @@ def generator():
     if not torch.cuda.is_available():
         pytest.skip("requires RDNA4 or SM120 scoring")
     target = AcceleratorTarget.from_device(torch.device("cuda"))
-    if not (amd_policy.supports_target(target) or nvidia_policy.supports_minmax_scores(target)):
+    if not (_backend.supports_amd_target(target) or nvidia_policy.supports_minmax_scores(target)):
         pytest.skip("requires RDNA4 or SM120 scoring")
     return torch.Generator(device="cuda").manual_seed(671)
 

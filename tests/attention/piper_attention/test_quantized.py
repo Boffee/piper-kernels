@@ -14,9 +14,9 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
+from piper_kernels.attention.piper_attention import _backend
 from piper_kernels.attention.piper_attention import _quantized_dispatch as dispatch
 from piper_kernels.attention.piper_attention._amd import gluon as amd
-from piper_kernels.attention.piper_attention._amd import policy as amd_policy
 from piper_kernels.attention.piper_attention._nvidia import policy as nvidia_policy
 from piper_kernels.attention.piper_attention._nvidia import triton as nvidia
 
@@ -279,7 +279,7 @@ def test_select_qk_quantization_follows_the_target_plans(target, granularity):
 @pytest.mark.parametrize("architecture", ["gfx1200", "gfx1201", "gfx1100", "gfx942"])
 def test_native_amd_target_gate(architecture):
     target = AcceleratorTarget("hip", architecture)
-    assert dispatch.supports_quantized_query(target) is amd_policy.supports_target(target)
+    assert dispatch.supports_quantized_query(target) is _backend.supports_amd_target(target)
 
 
 _CUDA_CAPABILITIES = {

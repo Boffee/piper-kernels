@@ -10,7 +10,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.convrot.int8._nvidia import policy as nvidia_policy
-from piper_kernels.weights.convrot.int8 import _gguf_policy
+from piper_kernels.weights.convrot.int8 import _gguf
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
@@ -33,13 +33,13 @@ def test_policy_preserves_previous_schedules_across_group_aligned_widths(target)
         previous = fused_preparation_chunks(width)
         if not target.is_nvidia_cuda and width > 8192:
             previous = None
-        assert _gguf_policy.select_conversion_chunks(target, width) == previous
+        assert _gguf.select_conversion_chunks(target, width) == previous
 
 
 @pytest.mark.parametrize("width", [16, 4096, 6144, 8192, 8208, 16384, 32768, 49152, 49168])
 def test_schedule_boundaries(width):
-    nvidia = _gguf_policy.select_conversion_chunks(AcceleratorTarget("cuda", "sm70"), width)
-    hip = _gguf_policy.select_conversion_chunks(AcceleratorTarget("hip", "gfx1201"), width)
+    nvidia = _gguf.select_conversion_chunks(AcceleratorTarget("cuda", "sm70"), width)
+    hip = _gguf.select_conversion_chunks(AcceleratorTarget("hip", "gfx1201"), width)
     for chunks, limit in ((nvidia, 49152), (hip, 8192)):
         if width > limit:
             assert chunks is None
@@ -56,7 +56,7 @@ def test_schedule_boundaries(width):
 def test_nvidia_conversion_does_not_require_a_matrix_backend():
     target = AcceleratorTarget("cuda", "sm70")
     assert not nvidia_policy.supports_target(target)
-    assert _gguf_policy.select_conversion_chunks(target, 16384) is not None
+    assert _gguf.select_conversion_chunks(target, 16384) is not None
 
 
 @pytest.mark.parametrize("chunks", [(2, 8192), None])

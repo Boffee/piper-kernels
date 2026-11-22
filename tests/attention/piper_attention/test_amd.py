@@ -2,20 +2,18 @@
 
 import pytest
 import torch
+from _accelerators import rdna4_available
 from _compile_capture import TargetCapturePass
 
 from piper_kernels import piper_attention
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention import dispatch
 from piper_kernels.attention.piper_attention._amd import gluon as backend
-from piper_kernels.attention.piper_attention._amd.policy import supports_target
 from piper_kernels.attention.piper_attention.reference import reference_piper_attention
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available()
-        or not supports_target(AcceleratorTarget.from_device(torch.device("cuda"))),
+        not rdna4_available(),
         reason="requires Linux RDNA4 ROCm",
     ),
 ]
