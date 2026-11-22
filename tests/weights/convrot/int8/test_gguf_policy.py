@@ -4,6 +4,8 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+from _accelerators import mock_rocm_target
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import GGUFQuantizationType
@@ -60,7 +62,7 @@ def test_nvidia_conversion_does_not_require_a_matrix_backend():
 @pytest.mark.parametrize("chunks", [(2, 8192), None])
 def test_shared_converter_executes_selected_schedule_without_vendor_rules(monkeypatch, chunks):
     target = AcceleratorTarget("hip", "gfx1201")
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
+    mock_rocm_target(monkeypatch, "gfx1201")
     select = Mock(return_value=chunks)
     fused = MagicMock()
     tiled = Mock()
@@ -69,10 +71,12 @@ def test_shared_converter_executes_selected_schedule_without_vendor_rules(monkey
     monkeypatch.setattr(int8_weight_triton, "_convert_gguf_tiled_out", tiled)
     # Force fusion above the former inline HIP cutoff, or tiles below it.
     width = 16384 if chunks is not None else 4096
-    data = torch.empty(2, 16, dtype=torch.uint8)
-    qdata, scale = torch.empty(2, width, dtype=torch.int8), torch.empty(2, 1)
-    arguments = (data, int(GGUFQuantizationType.Q4_K), 256, qdata, scale)
-    int8_weight_triton.convert_gguf_out(*arguments)
+    with FakeTensorMode():
+        data = torch.empty(2, 16, device="cuda:0", dtype=torch.uint8)
+        qdata = torch.empty(2, width, device="cuda:0", dtype=torch.int8)
+        scale = torch.empty(2, 1, device="cuda:0")
+        arguments = (data, int(GGUFQuantizationType.Q4_K), 256, qdata, scale)
+        int8_weight_triton.convert_gguf_out(*arguments)
     select.assert_called_once_with(target, width)
     if chunks is None:
         fused.__getitem__.assert_not_called()
@@ -99,11 +103,22 @@ def test_shared_converter_executes_selected_schedule_without_vendor_rules(monkey
 @pytest.mark.parametrize("shape", [(0, 256), (3, 0)])
 def test_empty_shared_conversion_does_not_select_a_schedule(monkeypatch, shape):
     unexpected = Mock(side_effect=AssertionError("empty conversion queried hardware or policy"))
-    monkeypatch.setattr(AcceleratorTarget, "from_device", unexpected)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", unexpected)
     monkeypatch.setattr(int8_weight_triton, "select_conversion_chunks", unexpected)
     qdata, scale = torch.empty(shape, dtype=torch.int8), torch.empty(shape[0], 1)
     int8_weight_triton.convert_gguf_out(
         torch.empty(shape), int(GGUFQuantizationType.F32), 16, qdata, scale
     )
     assert (scale == 1e-30).all()
+    with FakeTensorMode():
+        cuda_qdata = torch.empty(shape, device="cuda:0", dtype=torch.int8)
+        cuda_scale = torch.empty(shape[0], 1, device="cuda:0")
+        int8_weight_triton.convert_gguf_out(
+            torch.empty(shape, device="cuda:0"),
+            int(GGUFQuantizationType.F32),
+            16,
+            cuda_qdata,
+            cuda_scale,
+        )
     unexpected.assert_not_called()

@@ -1,10 +1,18 @@
-"""The shared SM120 test gate must exclude ROCm devices that report capability (12, 0)."""
+"""Tests for shared accelerator gates and hardware-probe test helpers."""
 
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import (
+    exact_sm120_available,
+    mock_cuda_target,
+    mock_rocm_target,
+    rocm_fences_only_lds,
+)
 
 
 @pytest.mark.parametrize("hip", [None, "test"])
@@ -18,3 +26,43 @@ def test_sm120_gate_distinguishes_rocm_from_cuda(monkeypatch, hip):
         lambda _device: SimpleNamespace(gcnArchName="gfx1201"),
     )
     assert exact_sm120_available() is (hip is None)
+
+
+def test_target_mocks_accept_zero_or_one_device_args_and_stub_device_guard(monkeypatch):
+    mock_cuda_target(monkeypatch, (8, 9))
+    assert torch.version.hip is None
+    assert torch.cuda.get_device_capability() == (8, 9)
+    assert torch.cuda.get_device_capability(torch.device("cuda:0")) == (8, 9)
+    with torch.cuda.device(torch.device("cuda:0")):
+        pass
+
+    mock_rocm_target(monkeypatch, "gfx1201")
+    assert torch.version.hip == "7.0"
+    assert torch.cuda.get_device_properties().gcnArchName == "gfx1201"
+    assert torch.cuda.get_device_properties(torch.device("cuda:0")).gcnArchName == "gfx1201"
+    with torch.cuda.device(torch.device("cuda:0")):
+        pass
+
+
+def test_mock_rocm_target_does_not_enable_rocm_only_fence_assertion_on_cuda(monkeypatch):
+    on_rocm_build = torch.version.hip is not None
+    mock_rocm_target(monkeypatch, "gfx1201")
+    if not on_rocm_build:
+        assert not rocm_fences_only_lds()
+
+
+def test_accelerators_helper_is_importable_without_triton() -> None:
+    tests_dir = Path(__file__).resolve().parent
+    script = f"""
+import builtins, sys
+orig_import = builtins.__import__
+def without_triton(name, *args, **kwargs):
+    if name == "triton" or name.startswith("triton."):
+        raise ModuleNotFoundError("Triton intentionally unavailable", name="triton")
+    return orig_import(name, *args, **kwargs)
+builtins.__import__ = without_triton
+sys.path.insert(0, {str(tests_dir)!r})
+import _accelerators
+assert "triton" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)

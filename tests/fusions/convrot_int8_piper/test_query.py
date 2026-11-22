@@ -2,13 +2,13 @@
 
 import math
 import sys
-from contextlib import nullcontext
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 import triton
-from _accelerators import rocm_fences_only_lds
+from _accelerators import mock_rocm_target, rocm_fences_only_lds
+from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
@@ -16,7 +16,6 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import SIGNED_HADAMARD_MASK
 from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.fusions.convrot_int8_piper import _backend, _kernels, query
-from piper_kernels.fusions.convrot_int8_piper import triton as projection
 
 
 def _available():
@@ -286,18 +285,19 @@ def test_fake_query_rejects_invalid_metadata(invalid):
     ],
 )
 def test_projection_selector_uses_validated_targets(monkeypatch, target, supported):
-    monkeypatch.setattr(_backend.amd_policy.sys, "platform", "linux")
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda _: target)
+    monkeypatch.setattr(sys, "platform", "linux")
     value = torch.empty(0)
-    assert (_backend.select_projection_backend(value, head_dim=64) is not None) is supported
-    assert _backend.select_projection_backend(value, head_dim=32) is None
+    assert (
+        _backend.select_projection_backend(value, head_dim=64, target=target) is not None
+    ) is supported
+    assert _backend.select_projection_backend(value, head_dim=32, target=target) is None
     if supported:
-        assert _backend.require_projection_backend(value, head_dim=64) is not None
+        assert _backend.require_projection_backend(value, head_dim=64, target=target) is not None
     else:
         with pytest.raises(ValueError, match="projections are unavailable"):
-            _backend.require_projection_backend(value, head_dim=64)
+            _backend.require_projection_backend(value, head_dim=64, target=target)
     with pytest.raises(ValueError, match="projections are unavailable"):
-        _backend.require_projection_backend(value, head_dim=32)
+        _backend.require_projection_backend(value, head_dim=32, target=target)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="offline ROCm compilation requires Linux")
@@ -307,15 +307,13 @@ def test_production_query_launches_compile_for_rdna4(monkeypatch, head_dim, affi
     function = _kernels._project_query_kernel
     kernel = MagicMock()
     monkeypatch.setattr(_kernels, "_project_query_kernel", kernel)
-    monkeypatch.setattr(projection, "device_context", lambda _: nullcontext())
-    monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda _: AcceleratorTarget("hip", "gfx1201")
-    )
-    operands = _operands("meta", sequence=193, head_dim=head_dim, affine=affine)
-    bias = torch.empty(3 * head_dim, device="meta", dtype=torch.bfloat16) if affine else None
-    query._launch_query_projection(
-        *operands, 1e-6, head_dim**-0.5, bias, head_dim=head_dim, qk_quantization="per_warp"
-    )
+    mock_rocm_target(monkeypatch, "gfx1201")
+    with FakeTensorMode():
+        operands = _operands("cuda:0", sequence=193, head_dim=head_dim, affine=affine)
+        bias = torch.empty(3 * head_dim, device="cuda:0", dtype=torch.bfloat16) if affine else None
+        query._launch_query_projection(
+            *operands, 1e-6, head_dim**-0.5, bias, head_dim=head_dim, qk_quantization="per_warp"
+        )
     calls = kernel.__getitem__.return_value.call_args_list
     assert len(calls) == 2
     assert [call.args[0] for call in kernel.__getitem__.call_args_list] == [(3, 3, 2), (1, 3, 2)]

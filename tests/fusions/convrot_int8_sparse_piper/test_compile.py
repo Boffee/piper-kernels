@@ -1,5 +1,7 @@
 """Tests for automatic ConvRot INT8-to-sparse-Piper graph fusion."""
 
+from typing import TypedDict, Unpack
+
 import pytest
 import torch
 from _compile_capture import TargetCapturePass
@@ -60,6 +62,16 @@ def _expected_specialization_count(cases) -> int:
     return len({sequence % TILE_ROWS == 0 for sequence, _ in cases})
 
 
+class _AttentionGeometry(TypedDict, total=False):
+    head_dim: int
+    sequence_length: int
+    sparse_key_blocks: int
+
+
+class _CoarseAttentionGeometry(_AttentionGeometry, total=False):
+    coarse_key_blocks: int
+
+
 class _SparseProjectionAttention(torch.nn.Module):
     """Small canonical H3 attention region used to exercise the fusion pass."""
 
@@ -76,8 +88,18 @@ class _SparseProjectionAttention(torch.nn.Module):
         *,
         strided_rope: bool = False,
         routing: str = "minmax",
+        head_dim: int | None = None,
+        sequence_length: int | None = None,
+        sparse_key_blocks: int | None = None,
     ) -> None:
         super().__init__()
+        if head_dim is not None:
+            self.head_dim = head_dim
+            self.rotary_dim = head_dim * 3 // 4
+        if sequence_length is not None:
+            self.sequence_length = sequence_length
+        if sparse_key_blocks is not None:
+            self.sparse_key_blocks = sparse_key_blocks
         projections = []
         for _ in range(3):
             weight = ConvRotInt8Tensor.from_quantized(
@@ -213,9 +235,13 @@ class _CoarseSparseProjectionAttention(_SparseProjectionAttention):
         *,
         sparse_routing: str,
         coarse_routing: str | None = None,
+        coarse_key_blocks: int | None = None,
+        **geometry: Unpack[_AttentionGeometry],
     ) -> None:
-        super().__init__(routing=sparse_routing)
+        super().__init__(routing=sparse_routing, **geometry)
         self.coarse_routing = sparse_routing if coarse_routing is None else coarse_routing
+        if coarse_key_blocks is not None:
+            self.coarse_key_blocks = coarse_key_blocks
 
     def forward(
         self,
@@ -409,8 +435,9 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
         *,
         escape_attention: bool = False,
         bias_dtype: torch.dtype = torch.bfloat16,
+        **geometry: Unpack[_AttentionGeometry],
     ) -> None:
-        super().__init__()
+        super().__init__(**geometry)
         self.output = _make_output_projection(
             self.heads * self.head_dim,
             self.output_features,
@@ -453,8 +480,8 @@ class _MeanPoolSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput)
 class _CoarseSparseProjectionAttentionOutput(_CoarseSparseProjectionAttention):
     output_features = 320
 
-    def __init__(self, *, routing: str) -> None:
-        super().__init__(sparse_routing=routing)
+    def __init__(self, *, routing: str, **geometry: Unpack[_CoarseAttentionGeometry]) -> None:
+        super().__init__(sparse_routing=routing, **geometry)
         self.output = _make_output_projection(
             self.heads * self.head_dim,
             self.output_features,
@@ -490,8 +517,8 @@ class _CoarseSparseProjectionAttentionOutput(_CoarseSparseProjectionAttention):
 class _ProjectedGateCoarseSparseAttentionOutput(_CoarseSparseProjectionAttentionOutput):
     """Canonical VSA region whose coarse gate is another ConvRot INT8 linear."""
 
-    def __init__(self, *, routing: str) -> None:
-        super().__init__(routing=routing)
+    def __init__(self, *, routing: str, **geometry: Unpack[_CoarseAttentionGeometry]) -> None:
+        super().__init__(routing=routing, **geometry)
         self.gate = _make_output_projection(
             self.input_features,
             self.heads * self.head_dim,
@@ -744,11 +771,9 @@ def test_compile_options_preserve_unrelated_pass_order() -> None:
         128,
     ],
 )
-def test_compile_options_fuse_sparse_piper_projection_region(monkeypatch, head_dim: int) -> None:
-    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
-    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
+def test_compile_options_fuse_sparse_piper_projection_region(head_dim: int) -> None:
     torch.manual_seed(701)
-    model = _SparseProjectionAttention().eval()
+    model = _SparseProjectionAttention(head_dim=head_dim).eval()
     hidden_states = torch.randn(
         model.batch,
         model.sequence_length,
@@ -1104,14 +1129,12 @@ def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
     ],
 )
 def test_compile_options_fuse_attention_output_boundary(
-    qkv_bias: bool, affine: bool, monkeypatch, head_dim: int, dtype: torch.dtype
+    qkv_bias: bool, affine: bool, head_dim: int, dtype: torch.dtype
 ) -> None:
     # Keep every parameter pair; test_query/test_key/test_value cover the full
     # bias/norm numerical matrix without repeating whole-graph compilation.
-    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
-    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(719)
-    model = _SparseProjectionAttentionOutput(bias_dtype=torch.float32).eval()
+    model = _SparseProjectionAttentionOutput(bias_dtype=torch.float32, head_dim=head_dim).eval()
     model.set_activation_dtype(dtype)
     if qkv_bias:
         model.set_projection_bias(dtype)
@@ -1278,13 +1301,9 @@ def test_compile_options_fuse_mean_pool_attention_and_output() -> None:
         128,
     ],
 )
-def test_compile_fuses_every_bounded_attention_feature(
-    monkeypatch, head_dim: int, routing: str
-) -> None:
-    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
-    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
+def test_compile_fuses_every_bounded_attention_feature(head_dim: int, routing: str) -> None:
     torch.manual_seed(721)
-    model = _CoarseSparseProjectionAttentionOutput(routing=routing).eval()
+    model = _CoarseSparseProjectionAttentionOutput(routing=routing, head_dim=head_dim).eval()
     hidden_states = torch.randn(
         model.batch,
         model.sequence_length,
@@ -1365,8 +1384,7 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
     torch.manual_seed(725)
     monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", query_chunk_rows)
     # Eight chunks exercise gate production while Q/attention/output reuse slots.
-    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 512)
-    model = _ProjectedGateCoarseSparseAttentionOutput(routing=routing).eval()
+    model = _ProjectedGateCoarseSparseAttentionOutput(routing=routing, sequence_length=512).eval()
     model.set_activation_dtype(dtype)
     model.set_projection_bias(dtype)
     if not query_affine:
@@ -1855,10 +1873,12 @@ def test_forced_output_fusion_reuses_dynamic_shapes_and_runtime_contents(monkeyp
 def test_forced_coarse_output_builds_membership_once(monkeypatch) -> None:
     torch.manual_seed(743)
     monkeypatch.setattr(output_fusion, "_DEFAULT_QUERY_CHUNK_ROWS", 64)
-    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 512)
-    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sparse_key_blocks", 6)
-    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "coarse_key_blocks", 8)
-    model = _ProjectedGateCoarseSparseAttentionOutput(routing="minmax").eval()
+    model = _ProjectedGateCoarseSparseAttentionOutput(
+        routing="minmax",
+        sequence_length=512,
+        sparse_key_blocks=6,
+        coarse_key_blocks=8,
+    ).eval()
     hidden = torch.randn(1, 512, model.input_features, device="cuda", dtype=torch.bfloat16)
     lengths = torch.tensor([64, 17, 63, 32, 64, 48, 21, 64], device="cuda", dtype=torch.int32)
     ids = (

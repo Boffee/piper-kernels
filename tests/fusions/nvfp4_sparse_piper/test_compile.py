@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from typing import TypedDict, Unpack
+
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import exact_sm120_available, mock_cuda_target
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -20,7 +22,6 @@ from piper_kernels import (
     compile_options,
     sparse_piper_coarse_residual,
 )
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
@@ -67,6 +68,19 @@ def _convert_weight(weight: torch.Tensor, group_size: int) -> ConvRotNVFP4Tensor
     return ConvRotNVFP4Tensor.from_torchao(converted, group_size=group_size)
 
 
+class _SparseAttentionConfig(TypedDict, total=False):
+    dynamic: bool
+    routing: str
+    group_size: int | None
+    head_dim: int
+    sequence_length: int
+
+
+class _SparseOutputConfig(_SparseAttentionConfig, total=False):
+    output_dynamic: bool
+    output_features: int
+
+
 class _SparseProjectionAttention(torch.nn.Module):
     """Small canonical H3 attention region used to exercise the fusion pass."""
 
@@ -84,10 +98,17 @@ class _SparseProjectionAttention(torch.nn.Module):
         dynamic: bool = False,
         routing: str = "minmax",
         group_size: int | None = None,
+        head_dim: int | None = None,
+        sequence_length: int | None = None,
     ) -> None:
         super().__init__()
         self.batch = batch
         self.group_size = group_size
+        if head_dim is not None:
+            self.head_dim = head_dim
+            self.rotary_dim = head_dim * 3 // 4
+        if sequence_length is not None:
+            self.sequence_length = sequence_length
         calibration = torch.full(
             (1, self.sequence_length, self.input_features),
             3.0,
@@ -212,12 +233,13 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
     def __init__(
         self,
         *,
-        dynamic: bool = False,
-        routing: str = "minmax",
         output_dynamic: bool = False,
-        group_size: int | None = None,
+        output_features: int | None = None,
+        **config: Unpack[_SparseAttentionConfig],
     ) -> None:
-        super().__init__(dynamic=dynamic, routing=routing, group_size=group_size)
+        super().__init__(**config)
+        if output_features is not None:
+            self.output_features = output_features
         calibration = torch.full(
             (1, self.sequence_length, self.heads * self.head_dim),
             3.0,
@@ -251,8 +273,8 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
             dtype=torch.bfloat16,
         )
         weight: torch.Tensor = PiperNVFP4Tensor.from_torchao(torchao_weight)
-        if group_size is not None:
-            weight = _convert_weight(weight, group_size)
+        if self.group_size is not None:
+            weight = _convert_weight(weight, self.group_size)
         self.output.weight = torch.nn.Parameter(weight, requires_grad=False)
 
     def forward(
@@ -271,21 +293,9 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
     coarse_scale = 0.125
     coarse_key_blocks = 3
 
-    def __init__(
-        self,
-        *,
-        dynamic: bool,
-        routing: str,
-        output_dynamic: bool = False,
-        group_size: int | None = None,
-    ) -> None:
-        super().__init__(
-            dynamic=dynamic,
-            routing=routing,
-            output_dynamic=output_dynamic,
-            group_size=group_size,
-        )
-        self.routing = routing
+    def __init__(self, **config: Unpack[_SparseOutputConfig]) -> None:
+        super().__init__(**config)
+        self.routing = config.get("routing", "minmax")
 
     def forward(
         self,
@@ -326,20 +336,8 @@ class _BoundedSparseProjectionAttentionOutput(_SparseProjectionAttentionOutput):
 class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentionOutput):
     """Bounded coarse attention whose gate is projected from hidden states."""
 
-    def __init__(
-        self,
-        *,
-        dynamic: bool,
-        routing: str,
-        output_dynamic: bool = False,
-        group_size: int | None = None,
-    ) -> None:
-        super().__init__(
-            dynamic=dynamic,
-            routing=routing,
-            output_dynamic=output_dynamic,
-            group_size=group_size,
-        )
+    def __init__(self, **config: Unpack[_SparseOutputConfig]) -> None:
+        super().__init__(**config)
         query_weight = self.query.weight
         assert isinstance(query_weight, TorchAONVFP4Tensor)
         dense = torch.randn(
@@ -362,8 +360,8 @@ class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentio
             dtype=torch.bfloat16,
         )
         weight: torch.Tensor = PiperNVFP4Tensor.from_torchao(torchao_weight)
-        if group_size is not None:
-            weight = _convert_weight(weight, group_size)
+        if self.group_size is not None:
+            weight = _convert_weight(weight, self.group_size)
         self.gate.weight = torch.nn.Parameter(weight, requires_grad=False)
 
     def forward(
@@ -588,11 +586,7 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
         k_affine=k_affine,
         group_size=group_size,
     )
-    monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
-    )
+    mock_cuda_target(monkeypatch, (12, 0))
 
     fold_nvfp4_linear(graph)
     fold_convrot_nvfp4_linear(graph)
@@ -803,11 +797,7 @@ def test_output_fold_supports_every_bounded_attention_variant(
         with_sparse_query_blocks=with_sparse_query_blocks,
         group_size=group_size,
     )
-    monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
-    )
+    mock_cuda_target(monkeypatch, (12, 0))
 
     assert _fold_attention_output(graph)
 
@@ -839,11 +829,7 @@ def test_high_first_output_fold_preserves_order_metadata(
         high_first=True,
         group_size=group_size,
     )
-    monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
-    )
+    mock_cuda_target(monkeypatch, (12, 0))
 
     assert _fold_attention_output(graph)
 
@@ -914,11 +900,7 @@ def test_output_fold_fails_closed_for_invalid_group_size(
         with_sparse_query_blocks=False,
         group_size=32,
     )
-    monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
-    )
+    mock_cuda_target(monkeypatch, (12, 0))
 
     assert not _fold_attention_output(graph)
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
@@ -960,16 +942,13 @@ def test_static_output_fails_closed_when_attention_escapes(
 )
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_cuda_compile_fuses_nvfp4_sparse_projection_region(
-    monkeypatch,
     head_dim: int,
     dynamic: bool,
     preparation_count: int,
     routing: str,
 ) -> None:
-    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
-    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(823)
-    model = _SparseProjectionAttention(dynamic=dynamic, routing=routing).eval()
+    model = _SparseProjectionAttention(dynamic=dynamic, routing=routing, head_dim=head_dim).eval()
     hidden_states = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
@@ -1036,23 +1015,20 @@ def test_cuda_compile_fuses_nvfp4_attention_output(
     group_size: int | None,
     output_dynamic: bool,
     affine: bool,
-    monkeypatch,
     dtype: torch.dtype,
     head_dim: int,
     dynamic: bool,
     routing: str,
     preparation_count: int,
 ) -> None:
-    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
-    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(829 + (0 if group_size is None else group_size) + dynamic)
-    if output_dynamic:
-        monkeypatch.setattr(_SparseProjectionAttentionOutput, "output_features", 128)
     model = _SparseProjectionAttentionOutput(
         dynamic=dynamic,
         routing=routing,
         output_dynamic=output_dynamic,
         group_size=group_size,
+        output_features=128 if output_dynamic else 320,
+        head_dim=head_dim,
     ).eval()
     model.set_activation_dtype(dtype)
     if not affine:
@@ -1116,11 +1092,9 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
     dynamic: bool,
     routing: str,
 ) -> None:
-    monkeypatch.setattr(_SparseProjectionAttention, "head_dim", head_dim)
-    monkeypatch.setattr(_SparseProjectionAttention, "rotary_dim", head_dim * 3 // 4)
     torch.manual_seed(831)
     model = _BoundedSparseProjectionAttentionOutput(
-        dynamic=dynamic, routing=routing, output_dynamic=output_dynamic
+        dynamic=dynamic, routing=routing, output_dynamic=output_dynamic, head_dim=head_dim
     ).eval()
     if output_dynamic:
         monkeypatch.setattr(_output, "DYNAMIC_QUERY_CHUNK_ROWS", 128)
@@ -1210,13 +1184,13 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
     monkeypatch.setattr(_output, "DEFAULT_QUERY_CHUNK_ROWS", query_chunk_rows)
     if output_dynamic:
         monkeypatch.setattr(_output, "DYNAMIC_QUERY_CHUNK_ROWS", query_chunk_rows)
-    monkeypatch.setattr(_ProjectedGateCoarseSparseAttentionOutput, "sequence_length", 960)
     torch.manual_seed(839 + (0 if group_size is None else group_size) + dynamic)
     model = _ProjectedGateCoarseSparseAttentionOutput(
         dynamic=dynamic,
         routing=routing,
         output_dynamic=output_dynamic,
         group_size=group_size,
+        sequence_length=960,
     ).eval()
     model.set_activation_dtype(dtype)
     if not key_affine:

@@ -1,7 +1,11 @@
 """Tests for MiniMax-H3 video VAE ConvRot graph specialization."""
 
+import sys
+
 import pytest
 import torch
+from _accelerators import mock_cuda_target, mock_rocm_target
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.specializations.minimax_h3_vae import (
@@ -278,10 +282,11 @@ def test_pass_emits_measured_rdna4_schedule() -> None:
 
 @pytest.mark.parametrize("target", [_SM120, AcceleratorTarget("cuda", "sm89")])
 def test_operator_builds_the_emitted_schedule_over_the_nvidia_plan(monkeypatch, target) -> None:
-    weight = torch.empty(16_384, 2_048, dtype=torch.int8, device="meta")
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-
-    plan = _execution_plan(weight, [128, 128, 64, 8, 3])
+    assert target.cuda_capability is not None
+    mock_cuda_target(monkeypatch, target.cuda_capability)
+    with FakeTensorMode():
+        weight = torch.empty(16_384, 2_048, dtype=torch.int8, device="cuda:0")
+        plan = _execution_plan(weight, [128, 128, 64, 8, 3])
     assert plan.matmul_kernel == "triton"
     assert plan.matmul_group_m == 0
 
@@ -294,10 +299,11 @@ def test_operator_builds_the_emitted_schedule_over_the_nvidia_plan(monkeypatch, 
 
 
 def test_operator_builds_the_emitted_schedule_over_the_amd_plan(monkeypatch) -> None:
-    weight = torch.empty(2_048, 8_192, dtype=torch.int8, device="meta")
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: _GFX1201)
-
-    plan = _execution_plan(weight, [128, 128, 64, 8, 2])
+    monkeypatch.setattr(sys, "platform", "linux")
+    mock_rocm_target(monkeypatch, "gfx1201")
+    with FakeTensorMode():
+        weight = torch.empty(2_048, 8_192, dtype=torch.int8, device="cuda:0")
+        plan = _execution_plan(weight, [128, 128, 64, 8, 2])
 
     assert plan.matmul_block_m == 128
     assert plan.matmul_block_n == 128

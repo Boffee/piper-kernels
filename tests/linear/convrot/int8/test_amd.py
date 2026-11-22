@@ -7,10 +7,10 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import mock_rocm_target, mock_triton_driver
 
 from piper_kernels import compile_options
 from piper_kernels._input_activations import apply_input_activation
-from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, reference
@@ -38,10 +38,9 @@ amd = _backend._amd_backend
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201"])
 @pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
 def test_amd_selection_and_independent_auxiliary_support(monkeypatch, architecture, platform):
-    monkeypatch.setattr(policy.sys, "platform", platform)
-    target = AcceleratorTarget("hip", architecture)
-    monkeypatch.setattr(AcceleratorTarget, "from_device", lambda device: target)
-    monkeypatch.setattr(runtime, "supports_device", lambda device: True)
+    monkeypatch.setattr(sys, "platform", platform)
+    mock_rocm_target(monkeypatch, architecture)
+    mock_triton_driver(monkeypatch, backend="hip", arch=architecture)
     value = SimpleNamespace(device=torch.device("cuda"), shape=(2, 256), numel=lambda: 512)
     expected = amd if platform in ("linux", "win32") else None
     assert _backend.select_linear_backend(value) is expected
@@ -68,9 +67,7 @@ def test_amd_policy_rejects_unvalidated_targets(target):
 
 def test_amd_missing_runtime_falls_back(monkeypatch):
     monkeypatch.setattr(_backend, "_amd_backend", None)
-    monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", "gfx1201")
-    )
+    mock_rocm_target(monkeypatch, "gfx1201")
     value = SimpleNamespace(device=torch.device("cuda"), shape=(2, 256), numel=lambda: 512)
     assert _backend.select_linear_backend(value) is None
     assert _backend.select_preparation_backend(value) is _generic
