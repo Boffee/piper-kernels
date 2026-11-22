@@ -49,7 +49,7 @@ from piper_kernels.attention.piper_attention import _quantized_dispatch as dense
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_piper import _backend as dense_fusion_backend
-from piper_kernels.fusions.convrot_int8_piper import _distributed_compile as dense_dist_compile
+from piper_kernels.fusions.convrot_int8_piper import _compile as dense_compile
 from piper_kernels.fusions.convrot_int8_piper import distributed_output as dense_distributed_output
 from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import NvidiaExecutionPlan
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
@@ -79,6 +79,9 @@ _c10d = torch.ops._c10d_functional
 _aten = torch.ops.aten
 _AUTO_FUNCTIONALIZED = torch.ops.higher_order.auto_functionalized
 _RESIDUAL_ADD = _ops.residual_add_.default
+_DENSE_RS_RESIDUAL_ADD = (
+    _ops.convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default
+)
 
 _DEVICE = torch.device("cuda", 0)
 
@@ -1546,15 +1549,14 @@ def test_fold_dense_distributed_attention_output_fx(
             out_node = wait_node
         graph.output(out_node)
 
-        assert dense_dist_compile.fold_distributed_attention_output(graph)
+        assert dense_compile.fold_distributed_attention_output(graph)
         graph.lint()
         assert not distributed_fx.has_c10d_collectives(graph)
         targets = [n.target for n in graph.nodes if n.op == "call_function"]
         assert _ops.convrot_int8_piper_projected_query_attention_output.default not in targets
         if residual:
-            expected_res_op = dense_dist_compile._PROJECTED_QUERY_RS_RESIDUAL_ADD
             assert any(
-                n.target is _AUTO_FUNCTIONALIZED and n.args and n.args[0] is expected_res_op
+                n.target is _AUTO_FUNCTIONALIZED and n.args and n.args[0] is _DENSE_RS_RESIDUAL_ADD
                 for n in graph.nodes
             )
         else:
@@ -1579,7 +1581,7 @@ def test_fold_dense_distributed_attention_output_fx_negative(fake_triton_device:
         )
         extra = g_shared.call_function(_aten.neg.default, args=(attn_out,))
         g_shared.output((wait_node, extra))
-        assert not dense_dist_compile.fold_distributed_attention_output(g_shared)
+        assert not dense_compile.fold_distributed_attention_output(g_shared)
 
         # Residual dtype mismatch rejects folding into residual_add_.
         g_dtype = torch.fx.Graph()
@@ -1610,13 +1612,11 @@ def test_fold_dense_distributed_attention_output_fx_negative(fake_triton_device:
         out = g_dtype.call_function(operator.getitem, args=(call, 1))
         g_dtype.output(out)
         # Residual fold skips on dtype mismatch, then standalone fold rewrites the reduce-scatter.
-        assert dense_dist_compile.fold_distributed_attention_output(g_dtype)
+        assert dense_compile.fold_distributed_attention_output(g_dtype)
         targets = [n.target for n in g_dtype.nodes if n.op == "call_function"]
-        assert dense_dist_compile._PROJECTED_QUERY_RS in targets
+        assert _ops.convrot_int8_piper_projected_query_attention_reduce_scatter.default in targets
         assert not any(
-            n.target is _AUTO_FUNCTIONALIZED
-            and n.args
-            and n.args[0] is dense_dist_compile._PROJECTED_QUERY_RS_RESIDUAL_ADD
+            n.target is _AUTO_FUNCTIONALIZED and n.args and n.args[0] is _DENSE_RS_RESIDUAL_ADD
             for n in g_dtype.nodes
         )
 

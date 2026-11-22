@@ -7,10 +7,23 @@ from collections.abc import Callable
 import torch
 
 from piper_kernels._triton import runtime
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf._tensor import prepare_packed_matrix
 from piper_kernels.weights.convrot._rotation import validate_group_size
 
+from ._packing import fused_preparation_chunks
+
+_DEFAULT_FUSED_MAX_WIDTH = 8192
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def select_conversion_chunks(target: AcceleratorTarget, in_features: int) -> tuple[int, int] | None:
+    """Return fused ``(chunk_count, chunk_size)``, or None for bounded tiled execution."""
+    # Fusion wins for moderate gfx1201 widths. Keep the same conservative
+    # default for other Triton targets without imposing a GPU-model allowlist.
+    if target.is_nvidia_cuda or in_features <= _DEFAULT_FUSED_MAX_WIDTH:
+        return fused_preparation_chunks(in_features)
+    return None
 
 
 def select_gguf_converter(

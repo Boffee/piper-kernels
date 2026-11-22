@@ -3,7 +3,7 @@
 import pytest
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.sparse_piper_attention._amd import policy as amd_policy
+from piper_kernels.attention.sparse_piper_attention import _backend
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy
 
 
@@ -117,7 +117,7 @@ def test_minmax_score_kernel_is_limited_to_exact_sm120(target, supported):
     ("selector", "expect_lds_only_fences"),
     [
         (policy.select_sm120_minmax_score_schedule, False),
-        (amd_policy.select_minmax_score_schedule, True),
+        (_backend.select_amd_minmax_score_schedule, True),
     ],
     ids=["sm120", "rdna4"],
 )

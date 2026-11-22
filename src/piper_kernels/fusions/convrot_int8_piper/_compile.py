@@ -17,6 +17,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
     count_query_scales,
 )
 from piper_kernels.attention.piper_attention import _quantized_dispatch
+from piper_kernels.fusions.attention import _distributed_fold as distributed_fold
 from piper_kernels.fusions.attention import _head_slices as head_slices
 from piper_kernels.fusions.attention import _projected_qk_compile as projected_compile
 from piper_kernels.fusions.attention import _residual_fold as residual_fold
@@ -26,7 +27,10 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile_fx
 from piper_kernels.weights.convrot import _rotation
 
-from . import _backend, _distributed_compile, _output_compile
+from . import _backend, _output_compile
+from . import (
+    distributed_output as distributed_output_operators,  # noqa: F401 - registers distributed output ops
+)
 from . import key as key_operators  # noqa: F401 - registers the K projection
 from . import value as value_operators  # noqa: F401 - registers the V projection
 
@@ -547,6 +551,18 @@ _HEAD_SLICING = head_slices.HeadSlicing(
 )
 
 
+def fold_distributed_attention_output(graph: torch.fx.Graph) -> bool:
+    """Fold ``projected_query_attention_output -> reduce_scatter -> (optional) residual_add_``."""
+    return distributed_fold.fold_distributed_projected_output(
+        graph,
+        output_op=_kernels.convrot_int8_piper_projected_query_attention_output.default,
+        reduce_scatter_op=_kernels.convrot_int8_piper_projected_query_attention_reduce_scatter.default,
+        reduce_scatter_residual_op=(
+            _kernels.convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default
+        ),
+    )
+
+
 def fold_attention_output(graph: torch.fx.Graph) -> bool:
     """Fold dense attention output projections, residual adds, and reduce-scatters."""
     changed = _output_compile.fold_attention_output(graph)
@@ -562,11 +578,15 @@ def fold_attention_output(graph: torch.fx.Graph) -> bool:
         )
         or changed
     )
-    changed = _distributed_compile.fold_distributed_attention_output(graph) or changed
+    changed = fold_distributed_attention_output(graph) or changed
     if changed:
         graph.eliminate_dead_code()
         graph.lint()
     return changed
 
 
-__all__ = ["fold_attention_output", "fold_attention_projections"]
+__all__ = [
+    "fold_attention_output",
+    "fold_attention_projections",
+    "fold_distributed_attention_output",
+]

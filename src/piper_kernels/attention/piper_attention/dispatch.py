@@ -8,12 +8,31 @@ from piper_kernels.attention._validation import validate_attention_inputs
 from . import _backend
 from .reference import reference_piper_attention
 
-try:
-    from .triton import triton_piper_attention as _triton_piper_attention
-except ModuleNotFoundError as error:
-    if error.name != "triton":
-        raise
-    _triton_piper_attention = None
+
+@torch.library.custom_op("piper_kernels::piper_attention", mutates_args=())
+def _triton_piper_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+) -> torch.Tensor:
+    """Run the selected native preparation and integer-PV recurrence."""
+    backend = _backend.select_backend(AcceleratorTarget.from_device(query.device))
+    if backend is None:
+        raise RuntimeError(f"native Piper Attention is unavailable on {query.device}")
+    return backend(query, key, value, scale, is_causal)
+
+
+@_triton_piper_attention.register_fake
+def _triton_piper_attention_fake(
+    query: torch.Tensor,
+    _key: torch.Tensor,
+    _value: torch.Tensor,
+    _scale: float,
+    _is_causal: bool,
+) -> torch.Tensor:
+    return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
 def _validate_inputs(
@@ -35,7 +54,7 @@ def _validate_inputs(
 
 
 def _supports_triton(target: AcceleratorTarget) -> bool:
-    return _triton_piper_attention is not None and _backend.select_backend(target) is not None
+    return _backend.select_backend(target) is not None
 
 
 def piper_attention(
@@ -77,7 +96,6 @@ def piper_attention(
     converted_scale = _validate_inputs(query, key, value, scale, is_causal)
     target = AcceleratorTarget.from_device(query.device)
     if _supports_triton(target):
-        assert _triton_piper_attention is not None
         return _triton_piper_attention(
             query,
             key,
@@ -92,3 +110,6 @@ def piper_attention(
         converted_scale,
         is_causal,
     )
+
+
+__all__ = ["piper_attention"]

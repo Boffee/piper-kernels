@@ -21,7 +21,7 @@ from piper_kernels.stochastic_quantization.triton import stochastic_round_to_int
 from piper_kernels.weights.convrot import triton as convrot_backend
 
 from . import _update_reference as reference
-from ._gguf_policy import select_conversion_chunks
+from ._gguf import select_conversion_chunks
 
 _GGUF_TILE_SIZE = 1024
 _GGUF_MAXIMA_BYTES = 1024 * 1024
