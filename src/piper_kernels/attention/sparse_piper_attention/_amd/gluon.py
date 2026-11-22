@@ -32,7 +32,7 @@ from piper_kernels.attention.kernels.piper.gluon import (
     store_tile_column,
 )
 from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
-from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS, ValueFormat
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 
 from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, _ContextLauncher, _ValidatedAttentionLaunch
 from .._prepared import (
@@ -807,117 +807,77 @@ def _prepare_value_kernel(
         gl.store(value_int8_ptr + value_offsets, value_transposed)
 
 
-def prepare_operands(
+def launch_operand_preparation(
     query: torch.Tensor,
-    scale: float,
-    *,
-    sparse_key_blocks: int,
     combined_key: torch.Tensor,
     combined_value: torch.Tensor,
-    block_lengths: torch.Tensor | None = None,
-    sparse_query_blocks: int | None = None,
-    emit_summaries: bool = False,
-) -> _PreparedSparsePiperOperands:
-    """Quantize Q/K/V into RDNA4 WMMA storage with optional min/max summaries."""
-    batch, kv_heads, logical_sequence_length, head_dim = combined_key.shape
-    storage_tiles = (logical_sequence_length + TILE_ROWS - 1) // TILE_ROWS
-    storage_sequence_length = storage_tiles * TILE_ROWS
+    scale: float,
+    operands: _PreparedSparsePiperOperands,
+) -> None:
+    """Populate preallocated sparse-Piper operands using vectorized 8-warp RDNA4 Gluon kernels."""
+    _batch, query_heads, logical_sequence_length, head_dim = query.shape
+    kv_heads = combined_key.shape[1]
+    storage_sequence_length = operands.key.shape[2]
+    storage_tiles = storage_sequence_length // TILE_ROWS
+    if storage_tiles == 0:
+        return
+    block_lengths = operands.block_lengths
+    emit_summaries = operands.query_summary is not None
+    mask_block_lengths = block_lengths is not None
+    mask_rows = (logical_sequence_length != storage_sequence_length) or mask_block_lengths
+    heads_per_program = 128 // head_dim
+    lengths_buffer = block_lengths if block_lengths is not None else operands.key_scale
 
-    if emit_summaries:
-        query_int8, query_scale, query_summary = amd_quantization.prepare_query_with_summary(
-            query,
-            scale,
-            storage_sequence_length=storage_sequence_length,
-            block_lengths=block_lengths,
-        )
-    else:
-        query_int8, query_scale = amd_quantization.prepare_query(
-            query,
-            scale,
-            storage_sequence_length=storage_sequence_length,
-            block_lengths=block_lengths,
-        )
-        query_summary = None
-
-    key_int8 = torch.empty(
-        (batch, kv_heads, storage_sequence_length, head_dim),
-        device=combined_key.device,
-        dtype=torch.int8,
-    )
-    key_scale = torch.empty(
-        (batch, kv_heads, storage_tiles),
-        device=combined_key.device,
-        dtype=torch.float32,
-    )
-    key_center = torch.empty(
-        (batch, kv_heads, storage_tiles, 2, head_dim),
-        device=combined_key.device,
-        dtype=torch.int8,
-    )
-    key_center_scale = torch.empty(
-        (batch, kv_heads, storage_tiles, 2),
-        device=combined_key.device,
-        dtype=torch.float32,
-    )
-    key_summary = (
-        torch.empty(
-            (batch, kv_heads, sparse_key_blocks, head_dim),
-            device=combined_key.device,
-            dtype=torch.float32,
-        )
-        if emit_summaries
-        else None
-    )
-    key_aux = (
-        torch.empty(
-            (batch, kv_heads, sparse_key_blocks, head_dim),
-            device=combined_key.device,
-            dtype=torch.float32,
-        )
-        if emit_summaries
-        else None
-    )
-    value_int8 = torch.empty(
-        ValueFormat.AMD_WMMA.shape(batch, kv_heads, storage_sequence_length, head_dim),
-        device=combined_value.device,
-        dtype=torch.int8,
-    )
-    value_scale_multiplier = torch.empty(
-        (batch, kv_heads, storage_tiles, 1),
-        device=combined_value.device,
-        dtype=torch.float32,
-    )
-    value_mean = torch.empty(
-        (batch, kv_heads, storage_tiles, head_dim),
-        device=combined_value.device,
-        dtype=torch.bfloat16,
-    )
-
-    if combined_key.numel() > 0 and storage_tiles > 0:
-        heads_per_program = 128 // head_dim
-        key_grid, key_heads_inner = select_block_grid(
-            combined_key, storage_tiles, heads_per_program=heads_per_program
-        )
-        value_grid, value_heads_inner = select_block_grid(
-            combined_value, storage_tiles, heads_per_program=heads_per_program
-        )
-        mask_block_lengths = block_lengths is not None
-        mask_rows = (logical_sequence_length != storage_sequence_length) or mask_block_lengths
-        mask_kv_heads = head_dim == 64 and (kv_heads % 2 != 0)
-        lengths_buffer = block_lengths if block_lengths is not None else key_scale
-        with device_context(combined_key.device):
-            _prepare_key_kernel[key_grid](
-                combined_key,
-                key_int8,
-                key_scale,
-                key_center,
-                key_center_scale,
-                key_summary if key_summary is not None else key_scale,
-                key_aux if key_aux is not None else key_scale,
+    with device_context(combined_key.device):
+        if query_heads > 0:
+            query_grid, query_heads_inner = select_block_grid(
+                query, storage_tiles, heads_per_program=heads_per_program
+            )
+            _prepare_query_kernel[query_grid](
+                query,
+                operands.query,
+                operands.query_scale,
+                (
+                    operands.query_summary
+                    if operands.query_summary is not None
+                    else operands.query_scale
+                ),
                 lengths_buffer,
                 logical_sequence_length,
                 storage_tiles,
-                sparse_key_blocks,
+                query.stride(0),
+                query.stride(1),
+                query.stride(2),
+                query_heads,
+                query_heads_inner,
+                float(scale),
+                head_dim,
+                emit_summaries,
+                mask_block_lengths,
+                mask_rows,
+                head_dim == 64 and (query_heads % 2 != 0),
+                amd_quantization.is_aligned_16b(query),
+                num_warps=8,
+                num_stages=1,
+                llvm_fn_attrs=amd_quantization.PREP_LLVM_FN_ATTRS,
+            )
+        if kv_heads > 0:
+            mask_kv_heads = head_dim == 64 and (kv_heads % 2 != 0)
+            key_grid, key_heads_inner = select_block_grid(
+                combined_key, storage_tiles, heads_per_program=heads_per_program
+            )
+            _prepare_key_kernel[key_grid](
+                combined_key,
+                operands.key,
+                operands.key_scale,
+                operands.key_center,
+                operands.key_center_scale,
+                operands.key_summary if operands.key_summary is not None else operands.key_scale,
+                operands.key_aux if operands.key_aux is not None else operands.key_scale,
+                lengths_buffer,
+                logical_sequence_length,
+                storage_tiles,
+                operands.sparse_key_blocks,
                 combined_key.stride(0),
                 combined_key.stride(1),
                 combined_key.stride(2),
@@ -933,11 +893,14 @@ def prepare_operands(
                 num_stages=1,
                 llvm_fn_attrs=amd_quantization.PREP_LLVM_FN_ATTRS,
             )
+            value_grid, value_heads_inner = select_block_grid(
+                combined_value, storage_tiles, heads_per_program=heads_per_program
+            )
             _prepare_value_kernel[value_grid](
                 combined_value,
-                value_int8,
-                value_scale_multiplier,
-                value_mean,
+                operands.value,
+                operands.value_scale_multiplier,
+                operands.value_mean,
                 lengths_buffer,
                 logical_sequence_length,
                 storage_tiles,
@@ -955,26 +918,6 @@ def prepare_operands(
                 num_stages=1,
                 llvm_fn_attrs=amd_quantization.PREP_LLVM_FN_ATTRS,
             )
-
-    return _PreparedSparsePiperOperands(
-        key=key_int8,
-        value=value_int8,
-        value_format=ValueFormat.AMD_WMMA,
-        key_scale=key_scale,
-        key_center=key_center,
-        key_center_scale=key_center_scale,
-        value_scale_multiplier=value_scale_multiplier,
-        value_mean=value_mean,
-        query=query_int8,
-        query_scale=query_scale,
-        block_lengths=block_lengths,
-        sparse_key_blocks=sparse_key_blocks,
-        sparse_query_blocks=sparse_query_blocks,
-        logical_sequence_length=logical_sequence_length,
-        query_summary=query_summary,
-        key_summary=key_summary,
-        key_aux=key_aux,
-    )
 
 
 def bind_context(context: _PreparedSparsePiperContext) -> _ContextLauncher:

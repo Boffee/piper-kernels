@@ -73,9 +73,15 @@ def test_attention_selection_uses_operand_target(target, kind, head_dim):
         return
     assert selected is not None
     if kind == "amd":
+        assert _backend.preparation is not None
         assert selected.value_format is ValueFormat.AMD_WMMA
         assert selected.skip_dense_routing is False
-        assert selected.prepare is _backend.amd_gluon.prepare_operands
+        assert isinstance(selected.prepare, partial)
+        assert selected.prepare.func is _backend.preparation._prepare_sparse_piper_operands
+        assert selected.prepare.keywords == {
+            "value_format": ValueFormat.AMD_WMMA,
+            "launch_kernels": _backend.amd_gluon.launch_operand_preparation,
+        }
         assert selected.bind is _backend.amd_gluon.bind_context
     else:
         assert selected.value_format is ValueFormat.TRANSPOSED

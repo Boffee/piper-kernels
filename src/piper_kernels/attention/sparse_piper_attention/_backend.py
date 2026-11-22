@@ -93,11 +93,15 @@ _nvidia_async_copy_attention_skip_dense_routing = (
 )
 _amd_attention = (
     AttentionBackend(
-        prepare=amd_gluon.prepare_operands,
+        prepare=partial(
+            preparation._prepare_sparse_piper_operands,
+            value_format=ValueFormat.AMD_WMMA,
+            launch_kernels=amd_gluon.launch_operand_preparation,
+        ),
         value_format=ValueFormat.AMD_WMMA,
         bind=amd_gluon.bind_context,
     )
-    if amd_gluon is not None
+    if preparation is not None and amd_gluon is not None
     else None
 )
 
@@ -249,7 +253,7 @@ def use_fused_operand_preparation(
     Mean routing keeps its existing reduction order: a different FP32 sum can
     change routes tied within a ULP. SM120 also keeps its faster short-row path.
     """
-    if routing_mode == _MEAN_ROUTING or (preparation is None and amd_gluon is None):
+    if preparation is None or routing_mode == _MEAN_ROUTING:
         return False
     if not (
         query.device == key.device
@@ -263,10 +267,8 @@ def use_fused_operand_preparation(
         return False
     target = AcceleratorTarget.from_device(query.device) if target is None else target
     if nvidia_policy.uses_tensor_descriptors(target):
-        return preparation is not None and nvidia_policy.use_sm120_fused_preparation(
-            query.shape[-1], query.shape[2]
-        )
-    return (preparation is not None and nvidia_policy.uses_async_copies(target)) or (
+        return nvidia_policy.use_sm120_fused_preparation(query.shape[-1], query.shape[2])
+    return nvidia_policy.uses_async_copies(target) or (
         amd_gluon is not None and supports_amd_target(target)
     )
 

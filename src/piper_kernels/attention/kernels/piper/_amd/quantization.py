@@ -527,14 +527,13 @@ def _prepare_query_kernel(
         gl.store(query_scale_ptr + scale_offsets, stored_scale)
 
 
-def _prepare_query_impl(
+def prepare_query(
     query: torch.Tensor,
     scale: float,
     *,
     storage_sequence_length: int,
-    block_lengths: torch.Tensor | None = None,
-    emit_summaries: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize queries with signed Hadamard rotation into padded head-major storage."""
     batch, heads, logical_sequence_length, head_dim = query.shape
     storage_tiles = storage_sequence_length // TILE_ROWS
     query_int8 = torch.empty(
@@ -547,39 +546,22 @@ def _prepare_query_impl(
         device=query.device,
         dtype=torch.float32,
     )
-    query_summary = (
-        torch.empty(
-            (batch, heads, storage_tiles, head_dim),
-            device=query.device,
-            dtype=torch.float32,
-        )
-        if emit_summaries
-        else None
-    )
     if batch == 0 or heads == 0 or storage_tiles == 0:
-        return query_int8, query_scale, query_summary
+        return query_int8, query_scale
     if logical_sequence_length == 0:
         with device_context(query.device):
             query_int8.zero_()
             query_scale.zero_()
-            if query_summary is not None:
-                query_summary.zero_()
-        return query_int8, query_scale, query_summary
+        return query_int8, query_scale
 
     grid, heads_inner = select_block_grid(query, storage_tiles, heads_per_program=128 // head_dim)
-    mask_block_lengths = block_lengths is not None
-    mask_rows = (logical_sequence_length != storage_sequence_length) or mask_block_lengths
-    mask_heads = head_dim == 64 and (heads % 2 != 0)
-    aligned_16b = is_aligned_16b(query)
-    summary_buffer = query_summary if query_summary is not None else query_scale
-    lengths_buffer = block_lengths if block_lengths is not None else query_scale
     with device_context(query.device):
         _prepare_query_kernel[grid](
             query,
             query_int8,
             query_scale,
-            summary_buffer,
-            lengths_buffer,
+            query_scale,
+            query_scale,
             logical_sequence_length,
             storage_tiles,
             query.stride(0),
@@ -589,50 +571,13 @@ def _prepare_query_impl(
             heads_inner,
             float(scale),
             head_dim,
-            emit_summaries,
-            mask_block_lengths,
-            mask_rows,
-            mask_heads,
-            aligned_16b,
+            False,
+            False,
+            logical_sequence_length != storage_sequence_length,
+            head_dim == 64 and (heads % 2 != 0),
+            is_aligned_16b(query),
             num_warps=8,
             num_stages=1,
             llvm_fn_attrs=PREP_LLVM_FN_ATTRS,
         )
-    return query_int8, query_scale, query_summary
-
-
-def prepare_query(
-    query: torch.Tensor,
-    scale: float,
-    *,
-    storage_sequence_length: int,
-    block_lengths: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize queries with signed Hadamard rotation into padded head-major storage."""
-    query_int8, query_scale, _summary = _prepare_query_impl(
-        query,
-        scale,
-        storage_sequence_length=storage_sequence_length,
-        block_lengths=block_lengths,
-        emit_summaries=False,
-    )
     return query_int8, query_scale
-
-
-def prepare_query_with_summary(
-    query: torch.Tensor,
-    scale: float,
-    *,
-    storage_sequence_length: int,
-    block_lengths: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize queries and emit per-K64-tile min+max routing summaries."""
-    query_int8, query_scale, query_summary = _prepare_query_impl(
-        query,
-        scale,
-        storage_sequence_length=storage_sequence_length,
-        block_lengths=block_lengths,
-        emit_summaries=True,
-    )
-    assert query_summary is not None
-    return query_int8, query_scale, query_summary
