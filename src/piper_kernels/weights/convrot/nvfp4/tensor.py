@@ -11,13 +11,13 @@ from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwarg
 
 from piper_kernels.weights._views import require_untransposed
 from piper_kernels.weights.convrot._rotation import rotate_groups, validate_group_size
-from piper_kernels.weights.nvfp4._typing import NVFP4Storage
 from piper_kernels.weights.nvfp4.tensor import PiperNVFP4Tensor, _quantize_hp
 
 
 class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
     """Standard NVFP4 weight storage carrying its grouped rotation metadata."""
 
+    _update_format_name: ClassVar[str] = "ConvRot NVFP4"
     tensor_attribute_names: ClassVar[list[str]] = [
         *PiperNVFP4Tensor.tensor_attribute_names,
         "group_size",
@@ -62,35 +62,9 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
                 f"ConvRot NVFP4 weight features {features} must be divisible "
                 f"by group size {group_size}"
             )
-        return cast(ConvRotNVFP4Tensor, tensor)
-
-    def __init__(  # noqa: PLR0913, PLR0917
-        self,
-        qdata: torch.Tensor,
-        scale: torch.Tensor,
-        block_size: int,
-        orig_dtype: torch.dtype,
-        group_size: int,
-        per_tensor_scale: torch.Tensor | None = None,
-        act_per_tensor_scale: torch.Tensor | None = None,
-        is_swizzled_scales: bool = False,
-        use_triton_kernel: bool = False,
-        act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
-        high_first: bool = False,
-    ) -> None:
-        super().__init__(
-            qdata,
-            scale,
-            block_size,
-            orig_dtype,
-            per_tensor_scale,
-            act_per_tensor_scale,
-            is_swizzled_scales,
-            use_triton_kernel,
-            act_quant_kwargs,
-            high_first,
-        )
-        self.group_size = group_size
+        convrot = cast(ConvRotNVFP4Tensor, tensor)
+        convrot.group_size = group_size
+        return convrot
 
     @classmethod
     def from_torchao(
@@ -109,20 +83,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
                     f"ConvRot NVFP4 tensor uses group size {tensor.group_size}, not {group_size}"
                 )
             return tensor
-        storage = cast(NVFP4Storage, tensor)
-        return cls(
-            storage.qdata,
-            storage.scale,
-            storage.block_size,
-            storage.orig_dtype,
-            group_size,
-            storage.per_tensor_scale,
-            storage.act_per_tensor_scale,
-            storage.is_swizzled_scales,
-            storage.use_triton_kernel,
-            storage.act_quant_kwargs,
-            high_first=getattr(storage, "high_first", False),
-        )
+        return cls._from_torchao_storage(tensor, group_size)
 
     @classmethod
     def from_hp(
@@ -149,8 +110,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         """
         if group_size is None:
             raise TypeError("ConvRot NVFP4 quantization requires a group size")
-        storage = cast(
-            NVFP4Storage,
+        return cls._from_torchao_storage(
             _quantize_hp(
                 rotate_groups(hp_tensor.detach().float(), group_size),
                 block_size=block_size,
@@ -161,18 +121,8 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
                 use_triton_kernel=use_triton_kernel,
                 act_quant_kwargs=act_quant_kwargs,
             ),
-        )
-        return cls(
-            storage.qdata,
-            storage.scale,
-            storage.block_size,
-            hp_tensor.dtype,
             group_size,
-            storage.per_tensor_scale,
-            storage.act_per_tensor_scale,
-            storage.is_swizzled_scales,
-            storage.use_triton_kernel,
-            storage.act_quant_kwargs,
+            orig_dtype=hp_tensor.dtype,
         )
 
     @classmethod
@@ -258,22 +208,6 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
     def _stable_hash_for_caching(self) -> str:
         """Include the rotation group in AOTAutograd's persistent-cache key."""
         return repr((super()._stable_hash_for_caching(), self.group_size))
-
-    def _rebuild_with_logical_dtype(self, dtype: torch.dtype) -> ConvRotNVFP4Tensor:
-        """Preserve the concrete wrapper and rotation metadata across conversion."""
-        return type(self)(
-            self.qdata,
-            self.scale,
-            self.block_size,
-            dtype,
-            self.group_size,
-            self.per_tensor_scale,
-            self.act_per_tensor_scale,
-            self.is_swizzled_scales,
-            self.use_triton_kernel,
-            self.act_quant_kwargs,
-            high_first=self.high_first,
-        )
 
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
         """Recover the logical weight in the unrotated basis."""
