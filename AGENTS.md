@@ -29,14 +29,28 @@ for architecture, validation, and tests.
    the boundary; follow the [validation contract](docs/development.md#validation-contract)
    (no implicit content checks or readbacks, validate before mutating, never retry
    partial mutations, restore device state on failure).
-7. **Shrink on refactors; generalize first:** Cleanup/architecture changes must reduce
-   net LOC and files (justify exceptions); generalize and delete superseded paths in the
-   same PR when adding variants.
+7. **Remove what a refactor supersedes.** Prefer fewer lines and files. Removing
+   duplicated logic within one file counts as cleanup. For cleanup or architecture
+   changes, justify any net growth in lines or files. When adding a variant,
+   generalize the shared path and remove the superseded implementation in the same PR.
 8. **Test contracts, not private plumbing:** Assert observable behavior and compiler
    invariants in shared parametrized suites—never hardcoded tile tuples, private-global
    monkeypatches, or `src/` AST checks outside
    [`tests/test_architecture.py`](tests/test_architecture.py). Never raise its ceilings
    without explicit approval; lower them as cleanup lands.
+
+## Fixing kernel bugs
+
+1. For a runtime bug, call the public operator with the failing inputs on the
+   affected hardware and confirm which backend ran. A passing fallback can hide
+   a broken GPU kernel. For a compilation failure, reproduce it with the affected
+   compiler target and report whether you also tested the fix on hardware.
+2. For a numerical error, compare with the portable reference for the same
+   quantized operation. For a mutation bug, check what changed in caller-owned
+   storage and what should have stayed untouched.
+3. Trace the failure to the code that owns the behavior and check sibling variants
+   for the same cause. Verify the regression test fails for that reason before
+   the fix and passes afterward. Report any target you could not exercise.
 
 ## Contracts & checks
 
