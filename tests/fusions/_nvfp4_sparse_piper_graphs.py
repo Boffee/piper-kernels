@@ -6,10 +6,10 @@ import operator
 
 import pytest
 import torch
+from _accelerators import mock_cuda_target
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import compile_options
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MINMAX_ROUTING,
     _SparsePiperRatioProfile,
@@ -507,11 +507,7 @@ def run_nvfp4_passes(
     linear: bool = True,
 ) -> None:
     """Run the unified NVFP4 + ConvRot NVFP4 sparse-Piper pass pipeline on a fake graph."""
-    monkeypatch.setattr(
-        AcceleratorTarget,
-        "from_device",
-        classmethod(lambda _cls, _device: AcceleratorTarget("cuda", "sm120")),
-    )
+    mock_cuda_target(monkeypatch, (12, 0))
     passes = compile_options(linear=linear, attention=True)["post_grad_custom_pre_pass"]
     assert isinstance(passes, tuple)
     for compiler_pass in passes:

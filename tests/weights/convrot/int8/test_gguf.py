@@ -4,14 +4,12 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import mock_triton_driver
 from gguf_format._fixtures import finite_packed, reference_case
+from torch._subclasses.fake_tensor import FakeTensorMode
 
-from piper_kernels._triton import runtime
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import GGUFQuantizationType
-from piper_kernels.linear.convrot.int8 import _backend
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor, _gguf
-from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
 from piper_kernels.weights.convrot.int8 import triton as int8_weight_triton
 
 _gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
@@ -118,21 +116,22 @@ def test_from_gguf_reads_quant_type_attribute() -> None:
 
 @pytest.mark.parametrize("architecture", ["gfx1036", "gfx942", "gfx1201", "gfx9999"])
 def test_generic_conversion_does_not_require_a_tuned_amd_target(monkeypatch, architecture):
-    monkeypatch.setattr(
-        AcceleratorTarget, "from_device", lambda device: AcceleratorTarget("hip", architecture)
-    )
-    monkeypatch.setattr(runtime, "supports_device", lambda device: True)
-    assert int8_gguf.select_gguf_converter(torch.empty(1)) is int8_weight_triton.convert_gguf_out
-    monkeypatch.setattr(_backend, "_amd_backend", None)
-    monkeypatch.setattr(_backend, "_nvidia_backend", None)
-    assert int8_gguf.select_gguf_converter(torch.empty(1)) is int8_weight_triton.convert_gguf_out
+    mock_triton_driver(monkeypatch, backend="hip", arch=architecture)
+    with FakeTensorMode():
+        assert (
+            _gguf.select_gguf_converter(torch.empty(1, device="cuda:0"))
+            is int8_weight_triton.convert_gguf_out
+        )
 
 
 def test_conversion_requires_a_matching_triton_driver(monkeypatch):
-    monkeypatch.setattr(_backend, "_nvidia_backend", None)
-    monkeypatch.setattr(runtime, "supports_device", lambda device: False)
-    assert int8_gguf.select_gguf_converter(torch.empty(1)) is None
-    assert int8_gguf.select_gguf_converter(torch.empty(1)) is None
+    assert _gguf.select_gguf_converter(torch.empty(1)) is None
+    mock_triton_driver(monkeypatch, backend="cuda", arch=60)
+    with FakeTensorMode():
+        assert _gguf.select_gguf_converter(torch.empty(1, device="cuda:0")) is None
+    mock_triton_driver(monkeypatch, backend="hip", arch="gfx1201", device_type="xpu")
+    with FakeTensorMode():
+        assert _gguf.select_gguf_converter(torch.empty(1, device="cuda:0")) is None
 
 
 @pytest.mark.gpu
@@ -150,8 +149,6 @@ def test_conversion_requires_a_matching_triton_driver(monkeypatch):
     ],
 )
 def test_generic_conversion_widths_and_bounded_batches(monkeypatch, quant_type, width, dtype):
-    monkeypatch.setattr(_backend, "_nvidia_backend", None)
-    monkeypatch.setattr(_backend, "_amd_backend", None)
     monkeypatch.setattr(int8_weight_triton, "select_conversion_chunks", lambda target, width: None)
     # Force repeated batches, including a one-row tail and maxima larger than the budget.
     monkeypatch.setattr(int8_weight_triton, "_GGUF_MAXIMA_BYTES", 48)
@@ -184,7 +181,7 @@ def test_empty_conversion_does_not_launch(monkeypatch, shape):
     def unexpected(*args):
         raise AssertionError("empty GGUF conversion launched a kernel")
 
-    monkeypatch.setattr(int8_gguf, "select_gguf_converter", lambda value: unexpected)
+    monkeypatch.setattr(int8_weight_triton, "convert_gguf_out", unexpected)
     packed = torch.empty(shape, device="cuda", dtype=torch.float32)
     weight = ConvRotInt8Tensor.from_gguf(packed, quant_type=GGUFQuantizationType.F32, group_size=16)
     assert weight.qdata.shape == shape
@@ -198,7 +195,6 @@ def test_empty_conversion_does_not_launch(monkeypatch, shape):
 @pytest.mark.parametrize("magnitude", [0.0, 1e-6, 1e-31])
 @pytest.mark.parametrize("tiled", [False, True])
 def test_generic_conversion_zero_and_tiny_scales(monkeypatch, dtype, magnitude, tiled):
-    monkeypatch.setattr(_backend, "_nvidia_backend", None)
     if tiled:
         monkeypatch.setattr(
             int8_weight_triton, "select_conversion_chunks", lambda target, width: None
@@ -218,7 +214,6 @@ def test_generic_conversion_zero_and_tiny_scales(monkeypatch, dtype, magnitude, 
 @_gpu
 @pytest.mark.parametrize("tiled", [False, True])
 def test_generic_conversion_does_not_materialize_dense_weights(monkeypatch, tiled):
-    monkeypatch.setattr(_backend, "_nvidia_backend", None)
     if tiled:
         monkeypatch.setattr(
             int8_weight_triton, "select_conversion_chunks", lambda target, width: None
@@ -247,9 +242,6 @@ def test_shared_fused_conversion_matches_tiled_multichunk_rows(
 ):
     torch.manual_seed(740)
     packed = finite_packed(quant_type, rows=3, features=width).cuda()
-    # Both paths are generic; disable tuned linear implementations to verify independence.
-    monkeypatch.setattr(_backend, "_nvidia_backend", None)
-    monkeypatch.setattr(_backend, "_amd_backend", None)
     fused = Mock(wraps=int8_weight_triton.rotate_quantize_rows_kernel)
     # JIT kernels launch through __getitem__, so record the selected grid explicitly.
     launch = Mock(wraps=int8_weight_triton.rotate_quantize_rows_kernel.__getitem__)
@@ -287,23 +279,26 @@ def test_conversion_validates_output_storage_before_execution(monkeypatch, inval
     def unexpected(*args):
         raise AssertionError("invalid output reached the converter")
 
-    monkeypatch.setattr(int8_gguf, "select_gguf_converter", lambda value: unexpected)
-    packed = finite_packed(GGUFQuantizationType.Q4_K)
-    qdata = torch.empty(2, 256, dtype=torch.int8)
-    scale = torch.empty(2, 1)
-    if invalid == "shape":
-        qdata = qdata[:1]
-    elif invalid == "dtype":
-        qdata = qdata.float()
-    elif invalid == "noncontiguous":
-        qdata = torch.empty(2, 512, dtype=torch.int8)[:, ::2]
-    else:
-        scale = scale.double()
-    with pytest.raises(ValueError, match="output storage is incompatible"):
-        _gguf.convert(
-            packed,
-            quant_type=GGUFQuantizationType.Q4_K,
-            group_size=64,
-            logical_dtype=torch.bfloat16,
-            out=(qdata, scale),
-        )
+    mock_triton_driver(monkeypatch, backend="cuda", arch=120)
+    monkeypatch.setattr(int8_weight_triton, "convert_gguf_out", unexpected)
+    reference = finite_packed(GGUFQuantizationType.Q4_K)
+    with FakeTensorMode():
+        packed = torch.empty(reference.shape, device="cuda:0", dtype=reference.dtype)
+        qdata = torch.empty(2, 256, device="cuda:0", dtype=torch.int8)
+        scale = torch.empty(2, 1, device="cuda:0")
+        if invalid == "shape":
+            qdata = qdata[:1]
+        elif invalid == "dtype":
+            qdata = qdata.float()
+        elif invalid == "noncontiguous":
+            qdata = torch.empty(2, 512, device="cuda:0", dtype=torch.int8)[:, ::2]
+        else:
+            scale = scale.double()
+        with pytest.raises(ValueError, match="output storage is incompatible"):
+            _gguf.convert(
+                packed,
+                quant_type=GGUFQuantizationType.Q4_K,
+                group_size=64,
+                logical_dtype=torch.bfloat16,
+                out=(qdata, scale),
+            )

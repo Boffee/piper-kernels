@@ -22,23 +22,25 @@ def select_projection_backend(
     input: torch.Tensor,  # noqa: A002
     *,
     head_dim: int = 128,
+    target: AcceleratorTarget | None = None,
 ) -> ProjectionBackend | None:
     """Return typed Q/K/V operations for exact SM120, SM89, or RDNA4 D64/D128."""
     if (_nvidia_projection is None and _amd_projection is None) or head_dim not in (64, 128):
         return None
-    target = AcceleratorTarget.from_device(input.device)
-    if nvidia_projection_policy.supports_target(target):
+    resolved_target = AcceleratorTarget.from_device(input.device) if target is None else target
+    if nvidia_projection_policy.supports_target(resolved_target):
         return _nvidia_projection
-    return _amd_projection if amd_policy.supports_target(target) else None
+    return _amd_projection if amd_policy.supports_target(resolved_target) else None
 
 
 def require_projection_backend(
     input: torch.Tensor,  # noqa: A002
     *,
     head_dim: int = 128,
+    target: AcceleratorTarget | None = None,
 ) -> ProjectionBackend:
     """Require a native projection backend after validating execution inputs."""
-    backend = select_projection_backend(input, head_dim=head_dim)
+    backend = select_projection_backend(input, head_dim=head_dim, target=target)
     if backend is None:
         raise ValueError(f"ConvRot INT8 dense projections are unavailable on {input.device}")
     return backend
