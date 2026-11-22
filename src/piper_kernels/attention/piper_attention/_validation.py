@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
-    from ._nvidia._plan import PiperAttentionExecutionPlan
+    from ._nvidia.policy import PiperAttentionExecutionPlan
 
 
 @dataclass(frozen=True, slots=True)
