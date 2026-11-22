@@ -6,18 +6,16 @@ import sys
 import pytest
 
 
-def test_decoder_options_and_calibration_do_not_import_conv3d_operators():
+def test_compile_options_and_calibration_do_not_import_conv3d_operators():
     subprocess.run(
         [
             sys.executable,
             "-c",
             """
 import sys
-from piper_kernels.specializations.minimax_h3_vae import (
-    minimax_h3_vae_convrot_int8_compile_options,
-)
+from piper_kernels import compile_options
 
-minimax_h3_vae_convrot_int8_compile_options()
+compile_options()
 assert 'piper_kernels.specializations.minimax_h3_vae.conv3d' not in sys.modules
 assert 'piper_kernels.conv3d' not in sys.modules
 

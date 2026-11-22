@@ -3,11 +3,11 @@
 Public callers configure compilation through :func:`piper_kernels.compile_options`,
 which installs at most one post-grad pass (:class:`_PiperPostGradPass`) and one
 pre-grad pass (:class:`_PiperPreGradPass`) without mutating caller options or
-duplicating passes across repeated calls. Model-specific specializations attach
-via :func:`add_post_grad_hook` and :func:`add_pre_grad_hook` so core stays
-model-agnostic. Every pass hashes both the package source tree and its active
-configuration tuple into ``uuid()``, and imports rewrite modules lazily inside
-``__call__`` only when matching operators appear in the FX graph.
+duplicating passes across repeated calls. Model-specific pre-grad specializations attach
+via :func:`add_pre_grad_hook` so core stays model-agnostic. Every pass hashes both the
+package source tree and its active configuration tuple into ``uuid()``, and imports
+rewrite modules lazily inside ``__call__`` only when matching operators appear in the FX
+graph.
 """
 
 from __future__ import annotations
@@ -125,8 +125,7 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
 
     Phase 0: residual updates; Phase 1: semantic FFN and ConvRot INT8 attention;
     Phase 2: linear preparation sharing and quantized all-gather hoisting;
-    Phase 3: NVFP4 sparse attention and opt-in dense attention output;
-    Phase 4: registered specialization hooks.
+    Phase 3: NVFP4 sparse attention and opt-in dense attention output.
     """
 
     linear: bool = True
@@ -134,20 +133,17 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
     attention: bool = False
     attention_output: bool = False
     residual_updates: bool = False
-    hooks: tuple[GraphPassHook, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "attention", self.attention or self.attention_output)
-        object.__setattr__(self, "hooks", _dedupe_hooks(self.hooks))
 
-    def _config_key(self) -> tuple[bool, bool, bool, bool, bool, tuple[str, ...]]:
+    def _config_key(self) -> tuple[bool, bool, bool, bool, bool]:
         return (
             self.linear,
             self.ffn,
             self.attention,
             self.attention_output,
             self.residual_updates,
-            tuple(hook.key for hook in self.hooks),
         )
 
     def merge(
@@ -158,7 +154,6 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
         attention: bool = False,
         attention_output: bool = False,
         residual_updates: bool = False,
-        hooks: tuple[GraphPassHook, ...] = (),
     ) -> _PiperPostGradPass:
         return _PiperPostGradPass(
             linear=self.linear or linear,
@@ -166,7 +161,6 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
             attention=self.attention or attention,
             attention_output=self.attention_output or attention_output,
             residual_updates=self.residual_updates or residual_updates,
-            hooks=(*self.hooks, *hooks),
         )
 
     def _run_phase1(self, graph: torch.fx.Graph, op_names: set[str]) -> bool:
@@ -247,8 +241,6 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
         if self._run_phase2(graph, op_names):
             op_names = _graph_op_names(graph)
         self._run_phase3(graph, op_names)
-        for hook in self.hooks:
-            hook.apply(graph)
 
     def uuid(self) -> bytes:
         return compute_compile_pass_uuid(self)
@@ -398,29 +390,6 @@ def compile_options(
     return combined
 
 
-def add_post_grad_hook(
-    options: Mapping[str, object] | None,
-    hook: GraphPassHook,
-    *,
-    linear: bool = False,
-) -> dict[str, object]:
-    """Attach a Phase 4 hook to the unified post-grad pass without mutating options."""
-    combined = dict(options) if options is not None else {}
-    merged = _install_or_merge(
-        combined,
-        _POST_GRAD_PRE_PASS,
-        _PiperPostGradPass,
-        lambda existing: (
-            existing.merge(linear=linear, hooks=(hook,))
-            if existing is not None
-            else _PiperPostGradPass(linear=linear, hooks=(hook,))
-        ),
-    )
-    if merged is not None and merged.residual_updates:
-        combined["allow_buffer_reuse"] = False
-    return combined
-
-
 def add_pre_grad_hook(
     options: Mapping[str, object] | None,
     hook: GraphPassHook,
@@ -444,7 +413,6 @@ __all__ = [
     "GraphPassHook",
     "_PiperPostGradPass",
     "_PiperPreGradPass",
-    "add_post_grad_hook",
     "add_pre_grad_hook",
     "compile_options",
     "compute_compile_pass_uuid",

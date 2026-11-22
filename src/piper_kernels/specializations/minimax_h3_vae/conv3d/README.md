@@ -35,7 +35,7 @@ encoder.compile(
 ```
 
 Run under `torch.no_grad()` or inference mode. Encoder options are independent
-of, and composable with, decoder options.
+of, and composable with, `piper_kernels.compile_options(...)`.
 
 The helper fuses exclusive framewise GroupNorm, SiLU, and optional residual
 around compatible ConvRot convolutions, including their padding. It leaves
