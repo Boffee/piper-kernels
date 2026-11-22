@@ -1,5 +1,6 @@
 """Offline matrix-instruction and preparation coverage for ConvRot INT8 Conv3D."""
 
+import re
 import sys
 
 import pytest
@@ -14,24 +15,19 @@ from piper_kernels.conv3d.convrot.int8 import _policy
 from piper_kernels.conv3d.convrot.int8 import triton as kernels
 
 
-@pytest.mark.parametrize("channels", [64, 128, 256, 512, 1024, 4096])
-@pytest.mark.parametrize("rows", [64, 16384])
-@pytest.mark.parametrize(
-    "target",
-    [
-        GPUTarget("cuda", 120, 32),
-        GPUTarget("cuda", 89, 32),
-        pytest.param(
-            GPUTarget("hip", "gfx1201", 32),
-            marks=pytest.mark.skipif(sys.platform != "linux", reason="ROCm requires Linux"),
-        ),
-    ],
-)
-def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, target):
+def _compile_conv3d(
+    target,
+    *,
+    channels,
+    outputs,
+    rows,
+    has_bias,
+    has_residual,
+):
     plan = _policy.select_execution_plan(
         AcceleratorTarget.from_compiler_target(target),
         channels=channels,
-        outputs=128,
+        outputs=outputs,
         input_rows=rows,
         output_rows=rows,
         output_height=17,
@@ -80,14 +76,15 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
             "block_n": schedule.block_n,
             "block_k": schedule.block_k,
             "bias_stride": 2,
-            "has_bias": True,
-            "has_residual": True,
+            "has_bias": has_bias,
+            "has_residual": has_residual,
             "padding_front": 2 if causal else 0,
             "padding_top": 1 if causal else 0,
             "padding_left": 1 if causal else 0,
             "spatial_reflection": causal,
             "use_weight_descriptor": False,
             "loop_num_stages": schedule.num_stages,
+            "accumulator_seed": plan.accumulator_seed,
         },
     )
     compiled = triton.compile(
@@ -99,12 +96,77 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
             **lds_only_fence_options(plan.lds_only_fences),
         },
     )
+    return plan, compiled
+
+
+@pytest.mark.parametrize("channels", [64, 128, 256, 512, 1024, 4096])
+@pytest.mark.parametrize("rows", [64, 16384])
+@pytest.mark.parametrize(
+    "target",
+    [
+        GPUTarget("cuda", 120, 32),
+        GPUTarget("cuda", 89, 32),
+        pytest.param(
+            GPUTarget("hip", "gfx1201", 32),
+            marks=pytest.mark.skipif(sys.platform != "linux", reason="ROCm requires Linux"),
+        ),
+    ],
+)
+def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, target):
+    _, compiled = _compile_conv3d(
+        target,
+        channels=channels,
+        outputs=128,
+        rows=rows,
+        has_bias=True,
+        has_residual=True,
+    )
     if target.backend == "hip":
         assert "v_wmma_i32" in compiled.asm["amdgcn"]
         if rocm_fences_only_lds():
             assert "global_inv" not in compiled.asm["amdgcn"]
     else:
         assert "mma.sync" in compiled.asm["ptx"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="ROCm requires Linux")
+def test_amd_seeded_convolution_compile_invariants():
+    target = GPUTarget("hip", "gfx1201", 32)
+    wide_plan, wide_compiled = _compile_conv3d(
+        target,
+        channels=256,
+        outputs=256,
+        rows=16384,
+        has_bias=False,
+        has_residual=False,
+    )
+    assert wide_plan.convolution.block_n == 256
+    assert wide_plan.accumulator_seed == 0x155555
+    assert "v_wmma_i32" in wide_compiled.asm["amdgcn"]
+    assert "0x155555" in wide_compiled.asm["amdgcn"]
+    scratch_match = re.search(
+        r"amdhsa_private_segment_fixed_size\s+(\d+)\b", wide_compiled.asm["amdgcn"]
+    )
+    assert scratch_match is not None
+    assert int(scratch_match.group(1)) <= 768
+    if rocm_fences_only_lds():
+        assert "global_inv" not in wide_compiled.asm["amdgcn"]
+
+    medium_plan, medium_compiled = _compile_conv3d(
+        target,
+        channels=256,
+        outputs=128,
+        rows=16384,
+        has_bias=False,
+        has_residual=False,
+    )
+    assert medium_plan.convolution.block_n == 128
+    assert medium_plan.accumulator_seed == 0x155555
+    assert "v_wmma_i32" in medium_compiled.asm["amdgcn"]
+    assert "0x155555" in medium_compiled.asm["amdgcn"]
+    assert re.search(r"amdhsa_private_segment_fixed_size\s+0\b", medium_compiled.asm["amdgcn"])
+    if rocm_fences_only_lds():
+        assert "global_inv" not in medium_compiled.asm["amdgcn"]
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm requires Linux")

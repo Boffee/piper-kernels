@@ -15,8 +15,9 @@ Arithmetic invariants:
 Target schedules (selected in ``_policy.py``):
 - NVIDIA SM120 uses optional 16-byte-aligned weight TMA descriptors; SM8x uses
   pointer loads and narrower tiles to avoid SM120 register pressure; RDNA4
-  (``gfx1200``/``gfx1201``) uses HIP rounding, pointer loads, and LDS-only
-  barrier fences. Checkpoints move across targets without scale conversion.
+  (``gfx1200``/``gfx1201``) uses HIP rounding, pointer loads, LDS-only barrier
+  fences, and ``0x155555`` INT32 accumulator seeding on ``gfx1201``. Checkpoints
+  move across targets without scale conversion.
 """
 
 # pyright: reportCallIssue=false
@@ -271,6 +272,7 @@ def _conv3d_kernel(  # noqa: PLR0915
     residual_stride_height,
     residual_stride_width,
     loop_num_stages: tl.constexpr,
+    accumulator_seed: tl.constexpr,
 ):
     """Apply 3x3x3 ConvRot with explicit padding and one INT32 reduction."""
     row_offsets = tl.program_id(0) * block_m + tl.arange(0, block_m)
@@ -286,7 +288,7 @@ def _conv3d_kernel(  # noqa: PLR0915
     output_x = output_spatial % output_width
     reduction: tl.constexpr = 27 * input_channels
     reduction_offsets = tl.arange(0, block_k)
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
+    accumulator = tl.full((block_m, block_n), accumulator_seed, dtype=tl.int32)
 
     for reduction_start in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
         0,
@@ -338,8 +340,13 @@ def _conv3d_kernel(  # noqa: PLR0915
                 mask=(k[:, None] < reduction) & valid_channels[None, :],
                 other=0,
             )
-        accumulator += tl.dot(input_values, weight_values)
+        if accumulator_seed != 0:
+            accumulator = tl.dot(input_values, weight_values, accumulator)
+        else:
+            accumulator += tl.dot(input_values, weight_values)
 
+    if accumulator_seed != 0:
+        accumulator -= accumulator_seed
     output = accumulator.to(tl.float32) * tl.load(input_scale)
     weight_scale = tl.load(
         weight_scale_ptr + channel_offsets,
@@ -590,6 +597,7 @@ def _conv3d_prepared(
             residual_stride_height=residual_strides[3],
             residual_stride_width=residual_strides[4],
             loop_num_stages=schedule.num_stages,
+            accumulator_seed=execution_plan.accumulator_seed,
             num_warps=schedule.num_warps,
             num_stages=schedule.num_stages,
             **lds_only_fence_options(execution_plan.lds_only_fences),

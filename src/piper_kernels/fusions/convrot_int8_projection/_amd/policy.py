@@ -4,7 +4,11 @@ import sys
 from dataclasses import dataclass
 from typing import Literal
 
-from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels._triton.targets import (
+    RDNA4_INT8_ACCUMULATOR_SEED,
+    RDNA4_INT8_ACCUMULATOR_SEED_MIN_REDUCTION,
+    AcceleratorTarget,
+)
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 
 type ProjectionOperation = Literal["query", "key", "value"]
@@ -15,10 +19,8 @@ GLUON_BLOCK_M = 2 * TILE_ROWS
 GLUON_BLOCK_K = 64
 GLUON_NUM_WARPS = 8
 GLUON_GROUP_M = 8
-# Avoid signed zero-crossing WMMA clock drops across >=4096-feature reductions
-# (see linear/convrot/int8/_amd/policy.py:matmul_accumulator_seed).
-GLUON_ACCUMULATOR_SEED = 0x155555
-GLUON_ACCUMULATOR_SEED_MIN_K = 4096
+GLUON_ACCUMULATOR_SEED = RDNA4_INT8_ACCUMULATOR_SEED
+GLUON_ACCUMULATOR_SEED_MIN_K = RDNA4_INT8_ACCUMULATOR_SEED_MIN_REDUCTION
 GLUON_ROTARY_DIMS: dict[int, tuple[int, ...]] = {
     64: (0, 32, 48, 64),
     128: (0, 32, 64, 96, 128),
