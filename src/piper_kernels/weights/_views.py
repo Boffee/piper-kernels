@@ -10,18 +10,15 @@ from torch._prims_common import infer_size
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.utils import TorchAOBaseTensor
 
-from piper_kernels.weights._dispatch import unsupported_operation_dispatch
+from piper_kernels.weights._dispatch import (
+    require_untransposed as require_untransposed,  # noqa: PLC0414 - shared export
+)
+from piper_kernels.weights._dispatch import (
+    unsupported_operation_dispatch,
+)
 
 if TYPE_CHECKING:
     from piper_kernels.weights._dispatch import QuantizedWeight
-
-
-def require_untransposed(weight: QuantizedWeight, operation: str) -> None:
-    """Reject operations that would interpret a transpose as canonical storage."""
-    if weight.transposed:
-        raise NotImplementedError(
-            f"{type(weight).__name__} {operation} does not support a transposed weight"
-        )
 
 
 def _transpose_dispatch(

@@ -7,13 +7,10 @@ import torch
 from torchao.utils import TorchAOBaseTensor
 
 from piper_kernels.weights._dispatch import (
-    register_conversion_ops,
-    register_inference_mode_dispatch,
-    to_quantized_weight,
+    QuantizedWeightMixin,
+    register_quantized_weight_ops,
+    require_untransposed,
 )
-from piper_kernels.weights._matmul import register_matrix_ops
-from piper_kernels.weights._update import register_update_ops, run_add_, run_addmm_
-from piper_kernels.weights._views import register_view_ops, require_untransposed
 from piper_kernels.weights.convrot.int8._quantization import (
     dequantize_weight,
     quantize_weight,
@@ -22,7 +19,8 @@ from piper_kernels.weights.convrot.int8._quantization import (
 )
 
 
-class ConvRotInt8Tensor(TorchAOBaseTensor):
+# BaseTensor defines Tensor.addmm_/add_ with incompatible scalar/None/complex types.
+class ConvRotInt8Tensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright: ignore[reportIncompatibleMethodOverride]
     """INT8 rotated weight with per-output scale and logical floating dtype.
 
     Use :meth:`from_quantized` for existing quantized storage or :meth:`from_hp`
@@ -37,6 +35,10 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
     Calibrate the input after any activation and rotation for the chosen group size.
     Weight conversion and dequantization alone do not need an activation scale.
     """
+
+    _format_name: ClassVar[str] = "ConvRot INT8"
+    _update_format_name: ClassVar[str] = "ConvRot"
+    _contiguous_memory_format_only: ClassVar[bool] = True
 
     tensor_data_names: ClassVar[list[str]] = ["qdata", "scale"]
     tensor_attribute_names: ClassVar[list[str]] = ["group_size", "dtype"]
@@ -257,86 +259,11 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
         if self.ndim != 2:
             raise NotImplementedError(f"ConvRot INT8 {operation} requires a 2-D weight")
 
-    def _validate_memory_format(self, memory_format: object) -> None:
-        if memory_format not in (None, torch.preserve_format):
-            require_untransposed(self, "to with a different memory format")
-            if memory_format is not torch.contiguous_format:
-                raise NotImplementedError("ConvRot INT8 only supports contiguous memory format")
-
-    # Quantized updates require real coefficients; Tensor also accepts complex/symbolic scalars.
-    def addmm_(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        mat1: torch.Tensor,
-        mat2: torch.Tensor,
-        *,
-        beta: float = 1.0,
-        alpha: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> "ConvRotInt8Tensor":
-        """Update and requantize in place, optionally using stochastic rounding.
-
-        ``alpha`` and ``beta`` must be finite real numbers; integers are accepted.
-        Factors may share storage with ``qdata`` or ``scale``; the update uses
-        their values from before the mutation.
-
-        ``rounding_seed`` accepts the full unsigned 64-bit range. Supplying it
-        makes terminal INT8 code selection reproducible for a fixed device and
-        backend without consuming the process-global random-number generator.
-        """
-        self._require_matrix("addmm_")
+    def _update_target(self, operation: str) -> tuple[Any, tuple[object, ...]]:
+        self._require_matrix(operation)
         from piper_kernels.weights.convrot.int8 import _update  # noqa: PLC0415
 
-        return run_addmm_(
-            self,
-            mat1,
-            mat2,
-            operation="ConvRot addmm_",
-            apply=lambda left, right: _update.addmm_(
-                self.qdata,
-                self.scale,
-                self.dtype,
-                self.group_size,
-                left,
-                right,
-                beta=beta,
-                alpha=alpha,
-                rounding_seed=rounding_seed,
-            ),
-        )
-
-    # Tensor.add_ also types complex and None, which quantized updates reject.
-    def add_(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        other: object,
-        *,
-        beta: float = 1.0,
-        alpha: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> "ConvRotInt8Tensor":
-        """Requantize ``beta * weight + alpha * other`` in place.
-
-        ``alpha`` and ``beta`` must be finite real numbers; integers are accepted.
-        ``beta`` is a Piper extension to Tensor.add_; its default preserves
-        ordinary addition. Rounding follows the ``addmm_`` seed contract.
-        """
-        self._require_matrix("add_")
-        from piper_kernels.weights.convrot.int8 import _update  # noqa: PLC0415
-
-        return run_add_(
-            self,
-            other,
-            operation="ConvRot add_",
-            apply=lambda update: _update.add_(
-                self.qdata,
-                self.scale,
-                self.dtype,
-                self.group_size,
-                update,
-                beta=beta,
-                alpha=alpha,
-                rounding_seed=rounding_seed,
-            ),
-        )
+        return _update, (self.qdata, self.scale, self.dtype, self.group_size)
 
     def _stable_hash_for_caching(self) -> str:
         """Return a metadata fingerprint for AOTAutograd's cross-process cache."""
@@ -352,49 +279,10 @@ class ConvRotInt8Tensor(TorchAOBaseTensor):
             raise BypassAOTAutogradCache(
                 "ConvRot INT8 static input scales may alias across weights"
             )
-        return repr(
-            (
-                type(self).__qualname__,
-                tuple(self.shape),
-                self.stride(),
-                str(self.device),
-                str(self.dtype),
-                self.group_size,
-                self.transposed,
-                tuple(self.qdata.shape),
-                self.qdata.stride(),
-                tuple(self.scale.shape),
-                self.scale.stride(),
-            )
-        )
-
-    def _rebuild_with_logical_dtype(self, dtype: torch.dtype) -> Self:
-        """Rebuild the semantic wrapper without converting quantized storage."""
-        return type(self)(
-            self.qdata,
-            self.scale,
-            self.group_size,
-            dtype,
-            self.act_per_tensor_scale,
-            self.transposed,
-        )
-
-    def to(self, *args: object, **kwargs: object) -> Self:
-        """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
-        return to_quantized_weight(
-            self,
-            super().to,
-            args,
-            kwargs,
-            format_name="ConvRot INT8",
-        )
+        return self._stable_cache_key(self.group_size, self.transposed)
 
 
-register_inference_mode_dispatch(ConvRotInt8Tensor)
-register_view_ops(ConvRotInt8Tensor)
-register_matrix_ops(ConvRotInt8Tensor)
-register_conversion_ops(ConvRotInt8Tensor, format_name="ConvRot INT8")
-register_update_ops(ConvRotInt8Tensor, format_name="ConvRot")
+register_quantized_weight_ops(ConvRotInt8Tensor)
 
 
 @ConvRotInt8Tensor.implements(torch.ops.aten.embedding.default)

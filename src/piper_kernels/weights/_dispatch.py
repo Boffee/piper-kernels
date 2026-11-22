@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar, cast
 
 import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
@@ -16,6 +16,14 @@ if TYPE_CHECKING:
     from .nvfp4.tensor import PiperNVFP4Tensor
 type QuantizedWeight = ConvRotInt8Tensor | PiperNVFP4Tensor
 _WeightT = TypeVar("_WeightT", bound="QuantizedWeight")
+
+
+def require_untransposed(weight: QuantizedWeight, operation: str) -> None:
+    """Reject operations that would interpret a transpose as canonical storage."""
+    if weight.transposed:
+        raise NotImplementedError(
+            f"{type(weight).__name__} {operation} does not support a transposed weight"
+        )
 
 
 def _torch_dispatch(
@@ -182,3 +190,138 @@ def register_conversion_ops(cls: type[TorchAOBaseTensor], *, format_name: str) -
         )
 
     cls.implements(torch.ops.aten._to_copy.default)(_to_copy)
+
+
+class QuantizedWeightMixin:
+    """Shared Tensor subclass conversion, cache-key, and in-place update scaffolding."""
+
+    _format_name: ClassVar[str]
+    _update_format_name: ClassVar[str]
+    _contiguous_memory_format_only: ClassVar[bool] = False
+
+    def _validate_memory_format(self, memory_format: object) -> None:
+        if memory_format not in (None, torch.preserve_format):
+            require_untransposed(cast("QuantizedWeight", self), "to with a different memory format")
+            if self._contiguous_memory_format_only and memory_format is not torch.contiguous_format:
+                raise NotImplementedError(
+                    f"{self._format_name} only supports contiguous memory format"
+                )
+
+    def _rebuild_with_logical_dtype(self, dtype: torch.dtype) -> Self:
+        """Rebuild the concrete semantic wrapper while preserving quantized storage."""
+        names, attributes = cast(TorchAOBaseTensor, self).__tensor_flatten__()
+        tensors = {name: getattr(self, name) for name in names}
+        updated = dict(attributes)
+        updated["orig_dtype" if "orig_dtype" in updated else "dtype"] = dtype
+        return cast(
+            Self,
+            cast(Any, type(self)).__tensor_unflatten__(tensors, updated, None, None),
+        )
+
+    def _stable_cache_key(self, *extra: object) -> str:
+        """Build an AOTAutograd cache fingerprint from common metadata and format fields."""
+        weight = cast("QuantizedWeight", self)
+        return repr(
+            (
+                type(self).__qualname__,
+                tuple(weight.shape),
+                weight.stride(),
+                str(weight.device),
+                str(weight.dtype),
+                tuple(weight.qdata.shape),
+                weight.qdata.stride(),
+                tuple(weight.scale.shape),
+                weight.scale.stride(),
+                *extra,
+            )
+        )
+
+    def _update_target(self, _operation: str) -> tuple[Any, tuple[object, ...]]:
+        raise NotImplementedError
+
+    def addmm_(
+        self,
+        mat1: torch.Tensor,
+        mat2: torch.Tensor,
+        *,
+        beta: float = 1.0,
+        alpha: float = 1.0,
+        rounding_seed: int | None = None,
+    ) -> Self:
+        """Update and requantize in place; ``alpha``/``beta`` finite real, optional uint64 seed."""
+        from piper_kernels.weights._update import run_addmm_  # noqa: PLC0415
+
+        target, prefix = self._update_target("addmm_")
+        return cast(
+            Self,
+            run_addmm_(
+                cast("QuantizedWeight", self),
+                mat1,
+                mat2,
+                operation=f"{self._update_format_name} addmm_",
+                apply=lambda left, right: target.addmm_(
+                    *prefix,
+                    left,
+                    right,
+                    beta=beta,
+                    alpha=alpha,
+                    rounding_seed=rounding_seed,
+                ),
+            ),
+        )
+
+    def add_(
+        self,
+        other: object,
+        *,
+        beta: float = 1.0,
+        alpha: float = 1.0,
+        rounding_seed: int | None = None,
+    ) -> Self:
+        """Requantize ``beta * weight + alpha * other``; finite real scalars, uint64 seed."""
+        from piper_kernels.weights._update import run_add_  # noqa: PLC0415
+
+        target, prefix = self._update_target("add_")
+        return cast(
+            Self,
+            run_add_(
+                cast("QuantizedWeight", self),
+                other,
+                operation=f"{self._update_format_name} add_",
+                apply=lambda update: target.add_(
+                    *prefix,
+                    update,
+                    beta=beta,
+                    alpha=alpha,
+                    rounding_seed=rounding_seed,
+                ),
+            ),
+        )
+
+    def to(self, *args: object, **kwargs: object) -> Self:
+        """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
+        return cast(
+            Self,
+            to_quantized_weight(
+                cast("QuantizedWeight", self),
+                cast(Any, super()).to,
+                args,
+                kwargs,
+                format_name=self._format_name,
+            ),
+        )
+
+
+def register_quantized_weight_ops(cls: type[TorchAOBaseTensor]) -> None:
+    """Register all standard dispatch handlers for a concrete quantized weight subclass."""
+    from piper_kernels.weights._matmul import register_matrix_ops  # noqa: PLC0415
+    from piper_kernels.weights._update import register_update_ops  # noqa: PLC0415
+    from piper_kernels.weights._views import register_view_ops  # noqa: PLC0415
+
+    format_name = cast(Any, cls)._format_name
+    update_format_name = cast(Any, cls)._update_format_name
+    register_inference_mode_dispatch(cls)
+    register_view_ops(cls)
+    register_matrix_ops(cls)
+    register_conversion_ops(cls, format_name=format_name)
+    register_update_ops(cls, format_name=update_format_name)

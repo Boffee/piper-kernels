@@ -17,16 +17,11 @@ from torchao.prototype.mx_formats.utils import from_blocked
 from torchao.utils import TorchAOBaseTensor
 
 from piper_kernels.weights._dispatch import (
-    register_conversion_ops,
-    register_inference_mode_dispatch,
-    to_quantized_weight,
+    QuantizedWeightMixin,
+    register_quantized_weight_ops,
 )
-from piper_kernels.weights._matmul import register_matrix_ops
-from piper_kernels.weights._update import register_update_ops, run_add_, run_addmm_
-from piper_kernels.weights._views import register_view_ops, require_untransposed
 from piper_kernels.weights.nvfp4 import _layout
 from piper_kernels.weights.nvfp4._quantization import quantize_nvfp4
-from piper_kernels.weights.nvfp4._typing import NVFP4Storage
 
 
 def _quantize_hp(
@@ -75,9 +70,12 @@ def _quantize_hp(
     )
 
 
-class PiperNVFP4Tensor(TorchAONVFP4Tensor):
+# BaseTensor defines Tensor.addmm_/add_ with incompatible scalar/None/complex types.
+class PiperNVFP4Tensor(QuantizedWeightMixin, TorchAONVFP4Tensor):  # pyright: ignore[reportIncompatibleMethodOverride]
     """NVFP4 weight storage, quantization metadata, and tensor dispatch hooks."""
 
+    _format_name: ClassVar[str] = "NVFP4"
+    _update_format_name: ClassVar[str] = "NVFP4"
     __torch_function__ = classmethod(TorchAOBaseTensor.__torch_function__.__func__)
     optional_tensor_attribute_names: ClassVar[list[str]] = [
         *TorchAONVFP4Tensor.optional_tensor_attribute_names,
@@ -193,66 +191,45 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         )
 
     @classmethod
+    def _from_torchao_storage(
+        cls,
+        tensor: TorchAONVFP4Tensor,
+        *extra_args: object,
+        orig_dtype: torch.dtype | None = None,
+    ) -> Self:
+        storage: Any = tensor
+        ctor: Any = cls
+        return ctor(
+            storage.qdata,
+            storage.scale,
+            storage.block_size,
+            storage.orig_dtype if orig_dtype is None else orig_dtype,
+            *extra_args,
+            per_tensor_scale=storage.per_tensor_scale,
+            act_per_tensor_scale=storage.act_per_tensor_scale,
+            is_swizzled_scales=storage.is_swizzled_scales,
+            use_triton_kernel=storage.use_triton_kernel,
+            act_quant_kwargs=storage.act_quant_kwargs,
+            high_first=getattr(storage, "high_first", False),
+        )
+
+    @classmethod
     def from_torchao(cls, tensor: TorchAONVFP4Tensor) -> PiperNVFP4Tensor:
         """Wrap existing TorchAO NVFP4 storage without copying it."""
         if isinstance(tensor, cls):
             return tensor
-        storage = cast(NVFP4Storage, tensor)
-        return cls(
-            storage.qdata,
-            storage.scale,
-            storage.block_size,
-            storage.orig_dtype,
-            storage.per_tensor_scale,
-            storage.act_per_tensor_scale,
-            storage.is_swizzled_scales,
-            storage.use_triton_kernel,
-            storage.act_quant_kwargs,
-            high_first=getattr(storage, "high_first", False),
-        )
+        return cls._from_torchao_storage(tensor)
 
     def _stable_hash_for_caching(self) -> str:
         """Return a metadata fingerprint for AOTAutograd's persistent cache."""
-        return repr(
-            (
-                type(self).__qualname__,
-                tuple(self.shape),
-                self.stride(),
-                str(self.device),
-                str(self.dtype),
-                self.block_size,
-                tuple(self.qdata.shape),
-                self.qdata.stride(),
-                tuple(self.scale.shape),
-                self.scale.stride(),
-                self.is_swizzled_scales,
-                self.use_triton_kernel,
-                self.act_quant_kwargs,
-                self.high_first,
-                None if self.per_tensor_scale is None else tuple(self.per_tensor_scale.shape),
-                None
-                if self.act_per_tensor_scale is None
-                else tuple(self.act_per_tensor_scale.shape),
-            )
-        )
-
-    def _validate_memory_format(self, memory_format: object) -> None:
-        if memory_format not in (None, torch.preserve_format):
-            require_untransposed(self, "to with a different memory format")
-
-    def _rebuild_with_logical_dtype(self, dtype: torch.dtype) -> PiperNVFP4Tensor:
-        """Rebuild the concrete semantic wrapper while preserving its storage."""
-        return type(self)(
-            self.qdata,
-            self.scale,
+        return self._stable_cache_key(
             self.block_size,
-            dtype,
-            self.per_tensor_scale,
-            self.act_per_tensor_scale,
             self.is_swizzled_scales,
             self.use_triton_kernel,
             self.act_quant_kwargs,
-            high_first=self.high_first,
+            self.high_first,
+            None if self.per_tensor_scale is None else tuple(self.per_tensor_scale.shape),
+            None if self.act_per_tensor_scale is None else tuple(self.act_per_tensor_scale.shape),
         )
 
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -283,88 +260,13 @@ class PiperNVFP4Tensor(TorchAONVFP4Tensor):
         """Use the unrotated basis for ordinary NVFP4 updates."""
         return 0
 
-    # Quantized updates require real coefficients; Tensor also accepts complex/symbolic scalars.
-    def addmm_(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        mat1: torch.Tensor,
-        mat2: torch.Tensor,
-        *,
-        beta: float = 1.0,
-        alpha: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> Self:
-        """Update and requantize in place, optionally using stochastic rounding.
-
-        ``alpha`` and ``beta`` must be finite real numbers; integers are accepted.
-        ``rounding_seed`` accepts the full unsigned 64-bit range. Supplying it
-        makes terminal E2M1 code selection reproducible for a fixed device and
-        backend without consuming the process-global random-number generator.
-        """
+    def _update_target(self, _operation: str) -> tuple[Any, tuple[object, ...]]:
         from piper_kernels.weights.nvfp4 import _update  # noqa: PLC0415
 
-        return run_addmm_(
-            self,
-            mat1,
-            mat2,
-            operation=_update._operation(self, "addmm_"),
-            apply=lambda left, right: _update.addmm_(
-                self,
-                self._update_group_size(),
-                left,
-                right,
-                beta=beta,
-                alpha=alpha,
-                rounding_seed=rounding_seed,
-            ),
-        )
-
-    # Tensor.add_ also types complex and None, which quantized updates reject.
-    def add_(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        other: object,
-        *,
-        beta: float = 1.0,
-        alpha: float = 1.0,
-        rounding_seed: int | None = None,
-    ) -> Self:
-        """Requantize ``beta * weight + alpha * other`` in place.
-
-        ``alpha`` and ``beta`` must be finite real numbers; integers are accepted.
-        ``beta`` is a Piper extension to Tensor.add_; its default preserves
-        ordinary addition. Rounding follows the ``addmm_`` seed contract.
-        """
-        from piper_kernels.weights.nvfp4 import _update  # noqa: PLC0415
-
-        return run_add_(
-            self,
-            other,
-            operation=_update._operation(self, "add_"),
-            apply=lambda update: _update.add_(
-                self,
-                self._update_group_size(),
-                update,
-                beta=beta,
-                alpha=alpha,
-                rounding_seed=rounding_seed,
-            ),
-        )
-
-    def to(self, *args: object, **kwargs: object) -> Self:
-        """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
-        return to_quantized_weight(
-            self,
-            super().to,
-            args,
-            kwargs,
-            format_name="NVFP4",
-        )
+        return _update, (self, self._update_group_size())
 
 
-register_inference_mode_dispatch(PiperNVFP4Tensor)
-register_view_ops(PiperNVFP4Tensor)
-register_matrix_ops(PiperNVFP4Tensor)
-register_conversion_ops(PiperNVFP4Tensor, format_name="NVFP4")
-register_update_ops(PiperNVFP4Tensor, format_name="NVFP4")
+register_quantized_weight_ops(PiperNVFP4Tensor)
 
 
 __all__ = ["PiperNVFP4Tensor"]
