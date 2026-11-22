@@ -146,7 +146,7 @@ def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple[Argument, ...], dict[
     kwargs = {"head_dim": head_dim}
     try:
         values = cast(tuple[Any, ...], map_arg(arguments, _metadata))
-        query_shape = output._validate_inputs(*values, **kwargs)
+        query_shape = output.DenseOutputOperands(*values, head_dim=head_dim).validate()
     except KeyError, TypeError, ValueError, RuntimeError:
         return None
     if any(

@@ -1,6 +1,7 @@
 """Bounded Q projection, dense attention, and ConvRot INT8 output projection."""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 
@@ -21,182 +22,262 @@ from . import _backend, _schedule, query
 DEFAULT_QUERY_CHUNK_ROWS = pipeline.DEFAULT_QUERY_CHUNK_ROWS
 
 
-def _validate_inputs(  # noqa: PLR0913, PLR0917
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    query_weight: torch.Tensor,
-    query_weight_scale: torch.Tensor,
-    norm_weight: torch.Tensor | None,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    norm_epsilon: float,
-    softmax_scale: float,
-    query_bias: torch.Tensor | None,
-    key: torch.Tensor,
-    key_scale: torch.Tensor,
-    key_center: torch.Tensor,
-    value: torch.Tensor,
-    multiplier: torch.Tensor,
-    log_scale: torch.Tensor,
-    value_mean: torch.Tensor,
-    key_length: int,
-    is_causal: bool,
-    output_dtype: torch.dtype,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-    output_input_scale: torch.Tensor | None = None,
-    *,
-    head_dim: int,
-    query_chunk_rows: int = DEFAULT_QUERY_CHUNK_ROWS,
-) -> tuple[int, int, int, int]:
-    """Validate producer, native context, and output metadata without tensor work."""
-    batch, sequence, heads, head_dim = query._validate_inputs(
-        input_qdata,
-        input_scale,
-        query_weight,
-        query_weight_scale,
-        norm_weight,
-        cos,
-        sin,
-        norm_epsilon,
-        softmax_scale,
-        query_bias,
-        head_dim,
-    )
-    shape = (batch, heads, sequence, head_dim)
-    attention.validate_quantized_context(
-        key,
-        key_scale,
-        key_center,
-        value,
-        multiplier,
-        log_scale,
-        value_mean,
-        query_shape=shape,
-        query_device=input_qdata.device,
-        key_length=key_length,
-        is_causal=is_causal,
-        output_dtype=output_dtype,
-    )
-    if (
-        isinstance(query_chunk_rows, bool)
-        or not isinstance(query_chunk_rows, int)
-        or query_chunk_rows < 128
-        or query_chunk_rows % 128
-    ):
-        raise ValueError("dense Piper query chunks must be positive multiples of 128 rows")
-    validate_activation_scale(output_input_scale, input_qdata.device)
-    projection_output.validate_output_projection(
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        input_features=heads * head_dim,
-        device=input_qdata.device,
-        output_dtype=output_dtype,
-        name="dense Piper output",
-    )
-    return shape
+@dataclass(frozen=True, slots=True)
+class DenseOutputOperands:
+    """Shared operands for bounded dense ConvRot INT8 attention-output execution."""
 
+    input_qdata: torch.Tensor
+    input_scale: torch.Tensor
+    query_weight: torch.Tensor
+    query_weight_scale: torch.Tensor
+    norm_weight: torch.Tensor | None
+    cos: torch.Tensor
+    sin: torch.Tensor
+    norm_epsilon: float
+    softmax_scale: float
+    query_bias: torch.Tensor | None
+    key: torch.Tensor
+    key_scale: torch.Tensor
+    key_center: torch.Tensor
+    value: torch.Tensor
+    multiplier: torch.Tensor
+    log_scale: torch.Tensor
+    value_mean: torch.Tensor
+    key_length: int
+    is_causal: bool
+    output_dtype: torch.dtype
+    weight_qdata: torch.Tensor
+    weight_scale: torch.Tensor
+    bias: torch.Tensor | None
+    group_size: int
+    output_input_scale: torch.Tensor | None
+    head_dim: int
+    query_chunk_rows: int = DEFAULT_QUERY_CHUNK_ROWS
 
-def _run_projected_query_attention(  # noqa: PLR0913, PLR0917
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    query_weight: torch.Tensor,
-    query_weight_scale: torch.Tensor,
-    norm_weight: torch.Tensor | None,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    norm_epsilon: float,
-    softmax_scale: float,
-    query_bias: torch.Tensor | None,
-    context_operands: tuple[torch.Tensor, ...],
-    key_length: int,
-    is_causal: bool,
-    query_shape: tuple[int, int, int, int],
-    output_features: int,
-    output_dtype: torch.dtype,
-    query_chunk_rows: int,
-    build_projector: Callable[[int], tuple[pipeline.ChunkProjector, tuple[torch.Tensor, ...]]],
-    *,
-    out: torch.Tensor | None = None,
-    global_row_offset: int = 0,
-    sequence_length: int | None = None,
-    context: attention.QuantizedContext | None = None,
-    query_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
-) -> torch.Tensor:
-    """Run validated Q windows through attention and a chunk projector.
-
-    ``context_operands`` are the prepared K and V outputs. Without ``out``, attention
-    windows may borrow unwritten output rows; ``out`` rows hold live data, so
-    attention then uses separate bounded buffers.
-    """
-    batch, heads, sequence, head_dim = query_shape
-    target_sequence = sequence if sequence_length is None else sequence_length
-    query_chunk_rows = _schedule.select_query_chunk_rows(
-        (batch, heads, target_sequence, head_dim),
-        input_qdata.device,
-        query_chunk_rows,
-        is_causal=is_causal,
-    )
-    backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
-    if context is None:
-        context = attention.prepare_quantized_context(
-            *context_operands,
-            query_length=sequence,
-            key_length=key_length,
-            is_causal=is_causal,
+    def validate(self) -> tuple[int, int, int, int]:
+        """Validate producer, native context, and output metadata without tensor work."""
+        batch, sequence, heads, head_dim = query._validate_inputs(
+            self.input_qdata,
+            self.input_scale,
+            self.query_weight,
+            self.query_weight_scale,
+            self.norm_weight,
+            self.cos,
+            self.sin,
+            self.norm_epsilon,
+            self.softmax_scale,
+            self.query_bias,
+            self.head_dim,
         )
-    if query_buffers is None:
-        capacity = (min(query_chunk_rows, target_sequence) + 63) // 64 * 64
-        # Q scales follow the granularity of the validated K scales.
-        key, key_scale = context_operands[:2]
-        granularity = resolve_qk_quantization(key_scale, key.shape[2])
-        query_buffers = (
-            input_qdata.new_empty((batch, heads, capacity, head_dim)),
-            input_qdata.new_empty(
-                (batch, heads, count_query_scales(capacity, granularity)), dtype=torch.float32
-            ),
+        shape = (batch, heads, sequence, head_dim)
+        attention.validate_quantized_context(
+            self.key,
+            self.key_scale,
+            self.key_center,
+            self.value,
+            self.multiplier,
+            self.log_scale,
+            self.value_mean,
+            query_shape=shape,
+            query_device=self.input_qdata.device,
+            key_length=self.key_length,
+            is_causal=self.is_causal,
+            output_dtype=self.output_dtype,
         )
-    project_chunk, retained = build_projector(query_chunk_rows)
+        if (
+            isinstance(self.query_chunk_rows, bool)
+            or not isinstance(self.query_chunk_rows, int)
+            or self.query_chunk_rows < 128
+            or self.query_chunk_rows % 128
+        ):
+            raise ValueError("dense Piper query chunks must be positive multiples of 128 rows")
+        validate_activation_scale(self.output_input_scale, self.input_qdata.device)
+        projection_output.validate_output_projection(
+            self.weight_qdata,
+            self.weight_scale,
+            self.bias,
+            self.group_size,
+            input_features=heads * head_dim,
+            device=self.input_qdata.device,
+            output_dtype=self.output_dtype,
+            name="dense Piper output",
+        )
+        return shape
 
-    def launch_chunk(
-        output: torch.Tensor, start: int, rows: int, _auxiliary: torch.Tensor | None
-    ) -> None:
-        global_start = global_row_offset + start
-        backend.project_query(
-            input_qdata,
-            input_scale,
-            query_weight,
-            query_weight_scale,
-            norm_weight,
-            cos,
-            sin,
-            norm_epsilon,
-            softmax_scale,
-            query_bias,
-            chunk_start=global_start,
-            chunk_rows=rows,
-            out=query_buffers,
+    def validate_residual_add(
+        self,
+        residual: tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool],
+    ) -> tuple[tuple[int, int, int, int], ResidualAdd]:
+        """Check attention-output and residual metadata without tensor work."""
+        shape = self.validate()
+        batch, _, sequence, _ = shape
+        base, gate, gate_indices, python_indexing = residual
+        if base.ndim != 3 or base.shape[:2] != (batch, sequence):
+            raise ValueError("dense Piper residual base must have one row per query token")
+        if base.device != self.input_qdata.device:
+            raise ValueError("dense Piper residual base must share the input storage device")
+        residual_add = ResidualAdd(
+            base=base,
+            gate=gate,
+            gate_indices=gate_indices,
+            python_indexing=python_indexing,
         )
-        attention.launch_quantized_attention_into(
-            context, *query_buffers, output.transpose(1, 2), global_row_offset=global_start
+        validate_residual_add(base, residual_add, self.weight_qdata.shape[0])
+        return shape, residual_add
+
+    def prepare_window_runner(
+        self,
+        query_shape: tuple[int, int, int, int],
+        capacity: int,
+        *,
+        context: attention.QuantizedContext | None = None,
+        query_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[
+        attention.QuantizedContext,
+        tuple[torch.Tensor, torch.Tensor],
+        Callable[[int, int, torch.Tensor], None],
+    ]:
+        """Prepare native projection/attention state and reusable Q scratch for chunked launches."""
+        batch, heads, sequence, head_dim = query_shape
+        backend = _backend.require_projection_backend(self.input_qdata, head_dim=head_dim)
+        if context is None:
+            context = attention.prepare_quantized_context(
+                self.key,
+                self.key_scale,
+                self.key_center,
+                self.value,
+                self.multiplier,
+                self.log_scale,
+                self.value_mean,
+                query_length=sequence,
+                key_length=self.key_length,
+                is_causal=self.is_causal,
+            )
+        if query_buffers is None:
+            padded_capacity = (capacity + 63) // 64 * 64
+            # Q scales follow the granularity of the validated K scales.
+            granularity = resolve_qk_quantization(self.key_scale, self.key.shape[2])
+            query_buffers = (
+                self.input_qdata.new_empty((batch, heads, padded_capacity, head_dim)),
+                self.input_qdata.new_empty(
+                    (batch, heads, count_query_scales(padded_capacity, granularity)),
+                    dtype=torch.float32,
+                ),
+            )
+        active_buffers = query_buffers
+        active_context = context
+
+        def launch_window(
+            global_start: int,
+            rows: int,
+            attention_chunk: torch.Tensor,
+        ) -> None:
+            backend.project_query(
+                self.input_qdata,
+                self.input_scale,
+                self.query_weight,
+                self.query_weight_scale,
+                self.norm_weight,
+                self.cos,
+                self.sin,
+                self.norm_epsilon,
+                self.softmax_scale,
+                self.query_bias,
+                chunk_start=global_start,
+                chunk_rows=rows,
+                out=active_buffers,
+            )
+            attention.launch_quantized_attention_into(
+                active_context,
+                *active_buffers,
+                attention_chunk.transpose(1, 2),
+                global_row_offset=global_start,
+            )
+
+        return context, query_buffers, launch_window
+
+    def prepare_chunk_projector(
+        self,
+        sequence_length: int,
+        chunk_rows: int,
+        *,
+        backend: linear_backend.LinearBackend,
+        residual_add: ResidualAdd | None = None,
+    ) -> tuple[pipeline.ChunkProjector, tuple[torch.Tensor, ...]]:
+        """Build chunked output-projection storage for the shared backend."""
+        return projection_output.prepare_chunk_projector(
+            sequence_length,
+            chunk_rows,
+            self.weight_qdata,
+            self.weight_scale,
+            self.bias,
+            self.group_size,
+            backend=backend,
+            output_input_scale=self.output_input_scale,
+            residual_add=residual_add,
         )
 
-    return pipeline.run_chunked_attention_output(
-        (batch, target_sequence, heads, head_dim),
-        input_qdata.device,
-        output_features,
-        query_chunk_rows,
-        launch_chunk,
-        project_chunk,
-        retained,
-        output_dtype=output_dtype,
-        out=out,
-        reuse_output_for_attention=out is None,
-    )
+    def run(
+        self,
+        query_shape: tuple[int, int, int, int],
+        *,
+        output_backend: linear_backend.LinearBackend | None = None,
+        residual_add: ResidualAdd | None = None,
+        out: torch.Tensor | None = None,
+        global_row_offset: int = 0,
+        sequence_length: int | None = None,
+        query_chunk_rows: int | None = None,
+        context: attention.QuantizedContext | None = None,
+        query_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Run validated Q windows through attention and a chunk projector.
+
+        Without ``out``, attention windows may borrow unwritten output rows; ``out`` rows
+        hold live data, so attention then uses separate bounded buffers.
+        """
+        batch, heads, sequence, head_dim = query_shape
+        target_sequence = sequence if sequence_length is None else sequence_length
+        resolved_chunk_rows = _schedule.select_query_chunk_rows(
+            (batch, heads, target_sequence, head_dim),
+            self.input_qdata.device,
+            self.query_chunk_rows if query_chunk_rows is None else query_chunk_rows,
+            is_causal=self.is_causal,
+        )
+        resolved_output_backend = (
+            linear_backend.require_linear_backend(self.input_qdata)
+            if output_backend is None
+            else output_backend
+        )
+        _context, _buffers, launch_window = self.prepare_window_runner(
+            query_shape,
+            min(resolved_chunk_rows, target_sequence),
+            context=context,
+            query_buffers=query_buffers,
+        )
+        project_chunk, retained = self.prepare_chunk_projector(
+            target_sequence,
+            resolved_chunk_rows,
+            backend=resolved_output_backend,
+            residual_add=residual_add,
+        )
+
+        def launch_chunk(
+            output: torch.Tensor, start: int, rows: int, _auxiliary: torch.Tensor | None
+        ) -> None:
+            launch_window(global_row_offset + start, rows, output)
+
+        return pipeline.run_chunked_attention_output(
+            (batch, target_sequence, heads, head_dim),
+            self.input_qdata.device,
+            self.weight_qdata.shape[0],
+            resolved_chunk_rows,
+            launch_chunk,
+            project_chunk,
+            retained,
+            output_dtype=self.output_dtype,
+            out=out,
+            reuse_output_for_attention=out is None,
+        )
 
 
 @torch.library.custom_op(
@@ -233,7 +314,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     query_chunk_rows: int = DEFAULT_QUERY_CHUNK_ROWS,
 ) -> torch.Tensor:
     """Pipeline local Q through attention and output with query_chunk_rows as a cap."""
-    batch, heads, sequence, head_dim = _validate_inputs(
+    operands = DenseOutputOperands(
         input_qdata,
         input_scale,
         query_weight,
@@ -259,48 +340,13 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         bias,
         group_size,
         output_input_scale,
-        head_dim=head_dim,
-        query_chunk_rows=query_chunk_rows,
-    )
-    output_features = weight_qdata.shape[0]
-    if batch == 0:
-        return input_qdata.new_empty((batch, sequence, output_features), dtype=output_dtype)
-    output_backend = linear_backend.require_linear_backend(input_qdata)
-
-    def build_projector(
-        chunk_rows: int,
-    ) -> tuple[pipeline.ChunkProjector, tuple[torch.Tensor, ...]]:
-        return projection_output.prepare_chunk_projector(
-            sequence,
-            chunk_rows,
-            weight_qdata,
-            weight_scale,
-            bias,
-            group_size,
-            backend=output_backend,
-            output_input_scale=output_input_scale,
-        )
-
-    return _run_projected_query_attention(
-        input_qdata,
-        input_scale,
-        query_weight,
-        query_weight_scale,
-        norm_weight,
-        cos,
-        sin,
-        norm_epsilon,
-        softmax_scale,
-        query_bias,
-        (key, key_scale, key_center, value, multiplier, log_scale, value_mean),
-        key_length,
-        is_causal,
-        (batch, heads, sequence, head_dim),
-        output_features,
-        output_dtype,
+        head_dim,
         query_chunk_rows,
-        build_projector,
     )
+    shape = operands.validate()
+    if shape[0] == 0:
+        return input_qdata.new_empty((0, shape[2], weight_qdata.shape[0]), dtype=output_dtype)
+    return operands.run(shape)
 
 
 @_projected_query_attention_output_op.register_fake
@@ -334,7 +380,7 @@ def _projected_query_attention_output_op_fake(  # noqa: PLR0913, PLR0917
     head_dim: int,
     query_chunk_rows: int = DEFAULT_QUERY_CHUNK_ROWS,
 ) -> torch.Tensor:
-    batch, _, sequence, _ = _validate_inputs(
+    batch, _, sequence, _ = DenseOutputOperands(
         input_qdata,
         input_scale,
         query_weight,
@@ -360,88 +406,10 @@ def _projected_query_attention_output_op_fake(  # noqa: PLR0913, PLR0917
         bias,
         group_size,
         output_input_scale,
-        head_dim=head_dim,
-        query_chunk_rows=query_chunk_rows,
-    )
+        head_dim,
+        query_chunk_rows,
+    ).validate()
     return input_qdata.new_empty((batch, sequence, weight_qdata.shape[0]), dtype=output_dtype)
-
-
-def _validate_residual_add_inputs(  # noqa: PLR0913, PLR0917
-    base: torch.Tensor,
-    gate: torch.Tensor,
-    gate_indices: torch.Tensor,
-    python_indexing: bool,
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    query_weight: torch.Tensor,
-    query_weight_scale: torch.Tensor,
-    norm_weight: torch.Tensor | None,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    norm_epsilon: float,
-    softmax_scale: float,
-    query_bias: torch.Tensor | None,
-    key: torch.Tensor,
-    key_scale: torch.Tensor,
-    key_center: torch.Tensor,
-    value: torch.Tensor,
-    multiplier: torch.Tensor,
-    log_scale: torch.Tensor,
-    value_mean: torch.Tensor,
-    key_length: int,
-    is_causal: bool,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-    output_input_scale: torch.Tensor | None,
-    *,
-    head_dim: int,
-    query_chunk_rows: int,
-) -> tuple[tuple[int, int, int, int], ResidualAdd]:
-    """Check attention-output and residual metadata without tensor work."""
-    shape = _validate_inputs(
-        input_qdata,
-        input_scale,
-        query_weight,
-        query_weight_scale,
-        norm_weight,
-        cos,
-        sin,
-        norm_epsilon,
-        softmax_scale,
-        query_bias,
-        key,
-        key_scale,
-        key_center,
-        value,
-        multiplier,
-        log_scale,
-        value_mean,
-        key_length,
-        is_causal,
-        base.dtype,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        output_input_scale,
-        head_dim=head_dim,
-        query_chunk_rows=query_chunk_rows,
-    )
-    batch, _, sequence, _ = shape
-    if base.ndim != 3 or base.shape[:2] != (batch, sequence):
-        raise ValueError("dense Piper residual base must have one row per query token")
-    if base.device != input_qdata.device:
-        raise ValueError("dense Piper residual base must share the input storage device")
-    residual_add = ResidualAdd(
-        base=base,
-        gate=gate,
-        gate_indices=gate_indices,
-        python_indexing=python_indexing,
-    )
-    validate_residual_add(base, residual_add, weight_qdata.shape[0])
-    return shape, residual_add
 
 
 @torch.library.custom_op(
@@ -488,11 +456,7 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     into its ``base`` rows in FP32. The native epilogue preserves projection rounding
     without scratch.
     """
-    shape, residual_add = _validate_residual_add_inputs(
-        base,
-        gate,
-        gate_indices,
-        python_indexing,
+    operands = DenseOutputOperands(
         input_qdata,
         input_scale,
         query_weight,
@@ -512,54 +476,21 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
         value_mean,
         key_length,
         is_causal,
+        base.dtype,
         weight_qdata,
         weight_scale,
         bias,
         group_size,
         output_input_scale,
-        head_dim=head_dim,
-        query_chunk_rows=query_chunk_rows,
+        head_dim,
+        query_chunk_rows,
+    )
+    shape, residual_add = operands.validate_residual_add(
+        (base, gate, gate_indices, python_indexing)
     )
     if shape[0] == 0:
         return
-    output_backend = linear_backend.require_linear_backend(input_qdata)
-
-    def build_projector(
-        chunk_rows: int,
-    ) -> tuple[pipeline.ChunkProjector, tuple[torch.Tensor, ...]]:
-        return projection_output.prepare_chunk_projector(
-            shape[2],
-            chunk_rows,
-            weight_qdata,
-            weight_scale,
-            bias,
-            group_size,
-            backend=output_backend,
-            output_input_scale=output_input_scale,
-            residual_add=residual_add,
-        )
-
-    _run_projected_query_attention(
-        input_qdata,
-        input_scale,
-        query_weight,
-        query_weight_scale,
-        norm_weight,
-        cos,
-        sin,
-        norm_epsilon,
-        softmax_scale,
-        query_bias,
-        (key, key_scale, key_center, value, multiplier, log_scale, value_mean),
-        key_length,
-        is_causal,
-        shape,
-        weight_qdata.shape[0],
-        base.dtype,
-        query_chunk_rows,
-        build_projector,
-        out=base,
-    )
+    operands.run(shape, residual_add=residual_add, out=base)
 
 
 @_projected_query_attention_residual_add_op.register_fake
@@ -596,11 +527,7 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
     head_dim: int,
     query_chunk_rows: int = DEFAULT_QUERY_CHUNK_ROWS,
 ) -> None:
-    _validate_residual_add_inputs(
-        base,
-        gate,
-        gate_indices,
-        python_indexing,
+    DenseOutputOperands(
         input_qdata,
         input_scale,
         query_weight,
@@ -620,17 +547,15 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
         value_mean,
         key_length,
         is_causal,
+        base.dtype,
         weight_qdata,
         weight_scale,
         bias,
         group_size,
         output_input_scale,
-        head_dim=head_dim,
-        query_chunk_rows=query_chunk_rows,
-    )
+        head_dim,
+        query_chunk_rows,
+    ).validate_residual_add((base, gate, gate_indices, python_indexing))
 
-
-validate_output_inputs = _validate_inputs
-run_projected_query_attention = _run_projected_query_attention
 
 __all__: list[str] = []

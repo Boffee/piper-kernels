@@ -16,13 +16,11 @@ import torch.distributed as dist
 
 from piper_kernels._distributed import _peer_exchange as peer_exchange
 from piper_kernels._residual import ResidualAdd
-from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.weights.convrot.int8._quantization import validate_activation_scale
 
-from . import _backend as fusion_backend
 from . import output as output_ops
 from ._layout import TILE_ROWS
 
@@ -59,18 +57,12 @@ def _run_peer_attention_exchange(
             gate_projection.project(gate_chunk, global_start, rows)
         elif prepared.coarse_gate is not None:
             gate_chunk = prepared.coarse_gate[:, global_start : global_start + rows]
-        query, query_scale, query_summary = project_query_chunk(global_start, rows)
-        local_attention, coarse_output = _quantized_dispatch._prepare_quantized_sparse_piper_query(
-            prepared.quantized_context,
-            query,
-            query_scale,
-            query_summary,
-            global_block_offset=global_start // TILE_ROWS,
-        )
-        _quantized_dispatch._launch_quantized_sparse_piper_attention(
-            local_attention,
-            attention_chunk.transpose(1, 2),
-            coarse_output=coarse_output,
+        output_common.launch_projected_query_chunk(
+            prepared,
+            project_query_chunk,
+            global_start,
+            rows,
+            attention_chunk,
             coarse_gate=gate_chunk,
         )
 
@@ -87,80 +79,23 @@ def _run_peer_attention_exchange(
     )
 
 
-def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
+def _run_distributed_projected_query_attention_output(
     comm_group_size: int,
     comm_group_name: str,
-    query_input: torch.Tensor,
-    query_input_scale: torch.Tensor | None,
-    query_weight_qdata: torch.Tensor,
-    query_weight_scale: torch.Tensor,
-    query_norm_weight: torch.Tensor | None,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    query_norm_epsilon: float,
-    softmax_scale: float,
-    key: torch.Tensor,
-    key_scale: torch.Tensor,
-    key_center: torch.Tensor,
-    key_center_scale: torch.Tensor,
-    key_summary: torch.Tensor,
-    key_aux: torch.Tensor,
-    value: torch.Tensor,
-    value_scale_multiplier: torch.Tensor,
-    value_mean: torch.Tensor,
-    ratio_profile: _SparsePiperRatioProfile,
-    sparse_key_blocks: int,
-    logical_sequence_length: int,
-    routing_mode: int,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None,
-    group_size: int,
-    query_chunk_rows: int = _DEFAULT_QUERY_CHUNK_ROWS,
-    block_lengths: torch.Tensor | None = None,
-    coarse_gate: torch.Tensor | None = None,
-    coarse_scale: float | None = None,
-    coarse_key_blocks: int | None = None,
-    sparse_query_blocks: int | None = None,
-    gate_projection: output_ops.GateProjection | None = None,
+    operands: output_ops.SparseProjectedQueryOperands,
     *,
-    input_group_size: int | None = None,
-    output_dtype: torch.dtype = torch.bfloat16,
-    query_bias: torch.Tensor | None = None,
-    output_input_scale: torch.Tensor | None = None,
-    force_tile_ids: torch.Tensor | None = None,
-    force_tile_counts: torch.Tensor | None = None,
+    gate_projection: output_ops.GateProjection | None = None,
     residual_add: ResidualAdd | None = None,
 ) -> torch.Tensor:
     """Overlap peer chunk reduce-scatter behind own-slice attention + residual epilogue."""
-    projection_backend = fusion_backend.require_projection_backend(
-        query_input, head_dim=key.shape[-1]
+    sequence_length = output_common.validate_output_metadata(
+        operands.key,
+        operands.logical_sequence_length,
+        operands.block_lengths,
+        output_dtype=operands.output_dtype,
+        force_tile_ids=operands.force_tile_ids,
+        force_tile_counts=operands.force_tile_counts,
     )
-    backend = fusion_backend.require_output_backend(key)
-    prepared = output_common.prepare_attention_context(
-        key,
-        key_scale,
-        key_center,
-        key_center_scale,
-        key_summary,
-        key_aux,
-        value,
-        value_scale_multiplier,
-        value_mean,
-        ratio_profile,
-        sparse_key_blocks,
-        logical_sequence_length,
-        routing_mode,
-        block_lengths,
-        coarse_gate,
-        coarse_scale,
-        coarse_key_blocks,
-        sparse_query_blocks,
-        has_projected_coarse_gate=gate_projection is not None,
-        force_tile_ids=force_tile_ids,
-        force_tile_counts=force_tile_counts,
-    )
-    sequence_length = prepared.sequence_length
     local_sequence_length = peer_exchange.validate_distributed_sequence(
         sequence_length,
         comm_group_size,
@@ -172,86 +107,66 @@ def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         comm_group_size,
         name="distributed sparse Piper",
     )
-
-    output_ops.validate_projected_query_input(
-        query_input,
-        query_input_scale,
-        query_weight_qdata,
-        query_weight_scale,
-        key,
-        sequence_length,
-        query_norm_weight=query_norm_weight,
-        cos=cos,
-        sin=sin,
-        query_norm_epsilon=query_norm_epsilon,
-        softmax_scale=softmax_scale,
-        input_group_size=input_group_size,
-        query_bias=query_bias,
+    backend, prepared, project_query_chunk = operands.prepare_context(
+        has_projected_coarse_gate=gate_projection is not None,
     )
     if prepared.coarse_gate is not None:
         output_common.validate_coarse_gate(
             prepared.coarse_gate,
-            batch=key.shape[0],
+            batch=operands.key.shape[0],
             sequence_length=sequence_length,
-            heads=key.shape[1],
-            head_dim=key.shape[3],
-            dtype=output_dtype,
-            device=key.device,
+            heads=operands.key.shape[1],
+            head_dim=operands.key.shape[3],
+            dtype=operands.output_dtype,
+            device=operands.key.device,
         )
-    validate_activation_scale(output_input_scale, key.device)
+    validate_activation_scale(operands.output_input_scale, operands.key.device)
     _input_features, output_features = output_ops.validate_output_projection(
-        key,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        logical_sequence_length,
-        query_chunk_rows,
-        output_dtype=output_dtype,
+        operands.key,
+        operands.weight_qdata,
+        operands.weight_scale,
+        operands.bias,
+        operands.group_size,
+        operands.logical_sequence_length,
+        operands.query_chunk_rows,
+        output_dtype=operands.output_dtype,
     )
-    batch, heads, _storage_seq, head_dim = key.shape
+    batch, heads, _storage_seq, head_dim = operands.key.shape
+
+    def prepare_projector(
+        seq_rows: int,
+        chunk_rows: int,
+        *,
+        residual: ResidualAdd | None = None,
+    ) -> tuple[output_common.ChunkProjector, tuple[torch.Tensor, ...]]:
+        return projection_output.prepare_chunk_projector(
+            seq_rows,
+            chunk_rows,
+            operands.weight_qdata,
+            operands.weight_scale,
+            operands.bias,
+            operands.group_size,
+            backend=backend,
+            output_input_scale=operands.output_input_scale,
+            residual_add=residual,
+        )
 
     def run_fallback() -> torch.Tensor:
-        return output_ops.run_projected_query_attention_output(
-            query_input,
-            query_input_scale,
-            query_weight_qdata,
-            query_weight_scale,
-            query_norm_weight,
-            cos,
-            sin,
-            query_norm_epsilon,
-            softmax_scale,
-            key,
-            key_scale,
-            key_center,
-            key_center_scale,
-            key_summary,
-            key_aux,
-            value,
-            value_scale_multiplier,
-            value_mean,
-            ratio_profile,
-            sparse_key_blocks,
-            logical_sequence_length,
-            routing_mode,
-            weight_qdata,
-            weight_scale,
-            bias,
-            group_size,
-            query_chunk_rows,
-            block_lengths,
-            coarse_gate,
-            coarse_scale,
-            coarse_key_blocks,
-            sparse_query_blocks,
-            gate_projection,
-            input_group_size=input_group_size,
-            output_dtype=output_dtype,
-            query_bias=query_bias,
-            output_input_scale=output_input_scale,
-            force_tile_ids=force_tile_ids,
-            force_tile_counts=force_tile_counts,
+        project_chunk, projector_tensors = prepare_projector(
+            sequence_length, operands.query_chunk_rows
+        )
+        return output_common.run_chunked_projected_query_attention_output(
+            prepared,
+            output_features,
+            operands.query_chunk_rows,
+            project_query_chunk,
+            project_chunk,
+            projector_tensors,
+            project_coarse_gate_chunk=(
+                None if gate_projection is None else gate_projection.project
+            ),
+            output_dtype=operands.output_dtype,
+            reuse_output_for_attention=True,
         )
 
     def start_aligned(
@@ -261,35 +176,7 @@ def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
         reuse_direct_receive: bool,
         own_base: int,
     ) -> tuple[peer_exchange.PeerExchangeHandle, Callable[[], torch.Tensor | None]]:
-        project_query_chunk = output_ops.build_query_chunk_projector(
-            query_input,
-            query_input_scale,
-            query_weight_qdata,
-            query_weight_scale,
-            query_norm_weight,
-            cos,
-            sin,
-            query_norm_epsilon,
-            softmax_scale,
-            routing_mode,
-            block_lengths,
-            backend=backend,
-            projection_backend=projection_backend,
-            head_dim=head_dim,
-            input_group_size=input_group_size,
-            query_bias=query_bias,
-        )
-        peer_projector, _peer_retained = projection_output.prepare_chunk_projector(
-            local_sequence_length,
-            comm_chunk_rows,
-            weight_qdata,
-            weight_scale,
-            bias,
-            group_size,
-            backend=backend,
-            output_input_scale=output_input_scale,
-            residual_add=None,
-        )
+        peer_projector, _peer_retained = prepare_projector(local_sequence_length, comm_chunk_rows)
         last_exchange = _run_peer_attention_exchange(
             process_group,
             prepared,
@@ -312,16 +199,8 @@ def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
                 own_gate_project = lambda buf, start, rows: active_gate.project(  # noqa: E731
                     buf, own_base + start, rows
                 )
-            own_projector, own_retained = projection_output.prepare_chunk_projector(
-                local_sequence_length,
-                comm_chunk_rows,
-                weight_qdata,
-                weight_scale,
-                bias,
-                group_size,
-                backend=backend,
-                output_input_scale=output_input_scale,
-                residual_add=residual_add,
+            own_projector, own_retained = prepare_projector(
+                local_sequence_length, comm_chunk_rows, residual=residual_add
             )
             own_output = output_common.run_chunked_projected_query_attention_output(
                 prepared,
@@ -331,7 +210,7 @@ def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
                 own_projector,
                 own_retained,
                 project_coarse_gate_chunk=own_gate_project,
-                output_dtype=output_dtype,
+                output_dtype=operands.output_dtype,
                 out=None if residual_add is None else residual_add.base,
                 reuse_output_for_attention=residual_add is None,
                 global_row_offset=own_base,
@@ -344,9 +223,9 @@ def _run_distributed_projected_query_attention_output(  # noqa: PLR0913, PLR0917
     return peer_exchange.run_overlapped_distributed_output(
         process_group,
         output_shape=(batch, local_sequence_length, output_features),
-        output_dtype=output_dtype,
-        device=key.device,
-        query_chunk_rows=query_chunk_rows,
+        output_dtype=operands.output_dtype,
+        device=operands.key.device,
+        query_chunk_rows=operands.query_chunk_rows,
         tile_rows=TILE_ROWS,
         residual_add=residual_add,
         run_fallback=run_fallback,
@@ -470,25 +349,19 @@ def _projected_query_attention_reduce_scatter_residual_add_op(  # noqa: PLR0913,
         force_tile_ids,
         force_tile_counts,
     )
-    gate_projection = output_ops.prepare_optional_gate_projection(
+    gate_projection = output_ops.prepare_projected_gate_projection(
         key,
         logical_sequence_length,
         block_lengths,
-        output_ops.resolve_projected_gate_input(
-            query_input,
-            gate_input,
-            gate_weight_qdata,
-            input_group_size,
-        ),
+        query_input,
+        gate_input,
         gate_input_scale,
         gate_weight_qdata,
         gate_weight_scale,
         gate_bias,
         input_group_size,
     )
-    _run_distributed_projected_query_attention_output(
-        comm_group_size,
-        comm_group_name,
+    operands = output_ops.SparseProjectedQueryOperands(
         query_input,
         query_input_scale,
         query_weight_qdata,
@@ -521,13 +394,18 @@ def _projected_query_attention_reduce_scatter_residual_add_op(  # noqa: PLR0913,
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
-        gate_projection,
         input_group_size=input_group_size,
         output_dtype=base.dtype,
         query_bias=query_bias,
         output_input_scale=output_input_scale,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+    )
+    _run_distributed_projected_query_attention_output(
+        comm_group_size,
+        comm_group_name,
+        operands,
+        gate_projection=gate_projection,
         residual_add=residual_add,
     )
 
@@ -656,25 +534,19 @@ def _projected_query_attention_reduce_scatter_op(  # noqa: PLR0913, PLR0917
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Compute distributed sparse attention output + reduce-scatter into this rank's rows."""
-    gate_projection = output_ops.prepare_optional_gate_projection(
+    gate_projection = output_ops.prepare_projected_gate_projection(
         key,
         logical_sequence_length,
         block_lengths,
-        output_ops.resolve_projected_gate_input(
-            query_input,
-            gate_input,
-            gate_weight_qdata,
-            input_group_size,
-        ),
+        query_input,
+        gate_input,
         gate_input_scale,
         gate_weight_qdata,
         gate_weight_scale,
         gate_bias,
         input_group_size,
     )
-    return _run_distributed_projected_query_attention_output(
-        comm_group_size,
-        comm_group_name,
+    operands = output_ops.SparseProjectedQueryOperands(
         query_input,
         query_input_scale,
         query_weight_qdata,
@@ -707,13 +579,18 @@ def _projected_query_attention_reduce_scatter_op(  # noqa: PLR0913, PLR0917
         coarse_scale,
         coarse_key_blocks,
         sparse_query_blocks,
-        gate_projection,
         input_group_size=input_group_size,
         output_dtype=output_dtype,
         query_bias=query_bias,
         output_input_scale=output_input_scale,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
+    )
+    return _run_distributed_projected_query_attention_output(
+        comm_group_size,
+        comm_group_name,
+        operands,
+        gate_projection=gate_projection,
     )
 
 

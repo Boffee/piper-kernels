@@ -36,8 +36,8 @@ _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
 }
 
 # Legacy private piper_kernels import totals in tests/ (lower as tests decouple).
-_MAX_TEST_PRIVATE_IMPORT_FILES = 155
-_MAX_TEST_PRIVATE_IMPORTS = 638
+_MAX_TEST_PRIVATE_IMPORT_FILES = 153
+_MAX_TEST_PRIVATE_IMPORTS = 634
 
 # Legacy private-global monkeypatch totals in tests/ (lower as tests decouple).
 _MAX_TEST_PRIVATE_MONKEYPATCH_FILES = 50

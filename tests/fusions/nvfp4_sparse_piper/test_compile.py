@@ -26,8 +26,8 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
-from piper_kernels.fusions.nvfp4_sparse_piper import _output
 from piper_kernels.fusions.nvfp4_sparse_piper import key as fused_key
+from piper_kernels.fusions.nvfp4_sparse_piper import output as nvfp4_output
 from piper_kernels.fusions.nvfp4_sparse_piper import query as fused_query
 from piper_kernels.fusions.nvfp4_sparse_piper import value as fused_value
 from piper_kernels.fusions.nvfp4_sparse_piper._compile import fold_sparse_attention
@@ -1101,7 +1101,7 @@ def test_cuda_compile_fuses_every_bounded_nvfp4_attention_feature(
         dynamic=dynamic, routing=routing, output_dynamic=output_dynamic, head_dim=head_dim
     ).eval()
     if output_dynamic:
-        monkeypatch.setattr(_output, "DYNAMIC_QUERY_CHUNK_ROWS", 128)
+        monkeypatch.setattr(nvfp4_output, "_DYNAMIC_QUERY_CHUNK_ROWS", 128)
     hidden_states = torch.randn(
         (model.batch, model.sequence_length, model.input_features),
         device="cuda",
@@ -1185,9 +1185,9 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
     output_dynamic: bool,
 ) -> None:
     # Exercise eight windows with a short tail and the single-window path.
-    monkeypatch.setattr(_output, "DEFAULT_QUERY_CHUNK_ROWS", query_chunk_rows)
+    monkeypatch.setattr(nvfp4_output, "_DEFAULT_QUERY_CHUNK_ROWS", query_chunk_rows)
     if output_dynamic:
-        monkeypatch.setattr(_output, "DYNAMIC_QUERY_CHUNK_ROWS", query_chunk_rows)
+        monkeypatch.setattr(nvfp4_output, "_DYNAMIC_QUERY_CHUNK_ROWS", query_chunk_rows)
     torch.manual_seed(839 + (0 if group_size is None else group_size) + dynamic)
     model = _ProjectedGateCoarseSparseAttentionOutput(
         dynamic=dynamic,
@@ -1207,13 +1207,13 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
     block_lengths = torch.tensor([64, 17, 51] * 5, device="cuda", dtype=torch.int32)
     valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
     gate_chunks = []
-    project_gate = _output.PreparedGateProjection.project
+    project_gate = nvfp4_output._PreparedGateProjection.project
 
     def record_gate_chunk(projection, out, start, rows):
         gate_chunks.append((start, rows, out.data_ptr()))
         project_gate(projection, out, start, rows)
 
-    monkeypatch.setattr(_output.PreparedGateProjection, "project", record_gate_chunk)
+    monkeypatch.setattr(nvfp4_output._PreparedGateProjection, "project", record_gate_chunk)
     capture = TargetCapturePass()
     with torch.no_grad():
         gate_input = _prepare_nvfp4_input(hidden_states, model.gate.weight)
