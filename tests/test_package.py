@@ -126,10 +126,13 @@ assert "piper_kernels.fusions.attention.triton" not in sys.modules
 assert "piper_kernels.fusions.attention._projected_qk_compile" not in sys.modules
 assert "piper_kernels.linear._compile_fx" not in sys.modules
 assert "triton" not in sys.modules
-from piper_kernels.attention.piper_attention._nvidia import policy as piper_nvidia_policy
-from piper_kernels.attention.sage_attention_2pp import _policy as sage_policy
-assert piper_nvidia_policy.PiperAttentionExecutionPlan is not None
-assert sage_policy.SageAttention2ppExecutionPlan is not None
+from piper_kernels.attention.piper_attention._nvidia import policy as n_pol
+from piper_kernels.attention.sage_attention_2pp import _policy as s_pol
+sm120 = AcceleratorTarget("cuda", "sm120")
+n_plan = n_pol.select_execution_plan(sm120, head_dim=128, is_causal=False, query_length=128)
+s_plan = s_pol.select_execution_plan(sm120, candidate_block_m=128, head_dim=128, is_causal=False)
+assert isinstance(n_plan, n_pol.PiperAttentionExecutionPlan)
+assert isinstance(s_plan, s_pol.SageAttention2ppExecutionPlan)
 assert "triton" not in sys.modules
 prepared, scales = _ops.prepare_input(torch.ones(2, 32), 16)
 assert prepared.shape == (2, 32) and scales.shape == (2,)
@@ -137,11 +140,12 @@ weight.add_(torch.ones(7, 32))
 weight.addmm_(torch.ones(7, 2), torch.ones(2, 32))
 assert torch.isfinite(weight.dequantize()).all()
 assert "triton" not in sys.modules
-torch.cuda.get_device_capability = orig_cap
-torch.cuda.get_device_properties = orig_prop
-from piper_kernels.weights.nvfp4 import _update as nvfp4_update
-assert nvfp4_update._triton_backend is None
-assert "triton" not in sys.modules
+torch.cuda.get_device_capability, torch.cuda.get_device_properties = orig_cap, orig_prop
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
+nv = PiperNVFP4Tensor.from_hp(torch.ones(4, 32, dtype=torch.bfloat16))
+nv.add_(torch.ones(4, 32, dtype=torch.bfloat16))
+nv.addmm_(torch.ones(4, 2, dtype=torch.bfloat16), torch.ones(2, 32, dtype=torch.bfloat16))
+assert torch.isfinite(nv.dequantize()).all() and "triton" not in sys.modules
 """
     subprocess.run([sys.executable, "-c", script], check=True)
 
