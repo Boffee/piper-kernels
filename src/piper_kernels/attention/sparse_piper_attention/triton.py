@@ -464,7 +464,7 @@ def _prepare_sparse_piper_operands(
     tile_count = (logical_sequence_length + _BLOCK_N - 1) // _BLOCK_N
     storage_sequence_length = tile_count * _BLOCK_N
 
-    if launch_kernels is None and not emit_summaries:
+    if launch_kernels is None and not emit_summaries and batch > 0 and tile_count > 0:
         if block_lengths is not None:
             valid_rows = valid_block_rows(block_lengths).reshape(-1)
             valid_rows = valid_rows[None, None, :, None]

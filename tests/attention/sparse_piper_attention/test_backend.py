@@ -73,15 +73,8 @@ def test_attention_selection_uses_operand_target(target, kind, head_dim):
         return
     assert selected is not None
     if kind == "amd":
-        assert _backend.preparation is not None
         assert selected.value_format is ValueFormat.AMD_WMMA
         assert selected.skip_dense_routing is False
-        assert isinstance(selected.prepare, partial)
-        assert selected.prepare.func is _backend.preparation._prepare_sparse_piper_operands
-        assert selected.prepare.keywords == {
-            "value_format": ValueFormat.AMD_WMMA,
-            "launch_kernels": _backend.amd_gluon.launch_operand_preparation,
-        }
         assert selected.bind is _backend.amd_gluon.bind_context
     else:
         assert selected.value_format is ValueFormat.TRANSPOSED
@@ -119,6 +112,85 @@ def test_amd_device_probes_and_projection_inputs_preserve_d128_support(shape):
     assert selected.value_format is ValueFormat.AMD_WMMA
     assert selected.skip_dense_routing is False
     assert selected.bind is _backend.amd_gluon.bind_context
+
+
+@pytest.mark.skipif(
+    _backend.preparation is None or _backend.nvidia_gluon is None or _backend.amd_gluon is None,
+    reason="requires Triton import",
+)
+@pytest.mark.parametrize(
+    ("target", "expected_format"),
+    [
+        (AcceleratorTarget("cuda", "sm120"), ValueFormat.TRANSPOSED),
+        (AcceleratorTarget("hip", "gfx1201"), ValueFormat.AMD_WMMA),
+    ],
+)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("emit_summaries", [False, True])
+def test_selected_preparation_owns_backend_storage_contract(
+    target,
+    expected_format,
+    head_dim,
+    emit_summaries,
+):
+    query = torch.empty((0, 3, 65, head_dim), dtype=torch.bfloat16)
+    kv = torch.empty((0, 1, 65, head_dim), dtype=torch.bfloat16)
+    selected = _backend.select_attention_backend(query, target=target)
+    assert selected is not None
+    with forbid_triton_driver("empty-batch preparation launched a GPU kernel"):
+        operands = selected.prepare(
+            query,
+            head_dim**-0.5,
+            sparse_key_blocks=1,
+            combined_key=kv,
+            combined_value=kv,
+            emit_summaries=emit_summaries,
+        )
+    assert operands.value_format is expected_format
+    assert operands.query.shape == (0, 3, 128, head_dim)
+    assert operands.query.dtype is torch.int8
+    assert operands.query_scale.shape == (0, 3, 4)
+    assert operands.query_scale.dtype is torch.float32
+    assert operands.key.shape == (0, 1, 128, head_dim)
+    assert operands.key.dtype is torch.int8
+    assert operands.key_scale.shape == (0, 1, 2)
+    assert operands.key_scale.dtype is torch.float32
+    assert operands.key_center.shape == (0, 1, 2, 2, head_dim)
+    assert operands.key_center.dtype is torch.int8
+    assert operands.key_center_scale.shape == (0, 1, 2, 2)
+    assert operands.key_center_scale.dtype is torch.float32
+    assert operands.value.shape == expected_format.shape(0, 1, 128, head_dim)
+    assert operands.value.dtype is torch.int8
+    assert operands.value_scale_multiplier.shape == (0, 1, 2, 1)
+    assert operands.value_scale_multiplier.dtype is torch.float32
+    assert operands.value_mean.shape == (0, 1, 2, head_dim)
+    assert operands.value_mean.dtype is torch.bfloat16
+    assert operands.logical_sequence_length == 65
+    assert operands.sparse_key_blocks == 1
+    if emit_summaries:
+        assert operands.query_summary is not None
+        assert operands.query_summary.shape == (0, 3, 2, head_dim)
+        assert operands.query_summary.dtype is torch.float32
+        assert operands.key_summary is not None
+        assert operands.key_summary.shape == (0, 1, 1, head_dim)
+        assert operands.key_summary.dtype is torch.float32
+        assert operands.key_aux is not None
+        assert operands.key_aux.shape == (0, 1, 1, head_dim)
+        assert operands.key_aux.dtype is torch.float32
+    else:
+        assert operands.query_summary is None
+        assert operands.key_summary is None
+        assert operands.key_aux is None
+    bound = Mock(side_effect=lambda context: Mock(context=context))
+    prepared = operands.with_routes(
+        torch.empty((0, 2, 3), dtype=torch.uint16),
+        torch.tensor([1, 1, 1], dtype=torch.int32),
+        torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        bind=bound,
+    )
+    bound.assert_called_once()
+    assert prepared.context.value_format is expected_format
+    assert prepared.context.value is operands.value
 
 
 @pytest.mark.skipif(
