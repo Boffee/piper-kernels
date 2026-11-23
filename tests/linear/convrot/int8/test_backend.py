@@ -501,6 +501,43 @@ def test_backend_prepared_swiglu_falls_back_when_kernels_decline() -> None:
     assert fake_kernels.launch_prepared_linear.call_count == 2
 
 
+def test_nvidia_supports_prepared_swiglu_covers_sm8x_and_sm120_alignment() -> None:
+    sm89 = AcceleratorTarget("cuda", "sm89")
+    sm120 = AcceleratorTarget("cuda", "sm120")
+    aligned_k = 256
+    medium_weight = torch.empty((1024, aligned_k), device="meta", dtype=torch.int8)
+    large_weight = torch.empty((2048, aligned_k), device="meta", dtype=torch.int8)
+    unaligned_weight = torch.empty((1024, 264), device="meta", dtype=torch.int8)
+
+    assert nvidia.supports_prepared_swiglu(
+        medium_weight, medium_weight, torch.bfloat16, rows=4096, target=sm89
+    )
+    assert nvidia.supports_prepared_swiglu(
+        large_weight, large_weight, torch.float16, rows=4096, target=sm89
+    )
+    assert not nvidia.supports_prepared_swiglu(
+        medium_weight, medium_weight, torch.bfloat16, rows=16, target=sm89
+    )
+    assert not nvidia.supports_prepared_swiglu(
+        unaligned_weight, unaligned_weight, torch.bfloat16, rows=4096, target=sm89
+    )
+    assert not nvidia.supports_prepared_swiglu(
+        large_weight, large_weight, torch.float32, rows=4096, target=sm89
+    )
+    strided_weight = torch.empty((1024, 512), device="meta", dtype=torch.int8)[:, :256]
+    assert not nvidia.supports_prepared_swiglu(
+        strided_weight, strided_weight, torch.bfloat16, rows=4096, target=sm89
+    )
+    async_plan = nvidia.default_execution_plan(medium_weight, target=sm89, rows=4096)
+    assert nvidia.supports_prepared_swiglu(
+        medium_weight,
+        medium_weight,
+        torch.bfloat16,
+        execution_plan=async_plan,
+        target=sm120,
+    )
+
+
 @pytest.mark.parametrize(
     ("target", "supported"),
     [

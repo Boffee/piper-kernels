@@ -27,6 +27,13 @@ def exact_sm120_available() -> bool:
     ).is_cuda_capability(12, 0)
 
 
+def sm8x_available() -> bool:
+    """Return whether the default CUDA device is an NVIDIA SM8x GPU."""
+    return torch.cuda.is_available() and AcceleratorTarget.from_device(
+        torch.device("cuda")
+    ).is_cuda_capability(8)
+
+
 def rdna4_available() -> bool:
     """Return whether the default CUDA device is a supported Linux/Windows RDNA4 GPU."""
     if sys.platform not in ("linux", "win32") or not torch.cuda.is_available():

@@ -248,17 +248,20 @@ def supports_residual_epilogue(
 def supports_swiglu_epilogue(
     target: AcceleratorTarget, plan: NvidiaExecutionPlan, logical_dtype: torch.dtype
 ) -> bool:
-    """Use the SM120 dual-accumulator TMA SwiGLU epilogue for 16-bit projections.
+    """Use dual-accumulator 16-bit SwiGLU epilogues on SM120 TMA or SM8x/SM120 async copy.
 
-    Reuses the 73.7 KiB TMA ring shared memory for two 32 KiB 16-bit tiles so
-    the SwiGLU epilogue stays spill-free while preserving the logical-dtype
-    projection rounding boundary before FP32 SiLU multiplication.
+    SM120 ``gluon_tma`` reuses its 73.7 KiB TMA ring shared memory, while SM8x
+    and SM120 ``gluon_async_copy`` reuse pipeline shared memory across 32-row
+    SMEM chunks with 8 warps and K32 MMA slices so both stay spill-free on
+    SM80/SM86/SM89/SM120 and preserve the 16-bit projection rounding boundary.
     """
-    return (
-        target.is_cuda_capability(12, 0)
-        and plan.matmul_kernel == "gluon_tma"
-        and logical_dtype in (torch.float16, torch.bfloat16)
-    )
+    if logical_dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if plan.matmul_kernel == "gluon_tma":
+        return target.is_cuda_capability(12, 0)
+    if plan.matmul_kernel == "gluon_async_copy":
+        return target.is_cuda_capability(8) or target.is_cuda_capability(12, 0)
+    return False
 
 
 def supports_preparation_target(target: AcceleratorTarget) -> bool:

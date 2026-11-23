@@ -1148,6 +1148,230 @@ def test_explicit_async_copy_plan_preserves_paired_fma_on_unaligned_operand(unal
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
+@pytest.mark.parametrize("shape", [(1537, 256, 1000), (1024, 256, 2560), (1041, 272, 2577)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "bias_dtypes",
+    [
+        (None, None),
+        (torch.float16, torch.float32),
+        (None, torch.float32),
+        (torch.float32, None),
+    ],
+)
+@pytest.mark.parametrize("group_m", [0, 8])
+def test_sm8x_async_copy_swiglu_matches_paired_reference(
+    shape, dtype, bias_dtypes, group_m
+) -> None:
+    torch.manual_seed(901)
+    rows, features, width = shape
+    qdata = torch.randint(-127, 128, (rows, features), device="cuda", dtype=torch.int8)
+    scale = torch.rand(rows, device="cuda") * 0.01
+    weights = [
+        torch.randint(-127, 128, (width, features), device="cuda", dtype=torch.int8)
+        for _ in range(2)
+    ]
+    scales = [torch.rand(width, device="cuda") * 0.01 for _ in range(2)]
+    biases = [
+        None if bias_dtype is None else torch.randn(width, device="cuda", dtype=bias_dtype)
+        for bias_dtype in bias_dtypes
+    ]
+    plan = replace(
+        int8_nvidia.default_execution_plan(
+            weights[0], target=AcceleratorTarget("cuda", "sm89"), rows=rows
+        ),
+        matmul_group_m=group_m,
+    )
+    assert plan.matmul_kernel == "gluon_async_copy"
+    target = AcceleratorTarget("cuda", "sm89")
+    assert int8_nvidia.supports_prepared_swiglu(
+        weights[0], weights[1], dtype, execution_plan=plan, target=target
+    )
+
+    second = (weights[1], scales[1], biases[1])
+    paired = int8_nvidia.execute_prepared_linear(
+        qdata,
+        scale,
+        weights[0],
+        scales[0],
+        biases[0],
+        dtype,
+        plan,
+        second_projection=second,
+        target=target,
+    )
+    up_part, gate_part = paired.chunk(2, dim=-1)
+    expected = (up_part.float() * torch.nn.functional.silu(gate_part.float())).to(dtype)
+
+    actual = int8_nvidia.linear_prepared_swiglu(
+        qdata,
+        scale,
+        weights[0],
+        scales[0],
+        biases[0],
+        second,
+        dtype,
+        execution_plan=plan,
+        target=target,
+    )
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=2 * torch.finfo(dtype).eps,
+        atol=torch.finfo(dtype).smallest_normal,
+    )
+
+    storage = torch.full((rows, width + 32), torch.nan, device="cuda", dtype=dtype)
+    out = storage[:, 16:-16]
+    returned = int8_nvidia.linear_prepared_swiglu(
+        qdata,
+        scale,
+        weights[0],
+        scales[0],
+        biases[0],
+        second,
+        dtype,
+        out=out,
+        execution_plan=plan,
+        target=target,
+    )
+    assert returned is out
+    torch.testing.assert_close(out, actual, rtol=0, atol=0)
+    assert storage[:, :16].isnan().all()
+    assert storage[:, -16:].isnan().all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
+def test_sm8x_async_copy_swiglu_dispatches_medium_large_and_auto_target() -> None:
+    torch.manual_seed(903)
+    dtype = torch.bfloat16
+    target = AcceleratorTarget("cuda", "sm89")
+    swiglu_kernel = int8_nvidia.kernels.gluon_async_copy._int8_swiglu_matmul_kernel
+
+    for rows, features, width in ((1537, 256, 1000), (1024, 256, 2560)):
+        qdata = torch.randint(-127, 128, (rows, features), device="cuda", dtype=torch.int8)
+        scale = torch.rand(rows, device="cuda") * 0.01
+        w = [
+            torch.randint(-127, 128, (width, features), device="cuda", dtype=torch.int8)
+            for _ in range(2)
+        ]
+        s = [torch.rand(width, device="cuda") * 0.01 for _ in range(2)]
+        second = (w[1], s[1], None)
+        plan = int8_nvidia.default_execution_plan(w[0], target=target, rows=rows)
+        assert plan.matmul_kernel == "gluon_async_copy"
+        swiglu_kernel.device_caches.clear()
+        actual = int8_nvidia.linear_prepared_swiglu(
+            qdata, scale, w[0], s[0], None, second, dtype, execution_plan=plan, target=target
+        )
+        assert sum(len(cache[0]) for cache in swiglu_kernel.device_caches.values()) > 0
+        paired = int8_nvidia.execute_prepared_linear(
+            qdata, scale, w[0], s[0], None, dtype, plan, second_projection=second, target=target
+        )
+        up_p, gate_p = paired.chunk(2, dim=-1)
+        expected = (up_p.float() * torch.nn.functional.silu(gate_p.float())).to(dtype)
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=2 * torch.finfo(dtype).eps,
+            atol=torch.finfo(dtype).smallest_normal,
+        )
+
+    device_target = AcceleratorTarget.from_device(torch.device("cuda"))
+    if device_target.is_cuda_capability(12, 0) or device_target.is_cuda_capability(8):
+        assert int8_nvidia.supports_prepared_swiglu(w[0], w[1], dtype, execution_plan=plan)
+        swiglu_kernel.device_caches.clear()
+        auto_actual = int8_nvidia.linear_prepared_swiglu(
+            qdata, scale, w[0], s[0], None, second, dtype, execution_plan=plan
+        )
+        assert sum(len(cache[0]) for cache in swiglu_kernel.device_caches.values()) > 0
+        torch.testing.assert_close(auto_actual, actual, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
+def test_sm8x_async_copy_swiglu_falls_back_on_fp32_and_unaligned_operands() -> None:
+    torch.manual_seed(902)
+    rows, features, width = 1024, 256, 2560
+    dtype = torch.bfloat16
+    qdata = torch.randint(-127, 128, (rows, features), device="cuda", dtype=torch.int8)
+    scale = torch.rand(rows, device="cuda") * 0.01
+    weights = [
+        torch.randint(-127, 128, (width, features), device="cuda", dtype=torch.int8)
+        for _ in range(2)
+    ]
+    scales = [torch.rand(width, device="cuda") * 0.01 for _ in range(2)]
+    biases = (
+        torch.randn(width, device="cuda", dtype=torch.float16),
+        torch.randn(width, device="cuda", dtype=torch.float32),
+    )
+    target = AcceleratorTarget("cuda", "sm89")
+    plan = int8_nvidia.default_execution_plan(weights[0], target=target, rows=rows)
+    swiglu_kernel = int8_nvidia.kernels.gluon_async_copy._int8_swiglu_matmul_kernel
+
+    def assert_fallback(
+        in_tensor: torch.Tensor,
+        w0: torch.Tensor,
+        w1: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> None:
+        sec = (w1, scales[1], biases[1])
+        paired = int8_nvidia.execute_prepared_linear(
+            in_tensor,
+            scale,
+            w0,
+            scales[0],
+            biases[0],
+            out_dtype,
+            plan,
+            second_projection=sec,
+            target=target,
+        )
+        up_p, gate_p = paired.chunk(2, dim=-1)
+        expected = (up_p.float() * torch.nn.functional.silu(gate_p.float())).to(out_dtype)
+        actual = int8_nvidia.linear_prepared_swiglu(
+            in_tensor,
+            scale,
+            w0,
+            scales[0],
+            biases[0],
+            sec,
+            out_dtype,
+            execution_plan=plan,
+            target=target,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    assert_fallback(qdata, weights[0], weights[1], torch.float32)
+
+    unaligned_q = torch.randint(-127, 128, (rows * features + 16,), device="cuda", dtype=torch.int8)
+    unaligned_in = unaligned_q[8 : 8 + rows * features].view(rows, features)
+    swiglu_kernel.device_caches.clear()
+    assert_fallback(unaligned_in, weights[0], weights[1], dtype)
+    assert sum(len(cache[0]) for cache in swiglu_kernel.device_caches.values()) == 0
+
+    k_unaligned = features + 8
+    in_u = torch.randint(-127, 128, (rows, k_unaligned), device="cuda", dtype=torch.int8)
+    w_u = [
+        torch.randint(-127, 128, (width, k_unaligned), device="cuda", dtype=torch.int8)
+        for _ in range(2)
+    ]
+    assert not int8_nvidia.supports_prepared_swiglu(
+        w_u[0], w_u[1], dtype, execution_plan=plan, target=target
+    )
+    assert_fallback(in_u, w_u[0], w_u[1], dtype)
+
+    w_strided = torch.randint(-127, 128, (width, 2 * features), device="cuda", dtype=torch.int8)[
+        :, :features
+    ]
+    assert not int8_nvidia.supports_prepared_swiglu(
+        w_strided, weights[1], dtype, execution_plan=plan, target=target
+    )
+    assert_fallback(qdata, w_strided, weights[1], dtype)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
 @pytest.mark.parametrize(
     ("rows", "in_features", "group_size"),
     [(1, 16, 16), (7, 96, 16), (129, 256, 256), (1000, 768, 64), (1000, 1024, 256)],

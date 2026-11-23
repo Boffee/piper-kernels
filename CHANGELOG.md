@@ -17,11 +17,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
-- Fused 16-bit ConvRot INT8 SwiGLU into the SM120 up/gate projection epilogue, reducing
-  ConvRot INT8 SwiGLU FFN workspace by ~40% and improving end-to-end SwiGLU FFN latency by
-  ~3–7% on RTX 5090 while keeping the unfused fallback for FP32, unaligned, non-SM120, and
-  distinct-input-scale paths. Fused SM120 SwiGLU rounds the activated intermediate to the
-  16-bit logical dtype before down-projection preparation (matching eager 16-bit SwiGLU).
+- Fused 16-bit ConvRot INT8 SwiGLU into both the SM120 TMA and SM8x/SM120 async-copy
+  up/gate projection epilogues, reducing ConvRot INT8 SwiGLU FFN workspace by ~40% and
+  preserving the unfused fallback for FP32, unaligned, non-SM8x/SM120, and
+  distinct-input-scale paths (improving end-to-end SwiGLU FFN latency by ~3–7% on RTX 5090;
+  SM8x async-copy fused SwiGLU is verified spill-free on `sm_80`/`sm_86`/`sm_89`/`sm_120`
+  and via RTX 5090 proxy runs pending on-device SM8x speed tuning). Both fused epilogues
+  round the activated intermediate to the 16-bit logical dtype before down-projection
+  preparation (matching eager 16-bit SwiGLU).
 - Unified FFN chunk sizing (`default_chunk_rows` in `piper_kernels.fusions.ffn`) across both
   `swiglu` and `gelu_tanh` under shared workspace caps (`512 MiB` for ConvRot INT8 and
   `256 MiB` for NVFP4/ConvRot NVFP4, accounting for activation projection width and shared
