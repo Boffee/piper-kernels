@@ -350,37 +350,24 @@ def _prepare_activated_chunk(
         )
         return qdata, scale, activation_per_tensor_scale
 
-    if activation_fn == "swiglu":
-        from . import triton as ffn_triton  # noqa: PLC0415
-
-        return ffn_triton.prepare_convrot_nvfp4_swiglu(
-            projections,
-            activation_per_tensor_scale,
-            dynamic_activation_scale,
-            group_size,
-            high_first,
-            out=out,
-        )
-
     from piper_kernels.linear.convrot.nvfp4 import triton as convrot_backend  # noqa: PLC0415
 
     if dynamic_activation_scale:
         return convrot_backend.prepare_dynamic(
             projections,
             group_size,
-            "gelu_tanh",
+            activation_fn,
             out=out,
             high_first=high_first,
         )
-    validated_input = convrot_backend._validate_input(projections, group_size, "gelu_tanh")
     assert activation_per_tensor_scale is not None
-    qdata, scale = convrot_backend._prepare_static_storage(
-        validated_input,
+    qdata, scale = convrot_backend.prepare_static_out(
+        projections,
         activation_per_tensor_scale,
         group_size,
         out,
-        activation_fn="gelu_tanh",
         high_first=high_first,
+        activation_fn=activation_fn,
     )
     return qdata, scale, activation_per_tensor_scale
 

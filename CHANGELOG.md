@@ -17,6 +17,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Unified ConvRot NVFP4 activation preparation (`dynamic_scale`, `prepare_static`,
+  `prepare_static_out`, `prepare_dynamic` with optional `activation_fn`) across
+  ordinary, `gelu_tanh`, and `swiglu` inputs, lifting the 49,152-feature limit on
+  dense activation preparation and removing the 32 MiB temporary SwiGLU FP32 rotated
+  workspace (~3–11% faster GELU FFNs, ~0.3–1.6% faster SwiGLU FFNs, and ~1–7% faster
+  high-resolution standalone linears on RTX 5090; direct GGUF weight conversion is
+  unchanged).
 - Fused 16-bit ConvRot INT8 SwiGLU into the SM120 TMA, SM8x/SM120 async-copy, and RDNA4
   (`gfx1201`) paired up/gate projection epilogues, reducing ConvRot INT8 SwiGLU FFN
   workspace (~40% on RTX 5090; `-88` to `-204 MiB` peak VRAM on RX 9070 XT) and
