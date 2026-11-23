@@ -1,7 +1,4 @@
-"""ConvRot NVFP4 rotation and packing kernels, and direct GGUF conversion into weights.
-
-ConvRot NVFP4 activation preparation and weight conversion share the packing kernels.
-"""
+"""Direct GGUF ConvRot NVFP4 weight rotation and packing kernels."""
 
 # pyright: reportCallIssue=false
 from __future__ import annotations
@@ -11,7 +8,6 @@ import triton
 import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.gguf import triton as gguf_backend
 from piper_kernels.weights.convrot import triton as convrot_backend
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
@@ -25,21 +21,17 @@ _MAX_ROTATION_CHUNK_SIZE = 16_384
 @triton.jit
 def _rotated_chunk_amax(
     input_ptr,
-    input_row_offset,
     packed_row_offset,
     row_width,
     chunk_start: tl.constexpr,
     chunk_size: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
-    activation_fn: tl.constexpr,
-    accelerator_backend: tl.constexpr,
     gguf_quant_type: tl.constexpr,
 ):
     chunk_offsets = tl.arange(0, chunk_size)
-    values = convrot_backend.load_rotated_chunk(
+    values = convrot_backend.load_gguf_rotated_chunk(
         input_ptr,
-        input_row_offset,
         packed_row_offset,
         row_width,
         chunk_start,
@@ -47,8 +39,6 @@ def _rotated_chunk_amax(
         chunk_size,
         group_size,
         inverse_sqrt_group,
-        activation_fn,
-        accelerator_backend,
         gguf_quant_type,
     )
     return tl.max(tl.abs(values).to(tl.float32), axis=0)
@@ -65,33 +55,23 @@ def _rotated_row_amax_kernel(
     chunk_size2: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
-    activation_fn: tl.constexpr,
-    accelerator_backend: tl.constexpr,
     gguf_quant_type: tl.constexpr,
 ):
-    """Compute one exact post-rotation absolute maximum per activation row."""
-    row = tl.program_id(0)
-    row_i64 = row.to(tl.int64)
-    input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
-    input_row_offset = row_i64 * input_row_width
-    packed_row_offset = 0
-    if gguf_quant_type >= 0:
-        packed_row_offset = row_i64 * gguf_backend.packed_row_size(
-            row_width,
-            gguf_quant_type,
-        )
+    """Compute one exact post-rotation absolute maximum per packed GGUF row."""
+    row_i64 = tl.program_id(0).to(tl.int64)
+    packed_row_offset = row_i64 * gguf_backend.packed_row_size(
+        row_width,
+        gguf_quant_type,
+    )
 
     row_amax = _rotated_chunk_amax(
         input_ptr,
-        input_row_offset,
         packed_row_offset,
         row_width,
         tl.constexpr(0),
         chunk_size0,
         group_size,
         inverse_sqrt_group,
-        activation_fn,
-        accelerator_backend,
         gguf_quant_type,
     )
     if chunk_count >= 2:
@@ -99,15 +79,12 @@ def _rotated_row_amax_kernel(
             row_amax,
             _rotated_chunk_amax(
                 input_ptr,
-                input_row_offset,
                 packed_row_offset,
                 row_width,
                 chunk_size0,
                 chunk_size1,
                 group_size,
                 inverse_sqrt_group,
-                activation_fn,
-                accelerator_backend,
                 gguf_quant_type,
             ),
         )
@@ -116,15 +93,12 @@ def _rotated_row_amax_kernel(
             row_amax,
             _rotated_chunk_amax(
                 input_ptr,
-                input_row_offset,
                 packed_row_offset,
                 row_width,
                 chunk_size0 + chunk_size1,
                 chunk_size2,
                 group_size,
                 inverse_sqrt_group,
-                activation_fn,
-                accelerator_backend,
                 gguf_quant_type,
             ),
         )
@@ -137,7 +111,6 @@ def _rotate_quantize_chunk(
     per_tensor_scale_ptr,
     qdata_ptr,
     scale_ptr,
-    input_row_offset,
     packed_row_offset,
     qdata_row_offset,
     row,
@@ -147,18 +120,15 @@ def _rotate_quantize_chunk(
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
     scale_column_blocks: tl.constexpr,
-    activation_fn: tl.constexpr,
-    accelerator_backend: tl.constexpr,
     gguf_quant_type: tl.constexpr,
     has_per_tensor_scale: tl.constexpr,
     swizzled_scales: tl.constexpr,
     high_first: tl.constexpr,
 ):
-    """Rotate and encode one power-of-two row chunk into standard NVFP4 storage."""
+    """Decode, rotate, and encode one power-of-two GGUF row chunk into NVFP4 storage."""
     chunk_offsets = tl.arange(0, chunk_size)
-    values = convrot_backend.load_rotated_chunk(
+    values = convrot_backend.load_gguf_rotated_chunk(
         input_ptr,
-        input_row_offset,
         packed_row_offset,
         row_width,
         chunk_start,
@@ -166,8 +136,6 @@ def _rotate_quantize_chunk(
         chunk_size,
         group_size,
         inverse_sqrt_group,
-        activation_fn,
-        accelerator_backend,
         gguf_quant_type,
     )
     block_count: tl.constexpr = chunk_size // _NVFP4_BLOCK_SIZE_TL
@@ -219,24 +187,18 @@ def _rotate_quantize_nvfp4_kernel(
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
     scale_column_blocks: tl.constexpr,
-    activation_fn: tl.constexpr,
-    accelerator_backend: tl.constexpr,
     gguf_quant_type: tl.constexpr,
     has_per_tensor_scale: tl.constexpr,
     swizzled_scales: tl.constexpr,
     high_first: tl.constexpr,
 ):
-    """Apply the second exact rotation and write hardware-ready NVFP4 storage."""
+    """Apply the second exact GGUF rotation and write hardware-ready NVFP4 storage."""
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
-    input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
-    input_row_offset = row_i64 * input_row_width
-    packed_row_offset = 0
-    if gguf_quant_type >= 0:
-        packed_row_offset = row_i64 * gguf_backend.packed_row_size(
-            row_width,
-            gguf_quant_type,
-        )
+    packed_row_offset = row_i64 * gguf_backend.packed_row_size(
+        row_width,
+        gguf_quant_type,
+    )
     qdata_row_offset = row_i64 * (row_width // 2)
 
     _rotate_quantize_chunk(
@@ -244,7 +206,6 @@ def _rotate_quantize_nvfp4_kernel(
         per_tensor_scale_ptr,
         qdata_ptr,
         scale_ptr,
-        input_row_offset,
         packed_row_offset,
         qdata_row_offset,
         row,
@@ -254,8 +215,6 @@ def _rotate_quantize_nvfp4_kernel(
         group_size,
         inverse_sqrt_group,
         scale_column_blocks,
-        activation_fn,
-        accelerator_backend,
         gguf_quant_type,
         has_per_tensor_scale,
         swizzled_scales,
@@ -267,7 +226,6 @@ def _rotate_quantize_nvfp4_kernel(
             per_tensor_scale_ptr,
             qdata_ptr,
             scale_ptr,
-            input_row_offset,
             packed_row_offset,
             qdata_row_offset,
             row,
@@ -277,8 +235,6 @@ def _rotate_quantize_nvfp4_kernel(
             group_size,
             inverse_sqrt_group,
             scale_column_blocks,
-            activation_fn,
-            accelerator_backend,
             gguf_quant_type,
             has_per_tensor_scale,
             swizzled_scales,
@@ -290,7 +246,6 @@ def _rotate_quantize_nvfp4_kernel(
             per_tensor_scale_ptr,
             qdata_ptr,
             scale_ptr,
-            input_row_offset,
             packed_row_offset,
             qdata_row_offset,
             row,
@@ -300,8 +255,6 @@ def _rotate_quantize_nvfp4_kernel(
             group_size,
             inverse_sqrt_group,
             scale_column_blocks,
-            activation_fn,
-            accelerator_backend,
             gguf_quant_type,
             has_per_tensor_scale,
             swizzled_scales,
@@ -380,7 +333,6 @@ def _gguf_dynamic_scale(
     chunk_size0, chunk_size1, chunk_size2 = chunk_sizes
     amax_num_warps, _ = _preparation_num_warps(chunk_sizes, group_size)
     row_amax = torch.empty(rows, device=data.device, dtype=torch.float32)
-    target = AcceleratorTarget.from_device(data.device)
     with device_context(data.device):
         _rotated_row_amax_kernel[(rows,)](
             data,
@@ -392,8 +344,6 @@ def _gguf_dynamic_scale(
             chunk_size2=chunk_size2,
             group_size=group_size,
             inverse_sqrt_group=group_size**-0.5,
-            activation_fn=None,
-            accelerator_backend=target.backend,
             gguf_quant_type=quant_type,
             num_warps=amax_num_warps,
         )
@@ -418,7 +368,6 @@ def _gguf_prepare_out(
     chunk_count = sum(chunk_size > 0 for chunk_size in chunk_sizes)
     chunk_size0, chunk_size1, chunk_size2 = chunk_sizes
     _, packing_num_warps = _preparation_num_warps(chunk_sizes, group_size)
-    target = AcceleratorTarget.from_device(data.device)
     with device_context(data.device):
         _rotate_quantize_nvfp4_kernel[(rows,)](
             data,
@@ -434,8 +383,6 @@ def _gguf_prepare_out(
             inverse_sqrt_group=group_size**-0.5,
             scale_column_blocks=(row_width + nvfp4_layout.SCALE_COLUMN_TILE - 1)
             // nvfp4_layout.SCALE_COLUMN_TILE,
-            activation_fn=None,
-            accelerator_backend=target.backend,
             gguf_quant_type=quant_type,
             has_per_tensor_scale=per_tensor_scale is not None,
             swizzled_scales=is_swizzled_scales,

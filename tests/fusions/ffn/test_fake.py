@@ -370,14 +370,12 @@ import piper_kernels.fusions.ffn as ffn_pkg
 assert "piper_kernels.fusions.ffn._compile" not in sys.modules
 assert "piper_kernels.fusions.ffn._convrot_int8" not in sys.modules
 assert "piper_kernels.fusions.ffn._nvfp4" not in sys.modules
-assert "piper_kernels.fusions.ffn.triton" not in sys.modules
 
 options = piper_kernels.compile_options(ffn=True)
 assert "post_grad_custom_pre_pass" in options
 assert "piper_kernels.fusions.ffn._compile" not in sys.modules
 assert "piper_kernels.fusions.ffn._convrot_int8" not in sys.modules
 assert "piper_kernels.fusions.ffn._nvfp4" not in sys.modules
-assert "piper_kernels.fusions.ffn.triton" not in sys.modules
 assert "piper_kernels.linear.convrot" not in sys.modules
 assert "piper_kernels.linear.nvfp4" not in sys.modules
 assert "triton" not in sys.modules
@@ -434,6 +432,5 @@ assert not hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear")
 assert not hasattr(torch.ops.piper_kernels, "convrot_int8_linear")
 assert "piper_kernels.linear.convrot" not in sys.modules
 assert "piper_kernels.fusions.ffn._convrot_int8" not in sys.modules
-assert "piper_kernels.fusions.ffn.triton" not in sys.modules
 """
     subprocess.run([sys.executable, "-c", script], check=True, timeout=60)

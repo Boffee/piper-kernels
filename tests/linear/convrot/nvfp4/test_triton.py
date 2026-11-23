@@ -3,6 +3,11 @@
 import pytest
 import torch
 from _accelerators import exact_sm120_available
+from torch.nn import functional as F  # noqa: N812
+from torch.utils._python_dispatch import TorchDispatchMode
+from torchao.prototype.mx_formats.nvfp4_tensor import (
+    NVFP4Tensor as TorchAONVFP4Tensor,
+)
 
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
@@ -261,6 +266,347 @@ def test_swiglu_preparation_matches_materialized_activation(
             torch.testing.assert_close(actual_tensor, expected_tensor, rtol=3e-7, atol=0)
         else:
             assert torch.equal(actual_tensor, expected_tensor)
+
+
+def _assert_prepared_equal(
+    actual: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    expected: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    for left, right in zip(actual[:2], expected[:2], strict=True):
+        assert torch.equal(left.reshape(-1).view(torch.uint8), right.reshape(-1).view(torch.uint8))
+    torch.testing.assert_close(actual[2], expected[2], rtol=1e-6, atol=0)
+
+
+class _RejectCopies(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        assert func not in (torch.ops.aten.clone.default, torch.ops.aten._to_copy.default)
+        return func(*args, **(kwargs or {}))
+
+
+def _prepare_convrot_nvfp4_for_test(
+    projections: torch.Tensor,
+    activation: str,
+    per_tensor_scale: torch.Tensor | None,
+    dynamic: bool,
+    group: int,
+    high_first: bool,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if dynamic:
+        return convrot_nvfp4.prepare_dynamic(
+            projections,
+            group,
+            activation,
+            out=out,
+            high_first=high_first,
+        )
+    assert per_tensor_scale is not None
+    if out is None:
+        return convrot_nvfp4.prepare_static(
+            projections,
+            per_tensor_scale,
+            group,
+            activation,
+            high_first,
+        )
+    qdata, scale = convrot_nvfp4.prepare_static_out(
+        projections,
+        per_tensor_scale,
+        group,
+        out,
+        high_first=high_first,
+        activation_fn=activation,
+    )
+    return qdata, scale, per_tensor_scale
+
+
+def _dequantize_prepared_nvfp4(
+    prepared: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    high_first: bool,
+) -> torch.Tensor:
+    qdata, scale, per_tensor_scale = prepared
+    if high_first:
+        qdata = nvfp4_layout.swap_packed_pairs(qdata)
+    return (
+        TorchAONVFP4Tensor(qdata, scale, 16, torch.float32, is_swizzled_scales=True).dequantize(
+            torch.float32
+        )
+        * per_tensor_scale
+    )
+
+
+def _assert_prepared_matches_reference(
+    actual: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    expected: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    high_first: bool,
+) -> None:
+    torch.testing.assert_close(actual[2], expected[2], rtol=1e-5, atol=0)
+    assert actual[0].shape == expected[0].shape
+    assert actual[1].shape == expected[1].shape
+    assert (actual[0] != expected[0]).float().mean().item() < 1e-3
+    assert (
+        actual[1].view(torch.uint8) != expected[1].view(torch.uint8)
+    ).float().mean().item() < 1e-3
+    actual_dq = _dequantize_prepared_nvfp4(actual, high_first)
+    expected_dq = _dequantize_prepared_nvfp4(expected, high_first)
+    assert ((actual_dq - expected_dq).norm() / expected_dq.norm()).item() < 5e-3
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("activation", ["gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize(
+    ("shape", "group", "high_first"),
+    [
+        ((2, 17, 256), 256, False),
+        ((129, 80), 16, False),
+        ((129, 5_376), 16, True),
+        ((3, 13_824), 64, False),
+        ((1_797, 8_192), 256, True),
+    ],
+)
+def test_activation_preparation_matches_fp32_reference(
+    activation: str,
+    dtype: torch.dtype,
+    dynamic: bool,
+    shape: tuple[int, ...],
+    group: int,
+    high_first: bool,
+) -> None:
+    torch.manual_seed(941)
+    if activation == "swiglu":
+        gate = torch.randn(shape, device="cuda", dtype=dtype) * 3
+        value = torch.randn_like(gate)
+        projections = torch.cat((value, gate), dim=-1)
+    else:
+        projections = torch.randn(shape, device="cuda", dtype=dtype) * 3
+    per_tensor_scale = None if dynamic else torch.tensor(0.01, device="cuda")
+    with torch.inference_mode():
+        expected = nvfp4_reference.prepare_input(
+            projections,
+            per_tensor_scale,
+            dynamic,
+            activation,
+            high_first,
+            group_size=group,
+        )
+        actual = _prepare_convrot_nvfp4_for_test(
+            projections,
+            activation,
+            per_tensor_scale,
+            dynamic,
+            group,
+            high_first,
+        )
+    _assert_prepared_matches_reference(actual, expected, high_first)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("activation", ["gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("zero", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_activation_preparation_zero_copy_and_overflow_safe(
+    activation: str, zero: bool, dynamic: bool
+) -> None:
+    torch.manual_seed(943)
+    width = 1024 if activation == "swiglu" else 512
+    workspace = torch.randn(128, width, device="cuda", dtype=torch.float16)
+    projections = workspace[:17]
+    if zero:
+        if activation == "swiglu":
+            projections[:, 512:].zero_()
+        else:
+            projections.zero_()
+    before = workspace.clone()
+    per_tensor_scale = None if dynamic else torch.tensor(0.01, device="cuda")
+    with torch.inference_mode():
+        expected = nvfp4_reference.prepare_input(
+            projections, per_tensor_scale, dynamic, activation, group_size=256
+        )
+        with _RejectCopies():
+            if dynamic:
+                actual = convrot_nvfp4.prepare_dynamic(projections, 256, activation)
+            else:
+                assert per_tensor_scale is not None
+                out = (
+                    torch.empty((17, 256), device="cuda", dtype=torch.uint8),
+                    torch.empty((32, 128), device="cuda", dtype=torch.float8_e4m3fn),
+                )
+                qdata, scale = convrot_nvfp4.prepare_static_out(
+                    projections,
+                    per_tensor_scale,
+                    256,
+                    out,
+                    activation_fn=activation,
+                )
+                actual = (qdata, scale, per_tensor_scale)
+    if zero:
+        _assert_prepared_equal(actual, expected)
+    else:
+        _assert_prepared_matches_reference(actual, expected, False)
+    assert torch.equal(workspace, before)
+    assert torch.isfinite(actual[2])
+
+    # Verify FP32 intermediates prevent FP16 product overflow across tile counts.
+    if activation == "swiglu" and not zero and dynamic:
+        for rows, cols in ((17, 256), (1_025, 8_192)):
+            gate = torch.full((rows, cols), 512.0, dtype=torch.float16, device="cuda")
+            value = torch.full_like(gate, 512.0)
+            assert not torch.isfinite(F.silu(gate) * value).all()
+            with torch.inference_mode():
+                cat = torch.cat((value, gate), dim=-1)
+                exp = nvfp4_reference.prepare_input(cat, None, True, "swiglu", group_size=256)
+                act = convrot_nvfp4.prepare_dynamic(cat, 256, "swiglu")
+            _assert_prepared_equal(act, exp)
+            assert torch.isfinite(act[1].float()).all()
+            assert torch.isfinite(act[2])
+            assert act[2] > 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("activation", ["gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize(
+    ("shape", "group", "high_first"),
+    [
+        ((17, 80), 16, False),  # non-64-aligned width & padded rows
+        ((1_025, 8_192), 256, True),  # multi-tile width & padded rows
+    ],
+)
+def test_activation_preparation_reuses_dirty_out_storage(
+    activation: str,
+    dynamic: bool,
+    shape: tuple[int, int],
+    group: int,
+    high_first: bool,
+) -> None:
+    torch.manual_seed(945)
+    rows, features = shape
+    input_width = features * (2 if activation == "swiglu" else 1)
+    projections = torch.randn(rows, input_width, device="cuda", dtype=torch.bfloat16)
+    per_tensor_scale = None if dynamic else torch.tensor(0.01, device="cuda")
+    scale_elements = ((rows + 127) // 128 * 32) * ((features + 63) // 64 * 16)
+    qdata_buffer = torch.full(
+        (rows + 8, features // 2),
+        0xA5,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    scale_buffer = torch.full(
+        (scale_elements + 32,),
+        0x55,
+        device="cuda",
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+
+    with torch.inference_mode():
+        expected = _prepare_convrot_nvfp4_for_test(
+            projections,
+            activation,
+            per_tensor_scale,
+            dynamic,
+            group,
+            high_first,
+        )
+        actual = _prepare_convrot_nvfp4_for_test(
+            projections,
+            activation,
+            per_tensor_scale,
+            dynamic,
+            group,
+            high_first,
+            out=(qdata_buffer, scale_buffer),
+        )
+    assert actual[0].data_ptr() == qdata_buffer.data_ptr()
+    assert actual[1].data_ptr() == scale_buffer.data_ptr()
+    _assert_prepared_equal(actual, expected)
+
+    bad_qdata = torch.empty((rows, features // 2 + 1), device="cuda", dtype=torch.uint8)
+    untouched_scale = torch.full(
+        (scale_elements,),
+        0x55,
+        device="cuda",
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="NVFP4 activation storage is incompatible"):
+        _prepare_convrot_nvfp4_for_test(
+            projections,
+            activation,
+            per_tensor_scale,
+            dynamic,
+            group,
+            high_first,
+            out=(bad_qdata, untouched_scale),
+        )
+    assert torch.all(untouched_scale.view(torch.uint8) == 0x55)
+
+    if not dynamic:
+        bad_scale = torch.empty((1,), device="cuda", dtype=torch.float32)
+        with pytest.raises(ValueError, match="contiguous FP32 scalar"):
+            _prepare_convrot_nvfp4_for_test(
+                projections,
+                activation,
+                bad_scale,
+                False,
+                group,
+                high_first,
+                out=(qdata_buffer, untouched_scale),
+            )
+        assert torch.all(untouched_scale.view(torch.uint8) == 0x55)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("group_size", [16, 256])
+def test_dynamic_scale_with_activation_matches_fp32_reference(
+    activation_fn: str | None,
+    group_size: int,
+) -> None:
+    torch.manual_seed(609 + group_size)
+    width = 1024 if activation_fn == "swiglu" else 512
+    input = torch.randn(17, width, device="cuda", dtype=torch.bfloat16)  # noqa: A001
+    expected = nvfp4_reference.prepare_input(
+        input,
+        None,
+        True,
+        activation_fn,
+        group_size=group_size,
+    )[2]
+    actual = convrot_nvfp4.dynamic_scale(input, group_size, activation_fn=activation_fn)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=0)
+
+    bad_out = torch.empty((1,), device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="contiguous FP32 scalar"):
+        convrot_nvfp4.dynamic_scale(input, group_size, activation_fn=activation_fn, out=bad_out)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("activation_fn", [None, "gelu_tanh"])
+def test_dense_preparation_supports_widths_beyond_three_gguf_chunks(
+    activation_fn: str | None,
+) -> None:
+    torch.manual_seed(610)
+    input = torch.randn((2, 57_344), device="cuda", dtype=torch.bfloat16)  # noqa: A001
+    actual = convrot_nvfp4.prepare_dynamic(input, 256, activation_fn)
+    if activation_fn is None:
+        expected = _materialized_optimized_preparation(input, 256)
+        for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+            assert torch.equal(actual_tensor, expected_tensor)
+    else:
+        expected = nvfp4_reference.prepare_input(
+            input,
+            None,
+            True,
+            activation_fn,
+            group_size=256,
+        )
+        _assert_prepared_matches_reference(actual, expected, False)
 
 
 @pytest.mark.parametrize("group_size", [15, 32])
