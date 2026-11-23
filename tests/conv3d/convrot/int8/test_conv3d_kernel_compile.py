@@ -6,6 +6,7 @@ import sys
 import pytest
 import triton
 from _accelerators import rocm_fences_only_lds
+from _nvidia_resources import compile_with_spill_stores
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
@@ -13,6 +14,71 @@ from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_option
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import _policy
 from piper_kernels.conv3d.convrot.int8 import triton as kernels
+
+
+def _conv3d_source(
+    *,
+    channels,
+    frames,
+    height,
+    width,
+    causal,
+    schedule,
+    has_bias,
+    has_residual,
+    residual_contiguous,
+    accumulator_seed=0,
+):
+    return ASTSource(
+        kernels._conv3d_kernel,
+        {
+            "input_ptr": "*i8",
+            "weight_ptr": "*i8",
+            "weight_scale_ptr": "*fp32",
+            "bias_ptr": "*fp16",
+            "residual_ptr": "*fp16",
+            "output_ptr": "*fp16",
+            "output_rows": "i32",
+            "output_channels": "i32",
+            "input_scale": "*fp32",
+            **{
+                f"residual_stride_{axis}": "i64"
+                for axis in (
+                    "batch",
+                    "channel",
+                    "frame",
+                    "height",
+                    "width",
+                )
+            },
+        },
+        constexprs={
+            "input_channels": channels,
+            "input_frames": frames,
+            "input_height": height,
+            "input_width": width,
+            "output_frames": frames if causal else 1,
+            "output_height": height if causal else height - 2,
+            "output_width": width if causal else width - 2,
+            "stride_frames": 1,
+            "stride_height": 1,
+            "stride_width": 1,
+            "block_m": schedule.block_m,
+            "block_n": schedule.block_n,
+            "block_k": schedule.block_k,
+            "bias_stride": 2,
+            "has_bias": has_bias,
+            "has_residual": has_residual,
+            "residual_contiguous": residual_contiguous,
+            "padding_front": 2 if causal else 0,
+            "padding_top": 1 if causal else 0,
+            "padding_left": 1 if causal else 0,
+            "spatial_reflection": causal,
+            "use_weight_descriptor": False,
+            "loop_num_stages": schedule.num_stages,
+            "accumulator_seed": accumulator_seed,
+        },
+    )
 
 
 def _compile_conv3d(
@@ -40,54 +106,17 @@ def _compile_conv3d(
     # Cover ordinary valid convolution as well as causal spatial reflection
     # on every accepted compiler target without multiplying the tile matrix.
     causal = rows == 16384
-    source = ASTSource(
-        kernels._conv3d_kernel,
-        {
-            "input_ptr": "*i8",
-            "weight_ptr": "*i8",
-            "weight_scale_ptr": "*fp32",
-            "bias_ptr": "*fp16",
-            "residual_ptr": "*fp16",
-            "output_ptr": "*fp16",
-            "output_rows": "i32",
-            "output_channels": "i32",
-            "input_scale": "*fp32",
-            **{
-                f"residual_stride_{axis}": "i64"
-                for axis in (
-                    "batch",
-                    "channel",
-                    "frame",
-                    "height",
-                    "width",
-                )
-            },
-        },
-        constexprs={
-            "input_channels": channels,
-            "input_frames": 3,
-            "input_height": 17,
-            "input_width": 19,
-            "output_frames": 3 if causal else 1,
-            "output_height": 17 if causal else 15,
-            "output_width": 19 if causal else 17,
-            "stride_frames": 1,
-            "stride_height": 1,
-            "stride_width": 1,
-            "block_m": schedule.block_m,
-            "block_n": schedule.block_n,
-            "block_k": schedule.block_k,
-            "bias_stride": 2,
-            "has_bias": has_bias,
-            "has_residual": has_residual,
-            "padding_front": 2 if causal else 0,
-            "padding_top": 1 if causal else 0,
-            "padding_left": 1 if causal else 0,
-            "spatial_reflection": causal,
-            "use_weight_descriptor": False,
-            "loop_num_stages": schedule.num_stages,
-            "accumulator_seed": plan.accumulator_seed,
-        },
+    source = _conv3d_source(
+        channels=channels,
+        frames=3,
+        height=17,
+        width=19,
+        causal=causal,
+        schedule=schedule,
+        has_bias=has_bias,
+        has_residual=has_residual,
+        residual_contiguous=has_residual and causal,
+        accumulator_seed=plan.accumulator_seed,
     )
     compiled = triton.compile(
         source,
@@ -129,6 +158,42 @@ def test_convolution_compiles_to_integer_matrix_instructions(channels, rows, tar
             assert "global_inv" not in compiled.asm["amdgcn"]
     else:
         assert "mma.sync" in compiled.asm["ptx"]
+
+
+def test_sm120_contiguous_residual_avoids_uncoalesced_spills():
+    target = GPUTarget("cuda", 120, 32)
+    rows = 5 * 68 * 120
+    plan = _policy.select_execution_plan(
+        AcceleratorTarget.from_compiler_target(target),
+        channels=512,
+        outputs=512,
+        input_rows=rows,
+        output_rows=rows,
+        output_height=68,
+        weight_aligned=True,
+        group_norm=False,
+    )
+    schedule = plan.convolution
+    assert schedule.block_m == 128
+    assert not plan.use_weight_descriptor
+    source = _conv3d_source(
+        channels=512,
+        frames=5,
+        height=68,
+        width=120,
+        causal=True,
+        schedule=schedule,
+        has_bias=True,
+        has_residual=True,
+        residual_contiguous=True,
+        accumulator_seed=plan.accumulator_seed,
+    )
+    _, spill_stores = compile_with_spill_stores(
+        source,
+        target,
+        {"num_warps": schedule.num_warps, "num_stages": schedule.num_stages},
+    )
+    assert spill_stores <= 4096
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm requires Linux")

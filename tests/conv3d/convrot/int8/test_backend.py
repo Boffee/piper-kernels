@@ -106,41 +106,52 @@ def test_custom_op_uses_selected_backend_or_reference(monkeypatch, fused):
     fallback.assert_called_once()
 
 
-@pytest.mark.parametrize(
-    ("channels", "outputs", "rows", "expected"),
-    [
-        (128, 128, 1024, (128, 128, 64, 4, 3)),
-        (256, 128, 200_000, (128, 128, 64, 4, 4)),
-        (256, 128, 30_000, (128, 128, 64, 4, 2)),
-        (256, 256, 1024, (64, 128, 128, 4, 3)),
-        (256, 512, 1024, (128, 128, 128, 8, 3)),
-        (512, 512, 5000, (128, 128, 128, 8, 3)),
-        (512, 1024, 1024, (64, 128, 128, 4, 3)),
-        (512, 512, 1024, (32, 128, 256, 8, 3)),
-        (64, 32, 1024, (64, 64, 64, 4, 3)),
-        (1024, 128, 1024, (64, 128, 128, 4, 3)),
-    ],
-)
-def test_nvidia_convolution_policy_preserves_existing_tiles(channels, outputs, rows, expected):
-    assert SM120(channels=channels, outputs=outputs, output_rows=rows).convolution == expected
+def test_sm120_convolution_schedule_contracts():
+    for channels in (64, 128, 256, 512, 1024, 2048):
+        for outputs in (32, 64, 128, 256, 384, 512, 1024):
+            for rows in (16, 128, 1280, 5040, 20160, 293760):
+                plan = SM120(channels=channels, outputs=outputs, output_rows=rows)
+                schedule = plan.convolution
+                assert (
+                    schedule == SM120(channels=128, outputs=outputs, output_rows=rows).convolution
+                )
+                assert not plan.lds_only_fences
+                assert plan.accumulator_seed == 0
+                for size in (schedule.block_m, schedule.block_n, schedule.block_k):
+                    assert size > 0
+                    assert size & (size - 1) == 0
+                assert schedule.block_m >= 16
+                assert schedule.block_n >= 16
+                assert 32 <= schedule.block_k <= 27 * channels
+                assert schedule.num_warps in (2, 4, 8)
+                assert schedule.num_stages >= 2
+                if outputs <= 64:
+                    assert schedule.block_n <= 64
+                if rows < 128:
+                    assert schedule.block_m <= 64
+                if plan.use_weight_descriptor:
+                    assert outputs % schedule.block_n == 0
+                    assert (27 * channels) % 16 == 0
 
 
-@pytest.mark.parametrize(
-    ("channels", "rows", "group_norm", "expected"),
-    [
-        (128, 1024, False, (64, 4)),
-        (256, 200_000, True, (32, 4)),
-        (256, 1024, True, (16, 4)),
-        (256, 200_000, False, (64, 4)),
-        (256, 1024, False, (32, 8)),
-        (512, 5000, True, (16, 8)),
-        (512, 5000, False, (32, 8)),
-        (1024, 1024, False, (8, 8)),
-    ],
-)
-def test_nvidia_preparation_policy_preserves_existing_tiles(channels, rows, group_norm, expected):
-    assert SM120(channels=channels, input_rows=rows, group_norm=group_norm).preparation == expected
-    assert SM8X(channels=channels, input_rows=rows, group_norm=group_norm).preparation == expected
+def test_nvidia_preparation_schedule_contracts():
+    for channels in (64, 128, 256, 512, 1024, 2048, 4096):
+        for rows in (64, 1024, 5000, 200_000):
+            for group_norm in (False, True):
+                schedule = SM120(
+                    channels=channels, input_rows=rows, group_norm=group_norm
+                ).preparation
+                assert (
+                    schedule
+                    == SM8X(channels=channels, input_rows=rows, group_norm=group_norm).preparation
+                )
+                assert schedule.block_m > 0
+                assert schedule.block_m & (schedule.block_m - 1) == 0
+                assert schedule.block_m * channels <= 32768
+                assert schedule.num_warps in (4, 8)
+                if channels <= 128:
+                    wide = SM120(channels=1024, input_rows=rows, group_norm=group_norm).preparation
+                    assert schedule.block_m > wide.block_m
 
 
 @pytest.mark.parametrize(
@@ -151,7 +162,10 @@ def test_nvidia_preparation_policy_preserves_existing_tiles(channels, rows, grou
         (128, 256, 16, False, False),
         (128, 65, 256, True, False),
         (128, 128, 16, True, False),
-        (256, 256, 256, True, False),
+        (256, 256, 256, True, True),
+        (256, 512, 68, True, True),
+        (512, 512, 256, True, False),
+        (64, 64, 256, True, False),
     ],
 )
 def test_nvidia_descriptor_policy(channels, outputs, height, aligned, expected):
@@ -196,19 +210,27 @@ def test_sm8x_convolution_policy_uses_measured_tiles(channels, outputs, rows, ex
 
 @pytest.mark.parametrize("fused", [False, True])
 def test_strided_execution_selects_preparation_from_input_rows(fused):
-    # 200,000 input rows cross the preparation threshold; 12,500 output rows do not.
+    # 200,000 input rows cross the large-input preparation regime; 3,150 output rows do not.
     activation = torch.empty(1, 256, 1, 1, 1).expand(1, 256, 1, 400, 500)
     weight = torch.empty(256, 3, 3, 3, 256, dtype=torch.int8)
     plan = _policy.default_execution_plan(
         activation,
         weight,
-        (1, 4, 4),
+        (1, 8, 8),
         target=AcceleratorTarget("cuda", "sm120"),
         group_norm=fused,
         padding=(1, 1, 1, 1, 2, 0),
     )
-    assert plan.preparation == ((32, 4) if fused else (64, 4))
-    assert plan.convolution == (64, 128, 128, 4, 3)
+    expected_input = SM120(
+        channels=256, outputs=256, input_rows=200_000, output_rows=200_000, group_norm=fused
+    )
+    expected_output = SM120(
+        channels=256, outputs=256, input_rows=3_150, output_rows=3_150, group_norm=fused
+    )
+    assert plan.preparation == expected_input.preparation
+    assert plan.preparation != expected_output.preparation
+    assert plan.convolution == expected_output.convolution
+    assert plan.convolution != expected_input.convolution
 
 
 @pytest.mark.parametrize("architecture", ["sm120", "sm89"])

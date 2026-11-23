@@ -196,14 +196,16 @@ def test_public_fusion_rejects_trainable_normalization(gradient):
 @pytest.mark.gpu
 @pytest.mark.skipif(not _native_available(), reason="requires a native Conv3D backend")
 @pytest.mark.parametrize(
-    ("shape", "outputs", "padding", "stride", "residual_enabled"),
+    ("shape", "outputs", "padding", "stride", "residual_mode"),
     [
-        ((1, 128, 3, 16, 16), 128, "reflect", (1, 1, 1), True),
-        ((1, 128, 3, 17, 19), 256, "reflect_right", (1, 2, 2), False),
-        ((2, 256, 5, 7, 9), 128, "none", (2, 2, 2), True),
-        ((1, 512, 3, 5, 7), 65, "reflect", (2, 1, 1), False),
-        ((1, 1024, 2, 3, 3), 32, "reflect", (1, 1, 1), True),
-        ((1, 64, 1, 2, 2), 7, "reflect", (1, 1, 1), False),
+        ((1, 128, 3, 16, 16), 128, "reflect", (1, 1, 1), "strided"),
+        ((1, 128, 3, 17, 19), 256, "reflect_right", (1, 2, 2), None),
+        ((2, 256, 5, 7, 9), 128, "none", (2, 2, 2), "strided"),
+        ((1, 512, 3, 5, 7), 65, "reflect", (2, 1, 1), None),
+        ((1, 1024, 2, 3, 3), 32, "reflect", (1, 1, 1), "strided"),
+        ((1, 64, 1, 2, 2), 7, "reflect", (1, 1, 1), None),
+        ((2, 256, 2, 48, 64), 256, "reflect", (1, 1, 1), "contiguous"),
+        ((1, 64, 4, 64, 64), 64, "reflect", (1, 1, 1), "contiguous"),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
@@ -212,7 +214,7 @@ def test_triton_conv3d_matches_reference(
     outputs: int,
     padding: str,
     stride: tuple[int, int, int],
-    residual_enabled: bool,
+    residual_mode: str | None,
     dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(5678)
@@ -226,23 +228,35 @@ def test_triton_conv3d_matches_reference(
     symmetric = padding == "reflect"
     right = padding == "reflect_right"
     spatial = 2 if symmetric else int(right)
+    output_frames = (frames - 1) // stride[0] + 1
     output_height = (input.shape[3] + spatial - 3) // stride[1] + 1
     output_width = (input.shape[4] + spatial - 3) // stride[2] + 1
-    residual = (
-        torch.randn(
+    if residual_mode == "contiguous":
+        residual = torch.randn(
             batch,
             outputs,
-            (frames - 1) // stride[0] + 1,
-            output_width,
+            output_frames,
             output_height,
+            output_width,
             device="cuda",
             dtype=torch.float16,
+        ).mul_(0.1)
+    elif residual_mode == "strided":
+        residual = (
+            torch.randn(
+                batch,
+                outputs,
+                output_frames,
+                output_width,
+                output_height,
+                device="cuda",
+                dtype=torch.float16,
+            )
+            .transpose(3, 4)
+            .mul_(0.1)
         )
-        .transpose(3, 4)
-        .mul_(0.1)
-        if residual_enabled
-        else None
-    )
+    else:
+        residual = None
 
     with torch.no_grad():
         actual = conv3d(

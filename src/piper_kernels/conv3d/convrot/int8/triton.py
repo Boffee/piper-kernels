@@ -261,6 +261,7 @@ def _conv3d_kernel(  # noqa: PLR0915
     bias_stride: tl.constexpr,
     has_bias: tl.constexpr,
     has_residual: tl.constexpr,
+    residual_contiguous: tl.constexpr,
     padding_front: tl.constexpr,
     padding_top: tl.constexpr,
     padding_left: tl.constexpr,
@@ -357,26 +358,36 @@ def _conv3d_kernel(  # noqa: PLR0915
     if has_bias:
         bias = tl.load(bias_ptr + channel_offsets * bias_stride, mask=valid_channels, other=0.0)
         output += bias[None, :]
+    output_offset = (
+        batch[:, None].to(tl.int64) * output_channels + channel_offsets[None, :]
+    ) * output_volume + output_position[:, None]
     if has_residual:
-        residual_pointers = residual_ptr + (
-            batch[:, None].to(tl.int64) * residual_stride_batch
-            + channel_offsets[None, :].to(tl.int64) * residual_stride_channel
-            + output_frame[:, None].to(tl.int64) * residual_stride_frame
-            + output_y[:, None].to(tl.int64) * residual_stride_height
-            + output_x[:, None].to(tl.int64) * residual_stride_width
-        )
-        residual = tl.load(
-            residual_pointers,
-            mask=valid_rows[:, None] & valid_channels[None, :],
-            other=0.0,
-        )
+        if residual_contiguous:
+            residual = tl.load(
+                residual_ptr + output_offset,
+                mask=valid_rows[:, None] & valid_channels[None, :],
+                other=0.0,
+            )
+        else:
+            residual_row = (
+                batch.to(tl.int64) * residual_stride_batch
+                + output_frame.to(tl.int64) * residual_stride_frame
+                + output_y.to(tl.int64) * residual_stride_height
+                + output_x.to(tl.int64) * residual_stride_width
+            )
+            residual_pointers = (
+                residual_ptr
+                + residual_row[:, None]
+                + channel_offsets[None, :].to(tl.int64) * residual_stride_channel
+            )
+            residual = tl.load(
+                residual_pointers,
+                mask=valid_rows[:, None] & valid_channels[None, :],
+                other=0.0,
+            )
         output += residual.to(tl.float32)
-    output_pointers = output_ptr + (
-        (batch[:, None].to(tl.int64) * output_channels + channel_offsets[None, :]) * output_volume
-        + output_position[:, None]
-    )
     tl.store(
-        output_pointers,
+        output_ptr + output_offset,
         output,
         mask=valid_rows[:, None] & valid_channels[None, :],
     )
@@ -586,6 +597,7 @@ def _conv3d_prepared(
             bias_stride=bias.stride(0) if bias is not None else 1,
             has_bias=bias is not None,
             has_residual=residual is not None,
+            residual_contiguous=residual is not None and residual.is_contiguous(),
             padding_front=padding[4],
             padding_top=padding[2],
             padding_left=padding[0],

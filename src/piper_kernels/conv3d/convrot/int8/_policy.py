@@ -23,9 +23,10 @@ from piper_kernels._triton.targets import (
 
 type Padding = tuple[int, int, int, int, int, int]
 
-_SM120_C256_LARGE_MIN_ROWS = 200_000
-_SM120_C256_MEDIUM_MIN_ROWS = 30_000
-_SM120_C512_LARGE_MIN_ROWS = 5_000
+# Fill SM120 with 128-row tiles before falling back to 64-row tiles for small grids.
+_SM120_MIN_FULL_GRID_TILES = 128
+_PREPARE_C256_MIN_ROWS = 200_000
+_PREPARE_C512_MIN_ROWS = 5_000
 
 # SM89 measurements favor narrower tiles below 32 row tiles of 64.
 _SM8X_WIDE_MIN_ROWS = 2048
@@ -62,10 +63,7 @@ class ConvolutionExecutionPlan:
 
 _BASE_CONVOLUTION = ConvolutionSchedule(64, 128, 128, 4, 3)
 _SM120_K64 = ConvolutionSchedule(128, 128, 64, 4, 3)
-_SM120_K64_DEEP_PIPELINE = ConvolutionSchedule(128, 128, 64, 4, 4)
-_SM120_K64_SHORT_PIPELINE = ConvolutionSchedule(128, 128, 64, 4, 2)
-_SM120_LARGE_M = ConvolutionSchedule(128, 128, 128, 8, 3)
-_SM120_LARGE_K = ConvolutionSchedule(32, 128, 256, 8, 3)
+_SM120_NARROW_WIDE_M = ConvolutionSchedule(128, 64, 64, 4, 3)
 _SM120_NARROW_OUTPUT = ConvolutionSchedule(64, 64, 64, 4, 3)
 _SM8X_SHORT = ConvolutionSchedule(64, 64, 128, 4, 3)
 _SM8X_NARROW_OUTPUT = ConvolutionSchedule(32, 32, 128, 2, 3)
@@ -117,27 +115,28 @@ def supports_target(target: AcceleratorTarget) -> bool:
 def _sm120_use_weight_descriptor(
     channels: int, outputs: int, height: int, block_n: int, *, aligned: bool
 ) -> bool:
+    # TMA saves weight-addressing overhead on C=128/256 shorter K-loops; C=64 and
+    # C>=512 prefer pointer loads.
     return (
-        aligned and channels == 128 and outputs % block_n == 0 and (height >= 256 or outputs > 128)
+        aligned
+        and channels in (128, 256)
+        and outputs % block_n == 0
+        and (height >= 256 or outputs > 128)
     )
 
 
-def _sm120_convolution_schedule(channels: int, outputs: int, rows: int) -> ConvolutionSchedule:
-    if channels == 128:
-        return _SM120_K64
-    if channels == 256:
-        if rows >= _SM120_C256_MEDIUM_MIN_ROWS:
-            return (
-                _SM120_K64_DEEP_PIPELINE
-                if rows >= _SM120_C256_LARGE_MIN_ROWS
-                else _SM120_K64_SHORT_PIPELINE
-            )
-        return _BASE_CONVOLUTION if outputs == 256 else _SM120_LARGE_M
-    if channels == 512:
-        if rows >= _SM120_C512_LARGE_MIN_ROWS:
-            return _SM120_LARGE_M
-        return _BASE_CONVOLUTION if outputs > 512 else _SM120_LARGE_K
-    return _SM120_NARROW_OUTPUT if outputs <= 64 else _BASE_CONVOLUTION
+def _sm120_convolution_schedule(outputs: int, rows: int) -> ConvolutionSchedule:
+    if outputs <= 64:
+        return (
+            _SM120_NARROW_WIDE_M
+            if rows >= 128 and _tile_count(rows, outputs, 128, 64) >= _SM120_MIN_FULL_GRID_TILES
+            else _SM120_NARROW_OUTPUT
+        )
+    return (
+        _SM120_K64
+        if rows >= 128 and _tile_count(rows, outputs, 128, 128) >= _SM120_MIN_FULL_GRID_TILES
+        else _BASE_CONVOLUTION
+    )
 
 
 def _sm8x_convolution_schedule(outputs: int, rows: int) -> ConvolutionSchedule:
@@ -149,15 +148,16 @@ def _sm8x_convolution_schedule(outputs: int, rows: int) -> ConvolutionSchedule:
 def _nvidia_preparation_schedule(
     channels: int, rows: int, *, group_norm: bool
 ) -> PreparationSchedule:
-    # Preparation is bandwidth-bound; no measured SM89 tile beat SM120's schedule.
-    if channels == 128:
+    # SM120 and SM8x share bandwidth-bound preparation schedules; C=64 and C=512 were
+    # updated from SM120 measurements and verified spill-free on sm_89 offline.
+    if channels <= 128:
         return _PREPARE_WIDE
     if channels == 256:
         if group_norm:
-            return _PREPARE_MEDIUM if rows >= _SM120_C256_LARGE_MIN_ROWS else _PREPARE_SHORT
-        return _PREPARE_WIDE if rows >= _SM120_C256_LARGE_MIN_ROWS else _PREPARE_MEDIUM_8_WARPS
-    if channels == 512 and rows >= _SM120_C512_LARGE_MIN_ROWS:
-        return _PREPARE_SHORT_8_WARPS if group_norm else _PREPARE_MEDIUM_8_WARPS
+            return _PREPARE_MEDIUM if rows >= _PREPARE_C256_MIN_ROWS else _PREPARE_SHORT
+        return _PREPARE_WIDE if rows >= _PREPARE_C256_MIN_ROWS else _PREPARE_MEDIUM_8_WARPS
+    if channels == 512 and rows >= _PREPARE_C512_MIN_ROWS:
+        return _PREPARE_SHORT_8_WARPS
     return _PREPARE_DEFAULT
 
 
@@ -220,7 +220,7 @@ def select_execution_plan(
             convolution_schedule = (
                 _sm8x_convolution_schedule(outputs, output_rows)
                 if sm8x
-                else _sm120_convolution_schedule(channels, outputs, output_rows)
+                else _sm120_convolution_schedule(outputs, output_rows)
             )
         return ConvolutionExecutionPlan(
             preparation=_nvidia_preparation_schedule(channels, input_rows, group_norm=group_norm),
