@@ -601,7 +601,17 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
         else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
     )
     prepared_targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    assert prepared_targets.count(expected_prepare) == preparation_count
+    preparations = graph.find_nodes(op="call_function", target=expected_prepare)
+    assert len(preparations) == preparation_count
+    for node in preparations:
+        fake_args = torch.fx.map_arg(node.args, lambda arg: arg.meta["val"])
+        expected = expected_prepare(*fake_args)
+        for value, output in zip(node.meta["val"], expected, strict=True):
+            assert (value.shape, value.dtype) == (output.shape, output.dtype)
+        for getitem in node.users:
+            value = getitem.meta["val"]
+            output = expected[getitem.args[1]]
+            assert (value.shape, value.dtype) == (output.shape, output.dtype)
     assert prepared_targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 3
 
     fold_sparse_attention(graph)

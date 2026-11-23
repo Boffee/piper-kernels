@@ -25,6 +25,16 @@ def test_empty_reference_preparation_and_projection(dtype, dynamic, group_size, 
     assert prepared[0].shape == (0, 16)
     assert prepared[1].shape == _layout.scale_shape(0, 32)
     assert prepared[2].item() == (0 if dynamic else 0.25)
+    meta_value = value.to("meta")
+    meta_scale = None if scale is None else scale.to("meta")
+    fake = (
+        convrot_ops.prepare_input(meta_value, meta_scale, dynamic, group_size, activation)
+        if group_size
+        else _ops.prepare_input(meta_value, meta_scale, dynamic, activation)
+    )
+    for metadata, output in zip(fake, prepared, strict=True):
+        assert (metadata.shape, metadata.dtype) == (output.shape, output.dtype)
+
     weight = reference.prepare_input(torch.ones(16, 32), None, True, group_size=group_size)
     actual = reference.linear_prepared(*prepared, *weight, None, dtype)
     assert actual.shape == (0, 16)

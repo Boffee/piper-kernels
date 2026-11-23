@@ -5,10 +5,10 @@ from __future__ import annotations
 import torch
 
 from piper_kernels import _input_activations as input_activations
-from piper_kernels.weights.nvfp4 import _layout
 
 from . import _projection, _validation, reference
 from . import triton as nvfp4_triton
+from ._storage import prepared_input_metadata
 
 
 def _compiled_prepare_dynamic(
@@ -157,20 +157,7 @@ def _prepare_input_fake(
     activation_fn: str | None = None,
     _high_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    rows = input.numel() // input.shape[-1]
-    features = input.shape[-1] // input_activations.input_activation_width(activation_fn)
-    qdata_shape = _layout.qdata_shape(rows, features)
-    scale_shape = _layout.scale_shape(rows, features)
-    per_tensor_scale = (
-        activation_per_tensor_scale.new_empty(())
-        if activation_per_tensor_scale is not None
-        else input.new_empty((), dtype=torch.float32)
-    )
-    return (
-        input.new_empty(qdata_shape, dtype=torch.uint8),
-        input.new_empty(scale_shape, dtype=torch.float8_e4m3fn),
-        per_tensor_scale,
-    )
+    return prepared_input_metadata(input, activation_per_tensor_scale, activation_fn)
 
 
 @torch.library.custom_op("piper_kernels::nvfp4_linear_prepared", mutates_args=())

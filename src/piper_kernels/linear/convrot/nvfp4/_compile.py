@@ -15,8 +15,6 @@ from . import (
     _ops,  # noqa: F401 - registers convrot_nvfp4_linear
 )
 
-type _PreparedInputNodes = _compile_fx.PreparedInputNodes
-
 
 class _PreparationRule:
     """Describe how compatible ConvRot NVFP4 linears share preparation."""
@@ -55,16 +53,23 @@ class _PreparationRule:
         self,
         graph: torch.fx.Graph,
         first: torch.fx.Node,
-    ) -> _PreparedInputNodes:
+    ) -> nvfp4_compile_fx.PreparedInputNodes:
         operands = _compile_fx.SemanticLinearNodes.from_call(first)
         assert operands is not None
-        return _compile_fx.emit_prepared_input(graph, operands)
+        return nvfp4_compile_fx.emit_prepared_input(
+            graph,
+            operands.linear.input,
+            operands.linear.activation_per_tensor_scale,
+            operands.linear.dynamic_activation_scale,
+            high_first=operands.linear.high_first,
+            group_size=operands.group_size,
+        )
 
     def replace(
         self,
         graph: torch.fx.Graph,
         node: torch.fx.Node,
-        prepared: _PreparedInputNodes,
+        prepared: nvfp4_compile_fx.PreparedInputNodes,
     ) -> torch.fx.Node:
         operands = _compile_fx.SemanticLinearNodes.from_call(node)
         assert operands is not None
