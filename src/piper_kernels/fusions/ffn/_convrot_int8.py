@@ -30,7 +30,7 @@ from piper_kernels.weights.convrot.int8._quantization import (
 )
 
 DEFAULT_CHUNK_ROWS = 4_096
-_GELU_WORKSPACE_LIMIT_BYTES = 1_024 * 1_024 * 1_024
+_WORKSPACE_LIMIT_BYTES = 512 * 1_024 * 1_024
 _CHUNK_ROW_GRANULARITY = 128
 
 
@@ -55,12 +55,12 @@ def default_chunk_rows(
 ) -> int:
     """Return bounded row chunk size for ConvRot INT8 FFNs.
 
-    SwiGLU uses a fixed chunk size; GELU bounds reusable scratch to 1 GiB while
-    amortizing per-chunk launches and accounting for standalone residual scratch
-    when the output is wider than the intermediate projection.
+    Bounds reusable workspace to 512 MiB across both ``gelu_tanh`` and
+    ``swiglu`` while amortizing per-chunk launches and accounting for standalone
+    residual scratch when the output is wider than the up/gate workspace.
+    Falls back to ``DEFAULT_CHUNK_ROWS`` when feature widths are symbolic.
     """
-    if activation_fn == "swiglu":
-        return DEFAULT_CHUNK_ROWS
+    activation_width = input_activation_width(activation_fn)
     input_features = up_weight_qdata.shape[1]
     intermediate_features = up_weight_qdata.shape[0]
     output_features = down_weight_qdata.shape[0]
@@ -69,16 +69,17 @@ def default_chunk_rows(
         for features in (input_features, intermediate_features, output_features)
     ):
         return DEFAULT_CHUNK_ROWS
-    projection_bytes = intermediate_features * input.element_size()
+    projection_features = activation_width * intermediate_features
+    projection_bytes = projection_features * input.element_size()
     preparation_bytes = max(input_features, intermediate_features) * torch.int8.itemsize
     scale_bytes = torch.float32.itemsize
     projected_output_bytes = (
         output_features * input.element_size()
-        if adds_residual and output_features > intermediate_features
+        if adds_residual and output_features > projection_features
         else 0
     )
     bytes_per_row = projection_bytes + preparation_bytes + scale_bytes + projected_output_bytes
-    rows = _GELU_WORKSPACE_LIMIT_BYTES // bytes_per_row
+    rows = _WORKSPACE_LIMIT_BYTES // bytes_per_row
     return max(_CHUNK_ROW_GRANULARITY, rows // _CHUNK_ROW_GRANULARITY * _CHUNK_ROW_GRANULARITY)
 
 

@@ -15,6 +15,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Unified FFN chunk sizing (`default_chunk_rows` in `piper_kernels.fusions.ffn`) across both
+  `swiglu` and `gelu_tanh` under shared workspace caps (`512 MiB` for ConvRot INT8 and
+  `256 MiB` for NVFP4/ConvRot NVFP4, accounting for activation projection width and shared
+  NVFP4 source/activated storage, with fixed `128`-row granularity and `DEFAULT_CHUNK_ROWS`
+  only for symbolic widths). Dynamic NVFP4 SwiGLU per-chunk `per_tensor_scale` boundaries now
+  follow the computed chunk size while static NVFP4 and ConvRot INT8 stay numerically
+  equivalent.
 - Replaced the `torch.compile` dynamic activation-scale paths in standard NVFP4 linear
   preparation (`piper_kernels.linear.nvfp4.triton.prepare_dynamic` / `dynamic_scale`) and
   FFNs with native Triton amax/quantization kernels (`ffn-video-high-swiglu` `338.7 ms` ->
