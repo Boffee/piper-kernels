@@ -204,12 +204,21 @@ def _run_post_grad_pass(
         compiler_pass(graph, is_inference=True)
 
 
-@pytest.mark.parametrize("batch", [1, 2])
-@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize(
+    ("batch", "dynamic", "prepare_args", "prepare_kwargs"),
+    [
+        pytest.param(1, False, (64, None), {}, id="explicit-activation"),
+        pytest.param(2, False, (64,), {}, id="omitted-defaults"),
+        pytest.param(1, True, (), {"group_size": 64}, id="keyword-group-size"),
+        pytest.param(2, True, (64, None, None), {}, id="all-positional"),
+    ],
+)
 def test_fold_quantized_all_gather_fx_shapes_and_symint(
     fake_triton_device: None,
     batch: int,
     dynamic: bool,
+    prepare_args: tuple[int | None, ...],
+    prepare_kwargs: dict[str, int],
 ) -> None:
     shape_env = ShapeEnv()
     with FakeTensorMode(shape_env=shape_env):
@@ -251,7 +260,11 @@ def test_fold_quantized_all_gather_fx_shapes_and_symint(
         sym_seq = graph.call_function(_aten.sym_size.int, args=(ag_out, 1))
         sym_seq.meta["val"] = local_seq_expr * 2
 
-        prep = graph.call_function(_ops.convrot_int8_prepare_input.default, args=(ag_out, 64, None))
+        prep = graph.call_function(
+            _ops.convrot_int8_prepare_input.default,
+            args=(ag_out, *prepare_args),
+            kwargs=prepare_kwargs,
+        )
         q_full_val = torch.empty(
             (batch, local_seq_expr * 2, hidden), device=_DEVICE, dtype=torch.int8
         )
@@ -1400,7 +1413,9 @@ def _make_kv_fx_graph(include_value: bool) -> torch.fx.Graph:
     sin_s = graph.call_function(_aten.slice.Tensor, args=(p_nodes["sin"], 0, 0, sym_seq))
     sin_s.meta["val"] = torch.empty((x_val.shape[1] * 2, 96), device=_DEVICE)
 
-    prep = graph.call_function(_ops.convrot_int8_prepare_input.default, args=(ag_out, 64, None))
+    prep = graph.call_function(
+        _ops.convrot_int8_prepare_input.default, kwargs={"input": ag_out, "group_size": 64}
+    )
     q_val = torch.empty((1, x_val.shape[1] * 2, 128), device=_DEVICE, dtype=torch.int8)
     s_val = torch.empty((1, x_val.shape[1] * 2), device=_DEVICE, dtype=torch.float32)
     prep.meta["val"] = (q_val, s_val)

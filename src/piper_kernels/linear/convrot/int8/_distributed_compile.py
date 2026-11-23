@@ -117,7 +117,7 @@ def _reconstruct_full_sequence(
 
 
 def _fold_one_quantized_all_gather(graph: torch.fx.Graph, node: torch.fx.Node) -> bool:
-    parsed = distributed_fx.parse_convrot_int8_prepare_input(node)
+    parsed = _compile_fx.match_prepare_input(node)
     if parsed is None:
         return False
     source, group_size, input_scale = parsed

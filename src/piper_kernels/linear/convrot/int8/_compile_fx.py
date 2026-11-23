@@ -131,6 +131,26 @@ def valid_input_scale(node: object, device: torch.device) -> bool:
     )
 
 
+def match_prepare_input(
+    node: torch.fx.Node,
+) -> tuple[torch.fx.Node, int, torch.fx.Node | None] | None:
+    """Return the source, group size, and optional scale for unactivated preparation."""
+    bound = linear_fx.bind_call(node, torch.ops.piper_kernels.convrot_int8_prepare_input.default)
+    if bound is None or bound["activation_fn"] is not None:
+        return None
+    source = bound["input"]
+    group_size = bound["group_size"]
+    input_scale = bound["input_scale"]
+    if (
+        not isinstance(source, torch.fx.Node)
+        or type(group_size) is not int
+        or group_size < 1
+        or (input_scale is not None and not isinstance(input_scale, torch.fx.Node))
+    ):
+        return None
+    return source, group_size, input_scale
+
+
 def emit_prepared_input(
     graph: torch.fx.Graph,
     input_node: torch.fx.Node,
@@ -160,6 +180,7 @@ __all__ = [
     "BoundLinearNodes",
     "PreparedInputNodes",
     "emit_prepared_input",
+    "match_prepare_input",
     "valid_input_scale",
     "valid_linear_weight_and_bias",
 ]

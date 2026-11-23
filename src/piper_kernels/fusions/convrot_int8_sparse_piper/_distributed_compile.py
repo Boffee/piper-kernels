@@ -12,6 +12,7 @@ from piper_kernels._distributed import _fx as distributed_fx
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.fusions.attention import _distributed_fold as distributed_fold
 from piper_kernels.fusions.residual_updates import _graph as residual_graph
+from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import (
     distributed_output as distributed_output_operators,  # noqa: F401 - registers distributed output ops
@@ -19,7 +20,6 @@ from . import (
 from . import kv_gather as kv_gather_operators  # noqa: F401 - registers distributed KV gather
 
 _ops = torch.ops.piper_kernels
-_PREPARE_INPUT = _ops.convrot_int8_prepare_input.default
 _PROJECT_KEY = _ops.convrot_int8_sparse_piper_project_key.default
 _PROJECT_VALUE = _ops.convrot_int8_sparse_piper_project_value.default
 _PREPARE_GATHER_PROJECT_KV = _ops.convrot_int8_sparse_piper_prepare_gather_project_kv.default
@@ -117,7 +117,7 @@ def _match_prepare_kv_bundle(
     ]
     | None
 ):
-    parsed = distributed_fx.parse_convrot_int8_prepare_input(prepare_node)
+    parsed = _compile_fx.match_prepare_input(prepare_node)
     if parsed is None:
         return None
     source, prepare_group_size, input_scale = parsed

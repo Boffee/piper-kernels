@@ -30,7 +30,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   add folding when paired with `residual_updates=True`, with balanced peer-exchange
   chunking under a 256 MiB communication scratch cap and a single reused receive buffer.
   Measured faster with lower peak memory across 2× RX 9070 XT dense and sparse attention
-  blocks.
+  blocks. ConvRot INT8 input preparation also folds across the all-gather when a graph
+  uses keyword arguments or omits optional ones.
 
 ### Changed
 
