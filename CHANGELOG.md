@@ -7,6 +7,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Native PyTorch FSDP2 (`torch.distributed.fsdp.fully_shard`) support for contiguous
+  untransposed 2-D `ConvRotInt8Tensor`, `PiperNVFP4Tensor`, and `ConvRotNVFP4Tensor`
+  weights with even `dim=0` sharding, including `set_modules_to_forward_prefetch`,
+  `reshard_after_forward`, `MixedPrecisionPolicy`, `CPUOffloadPolicy(pin_memory=True)`,
+  2-D FSDP + TP, `device="meta"` + `load_state_dict(..., assign=True)` shard loading,
+  zero-copy all-gathers (with automatic block-scale reswizzling for NVFP4 when
+  `local_rows % 128 != 0`), and `torch.compile(..., options=compile_options(...))`.
+  Validated across CPU/Gloo (all three weight formats) and 2× RX 9070 XT (including
+  inner/outer FFN fusion compilation and hybrid TP+SP Attention + FSDP2 FFN blocks;
+  multi-GPU NVIDIA SM120 NVFP4 runtime remains unvalidated here).
 - `compile_options(attention=True, residual_updates=True)` now folds Q-projected
   NVFP4 and ConvRot NVFP4 sparse Piper attention outputs into exclusive copy-back
   gated residual updates on SM120, eliminating the full-sequence attention-output

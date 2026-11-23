@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
+from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -86,11 +87,88 @@ def test_same_shape_view_preserves_wrapper_metadata_and_aliases(wrapper, operati
     assert weight.qdata[0, 0].item() == 77
 
 
-@pytest.mark.parametrize("shape", [(64, 32), (16, 128), (2048,), (1, 32, 64)])
+@pytest.mark.parametrize("shape", [(64, 32), (16, 128), (1, 32, 64)])
 def test_shape_changing_view_is_rejected(wrapper, shape):
     weight = _weight(wrapper)
     with pytest.raises(NotImplementedError, match="only supports same-shape views"):
         weight.view(shape)
+
+
+@pytest.mark.parametrize("rows", [32, 0])
+@pytest.mark.parametrize("explicit_numel", [False, True])
+def test_flat_1d_view_handle_and_operation_rejections(wrapper, rows, explicit_numel):
+    weight = _weight(wrapper, rows=rows)
+    target_shape = (weight.numel(),) if explicit_numel else (-1,)
+    flat = weight.view(*target_shape)
+    assert flat.ndim == 1
+    assert flat.shape == (weight.numel(),)
+    assert flat.dtype is weight.dtype
+    assert flat.device == weight.device
+    assert "shape=" in repr(flat)
+
+    with pytest.raises(NotImplementedError):
+        flat.clone()
+    with pytest.raises(NotImplementedError):
+        flat.view(rows, 64)
+    with pytest.raises(NotImplementedError):
+        flat.dequantize()
+    with pytest.raises(NotImplementedError):
+        F.linear(torch.zeros(1, weight.numel(), dtype=weight.dtype), flat.unsqueeze(0))
+
+
+def test_flat_1d_view_rejects_view_as_and_transposed_or_non_2d(wrapper):
+    weight = _weight(wrapper)
+    for inference in (False, True):
+        with torch.inference_mode(inference):
+            with pytest.raises(NotImplementedError, match="only supports same-shape views"):
+                weight.view_as(torch.empty(64, 32))
+            flat = weight.view_as(torch.empty(weight.numel()))
+            assert flat.shape == (weight.numel(),)
+    with pytest.raises(NotImplementedError, match="transposed"):
+        weight.t().view(-1)
+
+
+def test_flat_1d_view_rejects_higher_rank_weights():
+    conv3d = ConvRotInt8Tensor.from_quantized(
+        torch.zeros(4, 3, 3, 3, 64, dtype=torch.int8),
+        torch.ones(4, 1),
+        group_size=64,
+        logical_dtype=torch.bfloat16,
+    )
+    moe = PiperNVFP4Tensor.from_hp(torch.randn(2, 32, 64, dtype=torch.bfloat16))
+    for weight in (conv3d, moe):
+        with pytest.raises(NotImplementedError, match="2-D"):
+            weight.view(-1)
+
+
+@pytest.mark.parametrize("rows", [32, 0])
+@pytest.mark.parametrize("operation", ["narrow", "slice", "negative_dim", "open_end"])
+def test_full_extent_dim0_slice_preserves_wrapper_and_aliases(wrapper, rows, operation):
+    weight = _weight(wrapper, rows=rows)
+    if operation == "narrow":
+        actual = weight.narrow(0, 0, rows)
+    elif operation == "slice":
+        actual = weight[:]
+    elif operation == "negative_dim":
+        actual = weight.narrow(-2, 0, rows)
+    else:
+        actual = torch.ops.aten.slice.Tensor(weight, 0, None, None, 1)
+    _assert_weight_view(actual, weight)
+
+
+def test_partial_or_invalid_slices_remain_rejected(wrapper):
+    weight = _weight(wrapper)
+    for run in (
+        lambda: weight[:3],
+        lambda: weight[1:],
+        lambda: weight[::2],
+        lambda: weight[:, :3],
+        lambda: weight.narrow(1, 0, 32),
+        lambda: weight.narrow(0, 0, 16),
+        lambda: weight.t()[:],
+    ):
+        with pytest.raises(NotImplementedError):
+            run()
 
 
 @pytest.mark.parametrize("shape", [(-1, -1), (31, 64), (-2, 64)])
