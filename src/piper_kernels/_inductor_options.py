@@ -189,21 +189,29 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
     def _run_phase2(self, graph: torch.fx.Graph, op_names: set[str]) -> bool:
         if not self.linear:
             return False
+        int8 = "piper_kernels::convrot_int8_linear" in op_names
+        nvfp4 = "piper_kernels::nvfp4_linear" in op_names
+        convrot_nvfp4 = "piper_kernels::convrot_nvfp4_linear" in op_names
         changed = False
-        if op_names & {
-            "piper_kernels::convrot_int8_linear",
-            "piper_kernels::convrot_int8_prepare_input",
-        }:
+        if int8 or nvfp4 or convrot_nvfp4:
+            from piper_kernels.linear._compile_fx import coalesce_input_casts  # noqa: PLC0415
+            from piper_kernels.linear._projection_views import (  # noqa: PLC0415
+                normalize_projection_views,
+            )
+
+            changed = normalize_projection_views(graph)
+            changed = coalesce_input_casts(graph) or changed
+        if int8 or "piper_kernels::convrot_int8_prepare_input" in op_names:
             from piper_kernels.linear.convrot.int8._compile import fold_linear  # noqa: PLC0415
 
             changed = fold_linear(graph) or changed
-        if "piper_kernels::nvfp4_linear" in op_names:
+        if nvfp4:
             from piper_kernels.linear.nvfp4._compile import (  # noqa: PLC0415
                 fold_linear as fold_nvfp4,
             )
 
             changed = fold_nvfp4(graph) or changed
-        if "piper_kernels::convrot_nvfp4_linear" in op_names:
+        if convrot_nvfp4:
             from piper_kernels.linear.convrot.nvfp4._compile import (  # noqa: PLC0415
                 fold_linear as fold_convrot_nvfp4,
             )

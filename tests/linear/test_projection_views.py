@@ -2,9 +2,12 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from piper_kernels import compile_options
 from piper_kernels.linear._projection_views import normalize_projection_views
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
@@ -15,6 +18,44 @@ _TARGETS = [
     pytest.param(nvfp4_ops.linear, id="nvfp4"),
     pytest.param(convrot_nvfp4_ops.linear, id="convrot_nvfp4"),
 ]
+
+
+@pytest.mark.parametrize("device", ["meta", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_mixed_linear_formats_share_one_batched_input_cast(device):
+    if device == "cuda" and not exact_sm120_available():
+        pytest.skip("CUDA execution requires SM120 for NVFP4")
+
+    def projections(source, int8_weight, int8_scale, fp4_weight, fp4_scale):
+        def project(target, *operands):
+            cast = torch.ops.prims.convert_element_type.default(source, torch.bfloat16)
+            return target(cast.flatten(0, 1), *operands).reshape(2, 16, 128)
+
+        fp4_args = (fp4_weight, fp4_scale, None, None, None, True)
+        return (
+            project(int8_ops.linear, int8_weight, int8_scale, None, 64),
+            project(nvfp4_ops.linear, *fp4_args),
+            project(convrot_nvfp4_ops.linear, *fp4_args, 64),
+        )
+
+    with torch.device(device):
+        args = (
+            torch.randn(2, 16, 256),
+            torch.randint(-127, 128, (128, 256), dtype=torch.int8),
+            torch.full((128, 1), 0.01),
+            torch.randint(256, (128, 128), dtype=torch.uint8),
+            torch.ones(32, 64).to(torch.float8_e4m3fn),
+        )
+    module = make_fx(projections, tracing_mode="fake")(*args)
+    (linear_pass,) = compile_options()["post_grad_custom_pre_pass"]
+    linear_pass(module.graph, is_inference=True)
+    module.graph.lint()
+    (cast,) = module.graph.find_nodes(
+        op="call_function", target=torch.ops.prims.convert_element_type.default
+    )
+    (output,) = module.graph.find_nodes(op="output")
+    assert set(cast.users) == set(output.args[0])
+    module.recompile()
+    torch.testing.assert_close(module(*args), projections(*args), rtol=0, atol=0)
 
 
 def _graph(target, source_shape=(2, 3, 64), *, reshape=torch.ops.aten.reshape.default):

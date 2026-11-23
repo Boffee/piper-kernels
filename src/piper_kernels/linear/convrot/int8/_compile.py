@@ -7,7 +7,6 @@ import torch
 from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _input_activation_compile as input_activation_compile
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-from piper_kernels.linear import _projection_views as projection_views
 
 from . import _compile_fx, _distributed_compile
 
@@ -198,10 +197,8 @@ def _fold_gelu_tanh_inputs(graph: torch.fx.Graph) -> bool:
 
 
 def fold_linear(graph: torch.fx.Graph) -> bool:
-    """Coalesce input casts, fold GELU-tanh inputs, share preparation, and hoist all-gathers."""
-    changed = projection_views.normalize_projection_views(graph)
-    changed = linear_fx.coalesce_input_casts(graph) or changed
-    changed = _fold_gelu_tanh_inputs(graph) or changed
+    """Fold GELU-tanh inputs, share INT8 preparation, and hoist quantized all-gathers."""
+    changed = _fold_gelu_tanh_inputs(graph)
     changed = preparation_sharing.share_preparation(graph, _PREPARATION_RULES) or changed
     changed = _distributed_compile.fold_quantized_all_gather(graph) or changed
     return changed
