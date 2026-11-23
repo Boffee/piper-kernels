@@ -17,6 +17,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Updated ConvRot INT8 3D convolution dispatch on NVIDIA SM120 to select full-grid tiles
+  and weight descriptors by grid tile count (`channels` 128/256 descriptors, updated
+  NVIDIA preparation schedules for 64 and 512 channels) and coalesced the
+  contiguous-residual epilogue across targets (`-0.9%` to `-9.4%` across standard
+  RTX 5090 catalog cases and `-7.2%` to `-33.2%` on `C=64`, `C=512`, `C=1024`, and
+  fused-residual layers; SM8x and RDNA4 verified by offline compilation only).
 - Unified ConvRot NVFP4 activation preparation (`dynamic_scale`, `prepare_static`,
   `prepare_static_out`, `prepare_dynamic` with optional `activation_fn`) across
   ordinary, `gelu_tanh`, and `swiglu` inputs, lifting the 49,152-feature limit on
