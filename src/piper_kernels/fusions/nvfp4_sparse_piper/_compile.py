@@ -14,6 +14,7 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     SUPPORTED_DTYPES,
     is_valid_routing_mode,
 )
+from piper_kernels.fusions.attention import _residual_fold as residual_fold
 from piper_kernels.fusions.attention import _sparse_compile as sparse_piper_compile
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
@@ -425,12 +426,20 @@ def _fold_projection(graph: torch.fx.Graph) -> bool:
 
 
 def fold_sparse_attention(graph: torch.fx.Graph) -> bool:
-    """Fold NVFP4 / ConvRot NVFP4 sparse-Piper projections and output projections."""
+    """Fold NVFP4 / ConvRot NVFP4 sparse-Piper projections, outputs, and residual adds."""
     changed = projection_views.normalize_projection_views(graph)
     changed = linear_compile_fx.coalesce_input_casts(graph) or changed
     changed = _fold_projection(graph) or changed
     changed = _output_compile._fold_attention_output(graph) or changed
-    return changed
+    post_changed = residual_fold.fold_residual_adds(
+        graph,
+        torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default,
+        torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_residual_add_.default,
+    )
+    if post_changed:
+        graph.eliminate_dead_code()
+        graph.lint()
+    return changed or post_changed
 
 
 __all__ = ["fold_sparse_attention"]

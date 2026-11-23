@@ -385,6 +385,12 @@ def _append_quantized_attention_output(
         if with_block_lengths
         else None
     )
+    arguments = (*operands, [5_000, 10_000], 2, 192, _MINMAX_ROUTING)
+    optional_arguments = (
+        (block_lengths, 2)
+        if with_sparse_query_blocks
+        else ((block_lengths,) if with_block_lengths else ())
+    )
     if with_coarse:
         coarse_gate = _placeholder(
             graph,
@@ -392,27 +398,15 @@ def _append_quantized_attention_output(
             torch.empty((1, 192, 2, 128), device="cuda", dtype=torch.bfloat16),
         )
         attention = graph.call_function(
-            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
-            args=(
-                *operands,
-                coarse_gate,
-                [5_000, 10_000],
-                2,
-                192,
-                _MINMAX_ROUTING,
-                0.125,
-                3,
-                block_lengths,
-                *((2,) if with_sparse_query_blocks else ()),
-            ),
+            torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
+            args=(*arguments, *optional_arguments),
+            kwargs={
+                "coarse_gate": coarse_gate,
+                "coarse_scale": 0.125,
+                "coarse_key_blocks": 3,
+            },
         )
     else:
-        arguments = (*operands, [5_000, 10_000], 2, 192, _MINMAX_ROUTING)
-        optional_arguments = (
-            (block_lengths, 2)
-            if with_sparse_query_blocks
-            else ((block_lengths,) if with_block_lengths else ())
-        )
         attention = graph.call_function(
             torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
             args=(*arguments, *optional_arguments),

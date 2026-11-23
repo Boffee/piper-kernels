@@ -10,7 +10,6 @@ from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
-    _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
@@ -122,14 +121,13 @@ def _padded_arguments(
     coarse_key_blocks = sequence_length // 64 if coarse else None
     if coarse:
         assert coarse_gate is not None
-        materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
-            *attention_arguments[:12],
-            coarse_gate,
-            *attention_arguments[12:],
-            coarse_scale,
-            coarse_key_blocks,
+        materialized_attention = _sparse_piper_attention_from_quantized_op(
+            *attention_arguments,
             block_lengths,
             sparse_query_blocks,
+            coarse_gate=coarse_gate,
+            coarse_scale=coarse_scale,
+            coarse_key_blocks=coarse_key_blocks,
         )
     else:
         materialized_attention = _sparse_piper_attention_from_quantized_op(
@@ -351,12 +349,11 @@ def test_attention_output_projects_a_bounded_coarse_gate(
     query_blocks = (sequence_length + 63) // 64
     coarse_scale = _HEAD_DIM**-0.5
     coarse_key_blocks = query_blocks
-    materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
-        *attention_arguments[:12],
-        coarse_gate,
-        *attention_arguments[12:],
-        coarse_scale,
-        coarse_key_blocks,
+    materialized_attention = _sparse_piper_attention_from_quantized_op(
+        *attention_arguments,
+        coarse_gate=coarse_gate,
+        coarse_scale=coarse_scale,
+        coarse_key_blocks=coarse_key_blocks,
     )
     output_weight, output_scale, output_bias, output_group_size = output_arguments
     expected = linear_backend.require_linear_backend(materialized_attention).linear(

@@ -18,7 +18,6 @@ from piper_kernels.attention.sparse_piper_attention import _backend as attention
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
-    _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import key as fused_key
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
@@ -672,19 +671,19 @@ def _run_explicit_fused_projection(  # noqa: PLR0913
         )
     assert coarse_scale is not None
     assert coarse_key_blocks is not None
-    return _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+    return _sparse_piper_attention_from_quantized_op(
         *query,
         *key,
         *value,
-        coarse_gate,
         model.sparse_attention._ratio_profile,
         sparse_key_blocks,
         hidden_states.shape[1],
         routing_mode,
-        coarse_scale,
-        coarse_key_blocks,
         block_lengths,
         sparse_query_blocks,
+        coarse_gate=coarse_gate,
+        coarse_scale=coarse_scale,
+        coarse_key_blocks=coarse_key_blocks,
         output_dtype=hidden_states.dtype,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
@@ -928,16 +927,13 @@ def test_compile_options_fuse_sparse_piper_coarse_residual(routing: str) -> None
         == 1
     )
     assert (
-        capture.targets.count(
-            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-        )
+        capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
         == 1
     )
     absent_targets = (
         torch.ops.piper_kernels.convrot_int8_linear.default,
         torch.ops.piper_kernels.convrot_int8_dequantized_input_mean.default,
         torch.ops.piper_kernels.sparse_piper_attention.default,
-        torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
         torch.ops.piper_kernels.sparse_piper_coarse_residual.default,
     )
     assert all(target not in capture.targets for target in absent_targets)
@@ -1000,9 +996,7 @@ def test_coarse_projection_fusion_respects_internal_block_lengths(routing: str) 
     ).norm() / semantic[:, valid_rows].float().norm()
     assert relative_l2 < 0.025
     assert (
-        capture.targets.count(
-            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-        )
+        capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
         == 1
     )
     assert torch.ops.piper_kernels.sparse_piper_attention.default not in capture.targets
@@ -1097,8 +1091,7 @@ def test_coarse_residual_fusion_fails_closed_for_mismatched_routing() -> None:
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert (
-        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-        not in capture.targets
+        torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in capture.targets
     )
     assert capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention.default) == 1
     assert capture.targets.count(torch.ops.piper_kernels.sparse_piper_coarse_residual.default) == 1
@@ -1354,7 +1347,7 @@ def test_compile_fuses_every_bounded_attention_feature(head_dim: int, routing: s
         == 1
     )
     absent_targets = (
-        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
+        torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
         torch.ops.piper_kernels.convrot_int8_linear.default,
     )
     assert all(target not in capture.targets for target in absent_targets)
@@ -1439,7 +1432,7 @@ def test_compile_lifetime_chunks_a_projected_coarse_gate(
     absent_targets = (
         torch.ops.piper_kernels.convrot_int8_linear.default,
         torch.ops.piper_kernels.convrot_int8_linear_prepared.default,
-        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
+        torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
     )
     assert all(target not in capture.targets for target in absent_targets)
 
@@ -1624,9 +1617,7 @@ def test_fused_coarse_projection_reuses_one_dynamic_shape_graph() -> None:
 
     assert capture.calls == 1
     assert (
-        capture.targets.count(
-            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-        )
+        capture.targets.count(torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default)
         == 1
     )
     # The dynamic Dynamo graph must not add a device kernel per sequence length.
@@ -1688,8 +1679,7 @@ def test_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
         assert bool(torch.isfinite(wide).all())
         assert capture.calls == 1
         assert (
-            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-            in capture.targets
+            torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default in capture.targets
         )
 
         narrow = compiled(hidden_states, cos, sin, 3, coarse_gate, 2)
@@ -1698,8 +1688,7 @@ def test_dynamic_coarse_scope_recompiles_without_invalid_fusion() -> None:
     assert relative_l2 < 0.025
     assert capture.calls == 2
     assert (
-        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-        not in capture.targets
+        torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in capture.targets
     )
     assert torch.ops.piper_kernels.sparse_piper_attention.default in capture.targets
     assert torch.ops.piper_kernels.sparse_piper_coarse_residual.default in capture.targets

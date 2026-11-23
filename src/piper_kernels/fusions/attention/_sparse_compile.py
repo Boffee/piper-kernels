@@ -356,7 +356,7 @@ def match_sparse_piper_projection(  # noqa: PLR0911, PLR0912
 def match_reshaped_quantized_attention(
     reshape_node: object,
 ) -> ReshapedQuantizedAttentionMatch | None:
-    """Anchor-match ``quantized_sparse_piper_attention(_with_coarse_residual) -> reshape``."""
+    """Anchor-match ``quantized_sparse_piper_attention -> reshape``."""
     if not isinstance(reshape_node, torch.fx.Node) or len(reshape_node.users) != 1:
         return None
     reshape_bound = linear_fx.bind_call(reshape_node, _aten.reshape.default)
@@ -364,22 +364,27 @@ def match_reshaped_quantized_attention(
         return None
     attention_node = reshape_bound["self"]
     quantized_attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default
-    coarse_attention = (
-        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-    )
     if (
         not isinstance(attention_node, torch.fx.Node)
         or attention_node.op != "call_function"
-        or attention_node.target not in (quantized_attention, coarse_attention)
+        or attention_node.target is not quantized_attention
         or len(attention_node.users) != 1
     ):
         return None
     attention_args = linear_fx.bind_arguments(attention_node)
     if attention_args is None:
         return None
+    coarse_gate = attention_args.get("coarse_gate")
+    coarse_scale = attention_args.get("coarse_scale")
+    coarse_key_blocks = attention_args.get("coarse_key_blocks")
+    has_coarse = coarse_gate is not None
     force_tile_ids = attention_args.get("force_tile_ids")
     force_tile_counts = attention_args.get("force_tile_counts")
-    if (force_tile_ids is None) != (force_tile_counts is None):
+    if (
+        (coarse_scale is not None) != has_coarse
+        or (coarse_key_blocks is not None) != has_coarse
+        or (force_tile_ids is None) != (force_tile_counts is None)
+    ):
         return None
     force_kwargs: dict[str, Argument] = (
         {}
@@ -391,7 +396,7 @@ def match_reshaped_quantized_attention(
         attention_node=attention_node,
         attention_shape=reshape_bound["shape"],
         attention_args=attention_args,
-        is_coarse=attention_node.target is coarse_attention,
+        is_coarse=has_coarse,
         force_kwargs=force_kwargs,
     )
 
@@ -445,26 +450,17 @@ def emit_quantized_sparse_piper_attention(
     )
     coarse_arguments = coarse_gate, matched.coarse_scale, matched.coarse_key_blocks
     with_coarse = any(argument is not None for argument in coarse_arguments)
-    if with_coarse:
-        if any(argument is None for argument in coarse_arguments):
-            raise ValueError("coarse sparse attention requires every coarse operand")
-        return graph.call_function(
-            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default,
-            args=(
-                *attention_arguments,
-                coarse_gate,
-                matched.ratio_profile,
-                matched.sparse_key_blocks,
-                logical_sequence_length,
-                matched.routing_mode,
-                matched.coarse_scale,
-                matched.coarse_key_blocks,
-                matched.block_lengths,
-                matched.sparse_query_blocks,
-                *force_arguments,
-            ),
-            kwargs={"output_dtype": output_dtype},
-        )
+    if with_coarse and any(argument is None for argument in coarse_arguments):
+        raise ValueError("coarse sparse attention requires every coarse operand")
+    coarse_kwargs: dict[str, Argument] = (
+        {
+            "coarse_gate": coarse_gate,
+            "coarse_scale": matched.coarse_scale,
+            "coarse_key_blocks": matched.coarse_key_blocks,
+        }
+        if with_coarse
+        else {}
+    )
     return graph.call_function(
         torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default,
         args=(
@@ -479,7 +475,7 @@ def emit_quantized_sparse_piper_attention(
                 *force_arguments,
             ),
         ),
-        kwargs={"output_dtype": output_dtype},
+        kwargs={"output_dtype": output_dtype, **coarse_kwargs},
     )
 
 

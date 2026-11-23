@@ -54,7 +54,6 @@ _SPARSE_ATTN_OPS = frozenset(
     {
         "piper_kernels::sparse_piper_attention",
         "piper_kernels::sparse_piper_attention_from_quantized",
-        "piper_kernels::sparse_piper_attention_with_coarse_residual_from_quantized",
     }
 )
 _SPARSE_INT8_OPS = _SPARSE_ATTN_OPS | frozenset(
@@ -213,7 +212,10 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
         return changed
 
     def _run_phase3(self, graph: torch.fx.Graph, op_names: set[str]) -> None:
-        if self.attention and (op_names & _SPARSE_ATTN_OPS) and (op_names & _NVFP4_LINEAR_OPS):
+        if self.attention and (
+            ((op_names & _SPARSE_ATTN_OPS) and (op_names & _NVFP4_LINEAR_OPS))
+            or "piper_kernels::nvfp4_sparse_piper_projected_query_attention_output" in op_names
+        ):
             from piper_kernels.fusions.nvfp4_sparse_piper._compile import (  # noqa: PLC0415
                 fold_sparse_attention,
             )

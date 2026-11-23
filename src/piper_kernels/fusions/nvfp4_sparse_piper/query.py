@@ -27,6 +27,63 @@ from . import _epilogue
 from ._validation import validate_block_lengths, validate_projection, validate_qk_epilogue
 
 
+def _validate_query_inputs(  # noqa: PLR0913, PLR0917
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    input_per_tensor_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_epsilon: float,
+    softmax_scale: float,
+    projection_chunk_rows: int,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None,
+    *,
+    head_dim: int | None = None,
+) -> tuple[int, int, int]:
+    """Validate Q projection and RoPE/summary metadata once at the owning boundary."""
+    validate_routing_mode(routing_mode)
+    resolved_head_dim = resolve_head_dim(norm_weight, head_dim)
+    sequence_length, heads = validate_projection(
+        input_qdata,
+        input_scale,
+        input_per_tensor_scale,
+        weight_qdata,
+        weight_scale,
+        weight_per_tensor_scale,
+        bias,
+        projection_chunk_rows,
+        "Q projection",
+        resolved_head_dim,
+    )
+    validate_qk_epilogue(
+        input_qdata,
+        sequence_length,
+        norm_weight,
+        cos,
+        sin,
+        norm_epsilon,
+        "Q projection",
+        head_dim=resolved_head_dim,
+    )
+    validate_block_lengths(
+        block_lengths,
+        sequence_length,
+        input_qdata.device,
+        "Q projection",
+    )
+    validate_positive_finite_float(
+        softmax_scale,
+        "Q projection softmax scale must be finite and positive",
+    )
+    return sequence_length, heads, resolved_head_dim
+
+
 def _launch_query_range(  # noqa: PLR0913, PLR0917
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -47,40 +104,29 @@ def _launch_query_range(  # noqa: PLR0913, PLR0917
     chunk_start: int = 0,
     chunk_rows: int | None = None,
     head_dim: int | None = None,
+    validated: tuple[int, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    validate_routing_mode(routing_mode)
-    head_dim = resolve_head_dim(norm_weight, head_dim)
-    sequence_length, heads = validate_projection(
-        input_qdata,
-        input_scale,
-        input_per_tensor_scale,
-        weight_qdata,
-        weight_scale,
-        weight_per_tensor_scale,
-        bias,
-        projection_chunk_rows,
-        "Q projection",
-        head_dim,
-    )
-    validate_qk_epilogue(
-        input_qdata,
-        sequence_length,
-        norm_weight,
-        cos,
-        sin,
-        norm_epsilon,
-        "Q projection",
-        head_dim=head_dim,
-    )
-    validate_block_lengths(
-        block_lengths,
-        sequence_length,
-        input_qdata.device,
-        "Q projection",
-    )
-    validate_positive_finite_float(
-        softmax_scale,
-        "Q projection softmax scale must be finite and positive",
+    sequence_length, heads, head_dim = (
+        _validate_query_inputs(
+            input_qdata,
+            input_scale,
+            input_per_tensor_scale,
+            weight_qdata,
+            weight_scale,
+            weight_per_tensor_scale,
+            bias,
+            norm_weight,
+            cos,
+            sin,
+            norm_epsilon,
+            softmax_scale,
+            projection_chunk_rows,
+            routing_mode,
+            block_lengths,
+            head_dim=head_dim,
+        )
+        if validated is None
+        else validated
     )
     if chunk_rows is None:
         chunk_rows = sequence_length
