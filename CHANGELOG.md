@@ -86,6 +86,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   `piper_kernels.specializations.minimax_h3_vae` and hooks into the unified pipeline.
   NVFP4 / ConvRot NVFP4 sparse-Piper attention fusion now also matches semantic linears
   (such as cross-attention query projections or `linear=False`).
+  Compiling mixed-format linears now normalizes projection views and shares input
+  casts in one pass each across all active formats.
 - **Breaking:** Consolidated all format- and activation-specific FFN fusion packages
   under `piper_kernels.fusions` into `piper_kernels.fusions.ffn`, covering ConvRot INT8,
   NVFP4, and ConvRot NVFP4 SwiGLU and `tanh`-GELU FFNs (including indexed gated updates

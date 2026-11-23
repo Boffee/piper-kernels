@@ -42,9 +42,7 @@ from piper_kernels.fusions.nvfp4_sparse_piper._output_compile import (
     _fold_attention_output,
 )
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
-from piper_kernels.linear.convrot.nvfp4._compile import fold_linear as fold_convrot_nvfp4_linear
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
-from piper_kernels.linear.nvfp4._compile import fold_linear as fold_nvfp4_linear
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
@@ -595,8 +593,8 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
     )
     mock_cuda_target(monkeypatch, (12, 0))
 
-    fold_nvfp4_linear(graph)
-    fold_convrot_nvfp4_linear(graph)
+    (linear_pass,) = compile_options()[_POST_GRAD_PRE_PASS]
+    linear_pass(graph, is_inference=True)
     expected_prepare = (
         torch.ops.piper_kernels.nvfp4_prepare_input.default
         if group_size is None
