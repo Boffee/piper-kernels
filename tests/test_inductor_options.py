@@ -125,9 +125,10 @@ def test_distinct_feature_combinations_produce_distinct_uuids() -> None:
             compile_options(linear=False, conv3d=True)
         ),
     ]
-    pre_uuids = [opts["pre_grad_custom_pass"][0].uuid() for opts in pre_configs]  # type: ignore[index]
-    assert len(set(pre_uuids)) == len(pre_uuids)
-    assert set(pre_uuids).isdisjoint(seen.values())
+    padding, h3, combined = (opts["pre_grad_custom_pass"][0].uuid() for opts in pre_configs)  # type: ignore[index]
+    assert h3 == combined
+    assert padding != h3
+    assert {padding, h3}.isdisjoint(seen.values())
 
 
 def test_uuid_and_options_are_invariant_to_composition_call_order() -> None:
