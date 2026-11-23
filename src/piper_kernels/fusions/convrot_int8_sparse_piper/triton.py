@@ -3,20 +3,16 @@
 # Triton's launch options and constexpr function arguments are not ordinary Python parameters.
 # pyright: reportCallIssue=false, reportArgumentType=false
 
-from collections.abc import Callable
-
 import torch
-import triton
 
 from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS, ValueFormat
 from piper_kernels.attention.sparse_piper_attention._contracts import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 
 from . import _kernels
 from ._interfaces import KeyOutput, QueryOutput, ValueOutput
-from ._layout import TILE_ROWS, resolve_row_block_launches
 
 
 def project_query(
@@ -46,11 +42,13 @@ def project_query(
     has_block_lengths = block_lengths is not None
     block_lengths_ptr = block_lengths if has_block_lengths else query_scale
     with device_context(input_qdata.device):
-
-        def launch(row_block_count: int, *, mask_ragged_tail: bool) -> None:
-            _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel[
-                (row_block_count, triton.cdiv(heads, execution_plan.heads_per_program), batch)
-            ](
+        for (
+            grid,
+            _row_block_offset,
+            aligned_rows,
+            aligned_projection,
+        ) in execution_plan.iter_row_block_launches(batch, chunk_rows, input_qdata.shape[2], heads):
+            _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel[grid](
                 input_qdata,
                 input_scale,
                 weight_qdata,
@@ -79,12 +77,8 @@ def project_query(
                 softmax_scale=softmax_scale,
                 mean_pool_summary=routing_mode == _MEAN_ROUTING,
                 mask_block_lengths=has_block_lengths,
-                mask_ragged_tail=mask_ragged_tail,
-                aligned_projection=(
-                    not mask_ragged_tail
-                    and input_qdata.shape[2] % execution_plan.block_k == 0
-                    and heads % execution_plan.heads_per_program == 0
-                ),
+                mask_ragged_tail=not aligned_rows,
+                aligned_projection=aligned_projection,
                 block_m=execution_plan.block_m,
                 block_n=head_dim * execution_plan.heads_per_program,
                 block_k=execution_plan.block_k,
@@ -93,41 +87,6 @@ def project_query(
                 num_stages=execution_plan.num_stages,
                 **lds_only_fence_options(execution_plan.lds_only_fences),
             )
-
-        full_row_blocks = chunk_rows // execution_plan.block_m
-        if full_row_blocks:
-            launch(full_row_blocks, mask_ragged_tail=False)
-        if chunk_rows % execution_plan.block_m:
-            launch(1, mask_ragged_tail=True)
-
-
-def _launch_full_and_tail_blocks(
-    input_qdata: torch.Tensor,
-    heads: int,
-    execution_plan: ProjectionExecutionPlan,
-    launch: Callable[[tuple[int, int, int], int, bool, bool], None],
-    *,
-    start_row_block: int = 0,
-    num_row_blocks: int | None = None,
-) -> None:
-    batch, sequence_length, input_features = input_qdata.shape
-    head_blocks = triton.cdiv(heads, execution_plan.heads_per_program)
-    aligned_shape = (
-        input_features % execution_plan.block_k == 0
-        and heads % execution_plan.heads_per_program == 0
-    )
-    for block_count, row_block_offset, aligned_rows in resolve_row_block_launches(
-        sequence_length,
-        execution_plan.block_m,
-        start_row_block=start_row_block,
-        num_row_blocks=num_row_blocks,
-    ):
-        launch(
-            (block_count, head_blocks, batch),
-            row_block_offset,
-            aligned_rows,
-            aligned_shape if aligned_rows else False,
-        )
 
 
 def project_key(
@@ -158,13 +117,19 @@ def project_key(
     block_n = head_dim * execution_plan.heads_per_program
 
     with device_context(input_qdata.device):
-
-        def launch(
-            grid: tuple[int, int, int],
-            row_block_offset: int,
-            aligned_rows: bool,
-            aligned_projection: bool,
-        ) -> None:
+        for (
+            grid,
+            row_block_offset,
+            aligned_rows,
+            aligned_projection,
+        ) in execution_plan.iter_row_block_launches(
+            batch,
+            sequence_length,
+            input_qdata.shape[2],
+            heads,
+            start_row_block=start_row_block,
+            num_row_blocks=num_row_blocks,
+        ):
             _kernels._convrot_project_rmsnorm_rope_quantize_sparse_key_kernel[grid](
                 input_qdata,
                 input_scale,
@@ -205,15 +170,6 @@ def project_key(
                 **lds_only_fence_options(execution_plan.lds_only_fences),
             )
 
-        _launch_full_and_tail_blocks(
-            input_qdata,
-            heads,
-            execution_plan,
-            launch,
-            start_row_block=start_row_block,
-            num_row_blocks=num_row_blocks,
-        )
-
 
 def project_value(
     input_qdata: torch.Tensor,
@@ -239,13 +195,19 @@ def project_value(
     block_lengths_ptr = block_lengths if has_block_lengths else value_scale_multiplier
 
     with device_context(input_qdata.device):
-
-        def launch(
-            grid: tuple[int, int, int],
-            row_block_offset: int,
-            _aligned_rows: bool,
-            aligned_projection: bool,
-        ) -> None:
+        for (
+            grid,
+            row_block_offset,
+            _aligned_rows,
+            aligned_projection,
+        ) in execution_plan.iter_row_block_launches(
+            batch,
+            sequence_length,
+            input_qdata.shape[2],
+            heads,
+            start_row_block=start_row_block,
+            num_row_blocks=num_row_blocks,
+        ):
             _kernels._convrot_project_quantize_sparse_value_kernel[grid](
                 input_qdata,
                 input_scale,
@@ -275,12 +237,3 @@ def project_value(
                 num_stages=execution_plan.num_stages,
                 **lds_only_fence_options(execution_plan.lds_only_fences),
             )
-
-        _launch_full_and_tail_blocks(
-            input_qdata,
-            heads,
-            execution_plan,
-            launch,
-            start_row_block=start_row_block,
-            num_row_blocks=num_row_blocks,
-        )

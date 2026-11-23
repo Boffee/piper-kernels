@@ -10,7 +10,6 @@ from torch.fx.node import Argument
 
 from piper_kernels.attention.sparse_piper_attention._contracts import SUPPORTED_DTYPES
 from piper_kernels.fusions.attention import _sparse_compile as sparse_piper_compile
-from piper_kernels.linear import _bias
 from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear.convrot.int8 import _compile_fx
@@ -87,20 +86,11 @@ def _prepared_gate_projection(
 
 
 def _prepared_query_projection(
-    query: object,
-    query_scale: object,
-    query_summary: object,
-    routing_mode: object,
-    block_lengths: Argument | None,
+    reshaped: sparse_piper_compile.ReshapedQuantizedAttentionMatch,
 ) -> tuple[_PreparedQueryProjectionNodes, torch.fx.Node | None] | None:
     """Recover one shared ConvRot INT8 Q producer from its three tuple outputs."""
-    bound = sparse_piper_compile.match_projected_query_producer(
-        query,
-        query_scale,
-        query_summary,
-        torch.ops.piper_kernels.convrot_int8_sparse_piper_project_query.default,
-        routing_mode=routing_mode,
-        block_lengths=block_lengths,
+    bound = reshaped.match_projected_query(
+        torch.ops.piper_kernels.convrot_int8_sparse_piper_project_query.default
     )
     if bound is None:
         return None
@@ -192,101 +182,66 @@ def _valid_attention_output(
     if common is None:
         return False
     weight = preparation_sharing.tensor_metadata(weight_qdata_node)
-    scale = preparation_sharing.tensor_metadata(weight_scale_node)
-    if weight is None or scale is None or weight.ndim != 2:
+    if weight is None or weight.ndim != 2:
         return False
-    input_features = sparse_piper_compile.static_int(weight.shape[1])
     output_features = sparse_piper_compile.static_int(weight.shape[0])
     device = common.query.device
     if (
-        weight.dtype is not torch.int8
-        or scale.dtype is not torch.float32
-        or input_features != common.input_features
-        or output_features is None
+        output_features is None
         or output_features < 1
         or common.projected.shape[2] != output_features
-        or tuple(scale.shape) != (output_features, 1)
         or group_size < 1
         or common.input_features % group_size
         or not _compile_fx.valid_input_scale(input_scale_node, device)
-        or any(
-            value.device != device or value.layout is not torch.strided or not value.is_contiguous()
-            for value in (weight, scale)
+        or not _compile_fx.valid_linear_weight_and_bias(
+            weight_qdata_node,
+            weight_scale_node,
+            bias_node,
+            input_features=common.input_features,
+            output_features=output_features,
+            device=device,
         )
     ):
         return False
-    if bias_node is not None:
-        bias = preparation_sharing.tensor_metadata(bias_node)
-        if (
-            bias is None
-            or bias.shape != (output_features,)
-            or not _bias.is_supported_dtype(bias.dtype)
-            or bias.device != device
-            or bias.layout is not torch.strided
-            or not bias.is_contiguous()
-        ):
-            return False
     return _backend.select_output_backend(common.query) is not None
 
 
 def _match_attention_output(linear_node: torch.fx.Node) -> _MatchedAttentionOutput | None:
     """Anchor-match one quantized sparse attention -> reshape -> ConvRot INT8 linear."""
-    linear_args = linear_fx.bind_call(
-        linear_node, torch.ops.piper_kernels.convrot_int8_linear.default
-    )
-    if linear_args is None or linear_args["activation_fn"] is not None:
+    bound = _compile_fx.BoundLinearNodes.from_call(linear_node)
+    if bound is None:
         return None
-    reshaped_match = sparse_piper_compile.match_reshaped_quantized_attention(linear_args["input"])
+    reshaped_match = sparse_piper_compile.match_reshaped_quantized_attention(bound.input)
     if reshaped_match is None:
-        return None
-    weight_qdata = linear_args["weight_qdata"]
-    weight_scale = linear_args["weight_scale"]
-    bias = linear_args["bias"]
-    group_size = sparse_piper_compile.static_int(linear_args["group_size"])
-    input_scale = linear_args["input_scale"]
-    if (
-        not isinstance(weight_qdata, torch.fx.Node)
-        or not isinstance(weight_scale, torch.fx.Node)
-        or (bias is not None and not isinstance(bias, torch.fx.Node))
-        or group_size is None
-        or (input_scale is not None and not isinstance(input_scale, torch.fx.Node))
-    ):
         return None
     if not _valid_attention_output(
         linear_node,
         reshaped_match,
-        weight_qdata,
-        weight_scale,
-        bias,
-        group_size,
-        input_scale,
+        bound.weight_qdata,
+        bound.weight_scale,
+        bound.bias,
+        bound.group_size,
+        bound.input_scale,
     ):
         return None
     return _MatchedAttentionOutput(
         linear_node=linear_node,
         reshaped=reshaped_match,
-        weight_qdata=weight_qdata,
-        weight_scale=weight_scale,
-        bias=bias,
-        group_size=group_size,
-        input_scale=input_scale,
+        weight_qdata=bound.weight_qdata,
+        weight_scale=bound.weight_scale,
+        bias=bound.bias,
+        group_size=bound.group_size,
+        input_scale=bound.input_scale,
     )
 
 
 def _replace_attention_output(graph: torch.fx.Graph, matched: _MatchedAttentionOutput) -> None:
     original = matched.linear_node
     bounded_arguments, gate_projection = matched.reshaped.defer_gate(_prepared_gate_projection)
-    block_lengths = bounded_arguments[0]
     gate_arguments: tuple[Argument, ...] = () if gate_projection is None else gate_projection
 
     attention_arguments = matched.reshaped.attention_arguments
-    query_projection = _prepared_query_projection(
-        attention_arguments[0],
-        attention_arguments[1],
-        attention_arguments[2],
-        attention_arguments[-1],
-        block_lengths,
-    )
+    query_projection = _prepared_query_projection(matched.reshaped)
     output_kwargs: dict[str, Argument] = {
         "output_dtype": original.meta["val"].dtype,
         "output_input_scale": matched.input_scale,

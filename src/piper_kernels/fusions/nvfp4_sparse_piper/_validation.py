@@ -6,13 +6,7 @@ from typing import cast
 
 import torch
 
-from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
-from piper_kernels.attention.sparse_piper_attention._contracts import SUPPORTED_DTYPES
-from piper_kernels.attention.sparse_piper_attention._contracts import (
-    validate_block_lengths as validate_k64_block_lengths,
-)
-from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 
 
@@ -53,56 +47,4 @@ def validate_projection(
     return cast(int, sequence_length), output_features // head_dim
 
 
-def validate_qk_epilogue(
-    input_qdata: torch.Tensor,
-    sequence_length: int,
-    norm_weight: torch.Tensor | None,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    norm_epsilon: float,
-    name: str,
-    *,
-    head_dim: int | None = None,
-) -> None:
-    """Validate the RMSNorm/RoPE inputs shared by Q and K epilogues."""
-    head_dim = resolve_head_dim(norm_weight, head_dim)
-    rotary_dim = cos.shape[1] if cos.ndim == 2 else 0
-    operands = tuple(operand for operand in (norm_weight, cos, sin) if operand is not None)
-    if (
-        (norm_weight is not None and norm_weight.dtype not in SUPPORTED_DTYPES)
-        or cos.ndim != 2
-        or sin.shape != cos.shape
-        or cos.shape[0] != sequence_length
-        or cos.dtype is not torch.float32
-        or sin.dtype is not torch.float32
-        or not 2 <= rotary_dim <= head_dim
-        or rotary_dim % 2
-        or any(operand.device != input_qdata.device for operand in operands)
-        or any(not operand.is_contiguous() for operand in operands)
-    ):
-        raise ValueError(f"{name} requires contiguous FP16/BF16/FP32 norm and FP32 split-half RoPE")
-    validate_positive_finite_float(
-        norm_epsilon,
-        f"{name} norm epsilon must be finite and positive",
-    )
-
-
-def validate_block_lengths(
-    block_lengths: torch.Tensor | None,
-    sequence_length: int,
-    device: torch.device,
-    name: str,
-) -> None:
-    """Validate optional trusted valid-prefix metadata for one NVFP4 projection."""
-    if block_lengths is not None:
-        validate_k64_block_lengths(
-            block_lengths,
-            sequence_length=sequence_length,
-            device=device,
-            context=name,
-            require_contiguous=True,
-            check_values=False,
-        )
-
-
-__all__ = ["validate_block_lengths", "validate_projection", "validate_qk_epilogue"]
+__all__ = ["validate_projection"]

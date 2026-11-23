@@ -11,7 +11,10 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     validate_routing_mode,
 )
 from piper_kernels.fusions.attention import _sparse_output as output_common
-from piper_kernels.fusions.attention._validation import resolve_head_dim
+from piper_kernels.fusions.attention._validation import (
+    resolve_head_dim,
+    validate_qk_transform_inputs,
+)
 from piper_kernels.linear.nvfp4._chunking import (
     DEFAULT_CHUNK_ROWS,
     PreparedProjection,
@@ -20,7 +23,7 @@ from piper_kernels.linear.nvfp4._chunking import (
 from piper_kernels.linear.nvfp4._projection import matmul_prepared_chunk_out
 
 from . import _epilogue
-from ._validation import validate_block_lengths, validate_projection, validate_qk_epilogue
+from ._validation import validate_projection
 
 
 def _validate_query_inputs(  # noqa: PLR0913, PLR0917
@@ -57,17 +60,17 @@ def _validate_query_inputs(  # noqa: PLR0913, PLR0917
         "Q projection",
         resolved_head_dim,
     )
-    validate_qk_epilogue(
-        input_qdata,
-        sequence_length,
+    validate_qk_transform_inputs(
         norm_weight,
         cos,
         sin,
-        norm_epsilon,
-        "Q projection",
+        sequence_length=sequence_length,
         head_dim=resolved_head_dim,
+        device=input_qdata.device,
+        norm_epsilon=norm_epsilon,
+        name="Q projection",
     )
-    validate_block_lengths(
+    output_common.validate_optional_block_lengths(
         block_lengths,
         sequence_length,
         input_qdata.device,

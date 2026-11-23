@@ -4,12 +4,15 @@ from typing import Literal
 
 import torch
 
-from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+from piper_kernels.attention.kernels.sparse_piper.layout import (
+    TILE_ROWS,
+    ValueFormat,
+    padded_sequence_length,
+)
 from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 
 from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
-from .._layout import TILE_ROWS, padded_sequence_length
 from . import gluon, policy
 
 
@@ -85,7 +88,7 @@ def project_query(
     )
     launch = (
         gluon.project_query
-        if isinstance(plan, policy.AmdExecutionPlan) and plan.kernel == "gluon"
+        if isinstance(plan, policy.AmdExecutionPlan) and plan.uses_gluon
         else projection.project_query
     )
     launch(
@@ -162,7 +165,7 @@ def project_key(
     )
     launch = (
         gluon.project_key
-        if isinstance(plan, policy.AmdExecutionPlan) and plan.kernel == "gluon"
+        if isinstance(plan, policy.AmdExecutionPlan) and plan.uses_gluon
         else projection.project_key
     )
     launch(
@@ -215,7 +218,7 @@ def project_value(
         gluon.project_value
         if (
             isinstance(plan, policy.AmdExecutionPlan)
-            and plan.kernel == "gluon"
+            and plan.uses_gluon
             and value_format is ValueFormat.AMD_WMMA
         )
         else projection.project_value

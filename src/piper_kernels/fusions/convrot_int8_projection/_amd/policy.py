@@ -34,6 +34,10 @@ class AmdExecutionPlan(ProjectionExecutionPlan):
 
     kernel: Literal["gluon", "triton"] = "triton"
 
+    @property
+    def uses_gluon(self) -> bool:
+        return self.kernel == "gluon"
+
 
 QK_TRITON_EXECUTION_PLAN = AmdExecutionPlan(
     block_m=TILE_ROWS,

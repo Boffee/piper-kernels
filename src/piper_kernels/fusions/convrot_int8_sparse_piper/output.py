@@ -8,10 +8,11 @@ import torch
 
 from piper_kernels._residual import ResidualAdd
 from piper_kernels._validation import validate_positive_finite_float
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.attention import _sparse_output as output_common
+from piper_kernels.fusions.attention._validation import validate_qk_transform_inputs
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
-from piper_kernels.fusions.convrot_int8_projection._validation import validate_qk_transform_inputs
 from piper_kernels.linear import _bias
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8._backend import LinearBackend
@@ -23,7 +24,6 @@ from piper_kernels.weights.convrot.int8._quantization import (
 from . import _backend as fusion_backend
 from . import query as query_projection
 from ._interfaces import ProjectionBackend
-from ._layout import TILE_ROWS
 
 DEFAULT_QUERY_CHUNK_ROWS = output_common.DEFAULT_QUERY_CHUNK_ROWS
 _DEFAULT_QUERY_CHUNK_ROWS = DEFAULT_QUERY_CHUNK_ROWS
@@ -330,7 +330,7 @@ def _validate_projected_query_input(  # noqa: PLR0913
         head_dim=head_dim,
         device=key.device,
         norm_epsilon=query_norm_epsilon,
-        name="Q",
+        name="Q projection",
     )
     validate_positive_finite_float(
         softmax_scale,

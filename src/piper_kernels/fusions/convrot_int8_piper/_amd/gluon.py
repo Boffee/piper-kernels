@@ -530,9 +530,7 @@ def project_query(
         if execution_plan is None
         else execution_plan
     )
-    if per_thread_scales or not (
-        isinstance(plan, amd_policy.AmdExecutionPlan) and plan.kernel == "gluon"
-    ):
+    if per_thread_scales or not (isinstance(plan, amd_policy.AmdExecutionPlan) and plan.uses_gluon):
         projection.project_query(
             input_qdata,
             input_scale,
@@ -617,7 +615,7 @@ def project_key(
         if execution_plan is None
         else execution_plan
     )
-    if not (isinstance(plan, amd_policy.AmdExecutionPlan) and plan.kernel == "gluon"):
+    if not (isinstance(plan, amd_policy.AmdExecutionPlan) and plan.uses_gluon):
         projection.project_key(
             input_qdata,
             input_scale,
@@ -699,7 +697,7 @@ def project_value(
         if execution_plan is None
         else execution_plan
     )
-    if not (isinstance(plan, amd_policy.AmdExecutionPlan) and plan.kernel == "gluon"):
+    if not (isinstance(plan, amd_policy.AmdExecutionPlan) and plan.uses_gluon):
         projection.project_value(
             input_qdata,
             input_scale,

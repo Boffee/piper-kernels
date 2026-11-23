@@ -5,9 +5,8 @@ from __future__ import annotations
 import torch
 
 from piper_kernels._validation import validate_positive_finite_float
-from piper_kernels.attention.sparse_piper_attention._contracts import (
-    validate_routing_mode,
-)
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
+from piper_kernels.attention.sparse_piper_attention._contracts import validate_routing_mode
 from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.fusions.convrot_int8_projection._validation import (
@@ -16,10 +15,6 @@ from piper_kernels.fusions.convrot_int8_projection._validation import (
 
 from . import _backend
 from ._interfaces import ProjectionBackend
-from ._layout import (
-    TILE_ROWS,
-    validate_block_lengths,
-)
 
 
 def _validate_inputs(  # noqa: PLR0913
@@ -96,7 +91,9 @@ def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
         chunk_rows = sequence_length
     output_common.validate_query_range(chunk_start, chunk_rows, sequence_length)
     head_dim = resolve_head_dim(norm_weight, head_dim)
-    validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
+    output_common.validate_optional_block_lengths(
+        block_lengths, sequence_length, input_qdata.device, "Q projection"
+    )
     if backend is None:
         backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
     query, query_scale, query_summary = output_common.allocate_query_storage(

@@ -21,6 +21,7 @@ from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _SparsePiperRatioProfile,
+    validate_block_lengths,
     validate_output_dtype,
 )
 
@@ -116,6 +117,24 @@ def fake_projected_output(
         output_features,
         output_dtype=output_dtype,
     )
+
+
+def validate_optional_block_lengths(
+    block_lengths: torch.Tensor | None,
+    sequence_length: int,
+    device: torch.device,
+    context: str,
+) -> None:
+    """Validate optional trusted valid-prefix metadata for aligned K64 storage."""
+    if block_lengths is not None:
+        validate_block_lengths(
+            block_lengths,
+            sequence_length=sequence_length,
+            device=device,
+            context=context,
+            require_contiguous=True,
+            check_values=False,
+        )
 
 
 def validate_query_range(chunk_start: int, chunk_rows: int, sequence_length: int) -> None:
@@ -622,6 +641,7 @@ __all__ = [
     "run_chunked_projected_query_attention_output",
     "validate_attention_output",
     "validate_coarse_gate",
+    "validate_optional_block_lengths",
     "validate_output_metadata",
     "validate_query_range",
     "validate_residual_add",

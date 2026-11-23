@@ -3,14 +3,13 @@
 from dataclasses import replace
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._nvidia import policy as attention_policy
 from piper_kernels.fusions.convrot_int8_projection._nvidia import policy as projection_policy
 from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import (
     NvidiaExecutionPlan,
     ProjectionOperation,
 )
-
-from .._layout import TILE_ROWS
 
 
 def supports_target(target: AcceleratorTarget) -> bool:

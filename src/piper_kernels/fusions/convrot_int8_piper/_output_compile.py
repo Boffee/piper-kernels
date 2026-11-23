@@ -11,6 +11,7 @@ from torch.fx.node import Argument, map_arg
 from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as sharing
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
+from piper_kernels.linear.convrot.int8 import _compile_fx
 
 from . import output
 
@@ -34,7 +35,29 @@ _QUERY_PROJECTION_ARG_NAMES = (
 )
 
 
-def _attention_source(node: object) -> tuple[torch.fx.Node, dict[str, Argument]] | None:  # noqa: PLR0911
+def _match_bhsd_transpose(node: torch.fx.Node) -> torch.fx.Node | None:
+    """Match ``permute(x, [0, 2, 1, 3])`` or ``transpose(x, 1, 2)``."""
+    transpose = linear_fx.bind_call(node, _aten.transpose.int)
+    if transpose is not None:
+        source = transpose["self"]
+        if isinstance(source, torch.fx.Node) and (transpose["dim0"], transpose["dim1"]) in (
+            (1, 2),
+            (2, 1),
+        ):
+            return source
+        return None
+    permute = linear_fx.bind_call(node, _aten.permute.default)
+    if (
+        permute is not None
+        and isinstance(permute["self"], torch.fx.Node)
+        and isinstance(permute["dims"], (tuple, list))
+        and tuple(permute["dims"]) == (0, 2, 1, 3)
+    ):
+        return permute["self"]
+    return None
+
+
+def _attention_source(node: object) -> tuple[torch.fx.Node, dict[str, Argument]] | None:
     """Require an exclusive BHSD -> BSHD -> merged-head path."""
     if not isinstance(node, torch.fx.Node) or node.target not in _RESHAPES:
         return None
@@ -48,20 +71,7 @@ def _attention_source(node: object) -> tuple[torch.fx.Node, dict[str, Argument]]
         assert isinstance(node, torch.fx.Node)
     if len(node.users) != 1:
         return None
-    transpose = linear_fx.bind_call(node, _aten.transpose.int)
-    if transpose is not None:
-        if (transpose["dim0"], transpose["dim1"]) not in ((1, 2), (2, 1)):
-            return None
-        attention = transpose["self"]
-    else:
-        permute = linear_fx.bind_call(node, _aten.permute.default)
-        if (
-            permute is None
-            or not isinstance(permute["dims"], (tuple, list))
-            or tuple(permute["dims"]) != (0, 2, 1, 3)
-        ):
-            return None
-        attention = permute["self"]
+    attention = _match_bhsd_transpose(node)
     if not isinstance(attention, torch.fx.Node) or len(attention.users) != 1:
         return None
     attn_bound = linear_fx.bind_call(
@@ -78,13 +88,10 @@ def _metadata(node: torch.fx.Node) -> torch.Tensor | int | torch.SymInt:
 
 
 def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple[Argument, ...], dict[str, Any]] | None:  # noqa: PLR0911, PLR0912
-    linear_bound = linear_fx.bind_call(linear, torch.ops.piper_kernels.convrot_int8_linear.default)
-    if linear_bound is None or linear_bound["activation_fn"] is not None:
+    bound = _compile_fx.BoundLinearNodes.from_call(linear)
+    if bound is None:
         return None
-    linear_input = linear_bound["input"]
-    if not isinstance(linear_input, torch.fx.Node):
-        return None
-    matched_attention = _attention_source(linear_input)
+    matched_attention = _attention_source(bound.input)
     if matched_attention is None:
         return None
     attention, attn_bound = matched_attention
@@ -104,7 +111,7 @@ def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple[Argument, ...], dict[
     producer_bound = linear_fx.bind_arguments(producer)
     if producer_bound is None:
         return None
-    input_value = sharing.tensor_metadata(linear_input)
+    input_value = sharing.tensor_metadata(bound.input)
     attention_value = sharing.tensor_metadata(attention)
     projected = sharing.tensor_metadata(linear)
     if input_value is None or attention_value is None or projected is None:
@@ -137,11 +144,11 @@ def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple[Argument, ...], dict[
         attn_bound["key_length"],
         attn_bound["is_causal"],
         attn_bound["output_dtype"],
-        linear_bound["weight_qdata"],
-        linear_bound["weight_scale"],
-        linear_bound["bias"],
-        linear_bound["group_size"],
-        linear_bound["input_scale"],
+        bound.weight_qdata,
+        bound.weight_scale,
+        bound.bias,
+        bound.group_size,
+        bound.input_scale,
     )
     kwargs = {"head_dim": head_dim}
     try:

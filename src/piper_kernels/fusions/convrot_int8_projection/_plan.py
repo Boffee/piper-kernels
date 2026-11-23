@@ -27,6 +27,41 @@ class ProjectionExecutionPlan:
             return self.value_mean_block_n
         return head_dim * self.heads_per_program
 
+    @property
+    def uses_gluon(self) -> bool:
+        """Whether this plan dispatches to a Gluon kernel instead of Triton."""
+        return False
+
+    def iter_row_block_launches(
+        self,
+        batch: int,
+        sequence_rows: int,
+        input_features: int,
+        heads: int,
+        *,
+        block_m: int | None = None,
+        start_row_block: int = 0,
+        num_row_blocks: int | None = None,
+    ) -> tuple[tuple[tuple[int, int, int], int, bool, bool], ...]:
+        """Return ``(grid, row_block_offset, aligned_rows, aligned_projection)`` launches."""
+        resolved_block_m = self.block_m if block_m is None else block_m
+        head_blocks = (heads + self.heads_per_program - 1) // self.heads_per_program
+        aligned_shape = input_features % self.block_k == 0 and heads % self.heads_per_program == 0
+        return tuple(
+            (
+                (row_blocks, head_blocks, batch),
+                row_block_offset,
+                aligned_rows,
+                aligned_rows and aligned_shape,
+            )
+            for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
+                sequence_rows,
+                resolved_block_m,
+                start_row_block=start_row_block,
+                num_row_blocks=num_row_blocks,
+            )
+        )
+
 
 def resolve_row_block_launches(
     sequence_rows: int,

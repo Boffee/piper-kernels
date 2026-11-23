@@ -23,13 +23,16 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+from piper_kernels.attention.kernels.sparse_piper.layout import (
+    QUERY_SCALE_ROWS,
+    TILE_ROWS,
+    ValueFormat,
+)
 from piper_kernels.attention.sparse_piper_attention._contracts import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_projection._nvidia import fragments
 from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import NvidiaExecutionPlan
 
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
-from .._layout import QUERY_SCALE_ROWS, TILE_ROWS
 
 _HEAD_DIM = fragments.HEAD_DIM
 

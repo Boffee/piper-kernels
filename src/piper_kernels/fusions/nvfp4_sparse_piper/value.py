@@ -12,7 +12,7 @@ from piper_kernels.linear.nvfp4._chunking import (
 )
 
 from . import _epilogue
-from ._validation import validate_block_lengths, validate_projection
+from ._validation import validate_projection
 
 
 @torch.library.custom_op("piper_kernels::nvfp4_sparse_piper_project_value", mutates_args=())
@@ -41,7 +41,7 @@ def project_value(
         "V projection",
         head_dim,
     )
-    validate_block_lengths(
+    output_common.validate_optional_block_lengths(
         block_lengths,
         sequence_length,
         input_qdata.device,

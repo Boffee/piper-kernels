@@ -4,7 +4,6 @@
 # pyright: reportCallIssue=false, reportArgumentType=false
 
 import torch
-import triton
 
 from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
 from piper_kernels._triton.runtime import device_context
@@ -12,10 +11,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
     resolve_qk_quantization,
 )
 from piper_kernels.attention.piper_attention import _quantization
-from piper_kernels.fusions.convrot_int8_projection._plan import (
-    ProjectionExecutionPlan,
-    resolve_row_block_launches,
-)
+from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 from piper_kernels.fusions.convrot_int8_projection.triton import project_value_chunk_means
 
 from . import _kernels
@@ -51,11 +47,15 @@ def project_query(
     if batch == 0:
         return
     with device_context(input_qdata.device):
-
-        def launch(row_blocks: int, row_block_offset: int, *, mask_ragged_tail: bool) -> None:
-            _kernels._project_query_kernel[
-                (row_blocks, triton.cdiv(heads, execution_plan.heads_per_program), batch)
-            ](
+        for (
+            grid,
+            row_block_offset,
+            aligned_rows,
+            aligned_projection,
+        ) in execution_plan.iter_row_block_launches(
+            batch, chunk_rows, input_qdata.shape[2], heads, block_m=64
+        ):
+            _kernels._project_query_kernel[grid](
                 input_qdata,
                 input_scale,
                 weight_qdata,
@@ -82,20 +82,13 @@ def project_query(
                 block_k=execution_plan.block_k,
                 group_m=execution_plan.group_m,
                 round_rsqrt_to_nearest=execution_plan.round_rsqrt_to_nearest,
-                aligned_projection=(
-                    not mask_ragged_tail
-                    and input_qdata.shape[2] % execution_plan.block_k == 0
-                    and heads % execution_plan.heads_per_program == 0
-                ),
-                mask_ragged_tail=mask_ragged_tail,
+                aligned_projection=aligned_projection,
+                mask_ragged_tail=not aligned_rows,
                 per_thread_scales=per_thread_scales,
                 num_warps=execution_plan.num_warps,
                 num_stages=execution_plan.num_stages,
                 **lds_only_fence_options(execution_plan.lds_only_fences),
             )
-
-        for count, offset, aligned_rows in resolve_row_block_launches(chunk_rows, 64):
-            launch(count, offset, mask_ragged_tail=not aligned_rows)
 
 
 def project_key(
@@ -120,12 +113,13 @@ def project_key(
     _, heads, storage_length, head_dim = key_int8.shape
     stored = input_qdata.new_empty((batch, heads, sequence_length, head_dim), dtype=torch.bfloat16)
     with device_context(input_qdata.device):
-        for count, offset, aligned_rows in resolve_row_block_launches(
-            sequence_length, execution_plan.block_m
-        ):
-            _kernels._project_key_kernel[
-                (count, triton.cdiv(heads, execution_plan.heads_per_program), batch)
-            ](
+        for (
+            grid,
+            offset,
+            aligned_rows,
+            aligned_projection,
+        ) in execution_plan.iter_row_block_launches(batch, sequence_length, input_features, heads):
+            _kernels._project_key_kernel[grid](
                 input_qdata,
                 input_scale,
                 weight_qdata,
@@ -143,11 +137,7 @@ def project_key(
                 head_dim=head_dim,
                 rotary_dim=cos.shape[1],
                 norm_epsilon=norm_epsilon,
-                aligned_projection=(
-                    aligned_rows
-                    and input_features % execution_plan.block_k == 0
-                    and heads % execution_plan.heads_per_program == 0
-                ),
+                aligned_projection=aligned_projection,
                 mask_ragged_tail=not aligned_rows,
                 block_m=execution_plan.block_m,
                 block_n=head_dim * execution_plan.heads_per_program,
@@ -195,10 +185,15 @@ def project_value(
             block_k=execution_plan.block_k,
             out=mean,
         )
-        for count, offset, aligned in resolve_row_block_launches(sequence, 64):
-            _kernels._project_value_kernel[
-                (count, triton.cdiv(heads, execution_plan.heads_per_program), batch)
-            ](
+        for (
+            grid,
+            offset,
+            _aligned_rows,
+            aligned_projection,
+        ) in execution_plan.iter_row_block_launches(
+            batch, sequence, input_qdata.shape[2], heads, block_m=64
+        ):
+            _kernels._project_value_kernel[grid](
                 input_qdata,
                 input_scale,
                 weight_qdata,
@@ -220,11 +215,7 @@ def project_value(
                 block_k=execution_plan.block_k,
                 group_m=execution_plan.group_m,
                 packed_amd=packed_amd,
-                aligned_projection=(
-                    aligned
-                    and input_qdata.shape[2] % execution_plan.block_k == 0
-                    and heads % execution_plan.heads_per_program == 0
-                ),
+                aligned_projection=aligned_projection,
                 num_warps=execution_plan.num_warps,
                 num_stages=execution_plan.num_stages,
                 **lds_only_fence_options(execution_plan.lds_only_fences),

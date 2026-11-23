@@ -32,6 +32,7 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     _SparsePiperRatioProfile,
 )
 from piper_kernels.fusions.attention import _sparse_output as output_common
+from piper_kernels.fusions.convrot_int8_projection._plan import resolve_row_block_launches
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend,
     _compile,
@@ -45,7 +46,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import gluon as amd_gluon
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy as amd_policy
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
-from piper_kernels.fusions.convrot_int8_sparse_piper._layout import resolve_row_block_launches
 from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import dispatch as nvidia
 from piper_kernels.fusions.nvfp4_sparse_piper import output as nvfp4_output
 
@@ -470,7 +470,7 @@ def _projection_match(head_dim, input_features=256, device="cpu"):
         )
         weight_scale = operand(f"sparse_{kind}_weight_scale", (2 * head_dim, 1), torch.float32)
         projections.append(
-            _compile._BoundInt8Projection(
+            _compile._compile_fx.BoundLinearNodes(
                 node=input_node,
                 input=input_node,
                 weight_qdata=weight_qdata,
@@ -1254,7 +1254,20 @@ def test_output_folding_preserves_query_bias(bias_argument):
     )
     outputs = tuple(graph.call_function(operator.getitem, args=(producer, i)) for i in range(3))
     outputs[0].meta["val"] = torch.empty((1, 2, 64, 64), dtype=torch.int8, device="meta")
-    recovered = _output_compile._prepared_query_projection(*outputs, _MINMAX_ROUTING, None)
+    reshaped = _compile.sparse_piper_compile.ReshapedQuantizedAttentionMatch(
+        reshape_node=producer,
+        attention_node=producer,
+        attention_shape=[1, 64, 128],
+        attention_args={
+            "query": outputs[0],
+            "query_scale": outputs[1],
+            "query_summary": outputs[2],
+            "routing_mode": _MINMAX_ROUTING,
+        },
+        is_coarse=False,
+        force_kwargs={},
+    )
+    recovered = _output_compile._prepared_query_projection(reshaped)
     if bias_argument == "duplicate":
         assert recovered is None
     else:
