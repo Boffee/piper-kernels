@@ -29,7 +29,6 @@ from piper_kernels.attention.sparse_piper_attention._prepared import (
 )
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
-    _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_from_sequences,
@@ -328,13 +327,11 @@ def test_quantized_coarse_residual_matches_fp32_composition(
         routing_mode,
     )
     coarse_scale = 128**-0.5
-    coarse_arguments = (
-        *fine_arguments[:12],
-        coarse_gate,
-        *fine_arguments[12:],
-        coarse_scale,
-        coarse_key_blocks,
-    )
+    coarse_kwargs = {
+        "coarse_gate": coarse_gate,
+        "coarse_scale": coarse_scale,
+        "coarse_key_blocks": coarse_key_blocks,
+    }
 
     with torch.no_grad():
         fine_output = _sparse_piper_attention_from_quantized_op(*fine_arguments)
@@ -342,18 +339,29 @@ def test_quantized_coarse_residual_matches_fp32_composition(
             scores * coarse_scale,
             prepared.context.value_mean[:, :, :coarse_key_blocks].float(),
         )
-        actual = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
-            *coarse_arguments,
-        )
-        zero_gate_arguments = list(coarse_arguments)
-        zero_gate_arguments[12] = torch.zeros_like(coarse_gate)
-        zero_gate_output = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
-            *zero_gate_arguments,
+        actual = _sparse_piper_attention_from_quantized_op(*fine_arguments, **coarse_kwargs)
+        zero_gate_output = _sparse_piper_attention_from_quantized_op(
+            *fine_arguments,
+            coarse_gate=torch.zeros_like(coarse_gate),
+            coarse_scale=coarse_scale,
+            coarse_key_blocks=coarse_key_blocks,
         )
         opcheck = torch.library.opcheck(
-            _sparse_piper_attention_with_coarse_residual_from_quantized_op,
-            coarse_arguments,
+            _sparse_piper_attention_from_quantized_op,
+            fine_arguments,
+            coarse_kwargs,
         )
+        with pytest.raises(ValueError, match="coarse sparse attention requires"):
+            _sparse_piper_attention_from_quantized_op(
+                *fine_arguments,
+                coarse_scale=coarse_scale,
+                coarse_key_blocks=coarse_key_blocks,
+            )
+        with pytest.raises(ValueError, match="coarse sparse attention requires"):
+            torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default(
+                *(t.to("meta") if isinstance(t, torch.Tensor) else t for t in fine_arguments),
+                coarse_gate=torch.empty_like(coarse_gate, device="meta"),
+            )
 
     _assert_fp32_coarse_composition(actual, fine_output, expected_coarse, coarse_gate)
     assert torch.equal(zero_gate_output, fine_output)
@@ -679,32 +687,27 @@ def test_quantized_coarse_residual_supports_internal_block_padding(
             fine_arguments[8][:, :, :coarse_key_blocks],
         )
     coarse_scale = head_dim**-0.5
-    coarse_arguments = (
-        *fine_arguments[:12],
-        coarse_gate,
-        *fine_arguments[12:],
-        coarse_scale,
-        coarse_key_blocks,
-        block_lengths,
-        2,
-    )
+    coarse_arguments = (*fine_arguments, block_lengths, 2)
+    coarse_kwargs = {
+        "coarse_gate": coarse_gate,
+        "coarse_scale": coarse_scale,
+        "coarse_key_blocks": coarse_key_blocks,
+    }
 
     with torch.no_grad():
-        fine_output = _sparse_piper_attention_from_quantized_op(
-            *fine_arguments,
-            block_lengths,
-            2,
-        )
+        fine_output = _sparse_piper_attention_from_quantized_op(*coarse_arguments)
         expected_coarse = coarse_attention(
             scores * coarse_scale,
             prepared.context.value_mean[:, :, :coarse_key_blocks].float(),
         )
-        actual = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
+        actual = _sparse_piper_attention_from_quantized_op(
             *coarse_arguments,
+            **coarse_kwargs,
         )
         opcheck = torch.library.opcheck(
-            _sparse_piper_attention_with_coarse_residual_from_quantized_op,
+            _sparse_piper_attention_from_quantized_op,
             coarse_arguments,
+            coarse_kwargs,
         )
 
     assert actual.shape == value.shape

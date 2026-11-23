@@ -16,7 +16,6 @@ from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
-    _sparse_piper_attention_with_coarse_residual_from_quantized_op,
 )
 from piper_kernels.fusions.nvfp4_sparse_piper import key, output, query, value
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
@@ -194,14 +193,13 @@ def _padded_arguments(
     coarse_key_blocks = sequence_length // 64 if coarse else None
     if coarse:
         assert coarse_gate is not None
-        materialized_attention = _sparse_piper_attention_with_coarse_residual_from_quantized_op(
-            *attention_arguments[:12],
-            coarse_gate,
-            *attention_arguments[12:],
-            coarse_scale,
-            coarse_key_blocks,
+        materialized_attention = _sparse_piper_attention_from_quantized_op(
+            *attention_arguments,
             block_lengths,
             sparse_query_blocks,
+            coarse_gate=coarse_gate,
+            coarse_scale=coarse_scale,
+            coarse_key_blocks=coarse_key_blocks,
         )
     else:
         materialized_attention = _sparse_piper_attention_from_quantized_op(
@@ -625,3 +623,421 @@ def test_attention_output_rejects_invalid_query_chunk_rows(query_chunk_rows: int
 
     with pytest.raises(ValueError, match="positive multiple of 128"):
         output._attention_output_op(*arguments, query_chunk_rows)
+
+
+def _residual_add_op():
+    return (
+        torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_residual_add_.default
+    )
+
+
+def _meta_projected_query_residual_arguments(
+    base: torch.Tensor,
+    *,
+    output_features: int = _OUTPUT_FEATURES,
+    weight_packed_cols: int = 128,
+    sequence_length: int = 192,
+    logical_sequence_length: int = 132,
+    with_block_lengths: bool = True,
+) -> tuple[object, ...]:
+    gate = torch.empty((5, output_features), device=base.device, dtype=base.dtype)
+    gate_indices = torch.empty(base.shape[0] * base.shape[1], device=base.device, dtype=torch.int64)
+    return (
+        base,
+        gate,
+        gate_indices,
+        True,
+        torch.empty((sequence_length, 256), device=base.device, dtype=torch.uint8),
+        torch.empty(
+            (sequence_length // 128 * 2, 16), device=base.device, dtype=torch.float8_e4m3fn
+        ),
+        torch.empty((), device=base.device, dtype=torch.float32),
+        torch.empty((256, 128), device=base.device, dtype=torch.uint8),
+        torch.empty((256, 128), device=base.device, dtype=torch.float8_e4m3fn),
+        torch.empty((), device=base.device, dtype=torch.float32),
+        None,
+        None,
+        torch.empty((sequence_length, 96), device=base.device, dtype=torch.float32),
+        torch.empty((sequence_length, 96), device=base.device, dtype=torch.float32),
+        1e-5,
+        128**-0.5,
+        torch.empty((1, 2, 192, 128), device=base.device, dtype=torch.int8),
+        torch.empty((1, 2, 3), device=base.device, dtype=torch.float32),
+        torch.empty((1, 2, 3, 2, 128), device=base.device, dtype=torch.int8),
+        torch.empty((1, 2, 3, 2), device=base.device, dtype=torch.float32),
+        torch.empty((1, 2, 3, 128), device=base.device, dtype=torch.float32),
+        torch.empty((1, 2, 3, 128), device=base.device, dtype=torch.float32),
+        torch.empty((1, 2, 128, 192), device=base.device, dtype=torch.int8),
+        torch.empty((1, 2, 3, 1), device=base.device, dtype=torch.float32),
+        torch.empty((1, 2, 3, 128), device=base.device, dtype=torch.bfloat16),
+        _SparsePiperRatioProfile((500_000, 1_000_000)),
+        2,
+        logical_sequence_length,
+        0,
+        torch.empty((output_features, weight_packed_cols), device=base.device, dtype=torch.uint8),
+        torch.empty((96, 64), device=base.device, dtype=torch.float8_e4m3fn),
+        torch.empty((), device=base.device, dtype=torch.float32),
+        torch.empty((), device=base.device, dtype=torch.float32),
+        None,
+        128,
+        torch.empty(3, device=base.device, dtype=torch.int32) if with_block_lengths else None,
+    )
+
+
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_projected_query_attention_residual_add_fake_accepts_padded_rows(
+    group_size: int | None,
+    dtype: torch.dtype,
+) -> None:
+    base = torch.empty((1, 192, _OUTPUT_FEATURES), device="meta", dtype=dtype)
+    assert (
+        _residual_add_op()(
+            *_meta_projected_query_residual_arguments(base),
+            group_size=group_size,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("base", "match"),
+    [
+        (
+            torch.empty((1, 132, _OUTPUT_FEATURES), device="meta", dtype=torch.bfloat16),
+            "one row per output row",
+        ),
+        (
+            torch.empty((2, 192, _OUTPUT_FEATURES), device="meta", dtype=torch.bfloat16),
+            "one row per output row",
+        ),
+        (
+            torch.empty((1, 192, _OUTPUT_FEATURES), device="meta", dtype=torch.bfloat16).transpose(
+                1, 2
+            ),
+            "one row per output row",
+        ),
+    ],
+    ids=["logical-rows", "batch", "transposed"],
+)
+def test_projected_query_attention_residual_add_fake_validates_base(
+    base: torch.Tensor,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _residual_add_op()(*_meta_projected_query_residual_arguments(base))
+
+
+def test_projected_query_attention_residual_add_fake_validates_group_size_and_stride() -> None:
+    noncontiguous = torch.empty(
+        (1, 192, _OUTPUT_FEATURES * 2), device="meta", dtype=torch.bfloat16
+    )[..., ::2]
+    with pytest.raises(ValueError, match="residual add base"):
+        _residual_add_op()(*_meta_projected_query_residual_arguments(noncontiguous))
+
+    base = torch.empty((1, 192, _OUTPUT_FEATURES), device="meta", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="ConvRot group size"):
+        _residual_add_op()(*_meta_projected_query_residual_arguments(base), group_size=32)
+
+    with pytest.raises(ValueError, match="divisible by group size"):
+        _residual_add_op()(
+            *_meta_projected_query_residual_arguments(base, weight_packed_cols=64),
+            group_size=256,
+        )
+
+
+def _residual_projected_query_setup(
+    *,
+    sequence_length: int,
+    output_features: int,
+    group_size: int | None,
+    dynamic_activation_scale: bool,
+    dtype: torch.dtype = torch.bfloat16,
+    coarse: bool = False,
+) -> tuple[tuple[object, ...], torch.Tensor, torch.Tensor | None]:
+    torch.manual_seed(1111 + sequence_length + output_features + (group_size or 0))
+    operands = make_operands(sequence_length=sequence_length)
+    q_projection = operands.projection(0)
+    dense_weight = torch.randn(
+        (output_features, _HEADS * _HEAD_DIM), device="cuda", dtype=torch.bfloat16
+    )
+    quantized_source = (
+        dense_weight if group_size is None else rotate_groups(dense_weight, group_size)
+    )
+    output_weight = TorchAONVFP4Tensor.to_nvfp4(
+        quantized_source,
+        per_tensor_scale=per_tensor_amax_to_scale(quantized_source.abs().amax()),
+        is_swizzled_scales=True,
+        use_triton_kernel=False,
+    )
+    activation_scale = (
+        None
+        if dynamic_activation_scale
+        else per_tensor_amax_to_scale(torch.tensor(3.0, device="cuda", dtype=torch.float32))
+    )
+    output_bias = torch.randn(output_features, device="cuda", dtype=torch.float32)
+    base_args, _ = _arguments(
+        sequence_length=sequence_length,
+        bias=True,
+        group_size=group_size,
+    )
+    query_operands = (
+        *q_projection.as_tuple(),
+        None,
+        operands.query_norm,
+        operands.cos,
+        operands.sin,
+        1e-5,
+        _HEAD_DIM**-0.5,
+    )
+    # Replace output projection weights/scale/bias on base_args for requested width and scaling.
+    kv_and_meta = base_args[3:16]
+    block_lengths = (
+        torch.tensor([64, 17, 51] * (sequence_length // 192), device="cuda", dtype=torch.int32)
+        if coarse
+        else None
+    )
+    coarse_kwargs: tuple[object, ...] = (
+        block_lengths,
+        None,
+        None,
+        None,
+        None,
+    )
+    if coarse:
+        hidden = operands.input
+        gate_scale = per_tensor_amax_to_scale(hidden.abs().amax())
+        gate_dense = torch.randn(
+            (_HEADS * _HEAD_DIM, hidden.shape[-1]), device="cuda", dtype=torch.bfloat16
+        )
+        gate_weight = TorchAONVFP4Tensor.to_nvfp4(
+            gate_dense,
+            per_tensor_scale=per_tensor_amax_to_scale(gate_dense.abs().amax()),
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+        )
+        gate_input = _ops.prepare_input(hidden, gate_scale, False, None, False)
+        gate_bias = torch.randn(_HEADS * _HEAD_DIM, device="cuda", dtype=torch.float32)
+        coarse_kwargs = (
+            block_lengths,
+            None,
+            0.125,
+            sequence_length // 64,
+            2,
+            *gate_input,
+            gate_weight.qdata,
+            gate_weight.scale,
+            gate_weight.per_tensor_scale,
+            gate_bias,
+        )
+    common_args = (
+        *query_operands,
+        *kv_and_meta,
+        output_weight.qdata,
+        output_weight.scale,
+        output_weight.per_tensor_scale,
+        activation_scale,
+        output_bias,
+        128,
+        *coarse_kwargs,
+    )
+    with torch.no_grad():
+        projected = (
+            torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default(
+                *common_args,
+                output_dtype=dtype,
+                dynamic_activation_scale=dynamic_activation_scale,
+                group_size=group_size,
+            )
+        )
+    return common_args, projected, block_lengths
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+@pytest.mark.parametrize("dynamic_activation_scale", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize("output_features", [128, 256, 320])
+def test_projected_query_attention_residual_add_matches_output_and_add(
+    group_size: int | None,
+    dynamic_activation_scale: bool,
+    output_features: int,
+) -> None:
+    common_args, projected, _ = _residual_projected_query_setup(
+        sequence_length=385,
+        output_features=output_features,
+        group_size=group_size,
+        dynamic_activation_scale=dynamic_activation_scale,
+    )
+    base = torch.randn_like(projected)
+    gate_storage = torch.randn(5, 3 * output_features, device="cuda", dtype=base.dtype)
+    gate = gate_storage[:, output_features : 2 * output_features]
+    gate_indices = torch.randint(-5, 5, (base.shape[0] * base.shape[1],), device="cuda")
+    expected = (base.float() + gate[gate_indices].view(base.shape).float() * projected.float()).to(
+        base.dtype
+    )
+
+    with torch.no_grad():
+        result = _residual_add_op()(
+            base,
+            gate,
+            gate_indices,
+            True,
+            *common_args,
+            dynamic_activation_scale=dynamic_activation_scale,
+            group_size=group_size,
+        )
+
+    assert result is None
+    torch.testing.assert_close(base, expected, atol=2e-2, rtol=2**-7)
+    error_norm = torch.linalg.vector_norm(base.float() - expected.float())
+    assert error_norm <= 5e-4 * torch.linalg.vector_norm(expected.float())
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+@pytest.mark.parametrize("dynamic_activation_scale", [False, True], ids=["static", "dynamic"])
+def test_projected_query_attention_residual_add_supports_coarse_and_block_lengths(
+    group_size: int | None,
+    dynamic_activation_scale: bool,
+) -> None:
+    common_args, projected, block_lengths = _residual_projected_query_setup(
+        sequence_length=576,
+        output_features=256,
+        group_size=group_size,
+        dynamic_activation_scale=dynamic_activation_scale,
+        coarse=True,
+    )
+    assert block_lengths is not None
+    valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
+    base = torch.randn_like(projected)
+    gate = torch.randn(4, 256, device="cuda", dtype=base.dtype)
+    gate_indices = torch.randint(0, 4, (base.shape[0] * base.shape[1],), device="cuda")
+    expected = (base.float() + gate[gate_indices].view(base.shape).float() * projected.float()).to(
+        base.dtype
+    )
+
+    with torch.no_grad():
+        _residual_add_op()(
+            base,
+            gate,
+            gate_indices,
+            False,
+            *common_args,
+            dynamic_activation_scale=dynamic_activation_scale,
+            group_size=group_size,
+        )
+
+    error_norm = torch.linalg.vector_norm(
+        base[:, valid_rows].float() - expected[:, valid_rows].float()
+    )
+    assert error_norm <= 5e-4 * torch.linalg.vector_norm(expected[:, valid_rows].float())
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32], ids=["fp16", "fp32"])
+@pytest.mark.parametrize("dynamic_activation_scale", [False, True], ids=["static", "dynamic"])
+def test_projected_query_attention_residual_add_supports_fp16_and_fp32_bases(
+    dtype: torch.dtype,
+    dynamic_activation_scale: bool,
+) -> None:
+    common_args, projected, _ = _residual_projected_query_setup(
+        sequence_length=256,
+        output_features=256,
+        group_size=64,
+        dynamic_activation_scale=dynamic_activation_scale,
+        dtype=dtype,
+    )
+    base = torch.randn_like(projected)
+    gate = torch.randn(3, 256, device="cuda", dtype=dtype)
+    gate_indices = torch.randint(0, 3, (base.shape[0] * base.shape[1],), device="cuda")
+    expected = (base.float() + gate[gate_indices].view(base.shape).float() * projected.float()).to(
+        dtype
+    )
+
+    with torch.no_grad():
+        _residual_add_op()(
+            base,
+            gate,
+            gate_indices,
+            False,
+            *common_args,
+            dynamic_activation_scale=dynamic_activation_scale,
+            group_size=64,
+        )
+
+    assert base.dtype is dtype
+    error_norm = torch.linalg.vector_norm(base.float() - expected.float())
+    assert error_norm <= 5e-4 * torch.linalg.vector_norm(expected.float())
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+@pytest.mark.parametrize("dynamic_activation_scale", [False, True], ids=["static", "dynamic"])
+def test_projected_query_attention_residual_add_opcheck_and_validates_before_mutating(
+    group_size: int | None,
+    dynamic_activation_scale: bool,
+) -> None:
+    common_args, projected, _ = _residual_projected_query_setup(
+        sequence_length=128,
+        output_features=256,
+        group_size=group_size,
+        dynamic_activation_scale=dynamic_activation_scale,
+    )
+    base = torch.randn_like(projected)
+    initial = base.clone()
+    gate = torch.randn(3, 256, device="cuda", dtype=base.dtype)
+    gate_indices = torch.randint(0, 3, (base.shape[0] * base.shape[1],), device="cuda")
+
+    with torch.no_grad():
+        result = torch.library.opcheck(
+            _residual_add_op(),
+            (base.clone(), gate, gate_indices, False, *common_args),
+            {"dynamic_activation_scale": dynamic_activation_scale, "group_size": group_size},
+            test_utils=(
+                "test_autograd_registration",
+                "test_faketensor",
+                "test_aot_dispatch_dynamic",
+            ),
+        )
+        assert set(result.values()) == {"SUCCESS"}
+
+        bad_gate = torch.randn(3, 128, device="cuda", dtype=base.dtype)
+        with pytest.raises(ValueError, match="residual add gates"):
+            _residual_add_op()(
+                base,
+                bad_gate,
+                gate_indices,
+                False,
+                *common_args,
+                dynamic_activation_scale=dynamic_activation_scale,
+                group_size=group_size,
+            )
+
+        bad_chunk_args = (*common_args[:-6], 64, *common_args[-5:])
+        with pytest.raises(ValueError, match="positive multiple of 128"):
+            _residual_add_op()(
+                base,
+                gate,
+                gate_indices,
+                False,
+                *bad_chunk_args,
+                dynamic_activation_scale=dynamic_activation_scale,
+                group_size=group_size,
+            )
+
+        bad_cos_args = (*common_args[:8], common_args[8][:-1], *common_args[9:])
+        with pytest.raises(ValueError, match="split-half RoPE"):
+            _residual_add_op()(
+                base,
+                gate,
+                gate_indices,
+                False,
+                *bad_cos_args,
+                dynamic_activation_scale=dynamic_activation_scale,
+                group_size=group_size,
+            )
+    assert torch.equal(base, initial)

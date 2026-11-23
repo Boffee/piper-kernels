@@ -7,6 +7,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- `compile_options(attention=True, residual_updates=True)` now folds Q-projected
+  NVFP4 and ConvRot NVFP4 sparse Piper attention outputs into exclusive copy-back
+  gated residual updates on SM120, eliminating the full-sequence attention-output
+  allocation and trailing residual-add pass while preserving bounded chunk
+  workspaces across static and dynamic scaling (`-96.0 MiB` at `S=16384` and
+  `-384.0 MiB` at `S=65536` peak activation memory with static `D=3072` BF16
+  output on RTX 5090, `-3.2%` to `+0.2%` latency).
 - Sequence-sharded (`Shard(1)`) ConvRot INT8 linears and fused dense
   (`compile_options(attention_output=True)`) or sparse Piper attention blocks now fold
   PyTorch TP+SP collective boundaries automatically, including two-step in-place residual

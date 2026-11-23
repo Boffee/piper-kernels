@@ -6,8 +6,15 @@ from typing import TypedDict, Unpack
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available, forbid_device_probes, mock_cuda_target
-from _compile_capture import TargetCapturePass
+from _accelerators import (
+    exact_sm120_available,
+    forbid_device_probes,
+    mock_cuda_target,
+    mock_triton_driver,
+)
+from _compile_capture import FunctionalTargetCapturePass, TargetCapturePass
+from torch._dynamo.utils import ReinplaceCounters
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor as TorchAONVFP4Tensor,
@@ -468,12 +475,12 @@ def _run_explicit_attention_output(
         head_dim=model.head_dim,
     )
     attention_arguments = (*query, *key, *value)
+    optional_arguments = (
+        (block_lengths, sparse_query_blocks)
+        if sparse_query_blocks is not None
+        else ((block_lengths,) if block_lengths is not None else ())
+    )
     if coarse_gate is None:
-        optional_arguments = (
-            (block_lengths, sparse_query_blocks)
-            if sparse_query_blocks is not None
-            else ((block_lengths,) if block_lengths is not None else ())
-        )
         attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default(
             *attention_arguments,
             model.sparse_attention._ratio_profile,
@@ -487,20 +494,16 @@ def _run_explicit_attention_output(
         )
     else:
         assert isinstance(model, _BoundedSparseProjectionAttentionOutput)
-        coarse_attention = (
-            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized
-        ).default
-        attention = coarse_attention(
+        attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default(
             *attention_arguments,
-            coarse_gate,
             model.sparse_attention._ratio_profile,
             model.sparse_key_blocks,
             model.sequence_length,
             model.sparse_attention._routing_mode,
-            model.coarse_scale,
-            model.coarse_key_blocks,
-            block_lengths,
-            sparse_query_blocks,
+            *optional_arguments,
+            coarse_gate=coarse_gate,
+            coarse_scale=model.coarse_scale,
+            coarse_key_blocks=model.coarse_key_blocks,
             output_dtype=hidden_states.dtype,
             force_tile_ids=force_tile_ids,
             force_tile_counts=force_tile_counts,
@@ -690,12 +693,10 @@ def test_projection_fold_supports_every_bounded_attention_variant(
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_query.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
-    expected_attention = (
-        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-        if with_coarse
-        else torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default
-    )
+    expected_attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default
     assert targets.count(expected_attention) == 1
+    attention_call = next(node for node in graph.nodes if node.target is expected_attention)
+    assert ("coarse_gate" in attention_call.kwargs) is with_coarse
     assert torch.ops.piper_kernels.sparse_piper_attention.default not in targets
     assert torch.ops.piper_kernels.sparse_piper_coarse_residual.default not in targets
     graph.lint()
@@ -812,10 +813,6 @@ def test_output_fold_supports_every_bounded_attention_variant(
     node = next(node for node in call_nodes if node.target is fused)
     assert node.kwargs["group_size"] == group_size
     assert torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default not in targets
-    assert (
-        torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-        not in targets
-    )
     assert torch.ops.piper_kernels.nvfp4_linear.default not in targets
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     graph.lint()
@@ -1321,11 +1318,7 @@ def test_forced_inputs_survive_projection_and_output_fusion(
     if output:
         target = torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
     else:
-        target = (
-            torch.ops.piper_kernels.sparse_piper_attention_with_coarse_residual_from_quantized.default
-            if bounded
-            else torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default
-        )
+        target = torch.ops.piper_kernels.sparse_piper_attention_from_quantized.default
     calls = [node for node in graph.nodes if node.target == target]
     assert len(calls) == 1
     if output:
@@ -1337,5 +1330,475 @@ def test_forced_inputs_survive_projection_and_output_fusion(
     assert all(
         node.target != torch.ops.piper_kernels.sparse_piper_attention.default
         for node in graph.nodes
+    )
+    graph.lint()
+
+
+class _SparseNvfp4ResidualBlock(torch.nn.Module):
+    """Copy-back gated residual block over sparse NVFP4 / ConvRot NVFP4 attention and a linear."""
+
+    width = _SparseProjectionAttention.input_features
+
+    def __init__(
+        self,
+        *,
+        group_size: int | None = None,
+        output_dynamic: bool = False,
+        sequence_length: int = 192,
+        with_second_update: bool = True,
+        coarse: bool = False,
+        escape_attention: bool = False,
+    ) -> None:
+        super().__init__()
+        self.sequence_length = sequence_length
+        self.escape_attention = escape_attention
+        self.coarse = coarse
+        self.sparse_query_blocks = 2 if coarse else None
+        if coarse:
+            self.attention: _SparseProjectionAttentionOutput = (
+                _ProjectedGateCoarseSparseAttentionOutput(
+                    dynamic=True,
+                    output_dynamic=output_dynamic,
+                    output_features=self.width,
+                    group_size=group_size,
+                    sequence_length=sequence_length,
+                )
+            )
+        else:
+            self.attention = _SparseProjectionAttentionOutput(
+                dynamic=True,
+                output_dynamic=output_dynamic,
+                output_features=self.width,
+                group_size=group_size,
+                sequence_length=sequence_length,
+            )
+        gates = torch.randn(3, 6 * self.width, device="cuda", dtype=torch.bfloat16).mul_(0.1)
+        gates[:, 5 * self.width :].mul_(0.05)
+        self.register_buffer("modulation", gates)
+        self.with_second_update = with_second_update
+        if with_second_update:
+            self.post_linear = self._make_nvfp4_linear(
+                self.width, self.width, group_size=group_size
+            )
+
+    @staticmethod
+    def _make_nvfp4_linear(
+        in_features: int,
+        out_features: int,
+        *,
+        group_size: int | None,
+    ) -> torch.nn.Linear:
+        calibration = torch.full((1, 16, in_features), 3.0, device="cuda", dtype=torch.bfloat16)
+        quantization = QuantizeTensorToNVFP4Kwargs(
+            block_size=16,
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+            use_dynamic_per_tensor_scale=False,
+        )
+        dense = torch.randn((out_features, in_features), device="cuda", dtype=torch.bfloat16)
+        torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+            dense,
+            per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
+            act_per_tensor_scale=per_tensor_amax_to_scale(calibration.abs().amax()),
+            is_swizzled_scales=True,
+            act_quant_kwargs=quantization,
+        )
+        layer = torch.nn.Linear(
+            in_features, out_features, bias=False, device="cuda", dtype=torch.bfloat16
+        )
+        weight: torch.Tensor = PiperNVFP4Tensor.from_torchao(torchao_weight)
+        if group_size is not None:
+            weight = _convert_weight(weight, group_size)
+        layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+        return layer
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        gate_indices: torch.Tensor,
+        block_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        shift, scale, attention_gate, post_shift, post_scale, post_gate = self.modulation.split(
+            self.width, dim=-1
+        )
+        normalized = F.rms_norm(hidden, (self.width,), eps=1e-6)
+        normalized = normalized * (1 + scale[gate_indices]) + shift[gate_indices]
+        if self.coarse:
+            assert isinstance(self.attention, _ProjectedGateCoarseSparseAttentionOutput)
+            assert block_lengths is not None
+            assert self.sparse_query_blocks is not None
+            attended = self.attention(normalized, block_lengths, self.sparse_query_blocks)
+        else:
+            attended = self.attention(normalized)
+        residual = hidden + attention_gate[gate_indices] * attended
+        if self.with_second_update:
+            post_input = F.rms_norm(residual, (self.width,), eps=1e-6)
+            post_input = post_input * (1 + post_scale[gate_indices]) + post_shift[gate_indices]
+            residual = residual + post_gate[gate_indices] * self.post_linear(post_input)
+        return (residual, attended) if self.escape_attention else residual
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+@pytest.mark.parametrize("output_dynamic", [False, True], ids=["static", "dynamic"])
+def test_cuda_compile_folds_residual_add_into_nvfp4_sparse_attention_output(
+    group_size: int | None,
+    output_dynamic: bool,
+) -> None:
+    torch.manual_seed(1207 + (group_size or 0) + int(output_dynamic))
+    model = _SparseNvfp4ResidualBlock(
+        group_size=group_size,
+        output_dynamic=output_dynamic,
+        sequence_length=192,
+        with_second_update=True,
+    ).eval()
+    hidden = torch.randn(1, model.sequence_length, model.width, device="cuda", dtype=torch.bfloat16)
+    gate_indices = torch.randint(-3, 3, (model.sequence_length,), device="cuda")
+
+    base_options = compile_options(attention=True)
+    with torch.no_grad():
+        torch._dynamo.reset()
+        expected = torch.compile(model, fullgraph=True, options=base_options)(
+            hidden.clone(), gate_indices
+        )
+
+    capture = FunctionalTargetCapturePass()
+    fused_options = capture.wrap_options(compile_options(base_options, residual_updates=True))
+
+    def copy_back(base: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        return base.copy_(model(base, indices))
+
+    torch._dynamo.reset()
+    compiled = torch.compile(copy_back, fullgraph=True, options=fused_options)
+    ReinplaceCounters.clear()
+    with torch.no_grad():
+        result = compiled(hidden, gate_indices)
+
+    assert result.data_ptr() == hidden.data_ptr()
+    assert ReinplaceCounters.get_total_missed() == 0
+    assert_fusion_output_close(hidden, expected, relative_l2=5e-3)
+    kernels = torch.ops.piper_kernels
+    assert (
+        capture.targets.count(
+            kernels.nvfp4_sparse_piper_projected_query_attention_residual_add_.default
+        )
+        == 1
+    )
+    assert capture.targets.count(kernels.residual_add_.default) == 1
+    assert kernels.nvfp4_sparse_piper_projected_query_attention_output.default not in (
+        capture.targets
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_cuda_compile_folds_residual_add_across_multi_chunk_stream_overlap() -> None:
+    torch.manual_seed(1213)
+    # Exceeds the 8192-row static window cap so producer/consumer stream overlap executes.
+    model = _SparseNvfp4ResidualBlock(
+        group_size=64,
+        output_dynamic=False,
+        sequence_length=8_320,
+        with_second_update=False,
+    ).eval()
+    hidden = torch.randn(1, model.sequence_length, model.width, device="cuda", dtype=torch.bfloat16)
+    gate_indices = torch.randint(0, 3, (model.sequence_length,), device="cuda")
+
+    base_options = compile_options(attention=True)
+    with torch.no_grad():
+        torch._dynamo.reset()
+        expected = torch.compile(model, fullgraph=True, options=base_options)(
+            hidden.clone(), gate_indices
+        )
+
+    capture = FunctionalTargetCapturePass()
+
+    def copy_back(base: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        return base.copy_(model(base, indices))
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        copy_back,
+        fullgraph=True,
+        options=capture.wrap_options(compile_options(base_options, residual_updates=True)),
+    )
+    ReinplaceCounters.clear()
+    with torch.no_grad():
+        result = compiled(hidden, gate_indices)
+
+    assert result.data_ptr() == hidden.data_ptr()
+    assert ReinplaceCounters.get_total_missed() == 0
+    assert_fusion_output_close(hidden, expected, relative_l2=5e-3)
+    kernels = torch.ops.piper_kernels
+    assert (
+        capture.targets.count(
+            kernels.nvfp4_sparse_piper_projected_query_attention_residual_add_.default
+        )
+        == 1
+    )
+    assert kernels.nvfp4_sparse_piper_projected_query_attention_output.default not in (
+        capture.targets
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_cuda_compile_folds_coarse_residual_add_with_block_lengths() -> None:
+    torch.manual_seed(1217)
+    model = _SparseNvfp4ResidualBlock(
+        group_size=64,
+        output_dynamic=False,
+        sequence_length=192,
+        with_second_update=False,
+        coarse=True,
+    ).eval()
+    block_lengths = torch.tensor([64, 17, 51], device="cuda", dtype=torch.int32)
+    valid_rows = (torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]).flatten()
+    hidden = torch.randn(1, model.sequence_length, model.width, device="cuda", dtype=torch.bfloat16)
+    gate_indices = torch.randint(0, 3, (model.sequence_length,), device="cuda")
+
+    base_options = compile_options(attention=True)
+    with torch.no_grad():
+        torch._dynamo.reset()
+        expected = torch.compile(model, fullgraph=True, options=base_options)(
+            hidden.clone(), gate_indices, block_lengths
+        )
+
+    capture = FunctionalTargetCapturePass()
+
+    def copy_back(base: torch.Tensor, indices: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        return base.copy_(model(base, indices, lengths))
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        copy_back,
+        fullgraph=True,
+        options=capture.wrap_options(compile_options(base_options, residual_updates=True)),
+    )
+    ReinplaceCounters.clear()
+    with torch.no_grad():
+        result = compiled(hidden, gate_indices, block_lengths)
+
+    assert result.data_ptr() == hidden.data_ptr()
+    assert ReinplaceCounters.get_total_missed() == 0
+    assert_fusion_output_close(hidden[:, valid_rows], expected[:, valid_rows], relative_l2=5e-3)
+    kernels = torch.ops.piper_kernels
+    assert (
+        capture.targets.count(
+            kernels.nvfp4_sparse_piper_projected_query_attention_residual_add_.default
+        )
+        == 1
+    )
+    assert kernels.nvfp4_sparse_piper_projected_query_attention_output.default not in (
+        capture.targets
+    )
+    assert kernels.residual_add_.default not in capture.targets
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+def test_cuda_compile_residual_add_fails_closed_without_exclusive_copy_back() -> None:
+    torch.manual_seed(1223)
+    model = _SparseNvfp4ResidualBlock(
+        group_size=None,
+        output_dynamic=False,
+        sequence_length=192,
+        with_second_update=False,
+        escape_attention=False,
+    ).eval()
+    hidden = torch.randn(1, model.sequence_length, model.width, device="cuda", dtype=torch.bfloat16)
+    original = hidden.clone()
+    gate_indices = torch.randint(0, 3, (model.sequence_length,), device="cuda")
+
+    kernels = torch.ops.piper_kernels
+    capture = TargetCapturePass()
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        model,
+        fullgraph=True,
+        options=capture.wrap_options(compile_options(attention=True, residual_updates=True)),
+    )
+    with torch.no_grad():
+        compiled(hidden, gate_indices)
+
+    torch.testing.assert_close(hidden, original, atol=0, rtol=0)
+    assert kernels.nvfp4_sparse_piper_projected_query_attention_output.default in capture.targets
+    assert kernels.nvfp4_sparse_piper_projected_query_attention_residual_add_.default not in (
+        capture.targets
+    )
+
+    escaping_model = _SparseNvfp4ResidualBlock(
+        group_size=None,
+        output_dynamic=False,
+        sequence_length=192,
+        with_second_update=False,
+        escape_attention=True,
+    ).eval()
+    func_capture = FunctionalTargetCapturePass()
+
+    def copy_back_escaped(
+        base: torch.Tensor, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual, attended = escaping_model(base, indices)
+        return base.copy_(residual), attended
+
+    torch._dynamo.reset()
+    compiled_escaped = torch.compile(
+        copy_back_escaped,
+        fullgraph=True,
+        options=func_capture.wrap_options(compile_options(attention=True, residual_updates=True)),
+    )
+    with torch.no_grad():
+        compiled_escaped(hidden.clone(), gate_indices)
+
+    assert kernels.nvfp4_sparse_piper_projected_query_attention_output.default in (
+        func_capture.targets
+    )
+    assert kernels.residual_add_.default in func_capture.targets
+    assert kernels.nvfp4_sparse_piper_projected_query_attention_residual_add_.default not in (
+        func_capture.targets
+    )
+
+
+def _append_gated_residual_copy_back(
+    graph: torch.fx.Graph,
+    attention_output: torch.fx.Node,
+) -> torch.fx.Node:
+    base = graph.placeholder("base")
+    base.meta["val"] = torch.empty((1, 192, 320), device="cuda", dtype=torch.bfloat16)
+    gate = graph.placeholder("gate")
+    gate.meta["val"] = torch.empty((3, 320), device="cuda", dtype=torch.bfloat16)
+    indices = graph.placeholder("gate_indices")
+    indices.meta["val"] = torch.empty((192,), device="cuda", dtype=torch.int64)
+    selected = graph.call_function(torch.ops.aten.index.Tensor, (gate, [indices]))
+    selected.meta["val"] = torch.empty((192, 320), device="cuda", dtype=torch.bfloat16)
+    scaled = graph.call_function(torch.ops.aten.mul.Tensor, (selected, attention_output))
+    scaled.meta["val"] = torch.empty((1, 192, 320), device="cuda", dtype=torch.bfloat16)
+    summed = graph.call_function(torch.ops.aten.add.Tensor, (base, scaled))
+    summed.meta["val"] = torch.empty((1, 192, 320), device="cuda", dtype=torch.bfloat16)
+    copied = graph.call_function(torch.ops.aten.copy_.default, (base, summed))
+    copied.meta["val"] = torch.empty((1, 192, 320), device="cuda", dtype=torch.bfloat16)
+    return copied
+
+
+def test_forced_inputs_survive_residual_add_fold(monkeypatch: pytest.MonkeyPatch) -> None:
+    graph = build_attention_graph(
+        dynamic=True,
+        output_dynamic=False,
+        with_block_lengths=True,
+        with_coarse=True,
+        with_sparse_query_blocks=True,
+        with_force_tiles=True,
+        group_size=64,
+    )
+    ids = next(node for node in graph.nodes if node.target == "force_tile_ids")
+    counts = next(node for node in graph.nodes if node.target == "force_tile_counts")
+    output_node = next(node for node in graph.nodes if node.op == "output")
+    attention_output = output_node.args[0]
+    assert isinstance(attention_output, torch.fx.Node)
+    with FakeTensorMode(), graph.inserting_before(output_node):
+        output_node.args = (_append_gated_residual_copy_back(graph, attention_output),)
+
+    mock_cuda_target(monkeypatch, (12, 0))
+    mock_triton_driver(monkeypatch, backend="cuda", arch=120)
+    passes = compile_options(linear=True, attention=True, residual_updates=True)[
+        "post_grad_custom_pre_pass"
+    ]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=True)
+
+    target = (
+        torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_residual_add_.default
+    )
+    calls = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function"
+        and node.target is torch.ops.higher_order.auto_functionalized
+        and node.args[0] is target
+    ]
+    assert len(calls) == 1
+    assert calls[0].kwargs["group_size"] == 64
+    assert calls[0].kwargs["force_tile_ids"] is ids
+    assert calls[0].kwargs["force_tile_counts"] is counts
+    assert (
+        torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
+        not in {node.target for node in graph.nodes}
+    )
+    graph.lint()
+
+
+def test_prefolded_projected_query_attention_output_folds_residual_add_without_sparse_ops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = torch.fx.Graph()
+    with FakeTensorMode():
+        profile = graph.placeholder("ratio_profile")
+        profile.meta["val"] = SparsePiperAttention((0.5, 1.0))._ratio_profile
+        attention_output = graph.call_function(
+            torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default,
+            args=(
+                graph.placeholder("q_in"),
+                graph.placeholder("q_s"),
+                graph.placeholder("q_g"),
+                graph.placeholder("qw"),
+                graph.placeholder("qws"),
+                None,
+                None,
+                None,
+                graph.placeholder("cos"),
+                graph.placeholder("sin"),
+                1e-5,
+                128**-0.5,
+                graph.placeholder("k"),
+                graph.placeholder("ks"),
+                graph.placeholder("kc"),
+                graph.placeholder("kcs"),
+                graph.placeholder("ksum"),
+                graph.placeholder("kaux"),
+                graph.placeholder("v"),
+                graph.placeholder("vs"),
+                graph.placeholder("vm"),
+                profile,
+                2,
+                192,
+                0,
+                graph.placeholder("w"),
+                graph.placeholder("ws"),
+                None,
+                None,
+                None,
+            ),
+        )
+        attention_output.meta["val"] = torch.empty(
+            (1, 192, 320), device="cuda", dtype=torch.bfloat16
+        )
+        graph.output(_append_gated_residual_copy_back(graph, attention_output))
+
+    mock_cuda_target(monkeypatch, (12, 0))
+    mock_triton_driver(monkeypatch, backend="cuda", arch=120)
+    passes = compile_options(linear=False, attention=True, residual_updates=True)[
+        "post_grad_custom_pre_pass"
+    ]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=True)
+
+    target = (
+        torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_residual_add_.default
+    )
+    calls = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function"
+        and node.target is torch.ops.higher_order.auto_functionalized
+        and node.args[0] is target
+    ]
+    assert len(calls) == 1
+    assert (
+        torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
+        not in {node.target for node in graph.nodes}
     )
     graph.lint()
