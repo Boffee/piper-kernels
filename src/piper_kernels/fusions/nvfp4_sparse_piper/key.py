@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels.attention.kernels.sparse_piper.layout import (
-    TILE_ROWS,
-    padded_sequence_length,
-)
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
     validate_routing_mode,
 )
+from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.linear.nvfp4._chunking import (
     DEFAULT_CHUNK_ROWS,
@@ -24,7 +21,8 @@ from . import _epilogue
 from ._validation import validate_block_lengths, validate_projection, validate_qk_epilogue
 
 
-def _launch_key(  # noqa: PLR0913, PLR0917
+@torch.library.custom_op("piper_kernels::nvfp4_sparse_piper_project_key", mutates_args=())
+def project_key(  # noqa: PLR0913, PLR0917
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     input_per_tensor_scale: torch.Tensor,
@@ -36,9 +34,9 @@ def _launch_key(  # noqa: PLR0913, PLR0917
     cos: torch.Tensor,
     sin: torch.Tensor,
     norm_epsilon: float,
-    chunk_rows: int,
-    routing_mode: int,
-    block_lengths: torch.Tensor | None,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    routing_mode: int = _MINMAX_ROUTING,
+    block_lengths: torch.Tensor | None = None,
     *,
     head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -72,39 +70,15 @@ def _launch_key(  # noqa: PLR0913, PLR0917
         input_qdata.device,
         "K projection",
     )
-    storage_sequence_length = padded_sequence_length(sequence_length)
-    storage_tiles = storage_sequence_length // TILE_ROWS
-    key = torch.empty(
-        (1, heads, storage_sequence_length, head_dim),
-        device=input_qdata.device,
-        dtype=torch.int8,
-    )
-    key_scale = torch.empty(
-        (1, heads, storage_tiles),
-        device=input_qdata.device,
-        dtype=torch.float32,
-    )
-    key_center = torch.empty(
-        (1, heads, storage_tiles, 2, head_dim),
-        device=input_qdata.device,
-        dtype=torch.int8,
-    )
-    key_center_scale = torch.empty(
-        (1, heads, storage_tiles, 2),
-        device=input_qdata.device,
-        dtype=torch.float32,
-    )
-    summary_shape = (1, heads, storage_tiles, head_dim)
-    key_summary = torch.empty(summary_shape, device=input_qdata.device, dtype=torch.float32)
-    mean_pool_summary = routing_mode == _MEAN_ROUTING
-    key_aux = (
-        torch.empty(
-            (1, heads, 0, head_dim),
-            device=input_qdata.device,
-            dtype=torch.float32,
+    key, key_scale, key_center, key_center_scale, key_summary, key_aux = (
+        output_common.allocate_key_storage(
+            input_qdata,
+            1,
+            heads,
+            sequence_length,
+            head_dim,
+            routing_mode,
         )
-        if mean_pool_summary
-        else torch.empty_like(key_summary)
     )
     projection = PreparedProjection(
         input_qdata,
@@ -112,6 +86,7 @@ def _launch_key(  # noqa: PLR0913, PLR0917
         weight_qdata,
         weight_scale,
     )
+    mean_pool_summary = routing_mode == _MEAN_ROUTING
 
     def consume(chunk: torch.Tensor, start: int) -> None:
         _epilogue.launch_key(
@@ -146,44 +121,6 @@ def _launch_key(  # noqa: PLR0913, PLR0917
     return outputs
 
 
-@torch.library.custom_op("piper_kernels::nvfp4_sparse_piper_project_key", mutates_args=())
-def project_key(  # noqa: PLR0913, PLR0917
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    input_per_tensor_scale: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_per_tensor_scale: torch.Tensor | None,
-    bias: torch.Tensor | None,
-    norm_weight: torch.Tensor | None,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    norm_epsilon: float,
-    chunk_rows: int = DEFAULT_CHUNK_ROWS,
-    routing_mode: int = _MINMAX_ROUTING,
-    block_lengths: torch.Tensor | None = None,
-    *,
-    head_dim: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _launch_key(
-        input_qdata,
-        input_scale,
-        input_per_tensor_scale,
-        weight_qdata,
-        weight_scale,
-        weight_per_tensor_scale,
-        bias,
-        norm_weight,
-        cos,
-        sin,
-        norm_epsilon,
-        chunk_rows,
-        routing_mode,
-        block_lengths,
-        head_dim=head_dim,
-    )
-
-
 @project_key.register_fake  # pyright: ignore[reportFunctionMemberAccess]
 def _project_key_fake(
     input_qdata: torch.Tensor,
@@ -204,33 +141,16 @@ def _project_key_fake(
     head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length = input_qdata.shape[0]
-    storage_sequence_length = padded_sequence_length(sequence_length)
-    storage_tiles = storage_sequence_length // TILE_ROWS
     head_dim = resolve_head_dim(norm_weight, head_dim)
     heads = weight_qdata.shape[0] // head_dim
-    key = input_qdata.new_empty((1, heads, storage_sequence_length, head_dim), dtype=torch.int8)
-    key_scale = input_qdata.new_empty(
-        (1, heads, storage_tiles),
-        dtype=torch.float32,
+    return output_common.allocate_key_storage(
+        input_qdata,
+        1,
+        heads,
+        sequence_length,
+        head_dim,
+        routing_mode,
     )
-    key_center = input_qdata.new_empty(
-        (1, heads, storage_tiles, 2, head_dim),
-        dtype=torch.int8,
-    )
-    key_center_scale = input_qdata.new_empty(
-        (1, heads, storage_tiles, 2),
-        dtype=torch.float32,
-    )
-    summary = input_qdata.new_empty(
-        (1, heads, storage_tiles, head_dim),
-        dtype=torch.float32,
-    )
-    key_aux = (
-        summary.new_empty((1, heads, 0, head_dim))
-        if routing_mode == _MEAN_ROUTING
-        else summary.new_empty(summary.shape)
-    )
-    return key, key_scale, key_center, key_center_scale, summary, key_aux
 
 
 __all__ = ["project_key"]

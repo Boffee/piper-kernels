@@ -333,11 +333,11 @@ def _run_output_fusion(projected_query, operands, storage):
         "query_chunk_rows": 128,
     }
     if not projected_query:
-        return output._run_attention_output(
+        return output._attention_output_op._init_fn(
             query=storage, query_scale=storage, query_summary=storage, **arguments
         )
     qdata, scale, weight, weight_scale, norm, cos, sin = operands
-    return output.SparseProjectedQueryOperands(
+    return output._projected_query_attention_output_op._init_fn(
         query_input=qdata,
         query_input_scale=scale,
         query_weight_qdata=weight,
@@ -348,7 +348,7 @@ def _run_output_fusion(projected_query, operands, storage):
         query_norm_epsilon=1e-6,
         softmax_scale=128**-0.5,
         **arguments,
-    ).run()
+    )
 
 
 @pytest.mark.parametrize(

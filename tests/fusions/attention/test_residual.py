@@ -6,6 +6,7 @@ from piper_kernels.fusions.convrot_int8_piper import _compile as dense_compile
 from piper_kernels.fusions.convrot_int8_piper import output as dense
 from piper_kernels.fusions.convrot_int8_sparse_piper import _compile as sparse_compile
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as sparse
+from piper_kernels.fusions.nvfp4_sparse_piper import output as nvfp4_sparse
 
 _PAIRS = {
     "dense": (
@@ -17,6 +18,11 @@ _PAIRS = {
         sparse._projected_query_attention_output_op,
         sparse._projected_query_attention_residual_add_op,
         sparse_compile._HEAD_SLICING,
+    ),
+    "nvfp4_sparse": (
+        nvfp4_sparse._projected_query_attention_output_op,
+        nvfp4_sparse._projected_query_attention_residual_add_op,
+        None,
     ),
 }
 
@@ -37,5 +43,5 @@ def test_residual_add_takes_the_add_then_the_output_arguments(name):
         "gate_indices",
         "python_indexing",
         *output_names,
-        *(slicing.slice_position or ()),
+        *(slicing.slice_position if slicing is not None and slicing.slice_position else ()),
     ]

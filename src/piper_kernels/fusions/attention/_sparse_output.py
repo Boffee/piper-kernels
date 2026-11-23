@@ -1,4 +1,4 @@
-"""Sparse-attention adapters for the shared output pipeline."""
+"""Shared sparse-attention output pipeline adapters and Q/K/V storage helpers."""
 
 from __future__ import annotations
 
@@ -8,9 +8,18 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, TILE_ROWS
+from piper_kernels._residual import ResidualAdd
+from piper_kernels._residual import validate_residual_add as _validate_residual_add_operands
+from piper_kernels.attention.kernels.sparse_piper.layout import (
+    QUERY_SCALE_ROWS,
+    SUPPORTED_HEAD_DIMS,
+    TILE_ROWS,
+    ValueFormat,
+    padded_sequence_length,
+)
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._contracts import (
+    _MEAN_ROUTING,
     _SparsePiperRatioProfile,
     validate_output_dtype,
 )
@@ -32,6 +41,167 @@ type QueryChunkProjector = Callable[[int, int], tuple[torch.Tensor, torch.Tensor
 
 output_sequence_length = _quantized_dispatch._quantized_attention_output_sequence_length
 validate_output_metadata = _quantized_dispatch.validate_quantized_attention_output
+
+
+def has_optional_operands(
+    required: Sequence[object],
+    optional: Sequence[object],
+    message: str,
+) -> bool:
+    """Return whether an optional operand group is present, rejecting partial sets."""
+    if not any(value is not None for value in (*required, *optional)):
+        return False
+    if any(value is None for value in required):
+        raise ValueError(message)
+    return True
+
+
+def validate_residual_add(
+    base: torch.Tensor,
+    gate: torch.Tensor,
+    gate_indices: torch.Tensor,
+    python_indexing: bool,
+    key: torch.Tensor,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None,
+    output_features: int,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
+) -> ResidualAdd:
+    """Check from metadata that ``base`` has the projected output's rows and dtype."""
+    sequence_length = validate_output_metadata(
+        key,
+        logical_sequence_length,
+        block_lengths,
+        output_dtype=base.dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
+    )
+    if base.ndim != 3 or base.shape[:2] != (key.shape[0], sequence_length):
+        raise ValueError("sparse Piper residual base must have one row per output row")
+    if base.device != key.device:
+        raise ValueError("sparse Piper residual base must share the attention storage device")
+    residual_add = ResidualAdd(
+        base=base,
+        gate=gate,
+        gate_indices=gate_indices,
+        python_indexing=python_indexing,
+    )
+    _validate_residual_add_operands(base, residual_add, output_features)
+    return residual_add
+
+
+def fake_projected_output(
+    storage: torch.Tensor,
+    logical_sequence_length: int,
+    block_lengths: torch.Tensor | None,
+    output_features: int,
+    *,
+    output_dtype: torch.dtype,
+    force_tile_ids: torch.Tensor | None = None,
+    force_tile_counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Validate sparse attention-output metadata and allocate its fake output."""
+    sequence_length = validate_output_metadata(
+        storage,
+        logical_sequence_length,
+        block_lengths,
+        output_dtype=output_dtype,
+        force_tile_ids=force_tile_ids,
+        force_tile_counts=force_tile_counts,
+    )
+    return new_projected_output(
+        storage,
+        sequence_length,
+        output_features,
+        output_dtype=output_dtype,
+    )
+
+
+def validate_query_range(chunk_start: int, chunk_rows: int, sequence_length: int) -> None:
+    """Validate an aligned ``[chunk_start, chunk_start + chunk_rows)`` query window."""
+    if (
+        isinstance(chunk_start, bool)
+        or not isinstance(chunk_start, int)
+        or isinstance(chunk_rows, bool)
+        or not isinstance(chunk_rows, int)
+        or chunk_start < 0
+        or chunk_rows < 1
+        or chunk_start % TILE_ROWS
+        or chunk_start + chunk_rows > sequence_length
+    ):
+        raise ValueError("Q projection range must be a nonempty aligned sequence window")
+
+
+def allocate_query_storage(
+    template: torch.Tensor,
+    batch: int,
+    heads: int,
+    rows: int,
+    head_dim: int,
+    *,
+    summary_template: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate tile-padded Q storage, Q scales, and summary buffers."""
+    storage_sequence_length = padded_sequence_length(rows)
+    resolved_summary = template if summary_template is None else summary_template
+    return (
+        template.new_empty((batch, heads, storage_sequence_length, head_dim), dtype=torch.int8),
+        template.new_empty(
+            (batch, heads, storage_sequence_length // QUERY_SCALE_ROWS),
+            dtype=torch.float32,
+        ),
+        resolved_summary.new_empty(
+            (batch, heads, storage_sequence_length // TILE_ROWS, head_dim),
+            dtype=torch.float32,
+        ),
+    )
+
+
+def allocate_key_storage(
+    template: torch.Tensor,
+    batch: int,
+    heads: int,
+    rows: int,
+    head_dim: int,
+    routing_mode: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate tile-padded sparse-Piper key storage and per-tile metadata."""
+    storage_sequence_length = padded_sequence_length(rows)
+    storage_tiles = storage_sequence_length // TILE_ROWS
+    summary_shape = (batch, heads, storage_tiles, head_dim)
+    return (
+        template.new_empty((batch, heads, storage_sequence_length, head_dim), dtype=torch.int8),
+        template.new_empty((batch, heads, storage_tiles), dtype=torch.float32),
+        template.new_empty((batch, heads, storage_tiles, 2, head_dim), dtype=torch.int8),
+        template.new_empty((batch, heads, storage_tiles, 2), dtype=torch.float32),
+        template.new_empty(summary_shape, dtype=torch.float32),
+        template.new_empty(
+            (batch, heads, 0 if routing_mode == _MEAN_ROUTING else storage_tiles, head_dim),
+            dtype=torch.float32,
+        ),
+    )
+
+
+def allocate_value_storage(
+    template: torch.Tensor,
+    batch: int,
+    heads: int,
+    rows: int,
+    head_dim: int,
+    storage_format: ValueFormat = ValueFormat.TRANSPOSED,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate tile-padded sparse-Piper value storage and per-tile metadata."""
+    storage_sequence_length = padded_sequence_length(rows)
+    storage_tiles = storage_sequence_length // TILE_ROWS
+    return (
+        template.new_empty(
+            storage_format.shape(batch, heads, storage_sequence_length, head_dim),
+            dtype=torch.int8,
+        ),
+        template.new_empty((batch, heads, storage_tiles, 1), dtype=torch.float32),
+        template.new_empty((batch, heads, storage_tiles, head_dim), dtype=torch.bfloat16),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,6 +608,11 @@ def run_chunked_projected_query_attention_output(  # noqa: PLR0913
 
 __all__ = [
     "DEFAULT_QUERY_CHUNK_ROWS",
+    "allocate_key_storage",
+    "allocate_query_storage",
+    "allocate_value_storage",
+    "fake_projected_output",
+    "has_optional_operands",
     "launch_projected_query_chunk",
     "new_projected_output",
     "output_sequence_length",
@@ -448,4 +623,6 @@ __all__ = [
     "validate_attention_output",
     "validate_coarse_gate",
     "validate_output_metadata",
+    "validate_query_range",
+    "validate_residual_add",
 ]
