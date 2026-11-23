@@ -4,7 +4,31 @@ from typing import cast
 
 import torch
 
+from piper_kernels._input_activations import input_activation_width
 from piper_kernels.weights.nvfp4._layout import has_scale_padding, qdata_shape, scale_shape
+
+
+def prepared_input_metadata(
+    input: torch.Tensor,  # noqa: A002
+    activation_per_tensor_scale: torch.Tensor | None,
+    activation_fn: str | None,
+    *,
+    group_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Describe the packed data, block scales, and global scale after activation."""
+    features = input.shape[-1] // input_activation_width(activation_fn)
+    if group_size is not None and isinstance(features, int) and features % group_size:
+        raise ValueError(
+            f"ConvRot NVFP4 input features {features} must be divisible by group size {group_size}"
+        )
+    rows = input.numel() // input.shape[-1]
+    return (
+        input.new_empty(qdata_shape(rows, features), dtype=torch.uint8),
+        input.new_empty(scale_shape(rows, features), dtype=torch.float8_e4m3fn),
+        activation_per_tensor_scale.new_empty(())
+        if activation_per_tensor_scale is not None
+        else input.new_empty((), dtype=torch.float32),
+    )
 
 
 def prepare_activation_storage(

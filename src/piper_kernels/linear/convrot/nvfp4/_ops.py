@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels._input_activations import input_activation_width
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
+from piper_kernels.linear.nvfp4._storage import prepared_input_metadata
 from piper_kernels.weights.convrot._rotation import validate_group_size
-from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 from . import triton as convrot_nvfp4
 
@@ -160,25 +159,8 @@ def _prepare_input_fake(
     validate_group_size(group_size)
     if input.ndim == 0:
         raise ValueError("ConvRot NVFP4 input must be non-scalar")
-    input_features = input.shape[-1] // input_activation_width(activation_fn)
-    if isinstance(input_features, int) and input_features % group_size:
-        raise ValueError(
-            f"ConvRot NVFP4 input features {input_features} must be divisible "
-            f"by group size {group_size}"
-        )
-    rows = input.numel() // input.shape[-1]
-    per_tensor_scale = (
-        activation_per_tensor_scale.new_empty(())
-        if activation_per_tensor_scale is not None
-        else input.new_empty((), dtype=torch.float32)
-    )
-    return (
-        input.new_empty(nvfp4_layout.qdata_shape(rows, input_features), dtype=torch.uint8),
-        input.new_empty(
-            nvfp4_layout.scale_shape(rows, input_features),
-            dtype=torch.float8_e4m3fn,
-        ),
-        per_tensor_scale,
+    return prepared_input_metadata(
+        input, activation_per_tensor_scale, activation_fn, group_size=group_size
     )
 
 

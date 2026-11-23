@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import operator
 from dataclasses import dataclass
 
 import torch
 
-from piper_kernels import _input_activations as input_activations
 from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
-from piper_kernels.weights.nvfp4 import _layout
 
 from . import _validation
+from ._storage import prepared_input_metadata
 
 type PreparedInputNodes = tuple[
     torch.fx.Node,
@@ -289,34 +287,25 @@ def emit_prepared_input(
     dynamic_activation_scale: bool,
     activation_fn: str | None = None,
     high_first: bool = False,
+    *,
+    group_size: int | None = None,
 ) -> PreparedInputNodes:
-    """Emit shared NVFP4 activation preparation with complete fake metadata."""
+    """Emit ordinary or ConvRot NVFP4 preparation with metadata on each tuple output."""
     input_value = preparation_sharing.tensor_metadata(input_node)
     assert input_value is not None
-    rows = input_value.numel() // input_value.shape[-1]
-    features = input_value.shape[-1] // input_activations.input_activation_width(activation_fn)
-    values = (
-        input_value.new_empty(_layout.qdata_shape(rows, features), dtype=torch.uint8),
-        input_value.new_empty(_layout.scale_shape(rows, features), dtype=torch.float8_e4m3fn),
-        input_value.new_empty((), dtype=torch.float32),
+    args: tuple[object, ...] = (input_node, activation_per_tensor_scale, dynamic_activation_scale)
+    if group_size is None:
+        target = torch.ops.piper_kernels.nvfp4_prepare_input.default
+    else:
+        target = torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
+        args = (*args, group_size)
+    qdata, scale, global_scale = linear_fx.emit_tuple_result(
+        graph,
+        target,
+        (*args, activation_fn, high_first),
+        prepared_input_metadata(input_value, _metadata(activation_per_tensor_scale), activation_fn),
     )
-    prepared = graph.call_function(
-        torch.ops.piper_kernels.nvfp4_prepare_input.default,
-        args=(
-            input_node,
-            activation_per_tensor_scale,
-            dynamic_activation_scale,
-            activation_fn,
-            high_first,
-        ),
-    )
-    prepared.meta["val"] = values
-    outputs = []
-    for index, value in enumerate(values):
-        output = graph.call_function(operator.getitem, args=(prepared, index))
-        output.meta["val"] = value
-        outputs.append(output)
-    return *outputs, tuple(input_value.shape[:-1])
+    return qdata, scale, global_scale, tuple(input_value.shape[:-1])
 
 
 __all__ = [

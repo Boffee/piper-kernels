@@ -262,23 +262,14 @@ def _emit_prepared_storage(
         semantic.high_first,
     )
     if key not in preparations:
-        if projection.group_size is None:
-            preparations[key] = _compile_fx.emit_prepared_input(
-                graph,
-                semantic.input,
-                semantic.activation_per_tensor_scale,
-                semantic.dynamic_activation_scale,
-                high_first=semantic.high_first,
-            )
-        else:
-            from piper_kernels.linear.convrot.nvfp4 import (  # noqa: PLC0415
-                _compile_fx as convrot_nvfp4_compile_fx,
-            )
-
-            preparations[key] = convrot_nvfp4_compile_fx.emit_prepared_input(
-                graph,
-                convrot_nvfp4_compile_fx.SemanticLinearNodes(semantic, projection.group_size),
-            )
+        preparations[key] = _compile_fx.emit_prepared_input(
+            graph,
+            semantic.input,
+            semantic.activation_per_tensor_scale,
+            semantic.dynamic_activation_scale,
+            high_first=semantic.high_first,
+            group_size=projection.group_size,
+        )
     input_qdata, input_scale, input_per_tensor_scale, _ = preparations[key]
     return (
         input_qdata,
