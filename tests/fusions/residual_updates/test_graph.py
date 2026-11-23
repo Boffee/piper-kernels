@@ -4,8 +4,7 @@ import operator
 
 import torch
 
-from piper_kernels.fusions.residual_updates import _ops  # noqa: F401 - registers residual_add_
-from piper_kernels.fusions.residual_updates._graph import bind_arguments, call_functional
+from piper_kernels.fusions.residual_updates import _graph
 
 
 def test_bind_arguments_names_positional_and_keyword_values():
@@ -13,13 +12,13 @@ def test_bind_arguments_names_positional_and_keyword_values():
     left, right = graph.placeholder("left"), graph.placeholder("right")
     node = graph.call_function(torch.ops.aten.add.Tensor, (left, right), {"alpha": 2})
 
-    assert bind_arguments(node) == {"self": left, "other": right, "alpha": 2}
+    assert _graph.bind_arguments(node) == {"self": left, "other": right, "alpha": 2}
 
 
 def test_call_functional_returns_the_new_base_of_a_wrapped_mutation():
     graph = torch.fx.Graph()
     base, update = graph.placeholder("base"), graph.placeholder("update")
-    residual_add = torch.ops.piper_kernels.residual_add_.default
+    residual_add = _graph.RESIDUAL_ADD
     values = {
         "base": base,
         "update": update,
@@ -28,7 +27,7 @@ def test_call_functional_returns_the_new_base_of_a_wrapped_mutation():
         "python_indexing": True,
     }
 
-    added = call_functional(graph, residual_add, values)
+    added = _graph.call_functional(graph, residual_add, values)
 
     (call,) = added.all_input_nodes
     assert added.target is operator.getitem

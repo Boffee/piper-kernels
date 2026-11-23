@@ -72,7 +72,6 @@ _ops = torch.ops.piper_kernels
 _c10d = torch.ops._c10d_functional
 _aten = torch.ops.aten
 _AUTO_FUNCTIONALIZED = torch.ops.higher_order.auto_functionalized
-_RESIDUAL_ADD = _ops.residual_add_.default
 _DENSE_RS_RESIDUAL_ADD = (
     _ops.convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default
 )
@@ -174,6 +173,12 @@ def _add_sequence_reduce_scatter(
     wait = graph.call_function(_c10d.wait_tensor.default, args=(rs,))
     wait.meta["val"] = local_val
     return wait
+
+
+def _residual_add_op() -> torch._ops.OpOverload:
+    from piper_kernels.fusions.residual_updates._graph import RESIDUAL_ADD  # noqa: PLC0415
+
+    return RESIDUAL_ADD
 
 
 @pytest.fixture
@@ -1535,7 +1540,7 @@ def test_fold_distributed_attention_output_fx(
             base.meta["val"] = base_val
             call = graph.call_function(
                 _AUTO_FUNCTIONALIZED,
-                args=(_RESIDUAL_ADD,),
+                args=(_residual_add_op(),),
                 kwargs={
                     "base": base,
                     "update": wait_node,
@@ -1728,7 +1733,7 @@ def test_fold_dense_distributed_attention_output_fx(
             base.meta["val"] = base_val
             call = graph.call_function(
                 _AUTO_FUNCTIONALIZED,
-                args=(_RESIDUAL_ADD,),
+                args=(_residual_add_op(),),
                 kwargs={
                     "base": base,
                     "update": wait_node,
@@ -1799,7 +1804,7 @@ def test_fold_dense_distributed_attention_output_fx_negative(fake_triton_device:
         base.meta["val"] = torch.empty((1, 128, 128), device=_DEVICE, dtype=torch.float16)
         call = g_dtype.call_function(
             _AUTO_FUNCTIONALIZED,
-            args=(_RESIDUAL_ADD,),
+            args=(_residual_add_op(),),
             kwargs={
                 "base": base,
                 "update": wait_mismatch,
