@@ -58,12 +58,22 @@ def _same_shape_view_dispatch(
     tensor = cast(TorchAOBaseTensor, args[0])
     size = args[1].shape if func is torch.ops.aten.view_as.default else args[1]
     shape = infer_size(size, tensor.numel())
-    if shape != tuple(tensor.shape):
-        raise NotImplementedError(
-            f"{type(tensor).__name__} only supports same-shape views; "
-            f"cannot view {tuple(tensor.shape)} as {shape}"
-        )
-    return _alias(func, args, kwargs)
+    if shape == tuple(tensor.shape):
+        return _alias(func, args, kwargs)
+    if len(shape) == 1:
+        weight = cast("QuantizedWeight", tensor)
+        if weight.ndim != 2:
+            raise NotImplementedError(
+                f"{type(weight).__name__} 1-D flat view requires a 2-D weight"
+            )
+        require_untransposed(weight, "1-D flat view")
+        from piper_kernels.weights._fsdp import _FlatQuantizedWeightView  # noqa: PLC0415
+
+        return _FlatQuantizedWeightView(weight)
+    raise NotImplementedError(
+        f"{type(tensor).__name__} only supports same-shape views; "
+        f"cannot view {tuple(tensor.shape)} as {shape}"
+    )
 
 
 def _as_strided_dispatch(
@@ -131,6 +141,32 @@ def _clone_dispatch(
     return weight._apply_fn_to_data(lambda value: func(value, **kwargs))
 
 
+def _full_extent_slice_dispatch(
+    func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> torch.Tensor:
+    """Allow full-extent dim-0 aliases used by FSDP2 while rejecting partial slices."""
+    weight = cast("QuantizedWeight", args[0])
+    dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
+    start = args[2] if len(args) > 2 else kwargs.get("start")
+    end = args[3] if len(args) > 3 else kwargs.get("end")
+    step = args[4] if len(args) > 4 else kwargs.get("step", 1)
+    if (
+        weight.ndim == 2
+        and not weight.transposed
+        and type(dim) is int
+        and dim in (0, -2)
+        and (start is None or (type(start) is int and start == 0))
+        and (end is None or (type(end) is int and end >= weight.shape[0]))
+        and type(step) is int
+        and step == 1
+    ):
+        return _alias(func, args, kwargs)
+    raise NotImplementedError(f"Piper quantized weights do not support {func}")
+
+
 def register_view_ops(cls: type[TorchAOBaseTensor]) -> None:
     """Preserve wrappers through views and reject unsupported layout changes."""
     aten = torch.ops.aten
@@ -141,9 +177,10 @@ def register_view_ops(cls: type[TorchAOBaseTensor]) -> None:
     cls.implements(aten.contiguous.default)(_contiguous_dispatch)
     cls.implements_torch_function(torch.Tensor.contiguous)(_contiguous_dispatch)
     # TorchAO's inherited slicing handlers construct a base NVFP4Tensor, losing
-    # interpretation metadata. Use shard_quantized_weight for owning partitions:
-    # repacked scales cannot promise the aliasing semantics of these views.
-    cls.implements([aten.slice.Tensor, aten.select.int])(unsupported_operation_dispatch)
+    # interpretation metadata. Only full-extent dim-0 aliases (for FSDP2) are
+    # permitted here; use shard_quantized_weight for owning partitions.
+    cls.implements(aten.slice.Tensor)(_full_extent_slice_dispatch)
+    cls.implements(aten.select.int)(unsupported_operation_dispatch)
 
 
 __all__ = ["register_view_ops", "require_untransposed"]

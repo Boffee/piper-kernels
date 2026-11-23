@@ -368,10 +368,33 @@ for alignment and fallback details. For other fused sharded blocks, keep full he
 FFN intermediate shards local, unwrap activations around fusions, keep collectives
 outside, and compare against the local **fused** output.
 
+Contiguous untransposed 2-D `ConvRotInt8Tensor`, `PiperNVFP4Tensor`, and
+`ConvRotNVFP4Tensor` weights also work with PyTorch FSDP2 (`torch.distributed.fsdp.fully_shard`)
+using even `dim=0` sharding (`out_features % shard_world_size == 0`), including
+`set_modules_to_forward_prefetch`, `reshard_after_forward`, `MixedPrecisionPolicy`
+(updating the logical floating dtype without requantizing), `CPUOffloadPolicy` (including
+`pin_memory=True`), 2-D FSDP + TP, and `compile_options(...)`. All-gather payloads stay
+zero-copy for ConvRot INT8, unswizzled NVFP4, and 128-row-aligned swizzled NVFP4
+(`local_rows % 128 == 0`); when swizzled `local_rows % 128 != 0`, FSDP2 hooks
+unswizzle block scales for the collective and reswizzle into FSDP-managed scale storage.
+For `device="meta"` initialization, install `device="meta"` quantized weight wrappers
+**before** calling `fully_shard(...)` (FSDP2 detects `fsdp_pre_all_gather` during module
+wrapping), then load local shards with `shard_quantized_weight(..., dim=0)`,
+`DTensor.from_local(..., [Shard(0)])`, and `load_state_dict(..., assign=True)`. Under
+`torch.compile(..., options=compile_options(ffn=True, residual_updates=True))`,
+`fully_shard` places a graph boundary around its unshard/reshard hooks; wrap the
+residual-updating FFN submodule with `fully_shard` (and commit attention's in-place
+residual before entering it in hybrid TP+SP Attention + FSDP2 FFN blocks) so both
+attention and FFN residual updates fold without recompiles.
+
 ## Storage and checkpoint compatibility
 
 Same-shape `view`/`view_as`, transposes, and matching `as_strided` views share
-storage; other shape/layout ops are unsupported. Transposed weights only support
+storage, and FSDP2 setup also uses an opaque 1-D flat view handle (`view(-1)` or
+`view_as` to 1-D on untransposed 2-D weights, rejecting compute ops), full-extent
+`dim=0` `narrow`/`slice` aliases, even `dim=0` `split`, `new_zeros`, same-layout
+`copy_`, and `is_pinned`/`pin_memory`; partial slices and other shape/layout ops
+remain unsupported. Transposed weights only support
 activation GEMMs (no `.contiguous()`, in-place updates, or `F.linear` reuse).
 DTensor `mm`/`addmm` supports linear `alpha=beta=1` with vector bias.
 

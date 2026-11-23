@@ -11,6 +11,7 @@ from torchao.utils import TorchAOBaseTensor, _dispatch__torch_dispatch__
 
 if TYPE_CHECKING:
     from torch._ops import OpOverload
+    from torch.distributed.device_mesh import DeviceMesh
 
     from .convrot.int8.tensor import ConvRotInt8Tensor
     from .nvfp4.tensor import PiperNVFP4Tensor
@@ -311,9 +312,38 @@ class QuantizedWeightMixin:
             ),
         )
 
+    def fsdp_pre_all_gather(
+        self,
+        mesh: DeviceMesh,
+    ) -> tuple[tuple[torch.Tensor, ...], object]:
+        """Expose sharded storage tensors and metadata for PyTorch FSDP2."""
+        from piper_kernels.weights._fsdp import fsdp_pre_all_gather  # noqa: PLC0415
+
+        return fsdp_pre_all_gather(cast("QuantizedWeight", self), mesh)
+
+    def fsdp_post_all_gather(
+        self,
+        all_gather_outputs: tuple[torch.Tensor, ...],
+        metadata: object,
+        param_dtype: torch.dtype,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]] | None:
+        """Reconstruct or refresh an unsharded weight from FSDP2 all-gather outputs."""
+        from piper_kernels.weights._fsdp import fsdp_post_all_gather  # noqa: PLC0415
+
+        return fsdp_post_all_gather(
+            cast("QuantizedWeight", self),
+            all_gather_outputs,
+            metadata,
+            param_dtype,
+            out=out,
+        )
+
 
 def register_quantized_weight_ops(cls: type[TorchAOBaseTensor]) -> None:
     """Register all standard dispatch handlers for a concrete quantized weight subclass."""
+    from piper_kernels.weights._fsdp import register_fsdp_ops  # noqa: PLC0415
     from piper_kernels.weights._matmul import register_matrix_ops  # noqa: PLC0415
     from piper_kernels.weights._update import register_update_ops  # noqa: PLC0415
     from piper_kernels.weights._views import register_view_ops  # noqa: PLC0415
@@ -322,6 +352,7 @@ def register_quantized_weight_ops(cls: type[TorchAOBaseTensor]) -> None:
     update_format_name = cast(Any, cls)._update_format_name
     register_inference_mode_dispatch(cls)
     register_view_ops(cls)
+    register_fsdp_ops(cls)
     register_matrix_ops(cls)
     register_conversion_ops(cls, format_name=format_name)
     register_update_ops(cls, format_name=update_format_name)
