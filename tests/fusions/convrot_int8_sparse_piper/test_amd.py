@@ -7,7 +7,12 @@ import pytest
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+from piper_kernels.attention.kernels.sparse_piper.layout import (
+    QUERY_SCALE_ROWS,
+    TILE_ROWS,
+    ValueFormat,
+    padded_sequence_length,
+)
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._amd import gluon as amd_attention
 from piper_kernels.attention.sparse_piper_attention._contracts import (
@@ -19,11 +24,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import _backend, key, outpu
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as shared_triton
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
-from piper_kernels.fusions.convrot_int8_sparse_piper._layout import (
-    QUERY_SCALE_ROWS,
-    TILE_ROWS,
-    padded_sequence_length,
-)
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 
 from ._reference import (

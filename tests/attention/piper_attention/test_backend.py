@@ -5,6 +5,7 @@ import sys
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes, forbid_triton_driver
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import piper_attention
@@ -43,14 +44,10 @@ def test_missing_implementation_retains_fallback(monkeypatch):
 
 def test_fake_execution_does_not_select_or_launch_backend(monkeypatch):
     assert piper_attention is not None
-
-    def forbidden(*args):
-        pytest.fail("fake execution must not inspect hardware or launch kernels")
-
-    monkeypatch.setattr(_backend, "select_backend", forbidden)
-    with FakeTensorMode():
-        query = torch.empty(2, 193, 6, 128, dtype=torch.bfloat16).transpose(1, 2)
-        key = torch.empty(2, 2, 257, 128, dtype=query.dtype)
+    forbid_device_probes(monkeypatch, "fake execution must not inspect hardware")
+    with forbid_triton_driver("fake execution must not launch kernels"), FakeTensorMode():
+        query = torch.empty(2, 193, 6, 128, device="cuda:0", dtype=torch.bfloat16).transpose(1, 2)
+        key = torch.empty(2, 2, 257, 128, device="cuda:0", dtype=query.dtype)
         output = torch.ops.piper_kernels.piper_attention.default(query, key, key, 128**-0.5, False)
         assert output.shape == query.shape
         assert output.dtype == query.dtype

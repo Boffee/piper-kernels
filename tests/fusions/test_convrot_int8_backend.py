@@ -1,10 +1,12 @@
 """Shared fusion orchestration needs operations, not vendor launch plans."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes, mock_cuda_target, mock_rocm_target
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels._input_activations import apply_input_activation
@@ -131,13 +133,11 @@ def test_ffn_uses_fused_swiglu_operation_and_halves_projection_workspace(operati
 def test_ffn_rejects_missing_backend_before_allocating_workspace(monkeypatch):
     value = torch.ones(5, 16)
     gate, up, down = _weight(32, 16), _weight(32, 16), _weight(20, 32)
-    select = Mock(return_value=None)
-    monkeypatch.setattr(_backend, "select_linear_backend", select)
+    forbid_device_probes(monkeypatch, "CPU FFN probed GPU hardware")
     allocate = Mock(side_effect=AssertionError("workspace allocated without a backend"))
     monkeypatch.setattr(torch, "empty", allocate)
     with pytest.raises(ValueError, match="optimized linear is unavailable"):
         ffn.convrot_int8_ffn_op(value, *up, 16, *down, 16, "swiglu", 4, *gate, 16)
-    select.assert_called_once_with(value)
     allocate.assert_not_called()
 
 
@@ -204,31 +204,46 @@ def _semantic_ffn_graph(device, output_features=20):
     return torch.fx.GraphModule(torch.nn.Module(), graph), value.meta["val"]
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda", "xpu"])
-@pytest.mark.parametrize("supported", [False, True])
-def test_ffn_compiler_uses_backend_support_not_device_family(monkeypatch, device, supported):
-    select = Mock(return_value=object() if supported else None)
-    monkeypatch.setattr(_backend, "select_linear_backend", select)
-    monkeypatch.setattr(
-        torch.cuda, "get_device_capability", Mock(side_effect=AssertionError("device probe"))
-    )
+@pytest.mark.parametrize(
+    ("device", "architecture", "supported"),
+    [
+        ("cuda:0", "sm120", True),
+        ("cuda:0", "gfx1201", True),
+        ("cuda:0", "sm90", True),
+        ("cuda:0", "sm70", False),
+        ("cpu", None, False),
+        ("xpu", None, False),
+    ],
+)
+def test_ffn_compiler_uses_backend_support_not_device_family(
+    monkeypatch, device, architecture, supported
+):
+    if architecture == "sm120":
+        mock_cuda_target(monkeypatch, (12, 0))
+    elif architecture == "gfx1201":
+        mock_rocm_target(monkeypatch, "gfx1201")
+        monkeypatch.setattr(sys, "platform", "linux")
+    elif architecture == "sm90":
+        mock_cuda_target(monkeypatch, (9, 0))
+    elif architecture == "sm70":
+        mock_cuda_target(monkeypatch, (7, 0))
+    else:
+        forbid_device_probes(monkeypatch, "device probe")
     with FakeTensorMode():
-        module, value = _semantic_ffn_graph(device)
+        module, _value = _semantic_ffn_graph(device)
         ffn_compile.fold_ffns(module.graph)
     targets = [node.target for node in module.graph.nodes]
     assert (torch.ops.piper_kernels.convrot_int8_ffn.default in targets) is supported
     assert targets.count(torch.ops.piper_kernels.convrot_int8_linear.default) == (
         0 if supported else 3
     )
-    assert select.called
-    assert all(call.args[0] is value for call in select.call_args_list)
 
 
 @pytest.mark.parametrize("argument_count", [5, 6, 7])
 def test_ffn_compiler_preserves_unfused_consumers(monkeypatch, argument_count):
-    monkeypatch.setattr(_backend, "select_linear_backend", Mock(return_value=object()))
+    mock_cuda_target(monkeypatch, (12, 0))
     with FakeTensorMode():
-        module, _value = _semantic_ffn_graph("cpu", output_features=32)
+        module, _value = _semantic_ffn_graph("cuda:0", output_features=32)
         graph = module.graph
         output = next(node for node in graph.nodes if node.op == "output")
         down = output.args[0]
@@ -247,20 +262,29 @@ def test_ffn_compiler_preserves_unfused_consumers(monkeypatch, argument_count):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_sparse_output_uses_operations_and_preserves_output_views(monkeypatch, operations, dtype):
+def test_sparse_output_uses_operations_and_preserves_output_views(operations, dtype):
     backend, select = operations
-    value = torch.linspace(-1, 1, 2 * 5 * 128).reshape(2, 5, 128).to(dtype)
-    storage = torch.empty(2, 1, 5, 128, dtype=torch.int8)
+    sequence = 65
+    value = torch.linspace(-1, 1, 2 * sequence * 128).reshape(2, sequence, 128).to(dtype)
+    storage = torch.empty(2, 1, 128, 128, dtype=torch.int8)
     weight, scale, bias = _weight(7, 128)
-    monkeypatch.setattr(sparse_output, "_validate_output_projection", Mock(return_value=(128, 7)))
     width, project, prepared = sparse_output._prepare_output_chunk_projector(
-        storage, 5, weight, scale, bias, 16, 5, 3, backend=backend, output_dtype=dtype
+        storage,
+        sequence,
+        weight,
+        scale,
+        bias,
+        16,
+        sequence,
+        64,
+        backend=backend,
+        output_dtype=dtype,
     )
     assert width == 7
-    backing = torch.full((2, 5, 9), -999, dtype=dtype)
+    backing = torch.full((2, sequence, 9), -999, dtype=dtype)
     output = backing[..., 1:-1]
-    chunk = torch.empty(2, 3, 1, 128, dtype=dtype)
-    for start, rows in ((0, 3), (3, 2)):
+    chunk = torch.empty(2, 64, 1, 128, dtype=dtype)
+    for start, rows in ((0, 64), (64, 1)):
         chunk[:, :rows, 0].copy_(value[:, start : start + rows])
         project(chunk, output, start, rows)
     expected = reference.linear(value, weight, scale, 16, bias)

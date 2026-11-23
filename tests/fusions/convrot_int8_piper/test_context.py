@@ -15,7 +15,7 @@ from piper_kernels.attention.piper_attention import _quantization as piper_quant
 from piper_kernels.attention.piper_attention import _quantized_dispatch as dispatch
 from piper_kernels.attention.piper_attention._nvidia import policy
 from piper_kernels.attention.piper_attention._nvidia import triton as nvidia
-from piper_kernels.fusions.convrot_int8_piper import _backend, key, value
+from piper_kernels.fusions.convrot_int8_piper import key, value
 from piper_kernels.linear.convrot.int8 import _ops as linear_ops
 
 from .test_query import _NATIVE, _operands
@@ -228,10 +228,6 @@ def test_padded_quantized_boundary_matches_native_dense(head_dim, causal, dtype,
 
 @pytest.mark.parametrize("batch", [0, 2])
 def test_context_fake_paths_do_not_probe_hardware(monkeypatch, batch):
-    def forbidden(*args, **kwargs):
-        raise AssertionError("fake execution must not probe hardware")
-
-    monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
     forbid_device_probes(monkeypatch, "fake execution must not probe hardware")
     with FakeTensorMode():
         operands = list(_operands("cuda:0"))

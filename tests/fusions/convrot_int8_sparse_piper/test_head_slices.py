@@ -4,13 +4,14 @@ import re
 
 import pytest
 import torch
+from _accelerators import rdna4_available
 from _compile_capture import FunctionalTargetCapturePass
 from torch._dynamo.utils import ReinplaceCounters
 from torch._inductor.utils import run_and_get_code
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import SparsePiperAttention, compile_options
-from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.fusions.convrot_int8_sparse_piper import key, value
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 
@@ -198,7 +199,7 @@ def test_head_slices_add_what_one_add_does():
     output_scale = torch.rand((_WIDTH, 1), device="cuda").mul_(0.01).add_(0.001)
     gate = torch.ones((1, _WIDTH), device="cuda", dtype=torch.bfloat16)
     gate_indices = torch.zeros(_SEQUENCE, device="cuda", dtype=torch.int64)
-    value_format = int(require_attention_backend(operands.input_qdata).value_format)
+    value_format = int(ValueFormat.AMD_WMMA if rdna4_available() else ValueFormat.TRANSPOSED)
     attention = SparsePiperAttention(_RATIOS)
 
     def add(base: torch.Tensor, rows: slice, **position: int) -> None:

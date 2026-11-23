@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-import piper_kernels.attention.sparse_piper_attention._routing as routing_module
 from piper_kernels import (
     coarse_attention_residual,
     mean_pool_block_values,
@@ -236,11 +235,10 @@ def test_padded_summaries_and_routes_ignore_every_invalid_block_tail() -> None:
         assert torch.equal(routes.indices, expected_routes.indices)
 
 
-def test_sparse_piper_coarse_residual_matches_padded_minmax_composition(monkeypatch) -> None:
-    monkeypatch.setattr(routing_module, "_QUERY_CHUNK_BLOCKS", 2)
+def test_sparse_piper_coarse_residual_matches_padded_minmax_composition() -> None:
     generator = torch.Generator().manual_seed(642)
-    block_lengths = torch.tensor([64, 17, 51], dtype=torch.int32)
-    shape = (1, 3 * 64, 2, 8)
+    block_lengths = torch.tensor([64, 17, 51] + [64] * 381 + [37], dtype=torch.int32)
+    shape = (1, 385 * 64, 2, 8)
     query, key, value, coarse_gate = [torch.randn(shape, generator=generator) for _ in range(4)]
     coarse_key_blocks = 3
     coarse_scale = shape[-1] ** -0.5

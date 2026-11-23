@@ -2,7 +2,9 @@
 
 import pytest
 import torch
+from _accelerators import forbid_device_probes, forbid_triton_driver
 from _compile_capture import TargetCapturePass
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import compile_options
 from piper_kernels._input_activations import apply_input_activation
@@ -155,39 +157,41 @@ def test_compiled_preparation_sharing_resolves_backend_at_execution(monkeypatch)
 
 @pytest.mark.parametrize("static", [False, True])
 def test_fake_schemas_need_no_implementation(monkeypatch, static):
-    def unexpected_selection(value):
-        raise AssertionError("fake propagation selected an implementation")
+    forbid_device_probes(monkeypatch, "fake propagation inspected hardware")
 
-    monkeypatch.setattr(_backend, "select_linear_backend", unexpected_selection)
-    monkeypatch.setattr(_backend, "select_preparation_backend", unexpected_selection)
-    monkeypatch.setattr(_update, "_use_triton", unexpected_selection)
-    value = torch.empty(2, 3, 64, device="meta", dtype=torch.bfloat16)
-    weight = torch.empty(7, 32, device="meta", dtype=torch.int8)
-    scale = torch.empty(7, 1, device="meta")
+    def check(device: str) -> None:
+        value = torch.empty(2, 3, 64, device=device, dtype=torch.bfloat16)
+        weight = torch.empty(7, 32, device=device, dtype=torch.int8)
+        scale = torch.empty(7, 1, device=device)
 
-    input_scale = torch.empty((), device="meta") if static else None
-    result = _ops.linear(value, weight, scale, None, 16, "swiglu", input_scale)
-    qdata, row_scale = _ops.prepare_input(value, 16, "swiglu", input_scale)
-    projected = _ops.linear_prepared(qdata, row_scale, weight, scale, None, value.dtype)
-    int8_update_ops.add_(
-        weight, scale, torch.empty_like(weight, dtype=value.dtype), 16, 1.0, beta=0.25
-    )
-    int8_update_ops.addmm_(
-        weight,
-        scale,
-        torch.empty(7, 2, device="meta"),
-        torch.empty(2, 32, device="meta"),
-        16,
-        1.0,
-        1.0,
-    )
+        input_scale = torch.empty((), device=device) if static else None
+        result = _ops.linear(value, weight, scale, None, 16, "swiglu", input_scale)
+        qdata, row_scale = _ops.prepare_input(value, 16, "swiglu", input_scale)
+        projected = _ops.linear_prepared(qdata, row_scale, weight, scale, None, value.dtype)
+        int8_update_ops.add_(
+            weight, scale, torch.empty_like(weight, dtype=value.dtype), 16, 1.0, beta=0.25
+        )
+        int8_update_ops.addmm_(
+            weight,
+            scale,
+            torch.empty(7, 2, device=device),
+            torch.empty(2, 32, device=device),
+            16,
+            1.0,
+            1.0,
+        )
 
-    assert result.shape == projected.shape == (2, 3, 7)
-    assert result.dtype == projected.dtype == torch.bfloat16
-    assert qdata.shape == (2, 3, 32)
-    assert qdata.dtype == torch.int8
-    assert row_scale.shape == (2, 3)
-    assert row_scale.dtype == torch.float32
+        assert result.shape == projected.shape == (2, 3, 7)
+        assert result.dtype == projected.dtype == torch.bfloat16
+        assert qdata.shape == (2, 3, 32)
+        assert qdata.dtype == torch.int8
+        assert row_scale.shape == (2, 3)
+        assert row_scale.dtype == torch.float32
+
+    with forbid_triton_driver("fake propagation accessed Triton"):
+        check("meta")
+        with FakeTensorMode():
+            check("cuda:0")
 
 
 @pytest.mark.parametrize("operation", ["add", "addmm"])
@@ -212,8 +216,7 @@ def test_linear_only_implementation_preserves_weight_update_fallback(monkeypatch
     assert implementation.calls == []
 
 
-def test_explicit_optimized_ops_fail_if_no_implementation_exists(monkeypatch):
-    monkeypatch.setattr(_backend, "select_linear_backend", lambda value: None)
+def test_explicit_optimized_ops_fail_if_no_implementation_exists():
     value, weight, scale, bias = _operands()
     with pytest.raises(ValueError, match="optimized linear is unavailable"):
         _ops.linear(value, weight, scale, bias, 16)

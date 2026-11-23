@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -49,14 +50,9 @@ from piper_kernels.attention.piper_attention import _quantized_dispatch as dense
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_piper import _backend as dense_fusion_backend
-from piper_kernels.fusions.convrot_int8_piper import _compile as dense_compile
 from piper_kernels.fusions.convrot_int8_piper import distributed_output as dense_distributed_output
-from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import NvidiaExecutionPlan
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend as fusion_backend,
-)
-from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    _distributed_compile as sparse_dist_compile,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     distributed_output,
@@ -69,8 +65,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import (
     value as value_ops,
 )
 from piper_kernels.linear.convrot.int8 import _backend as convrot_linear_backend
-from piper_kernels.linear.convrot.int8 import _distributed_compile as linear_dist_compile
-from piper_kernels.linear.convrot.int8 import _ops as convrot_int8_ops
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.sharding import shard_quantized_weight
 
@@ -187,6 +181,24 @@ def fake_triton_device(monkeypatch: pytest.MonkeyPatch) -> None:
     mock_triton_driver(monkeypatch, backend="cuda", arch=120)
 
 
+def _run_post_grad_pass(
+    graph: torch.fx.Graph,
+    *,
+    linear: bool = False,
+    attention: bool = False,
+    attention_output: bool = False,
+) -> None:
+    passes = compile_options(
+        linear=linear,
+        ffn=False,
+        attention=attention,
+        attention_output=attention_output,
+    )["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=True)
+
+
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_fold_quantized_all_gather_fx_shapes_and_symint(
@@ -246,7 +258,7 @@ def test_fold_quantized_all_gather_fx_shapes_and_symint(
         s_item.meta["val"] = s_full_val
         graph.output((q_item, s_item, sym_seq))
 
-        assert linear_dist_compile.fold_quantized_all_gather(graph)
+        _run_post_grad_pass(graph, linear=True)
         graph.lint()
         targets = [n.target for n in graph.nodes if n.op == "call_function"]
         assert _c10d.all_gather_into_tensor.default not in targets
@@ -263,7 +275,9 @@ def test_fold_quantized_all_gather_fx_noop_and_shared(fake_triton_device: None) 
         x = g_noop.placeholder("x")
         x.meta["val"] = torch.empty((1, 64, 128), device=_DEVICE, dtype=torch.bfloat16)
         g_noop.output(x)
-        assert not linear_dist_compile.fold_quantized_all_gather(g_noop)
+        _run_post_grad_pass(g_noop, linear=True)
+        assert not distributed_fx.has_c10d_collectives(g_noop)
+        assert [n.target for n in g_noop.nodes if n.op == "call_function"] == []
 
         # Shared gathered BF16 consumer prevents rewrite.
         g_shared = torch.fx.Graph()
@@ -282,7 +296,10 @@ def test_fold_quantized_all_gather_fx_noop_and_shared(fake_triton_device: None) 
         q_item = g_shared.call_function(operator.getitem, args=(prep, 0))
         extra = g_shared.call_function(_aten.neg.default, args=(ag_out,))
         g_shared.output((q_item, extra))
-        assert not linear_dist_compile.fold_quantized_all_gather(g_shared)
+        _run_post_grad_pass(g_shared, linear=True)
+        assert _c10d.all_gather_into_tensor.default in [
+            n.target for n in g_shared.nodes if n.op == "call_function"
+        ]
 
 
 def test_rewrite_sym_size_users_negative_dims_and_static_int(fake_triton_device: None) -> None:
@@ -358,29 +375,18 @@ def test_peer_exchange_world_size_3_keeps_zero_buffer_alive(
         return _FakeWork(sources[1])
 
     monkeypatch.setattr(dist, "reduce_scatter", fake_reduce_scatter)
-    monkeypatch.setattr(
-        _quantized_dispatch,
-        "_prepare_quantized_sparse_piper_query",
-        lambda *_args, **_kwargs: (None, None),
-    )
-    monkeypatch.setattr(
-        _quantized_dispatch,
-        "_launch_quantized_sparse_piper_attention",
-        lambda *_args, **_kwargs: None,
-    )
 
     output = torch.empty((1, 64, 128), dtype=torch.bfloat16)
     fake_pg = _FakeGroup()
-    work, offset, rows, _recv, keepalive = distributed_output._run_peer_attention_exchange(
+    work, offset, rows, _recv, keepalive = peer_exchange.run_peer_attention_exchange(
         fake_pg,  # type: ignore[arg-type]
-        SimpleNamespace(quantized_context=None, coarse_gate=None),  # type: ignore[arg-type]
-        (1, 1, 128),
         output,
-        64,
-        lambda _s, _r: (output, output, output),
-        None,
-        lambda *_args: None,
-        lambda _a, buf, _s, _r: buf.zero_(),
+        heads=1,
+        head_dim=128,
+        comm_chunk_rows=64,
+        run_attention=lambda *_args: None,
+        peer_projector=lambda _a, buf, _s, _r: buf.zero_(),
+        apply_received=lambda *_args: None,
         reuse_direct_receive=True,
     )
     gc.collect()
@@ -552,32 +558,21 @@ def test_peer_exchange_multi_chunk_ping_pong(
         return work
 
     monkeypatch.setattr(dist, "all_gather" if world_size == 2 else "reduce_scatter", fake_exchange)
-    monkeypatch.setattr(
-        _quantized_dispatch,
-        "_prepare_quantized_sparse_piper_query",
-        lambda *_args, **_kwargs: (None, None),
-    )
-    monkeypatch.setattr(
-        _quantized_dispatch,
-        "_launch_quantized_sparse_piper_attention",
-        lambda *_args, **_kwargs: None,
-    )
 
     output = torch.empty((1, 192, 128), dtype=torch.bfloat16)
 
     def record_apply(_tensor: torch.Tensor, off: int, cnt: int) -> None:
         events.append(("apply", off, cnt))
 
-    work, offset, rows, recv, keepalive = distributed_output._run_peer_attention_exchange(
+    work, offset, rows, recv, keepalive = peer_exchange.run_peer_attention_exchange(
         fake_pg,  # type: ignore[arg-type]
-        SimpleNamespace(quantized_context=None, coarse_gate=None),  # type: ignore[arg-type]
-        (1, 1, 128),
         output,
-        64,
-        lambda _s, _r: (output, output, output),
-        None,
-        record_apply,
-        lambda _a, buf, _s, _r: buf.zero_(),
+        heads=1,
+        head_dim=128,
+        comm_chunk_rows=64,
+        run_attention=lambda *_args: None,
+        peer_projector=lambda _a, buf, _s, _r: buf.zero_(),
+        apply_received=record_apply,
         reuse_direct_receive=reuse_direct_receive,
     )
     gc.collect()
@@ -609,26 +604,22 @@ def test_peer_exchange_multi_chunk_ping_pong(
     issued.clear()
     calls = 0
 
-    def fail_on_second_chunk(
-        _start: int, _rows: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def fail_on_second_chunk(_start: int, _rows: int, _attention_chunk: torch.Tensor) -> None:
         nonlocal calls
         calls += 1
         if calls > world_size - 1:
             raise RuntimeError("injected chunk failure")
-        return output, output, output
 
     with pytest.raises(RuntimeError, match="injected chunk failure"):
-        distributed_output._run_peer_attention_exchange(
+        peer_exchange.run_peer_attention_exchange(
             fake_pg,  # type: ignore[arg-type]
-            SimpleNamespace(quantized_context=None, coarse_gate=None),  # type: ignore[arg-type]
-            (1, 1, 128),
             output,
-            64,
-            fail_on_second_chunk,
-            None,
-            lambda *_args: None,
-            lambda _a, buf, _s, _r: buf.zero_(),
+            heads=1,
+            head_dim=128,
+            comm_chunk_rows=64,
+            run_attention=fail_on_second_chunk,
+            peer_projector=lambda _a, buf, _s, _r: buf.zero_(),
+            apply_received=lambda *_args: None,
             reuse_direct_receive=reuse_direct_receive,
         )
     assert len(issued) == 1
@@ -1163,14 +1154,19 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     k_out = key_ops.allocate_key_output(qdata, 1, 2, 128, 128, 0)
     v_out = value_ops.allocate_value_output(qdata, 1, 2, 128, 128, ValueFormat.TRANSPOSED)
 
-    gluon_plan = NvidiaExecutionPlan(
-        block_k=64, heads_per_program=1, num_warps=4, num_stages=3, block_m=128, kernel="gluon_tma"
+    sm120 = AcceleratorTarget("cuda", "sm120")
+    sm89 = AcceleratorTarget("cuda", "sm89")
+    orig_default_plan = nvidia_dispatch.default_execution_plan
+    sm120_key_plan = orig_default_plan(
+        qdata, weight, operation="key", head_dim=128, rotary_dim=64, target=sm120
     )
-    triton_plan = NvidiaExecutionPlan(
-        block_k=64, heads_per_program=1, num_warps=4, num_stages=2, block_m=64, kernel="triton"
+    sm120_value_plan = orig_default_plan(
+        qdata, weight, operation="value", head_dim=128, target=sm120
     )
-    monkeypatch.setattr(nvidia_dispatch, "default_execution_plan", lambda *_a, **_kw: gluon_plan)
 
+    monkeypatch.setattr(
+        nvidia_dispatch, "default_execution_plan", partial(orig_default_plan, target=sm120)
+    )
     assert (
         nvidia_dispatch.partial_row_block_size(
             qdata, weight, operation="key", head_dim=128, rotary_dim=64
@@ -1211,6 +1207,7 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
             0,
             None,
             out=k_out,
+            execution_plan=sm120_key_plan,
             start_row_block=1,
             num_row_blocks=1,
         )
@@ -1223,21 +1220,26 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
             None,
             value_format=ValueFormat.TRANSPOSED,
             out=v_out,
+            execution_plan=sm120_value_plan,
             start_row_block=1,
             num_row_blocks=1,
         )
 
-    monkeypatch.setattr(nvidia_dispatch, "default_execution_plan", lambda *_a, **_kw: triton_plan)
+    monkeypatch.setattr(
+        nvidia_dispatch, "default_execution_plan", partial(orig_default_plan, target=sm89)
+    )
+    triton_qdata = torch.empty((1, 128, 144), dtype=torch.int8)
+    triton_weight = torch.empty((256, 144), dtype=torch.int8)
     assert (
         nvidia_dispatch.partial_row_block_size(
-            qdata, weight, operation="key", head_dim=128, rotary_dim=64
+            triton_qdata, triton_weight, operation="key", head_dim=128, rotary_dim=64
         )
         == 64
     )
     assert (
         nvidia_dispatch.partial_row_block_size(
-            qdata,
-            weight,
+            triton_qdata,
+            triton_weight,
             operation="value",
             head_dim=128,
             value_format=ValueFormat.TRANSPOSED,
@@ -1453,16 +1455,18 @@ def test_fold_prepare_gather_project_kv_fx(
     shape_env = ShapeEnv()
     with FakeTensorMode(shape_env=shape_env):
         graph = _make_kv_fx_graph(include_value)
-        folded = sparse_dist_compile.fold_prepare_gather_project_kv(graph)
-        assert folded is include_value
+        _run_post_grad_pass(graph, attention=True)
         graph.lint()
+        targets = [n.target for n in graph.nodes if n.op == "call_function"]
         if include_value:
             assert not distributed_fx.has_c10d_collectives(graph)
-            targets = [n.target for n in graph.nodes if n.op == "call_function"]
             assert _ops.convrot_int8_sparse_piper_prepare_gather_project_kv.default in targets
             assert _ops.convrot_int8_prepare_input.default not in targets
             assert _ops.convrot_int8_sparse_piper_project_key.default not in targets
             assert _ops.convrot_int8_sparse_piper_project_value.default not in targets
+        else:
+            assert distributed_fx.has_c10d_collectives(graph)
+            assert _ops.convrot_int8_sparse_piper_prepare_gather_project_kv.default not in targets
 
 
 @pytest.mark.parametrize("batch", [1, 2])
@@ -1555,7 +1559,7 @@ def test_fold_distributed_attention_output_fx(
             out_node = wait_node
         graph.output(out_node)
 
-        assert sparse_dist_compile.fold_distributed_attention_output(graph)
+        _run_post_grad_pass(graph, attention=True)
         graph.lint()
         assert not distributed_fx.has_c10d_collectives(graph)
         targets = [n.target for n in graph.nodes if n.op == "call_function"]
@@ -1564,7 +1568,8 @@ def test_fold_distributed_attention_output_fx(
                 _ops.convrot_int8_sparse_piper_projected_query_attention_output.default
                 not in targets
             )
-            expected_res_op = sparse_dist_compile._PROJECTED_QUERY_RS_RESIDUAL_ADD
+            op_prefix = "convrot_int8_sparse_piper_projected_query_attention"
+            expected_res_op = getattr(_ops, f"{op_prefix}_reduce_scatter_residual_add_").default
             assert any(
                 n.target is _AUTO_FUNCTIONALIZED and n.args and n.args[0] is expected_res_op
                 for n in graph.nodes
@@ -1588,7 +1593,13 @@ def test_fold_distributed_attention_output_fx_shared_negative(fake_triton_device
         wait_node = _add_sequence_reduce_scatter(graph, attn_out, batch=1, local_seq=64, hidden=128)
         extra = graph.call_function(_aten.neg.default, args=(attn_out,))
         graph.output((wait_node, extra))
-        assert not sparse_dist_compile.fold_distributed_attention_output(graph)
+        _run_post_grad_pass(graph, attention=True)
+        assert distributed_fx.has_c10d_collectives(graph)
+        targets = [n.target for n in graph.nodes if n.op == "call_function"]
+        assert (
+            _ops.convrot_int8_sparse_piper_projected_query_attention_reduce_scatter.default
+            not in targets
+        )
 
 
 def _make_dense_distributed_output_meta_args(
@@ -1741,7 +1752,7 @@ def test_fold_dense_distributed_attention_output_fx(
             out_node = wait_node
         graph.output(out_node)
 
-        assert dense_compile.fold_distributed_attention_output(graph)
+        _run_post_grad_pass(graph, attention_output=True)
         graph.lint()
         assert not distributed_fx.has_c10d_collectives(graph)
         targets = [n.target for n in graph.nodes if n.op == "call_function"]
@@ -1773,7 +1784,11 @@ def test_fold_dense_distributed_attention_output_fx_negative(fake_triton_device:
         )
         extra = g_shared.call_function(_aten.neg.default, args=(attn_out,))
         g_shared.output((wait_node, extra))
-        assert not dense_compile.fold_distributed_attention_output(g_shared)
+        _run_post_grad_pass(g_shared, attention_output=True)
+        assert distributed_fx.has_c10d_collectives(g_shared)
+        assert _ops.convrot_int8_piper_projected_query_attention_output.default in [
+            n.target for n in g_shared.nodes if n.op == "call_function"
+        ]
 
         # Residual dtype mismatch rejects folding into residual_add_.
         g_dtype = torch.fx.Graph()
@@ -1804,7 +1819,8 @@ def test_fold_dense_distributed_attention_output_fx_negative(fake_triton_device:
         out = g_dtype.call_function(operator.getitem, args=(call, 1))
         g_dtype.output(out)
         # Residual fold skips on dtype mismatch, then standalone fold rewrites the reduce-scatter.
-        assert dense_compile.fold_distributed_attention_output(g_dtype)
+        _run_post_grad_pass(g_dtype, attention_output=True)
+        assert not distributed_fx.has_c10d_collectives(g_dtype)
         targets = [n.target for n in g_dtype.nodes if n.op == "call_function"]
         assert _ops.convrot_int8_piper_projected_query_attention_reduce_scatter.default in targets
         assert not any(
@@ -2845,7 +2861,9 @@ def _check_direct_multichunk_and_inplace_ownership(
     full_gi_2d = (torch.arange(batch * seq, device=device, dtype=torch.int64) % 4).view(batch, seq)
     cos_seq, sin_seq = cos_all[:seq].contiguous(), sin_all[:seq].contiguous()
 
-    qdata_2d, scale_1d = convrot_int8_ops.prepare_input(full_h.view(batch * seq, _LIVE_HIDDEN), 64)
+    qdata_2d, scale_1d = _ops.convrot_int8_prepare_input.default(
+        full_h.view(batch * seq, _LIVE_HIDDEN), 64, None
+    )
     full_qdata, full_scale = qdata_2d.view(batch, seq, _LIVE_HIDDEN), scale_1d.view(batch, seq)
     k_out = _ops.convrot_int8_sparse_piper_project_key.default(
         full_qdata, full_scale, k_local.qdata, k_local.scale, k_norm, cos_seq, sin_seq, 1e-5, 0
@@ -3320,7 +3338,9 @@ def _check_dense_direct_multichunk_and_ownership(
     gate = torch.randn(4, _LIVE_HIDDEN, dtype=torch.bfloat16, device=device)
     full_gi_2d = (torch.arange(batch * seq, device=device, dtype=torch.int64) % 4).view(batch, seq)
 
-    qdata_2d, scale_1d = convrot_int8_ops.prepare_input(full_h.view(batch * seq, _LIVE_HIDDEN), 64)
+    qdata_2d, scale_1d = _ops.convrot_int8_prepare_input.default(
+        full_h.view(batch * seq, _LIVE_HIDDEN), 64, None
+    )
     full_qdata, full_scale = qdata_2d.view(batch, seq, _LIVE_HIDDEN), scale_1d.view(batch, seq)
     qk_granularity = dense_quantized_dispatch.select_qk_quantization(
         AcceleratorTarget.from_device(device)
@@ -3589,8 +3609,8 @@ def _check_dense_narrow_output(
 
     torch.manual_seed(1604)
     full_h_narrow = torch.randn(batch, seq, _LIVE_HIDDEN, dtype=torch.bfloat16, device=device)
-    qdata_2d, scale_1d = convrot_int8_ops.prepare_input(
-        full_h_narrow.view(batch * seq, _LIVE_HIDDEN), 64
+    qdata_2d, scale_1d = _ops.convrot_int8_prepare_input.default(
+        full_h_narrow.view(batch * seq, _LIVE_HIDDEN), 64, None
     )
     full_qdata, full_scale = qdata_2d.view(batch, seq, _LIVE_HIDDEN), scale_1d.view(batch, seq)
     qk_granularity = dense_quantized_dispatch.select_qk_quantization(

@@ -110,13 +110,13 @@ def _targets(graph):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("affine", [False, True])
 @pytest.mark.parametrize("permute", [False, True])
-def test_fake_cpu_rewrite_preserves_floating_key_value_and_padded_query(
+def test_fake_rewrite_preserves_floating_key_value_and_padded_query(
     monkeypatch, dtype, affine, permute
 ):
-    graph = _semantic_graph(dtype=dtype, affine=affine, permute=permute)
+    mock_cuda_target(monkeypatch, (12, 0))
+    graph = _semantic_graph(dtype=dtype, affine=affine, permute=permute, device="cuda:0")
     key = next(node for node in graph.nodes if node.target == "key")
     value = next(node for node in graph.nodes if node.target == "value")
-    monkeypatch.setattr(_backend, "select_projection_backend", lambda *_args, **_kwargs: object())
 
     _compile.fold_attention_projections(graph)
 
@@ -157,24 +157,23 @@ def test_fake_cpu_rewrite_preserves_floating_key_value_and_padded_query(
     ],
 )
 def test_unrecognized_or_unsupported_region_stays_unchanged(monkeypatch, invalid):
-    graph = _semantic_graph()
+    mock_cuda_target(monkeypatch, (9, 0) if invalid == "target" else (12, 0))
+    graph = _semantic_graph(device="cuda:0")
     nodes = {node.name: node for node in graph.nodes}
-    if invalid != "target":
-        monkeypatch.setattr(
-            _backend, "select_projection_backend", lambda *_args, **_kwargs: object()
-        )
     with FakeTensorMode():
         if invalid == "cos_stride":
-            nodes["cos"].meta["val"] = torch.empty((65, 96))[:, ::2]
+            nodes["cos"].meta["val"] = torch.empty((65, 96), device="cuda:0")[:, ::2]
         elif invalid == "norm":
-            nodes["norm"].meta["val"] = torch.empty(32, dtype=torch.bfloat16)
+            nodes["norm"].meta["val"] = torch.empty(32, device="cuda:0", dtype=torch.bfloat16)
         elif invalid == "input_scale":
-            nodes["input_scale"].meta["val"] = torch.empty(1)
+            nodes["input_scale"].meta["val"] = torch.empty(1, device="cuda:0")
         elif invalid == "input_features":
-            nodes["hidden"].meta["val"] = torch.empty((2, 65, 0), dtype=torch.bfloat16)
-            nodes["weight"].meta["val"] = torch.empty((256, 0), dtype=torch.int8)
+            nodes["hidden"].meta["val"] = torch.empty(
+                (2, 65, 0), device="cuda:0", dtype=torch.bfloat16
+            )
+            nodes["weight"].meta["val"] = torch.empty((256, 0), device="cuda:0", dtype=torch.int8)
         elif invalid == "bias":
-            nodes["bias"].meta["val"] = torch.empty(256, dtype=torch.int8)
+            nodes["bias"].meta["val"] = torch.empty(256, device="cuda:0", dtype=torch.int8)
     linear = next(
         node
         for node in graph.nodes
@@ -616,7 +615,6 @@ def test_qkv_fake_rewrite_shares_preparation_without_hardware_execution(
     monkeypatch, architecture, query_scales, key_scales
 ):
     graph = _qkv_semantic_graph(device="cuda:0")
-    monkeypatch.setattr(_backend, "select_projection_backend", lambda *_args, **_kwargs: object())
     mock_cuda_target(monkeypatch, (12, 0) if architecture == "sm120" else (8, 9))
     _compile.fold_attention_projections(graph)
     granularity = "per_thread" if architecture == "sm89" else "per_warp"
@@ -644,7 +642,7 @@ def test_qkv_fake_rewrite_shares_preparation_without_hardware_execution(
 
 
 def test_qkv_preparation_reuse_keeps_late_tuple_users_after_attention(monkeypatch):
-    graph = _qkv_semantic_graph()
+    graph = _qkv_semantic_graph(device="cuda:0")
     linear = next(
         node
         for node in graph.nodes
@@ -664,7 +662,7 @@ def test_qkv_preparation_reuse_keeps_late_tuple_users_after_attention(monkeypatc
     output = next(node for node in graph.nodes if node.op == "output")
     output.args = ((attention, data, scales),)
     graph.lint()
-    monkeypatch.setattr(_backend, "select_projection_backend", lambda *_args, **_kwargs: object())
+    mock_cuda_target(monkeypatch, (12, 0))
 
     _compile.fold_attention_projections(graph)
 
@@ -677,7 +675,7 @@ def test_qkv_preparation_reuse_keeps_late_tuple_users_after_attention(monkeypatc
 
 @pytest.mark.parametrize("escaped_operand", [1, 2])
 def test_context_escape_preserves_the_query_only_rewrite(monkeypatch, escaped_operand):
-    graph = _qkv_semantic_graph()
+    graph = _qkv_semantic_graph(device="cuda:0")
     attention = next(
         node
         for node in graph.nodes
@@ -685,7 +683,7 @@ def test_context_escape_preserves_the_query_only_rewrite(monkeypatch, escaped_op
     )
     output = next(node for node in graph.nodes if node.op == "output")
     output.args = ((attention, attention.args[escaped_operand]),)
-    monkeypatch.setattr(_backend, "select_projection_backend", lambda *_args, **_kwargs: object())
+    mock_cuda_target(monkeypatch, (12, 0))
     _compile.fold_attention_projections(graph)
     targets = _targets(graph)
     assert torch.ops.piper_kernels.piper_attention_from_quantized_query.default in targets

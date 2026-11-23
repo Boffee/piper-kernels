@@ -4,8 +4,8 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available, rdna4_available, sm8x_available
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
@@ -25,14 +25,7 @@ pytestmark = pytest.mark.gpu
 
 @pytest.fixture
 def route_selector():
-    if not torch.cuda.is_available():
-        pytest.skip("requires a supported GPU route selector")
-    target = AcceleratorTarget.from_device(torch.device("cuda"))
-    if not (
-        target.is_cuda_capability(12, 0)
-        or target.is_cuda_capability(8)
-        or (target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201"))
-    ):
+    if not (exact_sm120_available() or sm8x_available() or rdna4_available()):
         pytest.skip("requires SM8x, SM120, or RDNA4 route selection")
     selector = _backend.select_route_selector(torch.empty(0, device="cuda", dtype=torch.uint16))
     assert selector is not None

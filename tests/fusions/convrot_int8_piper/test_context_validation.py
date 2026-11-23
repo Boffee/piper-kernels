@@ -7,7 +7,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels.attention.piper_attention import _quantized_dispatch as dispatch
-from piper_kernels.fusions.convrot_int8_piper import _backend, key, value
+from piper_kernels.fusions.convrot_int8_piper import key, value
 
 
 class _MetadataOnly(TorchDispatchMode):
@@ -166,10 +166,6 @@ def test_tensor_contents_remain_caller_preconditions(number):
 
 @pytest.mark.parametrize("batch", [0, 2])
 def test_fake_outputs_only_and_empty_execution_skips_target(monkeypatch, batch):
-    def forbidden(*args, **kwargs):
-        raise AssertionError("metadata path probed hardware")
-
-    monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
     forbid_device_probes(monkeypatch, "metadata path probed hardware")
     with FakeTensorMode():
         operands = _inputs(batch=batch, device="cuda:0")

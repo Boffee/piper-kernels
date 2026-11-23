@@ -4,7 +4,6 @@ import pytest
 import torch
 
 from piper_kernels._triton import runtime
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia import triton as piper_attention
 from piper_kernels.attention.sage_attention_2pp import triton as sage_attention
 from piper_kernels.gguf import GGUFQuantizationType
@@ -106,7 +105,10 @@ def test_operations_use_operand_device_and_its_current_stream(
     "operation", ["piper_attention", "sage_attention", "nvfp4", "convrot_nvfp4"]
 )
 def test_nvidia_attention_and_preparation_use_operand_context(execution_device, operation):
-    if not AcceleratorTarget.from_device(execution_device).is_architecture("sm120"):
+    if torch.version.hip is not None or torch.cuda.get_device_capability(execution_device) != (
+        12,
+        0,
+    ):
         pytest.skip("requires NVIDIA SM120")
     with torch.cuda.device(0):
         original_stream = torch.cuda.current_stream(execution_device)

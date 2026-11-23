@@ -13,6 +13,7 @@ import torch
 import triton
 from _accelerators import (
     forbid_device_probes,
+    forbid_triton_driver,
     mock_cuda_target,
     mock_rocm_target,
     rocm_fences_only_lds,
@@ -296,17 +297,10 @@ def test_output_support_is_independent_of_qkv_projection_support(
         ("darwin", AcceleratorTarget("hip", "gfx1201")),
     ],
 )
-def test_unvalidated_output_integration_rejects_before_resolving_operations(
-    monkeypatch, platform, target
-):
+def test_unvalidated_output_integration_is_rejected(monkeypatch, platform, target):
     monkeypatch.setattr(sys, "platform", platform)
-    attention = Mock(side_effect=AssertionError("resolved unsupported attention"))
-    linear = Mock(side_effect=AssertionError("resolved unsupported linear"))
-    monkeypatch.setattr(_backend.attention_backend, "select_attention_backend", attention)
-    monkeypatch.setattr(_backend.linear_backend, "select_linear_backend", linear)
+    forbid_device_probes(monkeypatch, "resolved unsupported device")
     assert _backend.select_output_backend(torch.empty(1), target=target) is None
-    attention.assert_not_called()
-    linear.assert_not_called()
 
 
 def _run_output_fusion(projected_query, operands, storage):
@@ -358,15 +352,11 @@ def _run_output_fusion(projected_query, operands, storage):
 def test_output_fusion_rejects_before_attention_preparation_or_allocation(
     monkeypatch, projected_query, missing
 ):
-    prepare = Mock(side_effect=AssertionError("prepared unsupported attention"))
-    monkeypatch.setattr(output_common, "prepare_attention", prepare)
-    monkeypatch.setattr(output_common, "prepare_attention_context", prepare)
-    monkeypatch.setattr(
-        _backend,
-        "select_projection_backend",
-        Mock(return_value=None if missing == "projection" else object()),
-    )
-    monkeypatch.setattr(_backend, "select_output_backend", Mock(return_value=None))
+    if projected_query and missing == "output":
+        mock_cuda_target(monkeypatch, (12, 0))
+        monkeypatch.setattr(_backend, "select_output_backend", Mock(return_value=None))
+    else:
+        mock_cuda_target(monkeypatch, (9, 0))
     with FakeTensorMode():
         operands = _operands()
         storage = torch.empty((2, 3, 256, 128), device="cuda:1", dtype=torch.int8)
@@ -377,9 +367,11 @@ def test_output_fusion_rejects_before_attention_preparation_or_allocation(
             if missing == "projection"
             else "sparse output fusion is unavailable"
         )
-        with pytest.raises(ValueError, match=message):
+        with (
+            forbid_triton_driver("prepared unsupported attention"),
+            pytest.raises(ValueError, match=message),
+        ):
             _run_output_fusion(projected_query, operands, storage)
-    prepare.assert_not_called()
     allocate.assert_not_called()
 
 
@@ -491,6 +483,8 @@ def _projection_match(head_dim, input_features=256, device="cpu"):
     attention_output = operand("attention_output", (1, 128, 2, head_dim), torch.bfloat16)
     cos = operand("cos", (128, head_dim // 2), torch.float32)
     sin = operand("sin", (128, head_dim // 2), torch.float32)
+    ratio_profile = graph.placeholder("ratio_profile")
+    ratio_profile.meta["val"] = _SparsePiperRatioProfile((5_000, 10_000))
     matched = _compile.sparse_piper_compile.SparsePiperProjectionMatch(
         output_node=attention_output,
         fine_node=attention_output,
@@ -508,7 +502,7 @@ def _projection_match(head_dim, input_features=256, device="cpu"):
         rotary_dim=head_dim // 2,
         half_rotary_dim=head_dim // 4,
         activation_dtype=torch.bfloat16,
-        ratio_profile=operand("ratio_profile", (2,), torch.int64),
+        ratio_profile=ratio_profile,
         sparse_key_blocks=2,
         softmax_scale=head_dim**-0.5,
         routing_mode=_MINMAX_ROUTING,
@@ -529,19 +523,11 @@ def _projection_match(head_dim, input_features=256, device="cpu"):
 def test_amd_projection_compiler_selects_actual_attention_width(
     monkeypatch, head_dim, input_features
 ):
+    mock_rocm_target(monkeypatch, "gfx1201")
     monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(torch.version, "hip", "7.0")
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _device: SimpleNamespace(gcnArchName="gfx1201"),
-    )
-    validate = Mock(return_value=True)
-    monkeypatch.setattr(_compile.sparse_piper_compile, "valid_sparse_piper_attention", validate)
     with FakeTensorMode():
         matched, projections, _ = _projection_match(head_dim, input_features, device="cuda:0")
         assert _compile._valid_sparse_piper_projection(matched, *projections)
-    validate.assert_called_once()
 
 
 @pytest.mark.parametrize("missing", [None, "projection", "linear", "attention"])
@@ -571,27 +557,40 @@ def test_projection_compiler_requires_each_emitted_operation(monkeypatch, missin
     assert validate_attention.called is (missing is None)
 
 
-@pytest.mark.parametrize("supported", [False, True])
-def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, supported):
-    select = Mock(return_value=object() if supported else None)
-    monkeypatch.setattr(_backend, "select_output_backend", select)
+@pytest.mark.parametrize(
+    ("architecture", "supported"),
+    [("sm120", True), ("gfx1201", True), ("sm90", False)],
+)
+def test_output_compiler_uses_selected_operation_not_device_family(
+    monkeypatch, architecture, supported
+):
+    if architecture == "sm120":
+        mock_cuda_target(monkeypatch, (12, 0))
+    elif architecture == "gfx1201":
+        mock_rocm_target(monkeypatch, "gfx1201")
+        monkeypatch.setattr(sys, "platform", "linux")
+    else:
+        mock_cuda_target(monkeypatch, (9, 0))
     graph = torch.fx.Graph()
 
-    def operand(name, shape, dtype):
-        node = graph.placeholder(name)
-        node.meta["val"] = torch.empty(shape, dtype=dtype)
-        return node
+    with FakeTensorMode():
 
-    query_node = operand("query", (1, 2, 128, 128), torch.int8)
-    attention = operand("attention", (1, 128, 2, 128), torch.bfloat16)
-    weight = operand("weight", (384, 256), torch.int8)
-    scale = operand("scale", (384, 1), torch.float32)
-    reshaped = graph.call_function(torch.reshape, (attention, (1, 128, 256)))
-    reshaped.meta["val"] = torch.empty((1, 128, 256), dtype=torch.bfloat16)
-    projected = graph.call_function(
-        torch.ops.piper_kernels.convrot_int8_linear.default, (reshaped, weight, scale, None, 16)
-    )
-    projected.meta["val"] = torch.empty((1, 128, 384), dtype=torch.bfloat16)
+        def operand(name, shape, dtype):
+            node = graph.placeholder(name)
+            node.meta["val"] = torch.empty(shape, device="cuda:0", dtype=dtype)
+            return node
+
+        query_node = operand("query", (1, 2, 128, 128), torch.int8)
+        attention = operand("attention", (1, 128, 2, 128), torch.bfloat16)
+        weight = operand("weight", (384, 256), torch.int8)
+        scale = operand("scale", (384, 1), torch.float32)
+        reshaped = graph.call_function(torch.reshape, (attention, (1, 128, 256)))
+        reshaped.meta["val"] = torch.empty((1, 128, 256), device="cuda:0", dtype=torch.bfloat16)
+        projected = graph.call_function(
+            torch.ops.piper_kernels.convrot_int8_linear.default,
+            (reshaped, weight, scale, None, 16),
+        )
+        projected.meta["val"] = torch.empty((1, 128, 384), device="cuda:0", dtype=torch.bfloat16)
     reshaped_match = _compile.sparse_piper_compile.ReshapedQuantizedAttentionMatch(
         reshape_node=reshaped,
         attention_node=attention,
@@ -606,7 +605,6 @@ def test_output_compiler_uses_selected_operation_not_device_family(monkeypatch, 
         )
         is supported
     )
-    select.assert_called_once_with(query_node.meta["val"])
 
 
 @pytest.mark.parametrize(
@@ -722,7 +720,6 @@ def _capture_projection(
     function = functions[operation]
     kernel = MagicMock()
     monkeypatch.setattr(_kernels, function.__name__, kernel)
-    monkeypatch.setattr(_backend, "require_projection_backend", Mock(return_value=implementation))
     guard = Mock(side_effect=lambda device: nullcontext())
     monkeypatch.setattr(torch.cuda, "device", guard)
     with FakeTensorMode():

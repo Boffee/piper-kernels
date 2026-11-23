@@ -12,7 +12,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import SIGNED_HADAMARD_MASK
-from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
+from piper_kernels.attention.kernels.sparse_piper.layout import padded_sequence_length
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 _BLOCK_ROWS = 64

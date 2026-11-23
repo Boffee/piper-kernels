@@ -2,21 +2,17 @@
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available, sm8x_available
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention._nvidia._recurrence import piper_pv_pair
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available()
-        or not (
-            AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(12, 0)
-            or AcceleratorTarget.from_device(torch.device("cuda")).is_cuda_capability(8)
-        ),
+        not (exact_sm120_available() or sm8x_available()),
         reason="requires NVIDIA SM8x or exact SM120",
     ),
 ]

@@ -1,6 +1,7 @@
 """Independent checks for shared weight-family workloads and sampled references."""
 
-import builtins
+import importlib.abc
+import sys
 
 import pytest
 import torch
@@ -28,14 +29,16 @@ def test_enumeration_does_not_construct_or_substitute_workloads(monkeypatch):
 
 
 def test_torch_baselines_do_not_import_optional_weight_or_kernel_packages(monkeypatch):
-    original_import = builtins.__import__
+    blocked_prefixes = ("torchao", "triton", "piper_kernels.weights", "piper_kernels.fusions")
 
-    def guarded_import(name, *args, **kwargs):
-        if name.startswith(("torchao", "triton", "piper_kernels.weights", "piper_kernels.fusions")):
-            raise AssertionError(f"torch baseline imported {name}")
-        return original_import(name, *args, **kwargs)
+    class _BlockedModules(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname.startswith(blocked_prefixes):
+                raise AssertionError(f"torch baseline imported {fullname}")
 
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    for loaded in [name for name in sys.modules if name.startswith(blocked_prefixes)]:
+        monkeypatch.delitem(sys.modules, loaded)
+    monkeypatch.setattr(sys, "meta_path", [_BlockedModules(), *sys.meta_path])
     for identity in ("linear-small", "ffn-small-gelu", "conv3d-small"):
         case = named_case(identity)
         operation = implementations(case, torch.device("cpu"))[0].build()

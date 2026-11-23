@@ -5,8 +5,8 @@ from dataclasses import replace
 
 import pytest
 import torch
+from _accelerators import sm8x_available
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention import _backend
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
@@ -29,8 +29,7 @@ from piper_kernels.attention.sparse_piper_attention._routing import packed_route
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available()
-        or not policy.uses_async_copies(AcceleratorTarget.from_device(torch.device("cuda"))),
+        not sm8x_available(),
         reason="requires NVIDIA SM8x",
     ),
 ]

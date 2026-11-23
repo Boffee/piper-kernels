@@ -11,7 +11,6 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 
 from piper_kernels import compile_options
-from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
@@ -372,16 +371,7 @@ def test_cuda_high_first_linear_matches_low_first() -> None:
     )
 
     actual = F.linear(input, high)
-    expected = nvfp4_ops.linear(
-        input,
-        low.qdata,
-        low.scale,
-        low.per_tensor_scale,
-        low.act_per_tensor_scale,
-        None,
-        False,
-        False,
-    )
+    expected = F.linear(input, low)
     relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert relative_l2 < 0.002
 

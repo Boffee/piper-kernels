@@ -12,7 +12,6 @@ from piper_kernels import compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
-from piper_kernels.weights.nvfp4._layout import swap_packed_pairs
 from piper_kernels.weights.sharding import shard_quantized_weight
 
 _WRAPPERS = (ConvRotInt8Tensor, PiperNVFP4Tensor, ConvRotNVFP4Tensor)
@@ -42,7 +41,7 @@ def _weight(cls, *, rows=32, features=128, swizzled=False, high_first=False, gro
         )
     weight = cls.from_hp(source, **options)
     if high_first:
-        weight.qdata = swap_packed_pairs(weight.qdata)
+        weight.qdata = (((weight.qdata & 0x0F) << 4) | (weight.qdata >> 4)).to(torch.uint8)
         weight.high_first = True
     return weight
 

@@ -1,6 +1,6 @@
 """Convolution dispatch and unified target launch policy contracts."""
 
-import builtins
+import importlib.abc
 import math
 import sys
 from functools import partial
@@ -59,14 +59,15 @@ def test_missing_triton_uses_reference(monkeypatch):
     with FakeTensorMode():
         operand = torch.empty(0, device="cuda:0")
     monkeypatch.delitem(sys.modules, "piper_kernels.conv3d.convrot.int8.triton", raising=False)
-    original_import = builtins.__import__
+    for loaded in [name for name in sys.modules if name == "triton" or name.startswith("triton.")]:
+        monkeypatch.delitem(sys.modules, loaded)
 
-    def without_triton(name, *args, **kwargs):
-        if name == "triton" or name.startswith("triton."):
-            raise ModuleNotFoundError("Triton intentionally unavailable", name="triton")
-        return original_import(name, *args, **kwargs)
+    class _WithoutTriton(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "triton" or fullname.startswith("triton."):
+                raise ModuleNotFoundError("Triton intentionally unavailable", name="triton")
 
-    monkeypatch.setattr(builtins, "__import__", without_triton)
+    monkeypatch.setattr(sys, "meta_path", [_WithoutTriton(), *sys.meta_path])
     assert _ops._select_native_backend(operand) is None
 
 
@@ -261,7 +262,7 @@ def test_tuning_tile_recomputes_descriptor_eligibility(architecture, aligned, bl
 
 
 def test_amd_policy_rejects_unsupported_platform(monkeypatch):
-    monkeypatch.setattr(_policy.sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "platform", "darwin")
     assert not _policy.supports_target(AcceleratorTarget("hip", "gfx1201"))
 
 

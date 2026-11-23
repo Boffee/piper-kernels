@@ -8,9 +8,11 @@ import pytest
 import torch
 from lib.sparse_piper import reference_value_storage
 
-from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+from piper_kernels.attention.kernels.sparse_piper.layout import (
+    ValueFormat,
+    padded_sequence_length,
+)
 from piper_kernels.fusions.convrot_int8_sparse_piper import value as value_fusion
-from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 from ._helpers import projection_available
