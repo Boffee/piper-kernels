@@ -35,6 +35,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Fused ConvRot INT8 sparse Piper attention validates prepared query metadata once
+  across all query windows.
 - Updated ConvRot INT8 3D convolution dispatch on NVIDIA SM120 to select full-grid tiles
   and weight descriptors by grid tile count (`channels` 128/256 descriptors, updated
   NVIDIA preparation schedules for 64 and 512 channels) and coalesced the

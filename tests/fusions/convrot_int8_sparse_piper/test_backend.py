@@ -253,6 +253,23 @@ def test_unvalidated_projection_rejects_before_output_allocation(monkeypatch, op
             _call(operation, operands)
 
 
+@pytest.mark.parametrize(
+    ("rows", "overrides", "error"),
+    [
+        (63, {}, "at least 64 sequence rows"),
+        (64, {"routing_mode": -1}, "routing mode"),
+        (64, {"softmax_scale": 0.0}, "softmax scale"),
+        (64, {"block_lengths": torch.empty(2, dtype=torch.int32)}, "block lengths"),
+    ],
+)
+def test_standalone_query_rejects_invalid_metadata_before_dispatch(rows, overrides, error):
+    options = {"norm_epsilon": 1e-6, "softmax_scale": 128**-0.5, "routing_mode": _MINMAX_ROUTING}
+    with pytest.raises(ValueError, match=error):
+        torch.ops.piper_kernels.convrot_int8_sparse_piper_project_query.default(
+            *_operands(sequence=rows, device="cpu"), **(options | overrides)
+        )
+
+
 @pytest.mark.parametrize("missing", [None, "attention", "linear"])
 @pytest.mark.parametrize(
     "target",
@@ -407,6 +424,8 @@ def test_output_fusion_selects_once_before_preparation_and_reuses_backend(
             project_query = args[3]
             project_query(0, 128)
             project_query(128, 65)
+            with pytest.raises(ValueError, match="aligned sequence window"):
+                project_query(128, 66)
         return result
 
     monkeypatch.setattr(output_common, "run_chunked_attention_output", run)
