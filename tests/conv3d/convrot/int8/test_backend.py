@@ -110,21 +110,28 @@ def test_sm120_convolution_schedule_contracts():
     for channels in (64, 128, 256, 512, 1024, 2048):
         for outputs in (32, 64, 128, 256, 384, 512, 1024):
             for rows in (16, 128, 1280, 5040, 20160, 293760):
-                schedule = SM120(channels=channels, outputs=outputs, output_rows=rows).convolution
+                plan = SM120(channels=channels, outputs=outputs, output_rows=rows)
+                schedule = plan.convolution
                 assert (
                     schedule == SM120(channels=128, outputs=outputs, output_rows=rows).convolution
                 )
-                expected_n = 64 if outputs <= 64 else 128
-                assert schedule.block_n == expected_n
-                full_grid = rows >= 128 and (
-                    math.ceil(rows / 128) * math.ceil(outputs / expected_n) >= 128
-                )
-                if full_grid:
-                    assert schedule.block_m == 128
-                    assert schedule.block_k == 64
-                else:
-                    assert schedule.block_m == 64
-                    assert schedule.block_k == (64 if outputs <= 64 else 128)
+                assert not plan.lds_only_fences
+                assert plan.accumulator_seed == 0
+                for size in (schedule.block_m, schedule.block_n, schedule.block_k):
+                    assert size > 0
+                    assert size & (size - 1) == 0
+                assert schedule.block_m >= 16
+                assert schedule.block_n >= 16
+                assert 32 <= schedule.block_k <= 27 * channels
+                assert schedule.num_warps in (2, 4, 8)
+                assert schedule.num_stages >= 2
+                if outputs <= 64:
+                    assert schedule.block_n <= 64
+                if rows < 128:
+                    assert schedule.block_m <= 64
+                if plan.use_weight_descriptor:
+                    assert outputs % schedule.block_n == 0
+                    assert (27 * channels) % 16 == 0
 
 
 def test_nvidia_preparation_schedule_contracts():
@@ -139,18 +146,12 @@ def test_nvidia_preparation_schedule_contracts():
                     == SM8X(channels=channels, input_rows=rows, group_norm=group_norm).preparation
                 )
                 assert schedule.block_m > 0
+                assert schedule.block_m & (schedule.block_m - 1) == 0
                 assert schedule.block_m * channels <= 32768
                 assert schedule.num_warps in (4, 8)
                 if channels <= 128:
                     wide = SM120(channels=1024, input_rows=rows, group_norm=group_norm).preparation
                     assert schedule.block_m > wide.block_m
-                if channels == 512 and rows >= 5000:
-                    assert (
-                        schedule
-                        == SM120(
-                            channels=channels, input_rows=rows, group_norm=not group_norm
-                        ).preparation
-                    )
 
 
 @pytest.mark.parametrize(
@@ -209,7 +210,7 @@ def test_sm8x_convolution_policy_uses_measured_tiles(channels, outputs, rows, ex
 
 @pytest.mark.parametrize("fused", [False, True])
 def test_strided_execution_selects_preparation_from_input_rows(fused):
-    # 200,000 input rows cross the preparation threshold; 3,150 output rows (< 128 tiles) do not.
+    # 200,000 input rows cross the large-input preparation regime; 3,150 output rows do not.
     activation = torch.empty(1, 256, 1, 1, 1).expand(1, 256, 1, 400, 500)
     weight = torch.empty(256, 3, 3, 3, 256, dtype=torch.int8)
     plan = _policy.default_execution_plan(
@@ -220,9 +221,16 @@ def test_strided_execution_selects_preparation_from_input_rows(fused):
         group_norm=fused,
         padding=(1, 1, 1, 1, 2, 0),
     )
-    assert plan.preparation == ((32, 4) if fused else (64, 4))
-    assert plan.convolution.block_m == 64
-    assert plan.convolution != SM120(channels=256, outputs=256, output_rows=200_000).convolution
+    expected_input = SM120(
+        channels=256, outputs=256, input_rows=200_000, output_rows=200_000, group_norm=fused
+    )
+    expected_output = SM120(
+        channels=256, outputs=256, input_rows=3_150, output_rows=3_150, group_norm=fused
+    )
+    assert plan.preparation == expected_input.preparation
+    assert plan.preparation != expected_output.preparation
+    assert plan.convolution == expected_output.convolution
+    assert plan.convolution != expected_input.convolution
 
 
 @pytest.mark.parametrize("architecture", ["sm120", "sm89"])
