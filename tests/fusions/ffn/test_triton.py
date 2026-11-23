@@ -183,6 +183,138 @@ def test_convrot_int8_accepts_adjacent_checkpoint_views() -> None:
 
 
 @pytest.mark.gpu
+@_SM120
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias_dtype", [None, torch.float32])
+def test_convrot_int8_sm120_fused_swiglu_ffn_matches_materialized(
+    dtype: torch.dtype,
+    bias_dtype: torch.dtype | None,
+) -> None:
+    torch.manual_seed(509)
+    # Chunk capacity triggers SM120 TMA (1024 * 10 >= 9216) and includes a 17-row tail chunk.
+    rows, input_features, intermediate_features, output_features = 1_041, 272, 2_560, 256
+    operands = make_int8_operands(
+        "swiglu",
+        rows=rows,
+        input_features=input_features,
+        intermediate_features=intermediate_features,
+        output_features=output_features,
+        bias_dtype=bias_dtype,
+        dtype=dtype,
+        group_size=16,
+        down_group_size=256,
+    )
+    expected = materialized_int8(operands)
+    actual = int8_ffn.convrot_int8_ffn_op(**operands.arguments(1_024))
+    assert actual.dtype is dtype
+    assert relative_l2(actual, expected) < 0.01
+
+    base = torch.randn(rows, output_features, dtype=dtype, device="cuda")
+    reusable = torch.randn_like(base)
+    update_gate = torch.randn(7, output_features, dtype=dtype, device="cuda")
+    ffn_gate = torch.randn(5, output_features, dtype=dtype, device="cuda")
+    gate_indices = torch.randint(-5, 5, (rows,), device="cuda")
+    expected_update = _materialized_gated_updates(
+        expected, base, reusable, update_gate, ffn_gate, gate_indices
+    )
+    actual_update = reusable.clone()
+    result = int8_ffn.convrot_int8_ffn_update_op(
+        **operands.arguments(1_024),
+        output=actual_update,
+        base=base,
+        update_gate=update_gate,
+        ffn_gate=ffn_gate,
+        gate_indices=gate_indices,
+        python_indexing=True,
+    )
+    assert result is None
+    assert relative_l2(actual_update, expected_update) < 0.01
+
+    if dtype is torch.bfloat16 and bias_dtype is None:
+        up_scale = torch.tensor(0.03, device="cuda")
+        gate_scale = torch.tensor(0.05, device="cuda")
+        distinct_expected = materialized_int8(
+            operands, up_input_scale=up_scale, gate_input_scale=gate_scale
+        )
+        distinct_actual = int8_ffn.convrot_int8_ffn_op(
+            **operands.arguments(1_024, up_input_scale=up_scale, gate_input_scale=gate_scale)
+        )
+        assert relative_l2(distinct_actual, distinct_expected) < 0.01
+
+        wide_out_features = intermediate_features + 256
+        wide_operands = make_int8_operands(
+            "swiglu",
+            rows=rows,
+            input_features=input_features,
+            intermediate_features=intermediate_features,
+            output_features=wide_out_features,
+            bias_dtype=None,
+            dtype=dtype,
+            group_size=16,
+            down_group_size=256,
+        )
+        wide_base = torch.randn(rows, wide_out_features, dtype=dtype, device="cuda")
+        wide_reusable = torch.randn_like(wide_base)
+        wide_update_gate = torch.randn(7, wide_out_features, dtype=dtype, device="cuda")
+        wide_ffn_gate = torch.randn(5, wide_out_features, dtype=dtype, device="cuda")
+        wide_expected = _materialized_gated_updates(
+            materialized_int8(wide_operands),
+            wide_base,
+            wide_reusable,
+            wide_update_gate,
+            wide_ffn_gate,
+            gate_indices,
+        )
+        wide_actual = wide_reusable.clone()
+        wide_result = int8_ffn.convrot_int8_ffn_update_op(
+            **wide_operands.arguments(1_024),
+            output=wide_actual,
+            base=wide_base,
+            update_gate=wide_update_gate,
+            ffn_gate=wide_ffn_gate,
+            gate_indices=gate_indices,
+            python_indexing=True,
+        )
+        assert wide_result is None
+        assert relative_l2(wide_actual, wide_expected) < 0.01
+
+
+@pytest.mark.gpu
+@_SM120
+def test_convrot_int8_sm120_fused_swiglu_ffn_halves_projection_scratch() -> None:
+    chunk_rows = 2_048
+    rows = 2 * chunk_rows
+    width = 512
+    intermediate = 8_192
+    operands = make_int8_operands(
+        "swiglu",
+        rows=rows,
+        input_features=width,
+        intermediate_features=intermediate,
+        output_features=width,
+        bias_dtype=None,
+        dtype=torch.bfloat16,
+    )
+    kwargs = operands.arguments(chunk_rows)
+    with torch.inference_mode():
+        warm = int8_ffn.convrot_int8_ffn_op(**kwargs)
+        torch.cuda.synchronize()
+        del warm
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        actual = int8_ffn.convrot_int8_ffn_op(**kwargs)
+        torch.cuda.synchronize()
+        peak_extra = torch.cuda.max_memory_allocated() - baseline
+
+    output_bytes = actual.numel() * actual.element_size()
+    # Fused SwiGLU allocates 1 * intermediate BF16 projections (32 MiB) instead of 2x (64 MiB).
+    projection_bytes = chunk_rows * intermediate * actual.element_size()
+    prepared_bytes = chunk_rows * intermediate
+    scale_bytes = chunk_rows * torch.float32.itemsize
+    assert peak_extra <= output_bytes + projection_bytes + prepared_bytes + scale_bytes + 1_048_576
+
+
+@pytest.mark.gpu
 @_GPU
 @pytest.mark.parametrize(
     "mode", ["shared", "alias", "distinct", "mixed", "static-down", "dynamic-down"]

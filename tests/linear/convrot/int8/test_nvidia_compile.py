@@ -329,6 +329,104 @@ def test_sm120_tma_residual_schedules_compile_without_spills(output, stages, tai
     )
 
 
+def _tma_swiglu_source(
+    *,
+    output: str,
+    has_bias: bool,
+    second_has_bias: bool,
+    stages: int,
+    tail_refills: int,
+    divisible_stride: bool,
+):
+    kernel = gluon_tma._int8_tma_swiglu_matmul_kernel
+    signature = {
+        "input_descriptor": _TMA_A_DESCRIPTOR,
+        "weight_descriptor": _TMA_A_DESCRIPTOR,
+        "second_weight_descriptor": _TMA_A_DESCRIPTOR,
+        "output_ptr": output,
+        "input_scale_ptr": "*fp32",
+        "weight_scale_ptr": "*fp32",
+        "bias_ptr": "*fp32" if has_bias else output,
+        "second_scale_ptr": "*fp32",
+        "second_bias_ptr": "*fp16" if second_has_bias else output,
+        "m": "i32",
+        "n": "i32",
+        "output_row_stride": "i32",
+        "full_groups": "i32",
+    }
+    aligned = [
+        "output_ptr",
+        "input_scale_ptr",
+        "weight_scale_ptr",
+        "bias_ptr",
+        "second_scale_ptr",
+        "second_bias_ptr",
+    ]
+    if divisible_stride:
+        aligned.append("output_row_stride")
+    return GluonASTSource(
+        kernel,
+        signature,
+        attrs={(kernel.arg_names.index(name),): [["tt.divisibility", 16]] for name in aligned},
+        constexprs={
+            "stages": stages,
+            "tail_refills": tail_refills,
+            "group_m": 16,
+            "has_bias": has_bias,
+            "second_has_bias": second_has_bias,
+        },
+    )
+
+
+@pytest.mark.parametrize("output", ["*fp16", "*bf16"])
+@pytest.mark.parametrize(
+    "biases",
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["no-bias", "up-bias", "gate-bias", "both-biases"],
+)
+def test_sm120_tma_swiglu_kernel_compiles_without_spills(output, biases):
+    has_bias, second_has_bias = biases
+    _assert_sm120_tma_zero_spills(
+        _tma_swiglu_source(
+            output=output,
+            has_bias=has_bias,
+            second_has_bias=second_has_bias,
+            stages=3,
+            tail_refills=1,
+            divisible_stride=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("output", ["*fp16", "*bf16"])
+@pytest.mark.parametrize(("stages", "tail_refills"), [(1, 0), (2, 0), (3, 0), (3, 2)])
+def test_sm120_tma_swiglu_schedules_compile_without_spills(output, stages, tail_refills):
+    _assert_sm120_tma_zero_spills(
+        _tma_swiglu_source(
+            output=output,
+            has_bias=True,
+            second_has_bias=True,
+            stages=stages,
+            tail_refills=tail_refills,
+            divisible_stride=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("output", ["*fp16", "*bf16"])
+def test_sm120_tma_swiglu_ragged_stride_compiles_without_spills(output):
+    _assert_sm120_tma_zero_spills(
+        _tma_swiglu_source(
+            output=output,
+            has_bias=True,
+            second_has_bias=True,
+            stages=3,
+            tail_refills=1,
+            divisible_stride=False,
+        )
+    )
+
+
 def _compile_int8_matmul(
     plan, architecture, *, output, biases, paired, aligned_m, aligned_nk, group_m
 ):

@@ -429,6 +429,78 @@ def test_backend_owns_plans_and_forwards_preparation_and_projection_buffers(
     }
 
 
+def test_backend_prepared_swiglu_falls_back_when_kernels_decline() -> None:
+    rows, features, width = 3, 16, 4
+    qdata = torch.empty((rows, features), dtype=torch.int8)
+    row_scale = torch.empty(rows)
+    weight = torch.empty((width, features), dtype=torch.int8)
+    second_weight = torch.empty_like(weight)
+    scale = torch.empty(width, 1)
+    paired_values = torch.tensor(
+        [[1.0, -2.0, 0.5, 4.0, 0.25, -1.5, 2.0, -0.5]] * rows,
+        dtype=torch.bfloat16,
+    )
+
+    def fake_paired_launch(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias,
+        output,
+        second_w,
+        second_s,
+        second_b,
+        **kwargs,
+    ) -> None:
+        output.copy_(paired_values)
+
+    fake_kernels = SimpleNamespace(
+        supports_prepared_swiglu=Mock(return_value=False),
+        try_launch_prepared_swiglu=Mock(return_value=False),
+        launch_prepared_linear=Mock(side_effect=fake_paired_launch),
+    )
+    implementation = _backend.LinearBackend(nvidia.policy, fake_kernels)  # type: ignore[arg-type]
+    target = AcceleratorTarget("cuda", "sm89")
+    plan = implementation.default_execution_plan(weight, target=target, rows=rows)
+    assert not implementation.supports_prepared_swiglu(
+        weight, second_weight, torch.bfloat16, execution_plan=plan, target=target
+    )
+    up_half, gate_half = paired_values.chunk(2, dim=-1)
+    expected = (up_half.float() * torch.nn.functional.silu(gate_half.float())).to(torch.bfloat16)
+
+    actual = implementation.linear_prepared_swiglu(
+        qdata,
+        row_scale,
+        weight,
+        scale,
+        None,
+        (second_weight, scale, None),
+        torch.bfloat16,
+        execution_plan=plan,
+        target=target,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    out_buf = torch.empty((rows, width + 4), dtype=torch.bfloat16)[:, 2:-2]
+    returned = implementation.linear_prepared_swiglu(
+        qdata,
+        row_scale,
+        weight,
+        scale,
+        None,
+        (second_weight, scale, None),
+        torch.bfloat16,
+        out=out_buf,
+        execution_plan=plan,
+        target=target,
+    )
+    assert returned is out_buf
+    torch.testing.assert_close(out_buf, expected, rtol=0, atol=0)
+    assert fake_kernels.try_launch_prepared_swiglu.call_count == 2
+    assert fake_kernels.launch_prepared_linear.call_count == 2
+
+
 @pytest.mark.parametrize(
     ("target", "supported"),
     [

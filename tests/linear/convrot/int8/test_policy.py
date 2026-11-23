@@ -426,9 +426,7 @@ def test_gluon_reports_effective_behavior_and_preserves_triton_options(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("architecture", ["sm89", "sm90", "sm120", "sm121"])
 @pytest.mark.parametrize("kernel", ["triton", "gluon_async_copy", "gluon_tma"])
-def test_supports_residual_epilogue_covers_sm120_triton_and_tma(
-    dtype, architecture, kernel
-) -> None:
+def test_supports_sm120_epilogues_cover_16bit_schedules(dtype, architecture, kernel) -> None:
     base = nvidia_policy.baseline_execution_plan(in_features=512)
     if kernel == "gluon_async_copy":
         plan = replace(
@@ -442,16 +440,13 @@ def test_supports_residual_epilogue_covers_sm120_triton_and_tma(
         plan = select_execution_plan(_SM120, in_features=512)
     else:
         plan = base
-    expected = (
-        architecture == "sm120"
-        and kernel in ("triton", "gluon_tma")
-        and dtype in (torch.float16, torch.bfloat16)
+    is_16bit_sm120 = architecture == "sm120" and dtype in (torch.float16, torch.bfloat16)
+    target = AcceleratorTarget("cuda", architecture)
+    assert nvidia_policy.supports_residual_epilogue(target, plan, dtype) is (
+        is_16bit_sm120 and kernel in ("triton", "gluon_tma")
     )
-    assert (
-        nvidia_policy.supports_residual_epilogue(
-            AcceleratorTarget("cuda", architecture), plan, dtype
-        )
-        is expected
+    assert nvidia_policy.supports_swiglu_epilogue(target, plan, dtype) is (
+        is_16bit_sm120 and kernel == "gluon_tma"
     )
 
 

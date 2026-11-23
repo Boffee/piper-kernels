@@ -39,7 +39,9 @@ def operations(monkeypatch):
         return out
 
     backend = SimpleNamespace(
-        prepare_input=Mock(side_effect=prepare), linear_prepared=Mock(side_effect=project)
+        prepare_input=Mock(side_effect=prepare),
+        linear_prepared=Mock(side_effect=project),
+        supports_prepared_swiglu=Mock(return_value=False),
     )
     select = Mock(return_value=backend)
     monkeypatch.setattr(_backend, "require_linear_backend", select)
@@ -83,6 +85,47 @@ def test_ffn_uses_operations_with_paired_projection_and_reused_buffers(operation
         else:
             assert call.args[2] is down[0]
             assert "second_projection" not in call.kwargs
+
+
+@pytest.mark.parametrize("chunk_rows", [1, 4, 16])
+def test_ffn_uses_fused_swiglu_operation_and_halves_projection_workspace(operations, chunk_rows):
+    backend, select = operations
+    value = torch.linspace(-1, 1, 160).reshape(2, 5, 16)
+    gate, up, down = _weight(32, 16), _weight(32, 16, offset=2), _weight(20, 32)
+
+    def project_swiglu(qdata, scale, weight, weight_scale, bias, second_projection, dtype, *, out):
+        second_weight, second_scale, second_bias = second_projection
+        up_result = reference.linear_prepared(qdata, scale, weight, weight_scale, dtype, bias)
+        gate_result = reference.linear_prepared(
+            qdata, scale, second_weight, second_scale, dtype, second_bias
+        )
+        paired = torch.cat((up_result, gate_result), dim=-1)
+        out.copy_(apply_input_activation(paired, "swiglu").to(dtype))
+        return out
+
+    backend.supports_prepared_swiglu = Mock(return_value=True)
+    backend.linear_prepared_swiglu = Mock(side_effect=project_swiglu)
+
+    actual = ffn.convrot_int8_ffn_op(value, *up, 16, *down, 16, "swiglu", chunk_rows, *gate, 16)
+    gate_result = reference.linear(value, *gate[:2], 16, gate[2])
+    up_result = reference.linear(value, *up[:2], 16, up[2])
+    expected = reference.linear(
+        torch.cat((up_result, gate_result), dim=-1), *down[:2], 16, down[2], activation_fn="swiglu"
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-8)
+    select.assert_called_once_with(value)
+    backend.supports_prepared_swiglu.assert_called_once()
+    chunks = (10 + chunk_rows - 1) // chunk_rows
+    assert backend.linear_prepared_swiglu.call_count == chunks
+    assert backend.linear_prepared.call_count == chunks
+    assert [call.kwargs.get("activation_fn") for call in backend.prepare_input.call_args_list] == [
+        None,
+        None,
+    ] * chunks
+    assert all(
+        call.kwargs["out"].shape[-1] == 32 for call in backend.linear_prepared_swiglu.call_args_list
+    )
+    assert all(call.args[2] is down[0] for call in backend.linear_prepared.call_args_list)
 
 
 def test_ffn_rejects_missing_backend_before_allocating_workspace(monkeypatch):
