@@ -9,6 +9,8 @@ from typing import Literal, cast
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from piper_kernels.fusions.ffn import _convrot_int8 as int8_ffn
 from piper_kernels.fusions.ffn import _nvfp4 as nvfp4_ffn
@@ -210,31 +212,59 @@ def test_update_op_mutates_only_output_and_shares_ffn_argument_names(
     ] == ["output"]
 
 
+@pytest.mark.parametrize("activation", _ACTIVATIONS)
 @pytest.mark.parametrize(
     ("output_features", "adds_residual"),
-    [(5_120, False), (16_384, True)],
+    [(5_120, False), (16_384, True), (32_768, True)],
 )
-def test_convrot_int8_gelu_chunk_rows_bounds_workspace(
-    output_features: int, adds_residual: bool
+def test_convrot_int8_chunk_rows_bounds_workspace(
+    activation: _Activation, output_features: int, adds_residual: bool
 ) -> None:
     source = torch.empty(100_000, 5_120, dtype=torch.bfloat16, device="meta")
     up = torch.empty(13_824, 5_120, dtype=torch.int8, device="meta")
     down = torch.empty(output_features, 13_824, dtype=torch.int8, device="meta")
 
-    rows = int8_ffn.default_chunk_rows(source, up, down, "gelu_tanh", adds_residual=adds_residual)
+    rows = int8_ffn.default_chunk_rows(source, up, down, activation, adds_residual=adds_residual)
+    projection_features = (2 if activation == "swiglu" else 1) * 13_824
     projected_output_bytes = (
-        output_features * source.element_size() if adds_residual and output_features > 13_824 else 0
+        output_features * source.element_size()
+        if adds_residual and output_features > projection_features
+        else 0
     )
     bytes_per_row = (
-        13_824 * source.element_size() + 13_824 + torch.float32.itemsize + projected_output_bytes
+        projection_features * source.element_size()
+        + 13_824
+        + torch.float32.itemsize
+        + projected_output_bytes
     )
+    limit = 512 * 1_024**2
     assert rows % 128 == 0
-    assert rows * bytes_per_row <= 1_024**3
-    assert (rows + 128) * bytes_per_row > 1_024**3
+    assert rows * bytes_per_row <= limit
+    assert (rows + 128) * bytes_per_row > limit
+
+    # Ultra-wide intermediates clamp cleanly to the 128-row granularity floor.
+    ultra_wide_up = torch.empty(2_097_152, 5_120, dtype=torch.int8, device="meta")
+    ultra_wide_down = torch.empty(5_120, 2_097_152, dtype=torch.int8, device="meta")
     assert (
-        int8_ffn.default_chunk_rows(source, up, down, "swiglu", adds_residual=adds_residual)
-        == int8_ffn.DEFAULT_CHUNK_ROWS
+        int8_ffn.default_chunk_rows(
+            source, ultra_wide_up, ultra_wide_down, activation, adds_residual=False
+        )
+        == 128
     )
+
+    # Symbolic feature widths fall back to DEFAULT_CHUNK_ROWS.
+    shape_env = ShapeEnv()
+    with FakeTensorMode(shape_env=shape_env):
+        sym_width = shape_env.create_unbacked_symint()
+        sym_source = torch.empty(1_024, sym_width, dtype=torch.bfloat16, device="cpu")
+        sym_up = torch.empty(1_024, sym_width, dtype=torch.int8, device="cpu")
+        sym_down = torch.empty(sym_width, 1_024, dtype=torch.int8, device="cpu")
+        assert (
+            int8_ffn.default_chunk_rows(
+                sym_source, sym_up, sym_down, activation, adds_residual=False
+            )
+            == int8_ffn.DEFAULT_CHUNK_ROWS
+        )
 
 
 def _nvfp4_prepared_bytes_per_row(features: int) -> int:
@@ -244,11 +274,18 @@ def _nvfp4_prepared_bytes_per_row(features: int) -> int:
     return (math.prod(qdata_shape) + math.prod(scale_shape)) // rows
 
 
+@pytest.mark.parametrize("activation", _ACTIVATIONS)
 @pytest.mark.parametrize(
     ("input_features", "intermediate_features", "output_features", "adds_residual"),
-    [(5_120, 13_824, 5_120, False), (80, 144, 192, True)],
+    [
+        (5_120, 13_824, 5_120, False),
+        (80, 144, 192, True),
+        (80, 144, 320, True),
+        (512, 256, 256, False),
+    ],
 )
-def test_nvfp4_gelu_chunk_rows_bounds_workspace(
+def test_nvfp4_chunk_rows_bounds_workspace(
+    activation: _Activation,
     input_features: int,
     intermediate_features: int,
     output_features: int,
@@ -260,25 +297,49 @@ def test_nvfp4_gelu_chunk_rows_bounds_workspace(
         output_features, intermediate_features // 2, dtype=torch.uint8, device="meta"
     )
 
-    rows = nvfp4_ffn.default_chunk_rows(source, up, down, "gelu_tanh", adds_residual=adds_residual)
+    rows = nvfp4_ffn.default_chunk_rows(source, up, down, activation, adds_residual=adds_residual)
+    projection_features = (2 if activation == "swiglu" else 1) * intermediate_features
     projected_output_bytes = (
         output_features * source.element_size()
-        if adds_residual and output_features > intermediate_features
+        if adds_residual and output_features > projection_features
         else 0
     )
     bytes_per_row = (
-        _nvfp4_prepared_bytes_per_row(input_features)
-        + intermediate_features * source.element_size()
-        + _nvfp4_prepared_bytes_per_row(intermediate_features)
+        max(
+            _nvfp4_prepared_bytes_per_row(input_features),
+            _nvfp4_prepared_bytes_per_row(intermediate_features),
+        )
+        + projection_features * source.element_size()
         + projected_output_bytes
     )
+    limit = 256 * 1_024**2
     assert rows % 128 == 0
-    assert rows * bytes_per_row <= 512 * 1_024**2
-    assert (rows + 128) * bytes_per_row > 512 * 1_024**2
+    assert rows * bytes_per_row <= limit
+    assert (rows + 128) * bytes_per_row > limit
+
+    # Ultra-wide intermediates clamp cleanly to the 128-row granularity floor.
+    ultra_wide_up = torch.empty(2_097_152, input_features // 2, dtype=torch.uint8, device="meta")
+    ultra_wide_down = torch.empty(output_features, 2_097_152 // 2, dtype=torch.uint8, device="meta")
     assert (
-        nvfp4_ffn.default_chunk_rows(source, up, down, "swiglu", adds_residual=adds_residual)
-        == nvfp4_ffn.DEFAULT_CHUNK_ROWS
+        nvfp4_ffn.default_chunk_rows(
+            source, ultra_wide_up, ultra_wide_down, activation, adds_residual=False
+        )
+        == 128
     )
+
+    # Symbolic feature widths fall back to DEFAULT_CHUNK_ROWS.
+    shape_env = ShapeEnv()
+    with FakeTensorMode(shape_env=shape_env):
+        sym_half = shape_env.create_unbacked_symint()
+        sym_source = torch.empty(1_024, 2 * sym_half, dtype=torch.bfloat16, device="cpu")
+        sym_up = torch.empty(1_024, sym_half, dtype=torch.uint8, device="cpu")
+        sym_down = torch.empty(2 * sym_half, 512, dtype=torch.uint8, device="cpu")
+        assert (
+            nvfp4_ffn.default_chunk_rows(
+                sym_source, sym_up, sym_down, activation, adds_residual=False
+            )
+            == nvfp4_ffn.DEFAULT_CHUNK_ROWS
+        )
 
 
 def test_ffn_package_and_compile_options_are_triton_and_extra_free() -> None:

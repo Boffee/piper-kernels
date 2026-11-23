@@ -27,7 +27,7 @@ from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 DEFAULT_CHUNK_ROWS = 1_536
-_GELU_WORKSPACE_LIMIT_BYTES = 512 * 1_024 * 1_024
+_WORKSPACE_LIMIT_BYTES = 256 * 1_024 * 1_024
 _CHUNK_ROW_GRANULARITY = 128
 
 
@@ -63,12 +63,12 @@ def default_chunk_rows(
 ) -> int:
     """Return bounded row chunk size for standard and ConvRot NVFP4 FFNs.
 
-    SwiGLU uses a fixed 1536-row chunk; GELU bounds reusable scratch to 512 MiB
-    while amortizing long-sequence launches and accounting for residual scratch
-    when the output is wider than the intermediate projection.
+    Bounds reusable workspace (shared source/activated NVFP4 buffers, up/gate
+    projection scratch, and standalone residual scratch when wider than the
+    up/gate workspace) to 256 MiB across both ``gelu_tanh`` and ``swiglu``.
+    Falls back to ``DEFAULT_CHUNK_ROWS`` when feature widths are symbolic.
     """
-    if activation_fn == "swiglu":
-        return DEFAULT_CHUNK_ROWS
+    activation_width = input_activation_width(activation_fn)
     input_features = 2 * up_weight_qdata.shape[1]
     intermediate_features = up_weight_qdata.shape[0]
     output_features = down_weight_qdata.shape[0]
@@ -77,21 +77,19 @@ def default_chunk_rows(
         for features in (input_features, intermediate_features, output_features)
     ):
         return DEFAULT_CHUNK_ROWS
-    source_preparation_bytes = _prepared_bytes_per_row(input_features)
-    activation_preparation_bytes = _prepared_bytes_per_row(intermediate_features)
-    projection_bytes = intermediate_features * input.element_size()
+    projection_features = activation_width * intermediate_features
+    preparation_bytes = max(
+        _prepared_bytes_per_row(input_features),
+        _prepared_bytes_per_row(intermediate_features),
+    )
+    projection_bytes = projection_features * input.element_size()
     projected_output_bytes = (
         output_features * input.element_size()
-        if adds_residual and output_features > intermediate_features
+        if adds_residual and output_features > projection_features
         else 0
     )
-    bytes_per_row = (
-        source_preparation_bytes
-        + projection_bytes
-        + activation_preparation_bytes
-        + projected_output_bytes
-    )
-    rows = _GELU_WORKSPACE_LIMIT_BYTES // bytes_per_row
+    bytes_per_row = preparation_bytes + projection_bytes + projected_output_bytes
+    rows = _WORKSPACE_LIMIT_BYTES // bytes_per_row
     return max(_CHUNK_ROW_GRANULARITY, rows // _CHUNK_ROW_GRANULARITY * _CHUNK_ROW_GRANULARITY)
 
 
