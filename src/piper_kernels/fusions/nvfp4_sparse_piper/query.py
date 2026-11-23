@@ -5,16 +5,12 @@ from __future__ import annotations
 import torch
 
 from piper_kernels._validation import validate_positive_finite_float
-from piper_kernels.attention.kernels.sparse_piper.layout import (
-    QUERY_SCALE_ROWS,
-    TILE_ROWS,
-    padded_sequence_length,
-)
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
     validate_routing_mode,
 )
+from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.linear.nvfp4._chunking import (
     DEFAULT_CHUNK_ROWS,
@@ -130,32 +126,9 @@ def _launch_query_range(  # noqa: PLR0913, PLR0917
     )
     if chunk_rows is None:
         chunk_rows = sequence_length
-    if (
-        isinstance(chunk_start, bool)
-        or not isinstance(chunk_start, int)
-        or isinstance(chunk_rows, bool)
-        or not isinstance(chunk_rows, int)
-        or chunk_start < 0
-        or chunk_rows < 1
-        or chunk_start % TILE_ROWS
-        or chunk_start + chunk_rows > sequence_length
-    ):
-        raise ValueError("Q projection range must be a nonempty aligned sequence window")
-    storage_sequence_length = padded_sequence_length(chunk_rows)
-    query = torch.empty(
-        (1, heads, storage_sequence_length, head_dim),
-        device=input_qdata.device,
-        dtype=torch.int8,
-    )
-    query_scale = torch.empty(
-        (1, heads, storage_sequence_length // QUERY_SCALE_ROWS),
-        device=input_qdata.device,
-        dtype=torch.float32,
-    )
-    query_summary = torch.empty(
-        (1, heads, storage_sequence_length // TILE_ROWS, head_dim),
-        device=input_qdata.device,
-        dtype=torch.float32,
+    output_common.validate_query_range(chunk_start, chunk_rows, sequence_length)
+    query, query_scale, query_summary = output_common.allocate_query_storage(
+        input_qdata, 1, heads, chunk_rows, head_dim
     )
 
     def consume(chunk: torch.Tensor, start: int) -> None:
@@ -220,46 +193,6 @@ def _launch_query_range(  # noqa: PLR0913, PLR0917
     return query, query_scale, query_summary
 
 
-def _launch_query(  # noqa: PLR0913, PLR0917
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    input_per_tensor_scale: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_per_tensor_scale: torch.Tensor | None,
-    bias: torch.Tensor | None,
-    norm_weight: torch.Tensor | None,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    norm_epsilon: float,
-    softmax_scale: float,
-    chunk_rows: int,
-    routing_mode: int,
-    block_lengths: torch.Tensor | None,
-    *,
-    head_dim: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Project complete query storage for the public standalone boundary."""
-    return _launch_query_range(
-        input_qdata,
-        input_scale,
-        input_per_tensor_scale,
-        weight_qdata,
-        weight_scale,
-        weight_per_tensor_scale,
-        bias,
-        norm_weight,
-        cos,
-        sin,
-        norm_epsilon,
-        softmax_scale,
-        chunk_rows,
-        routing_mode,
-        block_lengths,
-        head_dim=head_dim,
-    )
-
-
 @torch.library.custom_op("piper_kernels::nvfp4_sparse_piper_project_query", mutates_args=())
 def project_query(  # noqa: PLR0913, PLR0917
     input_qdata: torch.Tensor,
@@ -280,7 +213,7 @@ def project_query(  # noqa: PLR0913, PLR0917
     *,
     head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _launch_query(
+    return _launch_query_range(
         input_qdata,
         input_scale,
         input_per_tensor_scale,
@@ -321,19 +254,15 @@ def _project_query_fake(
     head_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length = input_qdata.shape[0]
-    storage_sequence_length = padded_sequence_length(sequence_length)
     head_dim = resolve_head_dim(norm_weight, head_dim)
     heads = weight_qdata.shape[0] // head_dim
-    return (
-        input_qdata.new_empty((1, heads, storage_sequence_length, head_dim), dtype=torch.int8),
-        input_qdata.new_empty(
-            (1, heads, storage_sequence_length // QUERY_SCALE_ROWS),
-            dtype=torch.float32,
-        ),
-        cos.new_empty(
-            (1, heads, storage_sequence_length // TILE_ROWS, head_dim),
-            dtype=torch.float32,
-        ),
+    return output_common.allocate_query_storage(
+        input_qdata,
+        1,
+        heads,
+        sequence_length,
+        head_dim,
+        summary_template=cos,
     )
 
 

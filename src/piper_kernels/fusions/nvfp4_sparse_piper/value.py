@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels.attention.kernels.sparse_piper.layout import (
-    TILE_ROWS,
-    padded_sequence_length,
-)
+from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.linear.nvfp4._chunking import (
     DEFAULT_CHUNK_ROWS,
     PreparedProjection,
@@ -18,7 +15,8 @@ from . import _epilogue
 from ._validation import validate_block_lengths, validate_projection
 
 
-def _launch_value(
+@torch.library.custom_op("piper_kernels::nvfp4_sparse_piper_project_value", mutates_args=())
+def project_value(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     input_per_tensor_scale: torch.Tensor,
@@ -26,8 +24,8 @@ def _launch_value(
     weight_scale: torch.Tensor,
     weight_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
-    chunk_rows: int,
-    block_lengths: torch.Tensor | None,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    block_lengths: torch.Tensor | None = None,
     *,
     head_dim: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -49,22 +47,12 @@ def _launch_value(
         input_qdata.device,
         "V projection",
     )
-    storage_sequence_length = padded_sequence_length(sequence_length)
-    storage_tiles = storage_sequence_length // TILE_ROWS
-    value = torch.empty(
-        (1, heads, head_dim, storage_sequence_length),
-        device=input_qdata.device,
-        dtype=torch.int8,
-    )
-    value_scale = torch.empty(
-        (1, heads, storage_tiles, 1),
-        device=input_qdata.device,
-        dtype=torch.float32,
-    )
-    value_mean = torch.empty(
-        (1, heads, storage_tiles, head_dim),
-        device=input_qdata.device,
-        dtype=torch.bfloat16,
+    value, value_scale, value_mean = output_common.allocate_value_storage(
+        input_qdata,
+        1,
+        heads,
+        sequence_length,
+        head_dim,
     )
     projection = PreparedProjection(
         input_qdata,
@@ -102,34 +90,6 @@ def _launch_value(
     return value, value_scale, value_mean
 
 
-@torch.library.custom_op("piper_kernels::nvfp4_sparse_piper_project_value", mutates_args=())
-def project_value(
-    input_qdata: torch.Tensor,
-    input_scale: torch.Tensor,
-    input_per_tensor_scale: torch.Tensor,
-    weight_qdata: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_per_tensor_scale: torch.Tensor | None,
-    bias: torch.Tensor | None,
-    chunk_rows: int = DEFAULT_CHUNK_ROWS,
-    block_lengths: torch.Tensor | None = None,
-    *,
-    head_dim: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _launch_value(
-        input_qdata,
-        input_scale,
-        input_per_tensor_scale,
-        weight_qdata,
-        weight_scale,
-        weight_per_tensor_scale,
-        bias,
-        chunk_rows,
-        block_lengths,
-        head_dim=head_dim,
-    )
-
-
 @project_value.register_fake  # pyright: ignore[reportFunctionMemberAccess]
 def _project_value_fake(
     input_qdata: torch.Tensor,
@@ -145,19 +105,13 @@ def _project_value_fake(
     head_dim: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sequence_length = input_qdata.shape[0]
-    storage_sequence_length = padded_sequence_length(sequence_length)
-    storage_tiles = storage_sequence_length // TILE_ROWS
     heads = weight_qdata.shape[0] // head_dim
-    return (
-        input_qdata.new_empty((1, heads, head_dim, storage_sequence_length), dtype=torch.int8),
-        input_qdata.new_empty(
-            (1, heads, storage_tiles, 1),
-            dtype=torch.float32,
-        ),
-        input_qdata.new_empty(
-            (1, heads, storage_tiles, head_dim),
-            dtype=torch.bfloat16,
-        ),
+    return output_common.allocate_value_storage(
+        input_qdata,
+        1,
+        heads,
+        sequence_length,
+        head_dim,
     )
 
 

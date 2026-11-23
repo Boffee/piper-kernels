@@ -10,10 +10,11 @@ from __future__ import annotations
 import torch
 
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.convrot_int8_projection._validation import validate_projection_inputs
 
 from . import _backend
-from ._layout import SUPPORTED_HEAD_DIMS, TILE_ROWS, padded_sequence_length, validate_block_lengths
+from ._layout import SUPPORTED_HEAD_DIMS, TILE_ROWS, validate_block_lengths
 
 
 def validate_value_inputs(
@@ -37,31 +38,7 @@ def validate_value_inputs(
 
 
 _validate_inputs = validate_value_inputs
-
-
-def allocate_value_output(
-    template: torch.Tensor,
-    batch: int,
-    heads: int,
-    storage_sequence_length: int,
-    head_dim: int,
-    storage_format: ValueFormat,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Allocate contiguous sparse-Piper value storage and per-tile metadata."""
-    storage_tiles = storage_sequence_length // TILE_ROWS
-    value = template.new_empty(
-        storage_format.shape(batch, heads, storage_sequence_length, head_dim),
-        dtype=torch.int8,
-    )
-    value_scale_multiplier = template.new_empty(
-        (batch, heads, storage_tiles, 1),
-        dtype=torch.float32,
-    )
-    value_mean = template.new_empty(
-        (batch, heads, storage_tiles, head_dim),
-        dtype=torch.bfloat16,
-    )
-    return value, value_scale_multiplier, value_mean
+allocate_value_output = output_common.allocate_value_storage
 
 
 def _launch_value_projection(
@@ -84,14 +61,13 @@ def _launch_value_projection(
         bias=bias,
     )
     validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
-    storage_sequence_length = padded_sequence_length(sequence_length)
     storage_format = ValueFormat(value_format)
     backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
     value, value_scale_multiplier, value_mean = allocate_value_output(
         input_qdata,
         batch,
         heads,
-        storage_sequence_length,
+        sequence_length,
         head_dim,
         storage_format,
     )
@@ -146,13 +122,12 @@ def _project_value_op_fake(
     value_format: int = int(ValueFormat.TRANSPOSED),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, sequence_length, _input_features = input_qdata.shape
-    storage_sequence_length = padded_sequence_length(sequence_length)
     heads = weight_qdata.shape[0] // head_dim
     return allocate_value_output(
         input_qdata,
         batch,
         heads,
-        storage_sequence_length,
+        sequence_length,
         head_dim,
         ValueFormat(value_format),
     )

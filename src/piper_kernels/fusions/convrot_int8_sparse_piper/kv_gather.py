@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._distributed import _comm as distributed_comm
-from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat, padded_sequence_length
+from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._contracts import validate_routing_mode
 from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.linear.convrot.int8 import _backend as convrot_linear_backend
@@ -230,12 +230,11 @@ def _prepare_kv_outputs(
         bias=value_spec.bias,
     )
     validate_block_lengths(value_spec.block_lengths, full_sequence_length, full_qdata.device)
-    storage_sequence_length = padded_sequence_length(full_sequence_length)
     key_outputs = key_ops.allocate_key_output(
         full_qdata,
         batch,
         key_heads,
-        storage_sequence_length,
+        full_sequence_length,
         resolved_key_head_dim,
         key_spec.routing_mode,
     )
@@ -243,7 +242,7 @@ def _prepare_kv_outputs(
         full_qdata,
         batch,
         value_heads,
-        storage_sequence_length,
+        full_sequence_length,
         value_spec.head_dim,
         value_spec.storage_format,
     )
@@ -511,17 +510,16 @@ def _prepare_gather_project_kv_op_fake(
     full_qdata = input.new_empty((batch, full_sequence_length, input_features), dtype=torch.int8)
     full_scale = input.new_empty((batch, full_sequence_length), dtype=torch.float32)
     resolved_key_head_dim = resolve_head_dim(k_norm_weight, k_head_dim)
-    storage_sequence_length = padded_sequence_length(full_sequence_length)
     key_heads = k_weight_qdata.shape[0] // resolved_key_head_dim
     value_heads = v_weight_qdata.shape[0] // v_head_dim
     key_outputs = key_ops.allocate_key_output(
-        full_qdata, batch, key_heads, storage_sequence_length, resolved_key_head_dim, routing_mode
+        full_qdata, batch, key_heads, full_sequence_length, resolved_key_head_dim, routing_mode
     )
     value_outputs = value_ops.allocate_value_output(
         full_qdata,
         batch,
         value_heads,
-        storage_sequence_length,
+        full_sequence_length,
         v_head_dim,
         ValueFormat(v_value_format),
     )
