@@ -42,33 +42,6 @@ def has_c10d_collectives(graph: torch.fx.Graph) -> bool:
     )
 
 
-def parse_convrot_int8_prepare_input(
-    node: torch.fx.Node,
-) -> tuple[torch.fx.Node, int, torch.fx.Node | None] | None:
-    """Parse ``convrot_int8_prepare_input`` without activation.
-
-    Returns ``(source, group_size, input_scale)`` when matched.
-    """
-    if (
-        node.op != "call_function"
-        or node.target is not torch.ops.piper_kernels.convrot_int8_prepare_input.default
-        or node.kwargs
-        or len(node.args) not in (3, 4)
-    ):
-        return None
-    source, group_size, activation_fn = node.args[:3]
-    input_scale = node.args[3] if len(node.args) == 4 else None
-    if (
-        not isinstance(source, torch.fx.Node)
-        or type(group_size) is not int
-        or group_size < 1
-        or activation_fn is not None
-        or (input_scale is not None and not isinstance(input_scale, torch.fx.Node))
-    ):
-        return None
-    return source, group_size, input_scale
-
-
 def _static_group_size(value: object) -> int | None:
     return value if type(value) is int and value >= 2 else None
 
@@ -619,6 +592,5 @@ __all__ = [
     "match_distributed_residual_add",
     "match_sequence_all_gather",
     "match_sequence_reduce_scatter",
-    "parse_convrot_int8_prepare_input",
     "rewrite_sym_size_users",
 ]
