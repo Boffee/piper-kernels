@@ -109,24 +109,31 @@ def _supports_rdna4_128m_fast_path(
     target: AcceleratorTarget,
     plan: LinearExecutionPlan,
     *,
-    rows: int,
     in_features: int,
     out_features: int,
-    output_row_bytes: int,
+    rows: int | None = None,
+    output_row_bytes: int | None = None,
 ) -> bool:
     """Check shared gfx1201 128-row schedule and signed-INT32 SRD byte bounds."""
-    padded_rows = (rows + 127) // 128 * 128
-    return (
+    if not (
         target.is_architecture("gfx1201")
         and plan.matmul_block_m == 128
         and plan.matmul_num_warps == 8
         and plan.matmul_num_stages == 2
-        and rows > 64
-        # Keep input, weight, and output byte/element offsets within signed INT32
-        # so AMDGPU lowers memory ops to SRD buffer instructions.
-        and max(in_features * out_features, padded_rows * max(in_features, output_row_bytes))
-        < 2**31
-    )
+        and out_features > 0
+        and in_features > 0
+        and in_features * out_features < 2**31
+    ):
+        return False
+    if rows is None:
+        return True
+    if rows <= 64:
+        return False
+    assert output_row_bytes is not None
+    padded_rows = (rows + 127) // 128 * 128
+    # Keep input, weight, and output byte/element offsets within signed INT32
+    # so AMDGPU lowers memory ops to SRD buffer instructions.
+    return padded_rows * max(in_features, output_row_bytes) < 2**31
 
 
 def supports_paired_matmul(
@@ -151,6 +158,35 @@ def supports_paired_matmul(
             in_features=in_features,
             out_features=out_features,
             output_row_bytes=logical_dtype.itemsize * output_row_stride,
+        )
+    )
+
+
+def supports_swiglu_epilogue(
+    target: AcceleratorTarget,
+    plan: LinearExecutionPlan,
+    logical_dtype: torch.dtype,
+    *,
+    in_features: int,
+    out_features: int,
+    rows: int | None = None,
+    output_row_stride: int | None = None,
+) -> bool:
+    """Return whether aligned RDNA4 16-bit paired GEMMs fuse the SwiGLU epilogue."""
+    if logical_dtype not in (torch.float16, torch.bfloat16):
+        return False
+    stride = out_features if output_row_stride is None else output_row_stride
+    return (
+        (plan.matmul_block_n, plan.matmul_block_k) == (256, 64)
+        and out_features % 128 == 0
+        and in_features % 64 == 0
+        and _supports_rdna4_128m_fast_path(
+            target,
+            plan,
+            rows=rows,
+            in_features=in_features,
+            out_features=out_features,
+            output_row_bytes=logical_dtype.itemsize * stride,
         )
     )
 

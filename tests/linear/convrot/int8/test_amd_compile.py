@@ -220,22 +220,35 @@ def test_amd_activated_preparation_compiles(architecture, width, static):
         assert "tt.reduce" not in compiled.asm["ttir"]
 
 
-@pytest.mark.parametrize("full_rows", [False, True])
-@pytest.mark.parametrize("has_bias", [False, True])
-def test_rdna4_unpacked_paired_matmul_compiles_spill_free(full_rows, has_bias):
+@pytest.mark.parametrize(
+    ("output_type", "fuse_swiglu", "full_rows", "has_bias"),
+    [
+        ("*bf16", False, False, False),
+        ("*bf16", False, False, True),
+        ("*bf16", False, True, False),
+        ("*bf16", False, True, True),
+        ("*bf16", True, False, False),
+        ("*bf16", True, True, True),
+        ("*fp16", True, False, True),
+        ("*fp16", True, True, False),
+    ],
+)
+def test_rdna4_unpacked_paired_matmul_compiles_spill_free(
+    output_type, fuse_swiglu, full_rows, has_bias
+):
     target = AcceleratorTarget("hip", "gfx1201")
     source = ASTSource(
         amd._paired_int8_matmul_kernel,
         {
             "input_ptr": "*i8",
             "weight_ptr": "*i8",
-            "output_ptr": "*bf16",
+            "output_ptr": output_type,
             "input_scale_ptr": "*fp32",
             "weight_scale_ptr": "*fp32",
-            "bias_ptr": "*bf16",
+            "bias_ptr": output_type,
             "second_weight_ptr": "*i8",
             "second_scale_ptr": "*fp32",
-            "second_bias_ptr": "*bf16",
+            "second_bias_ptr": output_type,
             "m": "i32",
             "output_row_stride": "i32",
         },
@@ -246,6 +259,7 @@ def test_rdna4_unpacked_paired_matmul_compiles_spill_free(full_rows, has_bias):
             "second_has_bias": has_bias,
             "full_rows": full_rows,
             "accumulator_seed": 0x155555,
+            "fuse_swiglu": fuse_swiglu,
         },
         attrs={
             **{(index,): [["tt.divisibility", 16], ["tt.pointer_range", 32]] for index in range(9)},
@@ -263,6 +277,10 @@ def test_rdna4_unpacked_paired_matmul_compiles_spill_free(full_rows, has_bias):
     assert ".private_segment_fixed_size: 0" in asm
     if rocm_fences_only_lds():
         assert "global_inv" not in asm
+    if fuse_swiglu:
+        assert "v_exp_f32" in asm
+        assert "v_rcp_f32" in asm
+        assert "v_div_fmas" not in asm
 
 
 @pytest.mark.parametrize(

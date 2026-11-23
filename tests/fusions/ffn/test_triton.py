@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import exact_gfx1201_available, exact_sm120_available, sm8x_available
 from torch.nn import functional as F  # noqa: N812
 from torch.utils._python_dispatch import TorchDispatchMode
 from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
@@ -38,6 +38,10 @@ from ._helpers import (
 
 _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 _SM120 = pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+_FUSED_SWIGLU_GPU = pytest.mark.skipif(
+    not (exact_sm120_available() or sm8x_available() or exact_gfx1201_available()),
+    reason="requires NVIDIA SM8x/SM120 or ROCm gfx1201",
+)
 
 
 def _materialized_gated_updates(
@@ -183,16 +187,18 @@ def test_convrot_int8_accepts_adjacent_checkpoint_views() -> None:
 
 
 @pytest.mark.gpu
-@_SM120
+@_FUSED_SWIGLU_GPU
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("bias_dtype", [None, torch.float32])
-def test_convrot_int8_sm120_fused_swiglu_ffn_matches_materialized(
+def test_convrot_int8_fused_swiglu_ffn_matches_materialized(
     dtype: torch.dtype,
     bias_dtype: torch.dtype | None,
 ) -> None:
     torch.manual_seed(509)
-    # Chunk capacity triggers SM120 TMA (1024 * 10 >= 9216) and includes a 17-row tail chunk.
-    rows, input_features, intermediate_features, output_features = 1_041, 272, 2_560, 256
+    # Chunk capacity triggers fused TMA (SM120), async-copy (SM8x), or paired RDNA4 (gfx1201).
+    rows = 1_041
+    input_features = 272 if (exact_sm120_available() or sm8x_available()) else 256
+    intermediate_features, output_features = 2_560, 256
     operands = make_int8_operands(
         "swiglu",
         rows=rows,
@@ -280,8 +286,8 @@ def test_convrot_int8_sm120_fused_swiglu_ffn_matches_materialized(
 
 
 @pytest.mark.gpu
-@_SM120
-def test_convrot_int8_sm120_fused_swiglu_ffn_halves_projection_scratch() -> None:
+@_FUSED_SWIGLU_GPU
+def test_convrot_int8_fused_swiglu_ffn_halves_projection_scratch() -> None:
     chunk_rows = 2_048
     rows = 2 * chunk_rows
     width = 512

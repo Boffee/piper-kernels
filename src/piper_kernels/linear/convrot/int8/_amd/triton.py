@@ -443,6 +443,47 @@ def quantize_input(
         )
 
 
+_LOG2E = tl.constexpr(1.4426950408889634)
+
+
+@triton.jit
+def _fence_register_value(value):
+    """Sequence AMDGPU register scheduling to bound VGPR pressure in wide epilogues.
+
+    In 256-column residual tiles, splitting the epilogue into two 128-column
+    halves separated by this zero-cost inline-asm fence and ``tl.debug_barrier()``
+    prevents AMDGPU from hoisting residual global loads across both live
+    ``128x256`` INT32 accumulators. In paired 16-bit SwiGLU epilogues, fencing
+    each rounded ``128x128`` projection before gate dequantization keeps FP16
+    bias kernels at 232 VGPRs with zero spills.
+    """
+    return tl.inline_asm_elementwise(
+        ";;", "=v,0", [value], dtype=value.dtype, is_pure=False, pack=1
+    )
+
+
+@triton.jit
+def _amd_rcp_f32(value):
+    """Compute single-instruction hardware FP32 reciprocal on AMDGPU."""
+    return tl.inline_asm_elementwise(
+        "v_rcp_f32 $0, $1", "=v,v", [value], dtype=tl.float32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _amd_fast_swiglu(up, gate):
+    """Apply ``up * silu(gate)`` via ``exp2`` + ``v_rcp_f32`` in GEMM epilogues.
+
+    Avoids Triton/HIP's multi-instruction IEEE division and ``tl.exp``
+    range-reduction wrapper across 64 elements/lane to keep zero VGPR spills.
+    Matches eager 16-bit SwiGLU within ``2 * eps`` across all FP16 values and
+    normal BF16 activations; for extreme negative BF16 inputs (``gate <= -88.5``),
+    ``1.0 + exp2(-gate * log2(e))`` exceeds ``2**126`` and ``v_rcp_f32`` flushes
+    the subnormal FP32 reciprocal to ``0.0``.
+    """
+    return up * (gate * _amd_rcp_f32(1.0 + tl.exp2(-gate * _LOG2E)))
+
+
 @triton.jit(do_not_specialize=["m"])
 def _paired_int8_matmul_kernel(
     input_ptr,
@@ -462,13 +503,16 @@ def _paired_int8_matmul_kernel(
     second_has_bias: tl.constexpr,
     full_rows: tl.constexpr,
     accumulator_seed: tl.constexpr,
+    fuse_swiglu: tl.constexpr,
 ):
     """Project one prepared input into two adjacent 128-column-tiled weights.
 
-    Selected by ``policy.supports_paired_matmul`` on aligned ``gfx1201``
-    ``(128, 256, 64)`` shapes with ``rows > 64`` and signed 32-bit element/byte
-    offsets for SRD buffer addressing. Reuses each ``128x64`` activation tile
-    across both 128-column INT32 accumulators.
+    Selected by ``policy.supports_paired_matmul`` and
+    ``policy.supports_swiglu_epilogue`` on aligned ``gfx1201`` ``(128, 256, 64)``
+    shapes with ``rows > 64`` and signed 32-bit element/byte offsets for SRD
+    buffer addressing. Reuses each ``128x64`` activation tile across both
+    128-column INT32 accumulators; when ``fuse_swiglu`` is enabled, rounds each
+    projection to ``output_ptr``'s 16-bit dtype and stores ``up * silu(gate)``.
     """
     # Caller validates that 32-bit element indexing fits inputs, weights, and outputs.
     pid = tl.program_id(0)
@@ -506,6 +550,10 @@ def _paired_int8_matmul_kernel(
     )
     if has_bias:
         first_result += tl.load(bias_ptr + cols).to(tl.float32)[None, :]
+    if fuse_swiglu:
+        # Round to 16-bit and fence before dequantizing the gate tile so FP16
+        # bias kernels stay at 232 VGPRs with zero spills.
+        first_rounded = _fence_register_value(first_result.to(output_ptr.dtype.element_ty))
     second_result = (
         (second_accumulator - accumulator_seed).to(tl.float32)
         * row_scale[:, None]
@@ -515,8 +563,59 @@ def _paired_int8_matmul_kernel(
         second_result += tl.load(second_bias_ptr + cols).to(tl.float32)[None, :]
     dest = output_ptr + rows[:, None] * output_row_stride + cols[None, :]
     valid_rows = True if full_rows else rows[:, None] < m
-    tl.store(dest + n, second_result, mask=valid_rows)
-    tl.store(dest, first_result, mask=valid_rows)
+    if fuse_swiglu:
+        second_rounded = _fence_register_value(second_result.to(output_ptr.dtype.element_ty))
+        activated = _amd_fast_swiglu(
+            first_rounded.to(tl.float32),  # pyright: ignore[reportPossiblyUnboundVariable]
+            second_rounded.to(tl.float32),
+        )
+        tl.store(dest, activated, mask=valid_rows)
+    else:
+        tl.store(dest + n, second_result, mask=valid_rows)
+        tl.store(dest, first_result, mask=valid_rows)
+
+
+def _launch_paired_int8_matmul(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output: torch.Tensor,
+    second_weight: torch.Tensor,
+    second_scale: torch.Tensor,
+    second_bias: torch.Tensor | None,
+    *,
+    target: AcceleratorTarget,
+    fuse_swiglu: bool,
+) -> None:
+    m, k = input_qdata.shape
+    n = weight_qdata.shape[0]
+    output_tiles = triton.cdiv(m, 128) * (n // 128)
+    with device_context(input_qdata.device):
+        _paired_int8_matmul_kernel[(output_tiles,)](
+            input_qdata,
+            weight_qdata,
+            output,
+            input_scale,
+            weight_scale,
+            bias if bias is not None else output,
+            second_weight,
+            second_scale,
+            second_bias if second_bias is not None else output,
+            m,
+            output.stride(0),
+            n=n,
+            k=k,
+            has_bias=bias is not None,
+            second_has_bias=second_bias is not None,
+            full_rows=m % 128 == 0,
+            accumulator_seed=policy.matmul_accumulator_seed(target, k, output_tiles),
+            fuse_swiglu=fuse_swiglu,
+            **_amd_matmul_compiler_options(target),
+            num_stages=2,
+            num_warps=8,
+        )
 
 
 def launch_prepared_linear(
@@ -540,8 +639,6 @@ def launch_prepared_linear(
     n = weight_qdata.shape[0]
     plan = execution_plan
     target = AcceleratorTarget.from_device(input_qdata.device) if target is None else target
-    compiler_options = _amd_matmul_compiler_options(target)
-    bias_pointer = bias if bias is not None else output
     if paired and policy.supports_paired_matmul(
         target,
         plan,
@@ -551,31 +648,22 @@ def launch_prepared_linear(
         out_features=n,
         output_row_stride=output.stride(0),
     ):
-        output_tiles = triton.cdiv(m, 128) * (n // 128)
-        with device_context(input_qdata.device):
-            _paired_int8_matmul_kernel[(output_tiles,)](
-                input_qdata,
-                weight_qdata,
-                output,
-                input_scale,
-                weight_scale,
-                bias_pointer,
-                second_weight,
-                second_scale,
-                second_bias if second_bias is not None else output,
-                m,
-                output.stride(0),
-                n=n,
-                k=k,
-                has_bias=bias is not None,
-                second_has_bias=second_bias is not None,
-                full_rows=m % 128 == 0,
-                accumulator_seed=policy.matmul_accumulator_seed(target, k, output_tiles),
-                **compiler_options,
-                num_stages=2,
-                num_warps=8,
-            )
+        _launch_paired_int8_matmul(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            bias,
+            output,
+            second_weight,
+            second_scale,
+            second_bias,
+            target=target,
+            fuse_swiglu=False,
+        )
         return
+    compiler_options = _amd_matmul_compiler_options(target)
+    bias_pointer = bias if bias is not None else output
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
     group_m = policy.matmul_group_m(plan)
     row_block_count = triton.cdiv(m, plan.matmul_block_m)
@@ -612,21 +700,6 @@ def launch_prepared_linear(
             num_stages=plan.matmul_num_stages,
             num_warps=plan.matmul_num_warps,
         )
-
-
-@triton.jit
-def _fence_register_value(value):
-    """Sequence AMDGPU register scheduling to bound VGPR spills in 256-column epilogues.
-
-    In 256-column tiles, splitting the residual epilogue into two 128-column halves
-    separated by this zero-cost inline-asm fence and ``tl.debug_barrier()`` prevents
-    AMDGPU from hoisting residual global loads across both live ``128x256`` INT32
-    accumulators, keeping ``128x128`` and non-reusable ``256x64`` kernels spill-free
-    while keeping reusable-update ``256x64`` spills bounded.
-    """
-    return tl.inline_asm_elementwise(
-        ";;", "=v,0", [value], dtype=value.dtype, is_pure=False, pack=1
-    )
 
 
 @triton.jit
@@ -805,12 +878,27 @@ def supports_prepared_swiglu(
     second_weight: torch.Tensor,
     logical_dtype: torch.dtype,
     *,
+    rows: int | None = None,
     execution_plan: LinearExecutionPlan,
     target: AcceleratorTarget,
 ) -> bool:
     """Return whether paired INT8 projections can fuse SwiGLU on this target."""
-    del weight_qdata, second_weight, logical_dtype, execution_plan, target
-    return False
+    if (
+        weight_qdata.ndim != 2
+        or second_weight.shape != weight_qdata.shape
+        or not weight_qdata.is_contiguous()
+        or not second_weight.is_contiguous()
+    ):
+        return False
+    out_features, in_features = weight_qdata.shape
+    return policy.supports_swiglu_epilogue(
+        target,
+        execution_plan,
+        logical_dtype,
+        in_features=in_features,
+        out_features=out_features,
+        rows=rows,
+    )
 
 
 def try_launch_prepared_swiglu(
@@ -827,8 +915,27 @@ def try_launch_prepared_swiglu(
     execution_plan: LinearExecutionPlan,
     target: AcceleratorTarget,
 ) -> bool:
-    """Launch fused SwiGLU GEMM when supported; return False for fallback."""
-    del (
+    """Launch fused RDNA4 SwiGLU GEMM when supported; return False for fallback."""
+    if (
+        not input_qdata.is_contiguous()
+        or not weight_qdata.is_contiguous()
+        or not second_weight.is_contiguous()
+        or second_weight.shape != weight_qdata.shape
+    ):
+        return False
+    m, k = input_qdata.shape
+    n = weight_qdata.shape[0]
+    if not policy.supports_swiglu_epilogue(
+        target,
+        execution_plan,
+        output.dtype,
+        in_features=k,
+        out_features=n,
+        rows=m,
+        output_row_stride=output.stride(0),
+    ):
+        return False
+    _launch_paired_int8_matmul(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -838,10 +945,10 @@ def try_launch_prepared_swiglu(
         second_weight,
         second_scale,
         second_bias,
-        execution_plan,
-        target,
+        target=target,
+        fuse_swiglu=True,
     )
-    return False
+    return True
 
 
 def try_launch_prepared_residual(

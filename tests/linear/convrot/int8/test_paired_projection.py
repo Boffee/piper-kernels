@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available, sm8x_available
+from _accelerators import exact_gfx1201_available, exact_sm120_available, sm8x_available
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.linear.convrot.int8._backend import require_linear_backend
@@ -81,7 +81,14 @@ def test_paired_projection_rejects_mismatched_weights() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
 @pytest.mark.parametrize(
     "shape",
-    [(1, 256, 384), (129, 512, 300), (1024, 256, 2560), (1024, 264, 2560), (1041, 272, 2577)],
+    [
+        (1, 256, 384),
+        (129, 512, 300),
+        (1024, 256, 2560),
+        (1041, 256, 2560),
+        (1024, 264, 2560),
+        (1041, 272, 2577),
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
@@ -109,11 +116,9 @@ def test_prepared_swiglu_matches_paired_reference(shape, dtype, bias_dtypes) -> 
         for bias_dtype in bias_dtypes
     ]
     implementation = require_linear_backend(qdata)
-    expected_fused = (
-        (exact_sm120_available() or sm8x_available())
-        and rows >= 1_024
-        and features % 16 == 0
-        and dtype in (torch.float16, torch.bfloat16)
+    expected_fused = dtype in (torch.float16, torch.bfloat16) and (
+        ((exact_sm120_available() or sm8x_available()) and rows >= 1_024 and features % 16 == 0)
+        or (exact_gfx1201_available() and rows > 64 and features % 64 == 0 and width % 128 == 0)
     )
     assert (
         implementation.supports_prepared_swiglu(weights[0], weights[1], dtype, rows=rows)
@@ -202,7 +207,7 @@ def test_prepared_swiglu_validates_outputs_handles_3d_and_empty() -> None:
     expected = (up_part.float() * F.silu(gate_part.float())).to(dtype)
     actual = implementation.linear_prepared_swiglu(*args)
     assert actual.shape == (batch, seq, width)
-    if exact_sm120_available() or sm8x_available():
+    if exact_sm120_available() or sm8x_available() or exact_gfx1201_available():
         torch.testing.assert_close(
             actual,
             expected,
@@ -230,3 +235,45 @@ def test_prepared_swiglu_validates_outputs_handles_3d_and_empty() -> None:
         dtype,
     )
     assert empty.shape == (0, width)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_prepared_swiglu_preserves_projection_rounding(dtype: torch.dtype) -> None:
+    rows, features, width = 1_024, 256, 2_560
+    qdata = torch.ones((rows, features), device="cuda", dtype=torch.int8)
+    scale = torch.ones(rows, device="cuda")
+    weights = [torch.ones((width, features), device="cuda", dtype=torch.int8) for _ in range(2)]
+    # 1.0 + 0.49 * eps rounds back to 1.0 in 16-bit, so only pre-activation
+    # rounding matches (1.0 * silu(1.0)).to(dtype).
+    unrounded_value = 1.0 + 0.49 * torch.finfo(dtype).eps
+    weight_scale = torch.full((width,), unrounded_value / features, device="cuda")
+    implementation = require_linear_backend(qdata)
+
+    paired = implementation.linear_prepared(
+        qdata,
+        scale,
+        weights[0],
+        weight_scale,
+        None,
+        dtype,
+        second_projection=(weights[1], weight_scale, None),
+    )
+    assert torch.equal(paired, torch.ones_like(paired))
+
+    actual = implementation.linear_prepared_swiglu(
+        qdata,
+        scale,
+        weights[0],
+        weight_scale,
+        None,
+        (weights[1], weight_scale, None),
+        dtype,
+    )
+    ones = torch.ones((rows, width), device="cuda", dtype=torch.float32)
+    expected_rounded = (ones * F.silu(ones)).to(dtype)
+    unrounded = torch.full((rows, width), unrounded_value, device="cuda", dtype=torch.float32)
+    expected_unrounded = (unrounded * F.silu(unrounded)).to(dtype)
+    assert not torch.equal(expected_rounded, expected_unrounded)
+    torch.testing.assert_close(actual, expected_rounded, rtol=0, atol=0)
