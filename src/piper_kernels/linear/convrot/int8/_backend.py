@@ -103,6 +103,7 @@ class _LinearKernels(Protocol):
         second_weight: torch.Tensor,
         logical_dtype: torch.dtype,
         *,
+        rows: int | None = None,
         execution_plan: LinearExecutionPlan,
         target: AcceleratorTarget,
     ) -> bool: ...
@@ -461,6 +462,7 @@ class LinearBackend:
             weight_qdata,
             second_weight,
             logical_dtype,
+            rows=rows,
             execution_plan=plan,
             target=target,
         )

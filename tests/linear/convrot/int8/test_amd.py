@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from _accelerators import mock_rocm_target, mock_triton_driver
+from _accelerators import exact_gfx1201_available, mock_rocm_target, mock_triton_driver
 
 from piper_kernels import compile_options
 from piper_kernels._input_activations import apply_input_activation
@@ -207,6 +207,39 @@ def test_gfx1201_paired_matmul_respects_custom_plan():
         in_features=5376,
         out_features=14336,
         output_row_stride=28672,
+    )
+
+
+@pytest.mark.parametrize(
+    ("arch", "dtype", "rows", "outputs", "width", "expected"),
+    [
+        ("gfx1201", torch.bfloat16, None, 14336, 5376, True),
+        ("gfx1201", torch.float16, None, 16384, 6144, True),
+        ("gfx1201", torch.bfloat16, 65, 14336, 5376, True),
+        ("gfx1201", torch.bfloat16, 64, 14336, 5376, False),
+        ("gfx1201", torch.bfloat16, 200000, 14336, 5376, False),
+        ("gfx1201", torch.float32, None, 14336, 5376, False),
+        ("gfx1200", torch.bfloat16, None, 14336, 5376, False),
+        ("gfx1201", torch.bfloat16, 4096, 6144, 8192, False),
+        ("gfx1201", torch.bfloat16, 4096, 320, 512, False),
+        ("gfx1201", torch.bfloat16, 4096, 512, 224, False),
+    ],
+)
+def test_gfx1201_swiglu_epilogue_selection_boundaries(arch, dtype, rows, outputs, width, expected):
+    target = AcceleratorTarget("hip", arch)
+    plan = policy.select_execution_plan(
+        target, in_features=width, rows=4096 if rows is None else rows, out_features=outputs
+    )
+    assert (
+        policy.supports_swiglu_epilogue(
+            target,
+            plan,
+            dtype,
+            in_features=width,
+            out_features=outputs,
+            rows=rows,
+        )
+        is expected
     )
 
 
@@ -441,3 +474,47 @@ def test_amd_short_batch_projections_match_reference(rows, paired):
         )
         end_to_end = convrot_int8_linear(x, weight, weights[0][2])
         torch.testing.assert_close(end_to_end, expected, rtol=2 * torch.finfo(dtype).eps, atol=1e-5)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not exact_gfx1201_available(), reason="requires ROCm gfx1201")
+@pytest.mark.parametrize(
+    ("rows", "width", "columns", "expected_fused"),
+    [
+        (64, 256, 2560, False),
+        (65, 256, 2560, True),
+        (1024, 8192, 2048, False),
+    ],
+)
+def test_gfx1201_swiglu_fallback_boundaries_match_reference(rows, width, columns, expected_fused):
+    torch.manual_seed(917 + rows)
+    dtype = torch.bfloat16
+    qdata = torch.randint(-127, 128, (rows, width), device="cuda", dtype=torch.int8)
+    scale = torch.rand(rows, device="cuda") * 0.01
+    weights = [
+        (
+            torch.randint(-127, 128, (columns, width), device="cuda", dtype=torch.int8),
+            torch.rand(columns, device="cuda") * 0.01,
+            torch.randn(columns, device="cuda", dtype=torch.float32),
+        )
+        for _ in range(2)
+    ]
+    assert (
+        amd.supports_prepared_swiglu(weights[0][0], weights[1][0], dtype, rows=rows)
+        is expected_fused
+    )
+    args = (qdata, scale, weights[0][0], weights[0][1], weights[0][2])
+    second = weights[1]
+    paired = amd.linear_prepared(*args, dtype, second_projection=second)
+    up_part, gate_part = paired.chunk(2, dim=-1)
+    expected = (up_part.float() * torch.nn.functional.silu(gate_part.float())).to(dtype)
+    actual = amd.linear_prepared_swiglu(*args, second, dtype)
+    if expected_fused:
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=2 * torch.finfo(dtype).eps,
+            atol=torch.finfo(dtype).smallest_normal,
+        )
+    else:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

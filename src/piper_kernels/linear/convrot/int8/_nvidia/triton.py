@@ -302,10 +302,12 @@ def supports_prepared_swiglu(
     second_weight: torch.Tensor,
     logical_dtype: torch.dtype,
     *,
+    rows: int | None = None,
     execution_plan: LinearExecutionPlan,
     target: AcceleratorTarget,
 ) -> bool:
     """Return whether paired INT8 projections can fuse SwiGLU via Gluon TMA or async copy."""
+    del rows
     if not isinstance(execution_plan, NvidiaExecutionPlan):
         raise TypeError("NVIDIA ConvRot execution requires a NvidiaExecutionPlan")
     if not policy.supports_swiglu_epilogue(target, execution_plan, logical_dtype):

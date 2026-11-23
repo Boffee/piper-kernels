@@ -538,6 +538,50 @@ def test_nvidia_supports_prepared_swiglu_covers_sm8x_and_sm120_alignment() -> No
     )
 
 
+def test_amd_supports_prepared_swiglu_enforces_rdna4_row_and_srd_bounds() -> None:
+    gfx1201 = AcceleratorTarget("hip", "gfx1201")
+    gfx1200 = AcceleratorTarget("hip", "gfx1200")
+    weight = torch.empty((14_336, 5_376), device="meta", dtype=torch.int8)
+    wide_k_weight = torch.empty((6_144, 8_192), device="meta", dtype=torch.int8)
+
+    assert amd.supports_prepared_swiglu(weight, weight, torch.bfloat16, rows=4_096, target=gfx1201)
+    assert amd.supports_prepared_swiglu(weight, weight, torch.float16, rows=65, target=gfx1201)
+    assert amd.supports_prepared_swiglu(weight, weight, torch.bfloat16, rows=None, target=gfx1201)
+    assert not amd.supports_prepared_swiglu(weight, weight, torch.bfloat16, rows=64, target=gfx1201)
+    assert not amd.supports_prepared_swiglu(weight, weight, torch.bfloat16, rows=0, target=gfx1201)
+    assert not amd.supports_prepared_swiglu(
+        weight, weight, torch.bfloat16, rows=200_000, target=gfx1201
+    )
+    assert not amd.supports_prepared_swiglu(
+        weight, weight, torch.float32, rows=4_096, target=gfx1201
+    )
+    assert not amd.supports_prepared_swiglu(
+        weight, weight, torch.bfloat16, rows=4_096, target=gfx1200
+    )
+
+    paired_plan = amd.default_execution_plan(weight, target=gfx1201, rows=4_096)
+    assert not amd.supports_prepared_swiglu(
+        weight, weight, torch.bfloat16, rows=64, execution_plan=paired_plan, target=gfx1201
+    )
+    assert not amd.supports_prepared_swiglu(
+        weight, weight, torch.bfloat16, rows=200_000, execution_plan=paired_plan, target=gfx1201
+    )
+    assert amd.supports_prepared_swiglu(
+        weight, weight, torch.bfloat16, rows=65, execution_plan=paired_plan, target=gfx1201
+    )
+
+    assert not amd.supports_prepared_swiglu(
+        wide_k_weight, wide_k_weight, torch.bfloat16, rows=4_096, target=gfx1201
+    )
+    strided_weight = torch.empty((14_336, 10_752), device="meta", dtype=torch.int8)[:, :5_376]
+    assert not amd.supports_prepared_swiglu(
+        strided_weight, strided_weight, torch.bfloat16, rows=4_096, target=gfx1201
+    )
+    assert not amd.supports_prepared_swiglu(
+        weight, weight[:128], torch.bfloat16, rows=4_096, target=gfx1201
+    )
+
+
 @pytest.mark.parametrize(
     ("target", "supported"),
     [

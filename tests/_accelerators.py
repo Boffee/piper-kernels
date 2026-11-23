@@ -42,6 +42,14 @@ def rdna4_available() -> bool:
     return target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201")
 
 
+def exact_gfx1201_available() -> bool:
+    """Return whether the default GPU is a supported Linux/Windows ROCm gfx1201 device."""
+    if sys.platform not in ("linux", "win32") or not torch.cuda.is_available():
+        return False
+    target = AcceleratorTarget.from_device(torch.device("cuda"))
+    return target.is_amd_hip and target.is_architecture("gfx1201")
+
+
 def rocm_fences_only_lds() -> bool:
     """Return whether opted-in RDNA kernels compile here with LDS-only barrier fences.
 
