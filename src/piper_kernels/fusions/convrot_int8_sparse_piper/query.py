@@ -69,36 +69,38 @@ def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
     backend: ProjectionBackend | None = None,
     head_dim: int | None = None,
     bias: torch.Tensor | None = None,
+    validated_shape: tuple[int, int, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Project a Q window, reusing the fusion's selected backend when supplied."""
-    validate_routing_mode(routing_mode)
-    batch, sequence_length, heads = _validate_inputs(
-        input_qdata,
-        input_scale,
-        weight_qdata,
-        weight_scale,
-        norm_weight,
-        cos,
-        sin,
-        norm_epsilon=norm_epsilon,
-        softmax_scale=softmax_scale,
-        head_dim=head_dim,
-        bias=bias,
-    )
+    """Project a Q window from standalone operands or a validated attention context."""
+    if validated_shape is None:
+        validate_routing_mode(routing_mode)
+        batch, sequence_length, heads = _validate_inputs(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            norm_weight,
+            cos,
+            sin,
+            norm_epsilon=norm_epsilon,
+            softmax_scale=softmax_scale,
+            head_dim=head_dim,
+            bias=bias,
+        )
+        head_dim = resolve_head_dim(norm_weight, head_dim)
+        output_common.validate_optional_block_lengths(
+            block_lengths, sequence_length, input_qdata.device, "Q projection"
+        )
+    else:
+        batch, sequence_length, heads, head_dim = validated_shape
     if chunk_rows is None:
         if sequence_length < TILE_ROWS:
             raise ValueError(f"Q projection requires at least {TILE_ROWS} sequence rows")
         chunk_rows = sequence_length
     output_common.validate_query_range(chunk_start, chunk_rows, sequence_length)
-    head_dim = resolve_head_dim(norm_weight, head_dim)
-    output_common.validate_optional_block_lengths(
-        block_lengths, sequence_length, input_qdata.device, "Q projection"
-    )
     if backend is None:
         backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
-    query, query_scale, query_summary = output_common.allocate_query_storage(
-        input_qdata, batch, heads, chunk_rows, head_dim
-    )
+    out = output_common.allocate_query_storage(input_qdata, batch, heads, chunk_rows, head_dim)
 
     backend.project_query(
         input_qdata,
@@ -114,10 +116,10 @@ def _launch_query_projection_range(  # noqa: PLR0913, PLR0917
         block_lengths,
         chunk_start=chunk_start,
         chunk_rows=chunk_rows,
-        out=(query, query_scale, query_summary),
+        out=out,
         bias=bias,
     )
-    return query, query_scale, query_summary
+    return out
 
 
 @torch.library.custom_op("piper_kernels::convrot_int8_sparse_piper_project_query", mutates_args=())

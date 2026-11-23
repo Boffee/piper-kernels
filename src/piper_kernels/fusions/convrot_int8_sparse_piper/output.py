@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 
@@ -271,8 +272,8 @@ def _validate_projected_query_input(  # noqa: PLR0913
     softmax_scale: float,
     input_group_size: int | None = None,
     query_bias: torch.Tensor | None = None,
-) -> None:
-    """Validate full Q projection metadata before launching bounded chunk pipelines."""
+) -> tuple[int, int, int, int] | None:
+    """Return the full projection shape when the input is already prepared."""
     if key.ndim != 4:
         raise ValueError("fused sparse Piper output requires four-dimensional quantized storage")
     batch, heads, _storage_sequence_length, head_dim = key.shape
@@ -304,7 +305,7 @@ def _validate_projected_query_input(  # noqa: PLR0913
         )
         if query_heads != heads:
             raise ValueError("fused ConvRot INT8 Q heads must match sparse attention key heads")
-        return
+        return batch, sequence_length, query_heads, head_dim
 
     validate_storage(query_weight_qdata, query_weight_scale, input_group_size, query_input.dtype)
     validate_activation_scale(query_input_scale, query_input.device)
@@ -336,72 +337,7 @@ def _validate_projected_query_input(  # noqa: PLR0913
         softmax_scale,
         "Q projection softmax scale must be finite and positive",
     )
-
-
-def _build_query_chunk_projector(  # noqa: PLR0913, PLR0917
-    query_input: torch.Tensor,
-    query_input_scale: torch.Tensor | None,
-    query_weight_qdata: torch.Tensor,
-    query_weight_scale: torch.Tensor,
-    query_norm_weight: torch.Tensor | None,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    query_norm_epsilon: float,
-    softmax_scale: float,
-    routing_mode: int,
-    block_lengths: torch.Tensor | None,
-    *,
-    backend: LinearBackend,
-    projection_backend: ProjectionBackend,
-    head_dim: int,
-    input_group_size: int | None = None,
-    query_bias: torch.Tensor | None = None,
-) -> output_common.QueryChunkProjector:
-    """Build a bounded chunk query projector over prepared or raw query inputs."""
-
-    def project_query_chunk(
-        start: int,
-        rows: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if input_group_size is None:
-            assert query_input_scale is not None
-            chunk_input, chunk_scale = query_input, query_input_scale
-            chunk_cos, chunk_sin = cos, sin
-            chunk_lengths = block_lengths
-            chunk_start = start
-        else:
-            chunk_input, chunk_scale = backend.prepare_input(
-                query_input[:, start : start + rows].contiguous(),
-                input_group_size,
-                input_scale=query_input_scale,
-            )
-            chunk_cos, chunk_sin = cos[start : start + rows], sin[start : start + rows]
-            chunk_lengths = (
-                None
-                if block_lengths is None
-                else block_lengths[start // TILE_ROWS : (start + rows + TILE_ROWS - 1) // TILE_ROWS]
-            )
-            chunk_start = 0
-        return query_projection._launch_query_projection_range(
-            chunk_input,
-            chunk_scale,
-            query_weight_qdata,
-            query_weight_scale,
-            query_norm_weight,
-            chunk_cos,
-            chunk_sin,
-            query_norm_epsilon,
-            softmax_scale,
-            routing_mode,
-            chunk_lengths,
-            chunk_start=chunk_start,
-            chunk_rows=rows,
-            backend=projection_backend,
-            head_dim=head_dim,
-            bias=query_bias,
-        )
-
-    return project_query_chunk
+    return None
 
 
 def prepare_projected_gate_projection(
@@ -479,6 +415,49 @@ class SparseProjectedQueryOperands:
     force_tile_ids: torch.Tensor | None = None
     force_tile_counts: torch.Tensor | None = None
 
+    def _project_query_chunk(
+        self,
+        start: int,
+        rows: int,
+        *,
+        backend: LinearBackend,
+        projection_backend: ProjectionBackend,
+        validated_shape: tuple[int, int, int, int] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        chunk_input, chunk_scale = self.query_input, self.query_input_scale
+        cos, sin, lengths = self.cos, self.sin, self.block_lengths
+        if self.input_group_size is not None:
+            end = start + rows
+            chunk_input, chunk_scale = backend.prepare_input(
+                chunk_input[:, start:end].contiguous(),
+                self.input_group_size,
+                input_scale=chunk_scale,
+            )
+            cos, sin = cos[start:end], sin[start:end]
+            if lengths is not None:
+                lengths = lengths[start // TILE_ROWS : (end + TILE_ROWS - 1) // TILE_ROWS]
+            start = 0
+        assert chunk_scale is not None
+        return query_projection._launch_query_projection_range(
+            chunk_input,
+            chunk_scale,
+            self.query_weight_qdata,
+            self.query_weight_scale,
+            self.query_norm_weight,
+            cos,
+            sin,
+            self.query_norm_epsilon,
+            self.softmax_scale,
+            self.routing_mode,
+            lengths,
+            chunk_start=start,
+            chunk_rows=rows,
+            backend=projection_backend,
+            head_dim=self.key.shape[-1],
+            bias=self.query_bias,
+            validated_shape=validated_shape,
+        )
+
     def prepare_context(
         self,
         *,
@@ -520,7 +499,7 @@ class SparseProjectedQueryOperands:
             start_head=start_head,
             end_head=end_head,
         )
-        _validate_projected_query_input(
+        validated_shape = _validate_projected_query_input(
             self.query_input,
             self.query_input_scale,
             self.query_weight_qdata,
@@ -535,23 +514,11 @@ class SparseProjectedQueryOperands:
             input_group_size=self.input_group_size,
             query_bias=self.query_bias,
         )
-        project_query_chunk = _build_query_chunk_projector(
-            self.query_input,
-            self.query_input_scale,
-            self.query_weight_qdata,
-            self.query_weight_scale,
-            self.query_norm_weight,
-            self.cos,
-            self.sin,
-            self.query_norm_epsilon,
-            self.softmax_scale,
-            self.routing_mode,
-            self.block_lengths,
+        project_query_chunk = partial(
+            self._project_query_chunk,
             backend=backend,
             projection_backend=projection_backend,
-            head_dim=self.key.shape[-1],
-            input_group_size=self.input_group_size,
-            query_bias=self.query_bias,
+            validated_shape=validated_shape,
         )
         return backend, prepared, project_query_chunk
 
