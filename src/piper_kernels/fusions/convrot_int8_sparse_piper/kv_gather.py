@@ -9,6 +9,7 @@ import torch
 from piper_kernels._distributed import _comm as distributed_comm
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._contracts import validate_routing_mode
+from piper_kernels.fusions.attention._sparse_output import validate_optional_block_lengths
 from piper_kernels.fusions.attention._validation import resolve_head_dim
 from piper_kernels.linear.convrot.int8 import _backend as convrot_linear_backend
 from piper_kernels.linear.convrot.int8._backend import LinearBackend
@@ -17,7 +18,6 @@ from . import _backend
 from . import key as key_ops
 from . import value as value_ops
 from ._interfaces import KeyOutput, ValueOutput
-from ._layout import validate_block_lengths
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,7 +220,9 @@ def _prepare_kv_outputs(
         head_dim=key_spec.head_dim,
         bias=key_spec.bias,
     )
-    validate_block_lengths(key_spec.block_lengths, full_sequence_length, full_qdata.device)
+    validate_optional_block_lengths(
+        key_spec.block_lengths, full_sequence_length, full_qdata.device, "K projection"
+    )
     _, _, value_heads = value_ops.validate_value_inputs(
         full_qdata,
         full_scale,
@@ -229,7 +231,9 @@ def _prepare_kv_outputs(
         value_spec.head_dim,
         bias=value_spec.bias,
     )
-    validate_block_lengths(value_spec.block_lengths, full_sequence_length, full_qdata.device)
+    validate_optional_block_lengths(
+        value_spec.block_lengths, full_sequence_length, full_qdata.device, "V projection"
+    )
     key_outputs = key_ops.allocate_key_output(
         full_qdata,
         batch,

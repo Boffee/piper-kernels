@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._contracts import validate_routing_mode
 from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.attention._validation import resolve_head_dim
@@ -12,7 +13,6 @@ from piper_kernels.fusions.convrot_int8_projection._validation import (
 )
 
 from . import _backend
-from ._layout import TILE_ROWS, validate_block_lengths
 
 
 def validate_key_inputs(
@@ -80,7 +80,9 @@ def _launch_key_projection(  # noqa: PLR0913
         bias=bias,
     )
     head_dim = resolve_head_dim(norm_weight, head_dim)
-    validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
+    output_common.validate_optional_block_lengths(
+        block_lengths, sequence_length, input_qdata.device, "K projection"
+    )
     backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
     key, key_scale, key_center, key_center_scale, key_summary, key_aux = allocate_key_output(
         input_qdata,

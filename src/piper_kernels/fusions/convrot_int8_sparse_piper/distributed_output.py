@@ -16,13 +16,13 @@ import torch.distributed as dist
 
 from piper_kernels._distributed import _peer_exchange as peer_exchange
 from piper_kernels._residual import ResidualAdd
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.convrot_int8_projection import output as projection_output
 from piper_kernels.weights.convrot.int8._quantization import validate_activation_scale
 
 from . import output as output_ops
-from ._layout import TILE_ROWS
 
 _DEFAULT_QUERY_CHUNK_ROWS = output_ops.DEFAULT_QUERY_CHUNK_ROWS
 

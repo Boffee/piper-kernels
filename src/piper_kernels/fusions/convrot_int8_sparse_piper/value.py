@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
+from piper_kernels.attention.kernels.sparse_piper.layout import (
+    SUPPORTED_HEAD_DIMS,
+    TILE_ROWS,
+    ValueFormat,
+)
 from piper_kernels.fusions.attention import _sparse_output as output_common
 from piper_kernels.fusions.convrot_int8_projection._validation import validate_projection_inputs
 
 from . import _backend
-from ._layout import SUPPORTED_HEAD_DIMS, TILE_ROWS, validate_block_lengths
 
 
 def validate_value_inputs(
@@ -60,7 +63,9 @@ def _launch_value_projection(
         head_dim,
         bias=bias,
     )
-    validate_block_lengths(block_lengths, sequence_length, input_qdata.device)
+    output_common.validate_optional_block_lengths(
+        block_lengths, sequence_length, input_qdata.device, "V projection"
+    )
     storage_format = ValueFormat(value_format)
     backend = _backend.require_projection_backend(input_qdata, head_dim=head_dim)
     value, value_scale_multiplier, value_mean = allocate_value_output(

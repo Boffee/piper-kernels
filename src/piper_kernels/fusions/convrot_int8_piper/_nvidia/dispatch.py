@@ -68,11 +68,7 @@ def project_query(  # noqa: PLR0913
             rotary_dim=cos.shape[1],
         )
     )
-    launch = (
-        gluon.project_query
-        if plan.kernel in ("gluon_async_copy", "gluon_tma")
-        else projection.project_query
-    )
+    launch = gluon.project_query if plan.uses_gluon else projection.project_query
     launch(
         input_qdata,
         input_scale,
@@ -117,11 +113,7 @@ def project_key(  # noqa: PLR0913
             rotary_dim=cos.shape[1],
         )
     )
-    launch = (
-        gluon.project_key
-        if plan.kernel in ("gluon_async_copy", "gluon_tma")
-        else projection.project_key
-    )
+    launch = gluon.project_key if plan.uses_gluon else projection.project_key
     launch(
         input_qdata,
         input_scale,
@@ -156,7 +148,7 @@ def project_value(
             input_qdata, weight_qdata, operation="value", head_dim=out[0].shape[2]
         )
     )
-    if plan.kernel in ("gluon_async_copy", "gluon_tma"):
+    if plan.uses_gluon:
         gluon.project_value(
             input_qdata,
             input_scale,

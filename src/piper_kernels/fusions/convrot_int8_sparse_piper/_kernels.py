@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from piper_kernels.attention.kernels.sparse_piper import triton as sparse_piper_kernels
+from piper_kernels.attention.kernels.sparse_piper.layout import QUERY_SCALE_ROWS, TILE_ROWS
 from piper_kernels.fusions.convrot_int8_projection.triton import (
     project_rmsnorm_rope_tile,
     project_tile,
@@ -15,8 +16,6 @@ from piper_kernels.fusions.convrot_int8_projection.triton import (
 from piper_kernels.fusions.convrot_int8_projection.triton import (
     projection_tile_ids as _projection_tile_ids,
 )
-
-from ._layout import QUERY_SCALE_ROWS, TILE_ROWS
 
 _JIT_QUERY_SCALE_ROWS = tl.constexpr(QUERY_SCALE_ROWS)
 _JIT_VALUE_TILE_ROWS = tl.constexpr(TILE_ROWS)

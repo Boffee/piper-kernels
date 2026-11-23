@@ -21,9 +21,9 @@ from piper_kernels.fusions.attention import _distributed_fold as distributed_fol
 from piper_kernels.fusions.attention import _head_slices as head_slices
 from piper_kernels.fusions.attention import _projected_qk_compile as projected_compile
 from piper_kernels.fusions.attention import _residual_fold as residual_fold
-from piper_kernels.linear import _bias, _projection_views
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear import _projection_views
 from piper_kernels.linear.convrot.int8 import _compile_fx
 from piper_kernels.weights.convrot import _rotation
 
@@ -68,38 +68,11 @@ def _same_shape(left: Sequence[int | torch.SymInt], right: Sequence[int | torch.
     )
 
 
-def _match_bhsd_transpose(node: torch.fx.Node) -> torch.fx.Node | None:
-    """Match ``permute(x, [0, 2, 1, 3])`` or ``transpose(x, 1, 2)``."""
-    permute = linear_compile_fx.bind_call(node, _aten.permute.default)
-    if permute is not None:
-        dims = permute["dims"]
-        source = permute["self"]
-        if (
-            isinstance(source, torch.fx.Node)
-            and isinstance(dims, (list, tuple))
-            and tuple(dims) == (0, 2, 1, 3)
-        ):
-            return source
-        return None
-    transpose = linear_compile_fx.bind_call(node, _aten.transpose.int)
-    if transpose is not None:
-        source = transpose["self"]
-        if isinstance(source, torch.fx.Node) and (transpose["dim0"], transpose["dim1"]) in (
-            (1, 2),
-            (2, 1),
-        ):
-            return source
-    return None
-
-
-def _valid_projected_tensor(  # noqa: PLR0911
-    matched: _MatchedProjection, *, normalized: bool = True
-) -> bool:
+def _valid_projected_tensor(matched: _MatchedProjection, *, normalized: bool = True) -> bool:
     input_value = preparation_sharing.tensor_metadata(matched.projection_input)
     weight = preparation_sharing.tensor_metadata(matched.weight_qdata)
-    weight_scale = preparation_sharing.tensor_metadata(matched.weight_scale)
     output_value = preparation_sharing.tensor_metadata(matched.output_node)
-    if input_value is None or weight is None or weight_scale is None or output_value is None:
+    if input_value is None or weight is None or output_value is None:
         return False
     if (
         output_value.ndim != 4
@@ -108,10 +81,8 @@ def _valid_projected_tensor(  # noqa: PLR0911
         or output_value.dtype is not input_value.dtype
         or input_value.ndim != 3
         or input_value.dtype not in _ACTIVATION_DTYPES
-        or any(
-            tensor.layout is not torch.strided or not tensor.is_contiguous()
-            for tensor in (input_value, weight, weight_scale)
-        )
+        or input_value.layout is not torch.strided
+        or not input_value.is_contiguous()
     ):
         return False
     head_dim = projected_compile.static_int(output_value.shape[-1])
@@ -127,34 +98,27 @@ def _valid_projected_tensor(  # noqa: PLR0911
         or output_features % head_dim
         or group_size not in _rotation.SUPPORTED_GROUP_SIZES
         or input_features % group_size
-        or weight.dtype is not torch.int8
         or input_value.shape[-1] != input_features
-        or weight_scale.dtype is not torch.float32
-        or tuple(weight_scale.shape) != (output_features, 1)
         or not _compile_fx.valid_input_scale(matched.input_scale, input_value.device)
+        or not _compile_fx.valid_linear_weight_and_bias(
+            matched.weight_qdata,
+            matched.weight_scale,
+            matched.bias,
+            input_features=input_features,
+            output_features=output_features,
+            device=input_value.device,
+        )
     ):
         return False
     heads = output_features // head_dim
     batch, sequence_length = input_value.shape[:2]
-    if not _same_shape(output_value.shape, (batch, heads, sequence_length, head_dim)):
+    if (
+        output_value.device != input_value.device
+        or not _same_shape(output_value.shape, (batch, heads, sequence_length, head_dim))
+        or (isinstance(sequence_length, int) and sequence_length < 1)
+        or (isinstance(batch, int) and batch < 1)
+    ):
         return False
-    if isinstance(sequence_length, int) and sequence_length < 1:
-        return False
-    if isinstance(batch, int) and batch < 1:
-        return False
-    if any(tensor.device != input_value.device for tensor in (weight, weight_scale, output_value)):
-        return False
-    if matched.bias is not None:
-        bias = preparation_sharing.tensor_metadata(matched.bias)
-        if (
-            bias is None
-            or tuple(bias.shape) != (output_features,)
-            or not _bias.is_supported_dtype(bias.dtype)
-            or bias.device != input_value.device
-            or bias.layout is not torch.strided
-            or not bias.is_contiguous()
-        ):
-            return False
     if not normalized:
         return _backend.select_projection_backend(input_value, head_dim=head_dim) is not None
     rotary_dim = head_dim if matched.rotary_dim is None else matched.rotary_dim
@@ -183,7 +147,7 @@ def _match_bhsd_projection(node: object, *, normalized: bool) -> _MatchedProject
     """Imperatively match one exclusive BHSD ConvRot INT8 projection chain."""
     if not isinstance(node, torch.fx.Node) or len(node.users) != 1:
         return None
-    transformed = _match_bhsd_transpose(node)
+    transformed = _output_compile._match_bhsd_transpose(node)
     if transformed is None:
         return None
     if normalized:
@@ -202,35 +166,17 @@ def _match_bhsd_projection(node: object, *, normalized: bool) -> _MatchedProject
             return None
         rope = None
 
-    linear_bound = linear_compile_fx.bind_call(
-        linear_node, torch.ops.piper_kernels.convrot_int8_linear.default
-    )
-    if linear_bound is None or linear_bound["activation_fn"] is not None:
-        return None
-    projection_input = linear_bound["input"]
-    weight_qdata = linear_bound["weight_qdata"]
-    weight_scale = linear_bound["weight_scale"]
-    bias = linear_bound["bias"]
-    group_size = linear_bound["group_size"]
-    input_scale = linear_bound["input_scale"]
-    if (
-        not isinstance(projection_input, torch.fx.Node)
-        or not isinstance(weight_qdata, torch.fx.Node)
-        or not isinstance(weight_scale, torch.fx.Node)
-        or (bias is not None and not isinstance(bias, torch.fx.Node))
-        or isinstance(group_size, bool)
-        or not isinstance(group_size, int)
-        or (input_scale is not None and not isinstance(input_scale, torch.fx.Node))
-    ):
+    linear = _compile_fx.BoundLinearNodes.from_call(linear_node)
+    if linear is None:
         return None
     matched = _MatchedProjection(
         output_node=node,
-        projection_input=projection_input,
-        weight_qdata=weight_qdata,
-        weight_scale=weight_scale,
-        bias=bias,
-        group_size=group_size,
-        input_scale=input_scale,
+        projection_input=linear.input,
+        weight_qdata=linear.weight_qdata,
+        weight_scale=linear.weight_scale,
+        bias=linear.bias,
+        group_size=linear.group_size,
+        input_scale=linear.input_scale,
         norm_weight=None if rope is None else rope.norm_weight,
         norm_epsilon=None if rope is None else rope.norm_epsilon,
         cos=None if rope is None else rope.cos,

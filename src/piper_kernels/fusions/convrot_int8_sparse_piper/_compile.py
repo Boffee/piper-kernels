@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS, padded_sequence_length
 from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
@@ -15,32 +14,22 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
 from piper_kernels.fusions.attention import _head_slices as head_slices
 from piper_kernels.fusions.attention import _residual_fold as residual_fold
 from piper_kernels.fusions.attention import _sparse_compile as sparse_piper_compile
-from piper_kernels.linear import _bias
 from piper_kernels.linear import _compile_fx as linear_compile_fx
 from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear import _projection_views as projection_views
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 from piper_kernels.linear.convrot.int8 import _compile_fx
 
-from . import _backend, _distributed_compile, _layout, _output_compile
+from . import _backend, _distributed_compile, _output_compile
 from . import key as key_operators  # noqa: F401 - registers the K projection
 from . import value as value_operators  # noqa: F401 - registers the V projections
 
-_TILE_ROWS = _layout.TILE_ROWS
-_LINEAR_TARGET = torch.ops.piper_kernels.convrot_int8_linear.default
-
-
-@dataclass(frozen=True, slots=True)
-class _BoundInt8Projection:
-    """One schema-bound unactivated ConvRot INT8 linear projection."""
-
-    node: torch.fx.Node
-    input: torch.fx.Node
-    weight_qdata: torch.fx.Node
-    weight_scale: torch.fx.Node
-    bias: torch.fx.Node | None
-    group_size: int
-    input_scale: torch.fx.Node | None
+type _MatchedProjection = tuple[
+    sparse_piper_compile.SparsePiperProjectionMatch,
+    _compile_fx.BoundLinearNodes,
+    _compile_fx.BoundLinearNodes,
+    _compile_fx.BoundLinearNodes,
+]
 
 
 type _SemanticGateProjection = tuple[
@@ -52,37 +41,6 @@ type _SemanticGateProjection = tuple[
 ]
 
 
-def _parse_int8_projection(node: torch.fx.Node) -> _BoundInt8Projection | None:
-    bound = linear_compile_fx.bind_call(node, _LINEAR_TARGET)
-    if bound is None or bound["activation_fn"] is not None:
-        return None
-    input_node = bound["input"]
-    weight_qdata = bound["weight_qdata"]
-    weight_scale = bound["weight_scale"]
-    bias = bound["bias"]
-    group_size = bound["group_size"]
-    input_scale = bound["input_scale"]
-    if (
-        not isinstance(input_node, torch.fx.Node)
-        or not isinstance(weight_qdata, torch.fx.Node)
-        or not isinstance(weight_scale, torch.fx.Node)
-        or (bias is not None and not isinstance(bias, torch.fx.Node))
-        or isinstance(group_size, bool)
-        or not isinstance(group_size, int)
-        or (input_scale is not None and not isinstance(input_scale, torch.fx.Node))
-    ):
-        return None
-    return _BoundInt8Projection(
-        node=node,
-        input=input_node,
-        weight_qdata=weight_qdata,
-        weight_scale=weight_scale,
-        bias=bias,
-        group_size=group_size,
-        input_scale=input_scale,
-    )
-
-
 def _semantic_gate_projection(
     gate: torch.fx.Node,
     sparse_input: torch.fx.Node,
@@ -92,7 +50,7 @@ def _semantic_gate_projection(
     linear = sparse_piper_compile.unwrap_reshaped_producer(gate)
     if linear is None:
         return None
-    parsed = _parse_int8_projection(linear)
+    parsed = _compile_fx.BoundLinearNodes.from_call(linear)
     if parsed is None or parsed.input is not sparse_input or parsed.group_size != group_size:
         return None
     gate_value = preparation_sharing.tensor_metadata(gate)
@@ -113,11 +71,11 @@ def _semantic_gate_projection(
     return linear, parsed.weight_qdata, parsed.weight_scale, parsed.bias, parsed.input_scale
 
 
-def _valid_sparse_piper_projection(  # noqa: PLR0911, PLR0912
+def _valid_sparse_piper_projection(  # noqa: PLR0911
     matched: sparse_piper_compile.SparsePiperProjectionMatch,
-    q_proj: _BoundInt8Projection,
-    k_proj: _BoundInt8Projection,
-    v_proj: _BoundInt8Projection,
+    q_proj: _compile_fx.BoundLinearNodes,
+    k_proj: _compile_fx.BoundLinearNodes,
+    v_proj: _compile_fx.BoundLinearNodes,
 ) -> bool:
     if not is_valid_routing_mode(matched.routing_mode):
         return False
@@ -129,26 +87,18 @@ def _valid_sparse_piper_projection(  # noqa: PLR0911, PLR0912
     ):
         return False
     input_value = preparation_sharing.tensor_metadata(q_proj.input)
-    projections = (q_proj, k_proj, v_proj)
-    weights = tuple(preparation_sharing.tensor_metadata(p.weight_qdata) for p in projections)
-    scales = tuple(preparation_sharing.tensor_metadata(p.weight_scale) for p in projections)
-    if input_value is None or any(value is None for value in (*weights, *scales)):
-        return False
-    if any(
-        value.layout is not torch.strided or not value.is_contiguous()
-        for value in (input_value, *weights, *scales)
-        if value is not None
+    q_weight = preparation_sharing.tensor_metadata(q_proj.weight_qdata)
+    if (
+        input_value is None
+        or input_value.ndim != 3
+        or input_value.dtype not in SUPPORTED_DTYPES
+        or input_value.layout is not torch.strided
+        or not input_value.is_contiguous()
+        or q_weight is None
+        or q_weight.ndim != 2
     ):
-        return False
-    if any(
-        not _compile_fx.valid_input_scale(p.input_scale, input_value.device) for p in projections
-    ):
-        return False
-    if input_value.ndim != 3:
         return False
     input_features = sparse_piper_compile.static_int(input_value.shape[-1])
-    q_weight = weights[0]
-    assert q_weight is not None
     output_features = sparse_piper_compile.static_int(q_weight.shape[0])
     head_dim = sparse_piper_compile.attention_head_dim(matched.output_node)
     if (
@@ -160,43 +110,28 @@ def _valid_sparse_piper_projection(  # noqa: PLR0911, PLR0912
         return False
     batch, sequence_length = input_value.shape[:2]
     heads = output_features // head_dim
-    if input_value.dtype not in SUPPORTED_DTYPES or (
-        isinstance(sequence_length, int) and sequence_length < _TILE_ROWS
-    ):
+    if isinstance(sequence_length, int) and sequence_length < TILE_ROWS:
         return False
+    if q_proj.group_size < 1:
+        return False
+    for proj in (q_proj, k_proj, v_proj):
+        if not _compile_fx.valid_input_scale(
+            proj.input_scale, input_value.device
+        ) or not _compile_fx.valid_linear_weight_and_bias(
+            proj.weight_qdata,
+            proj.weight_scale,
+            proj.bias,
+            input_features=input_features,
+            output_features=output_features,
+            device=input_value.device,
+        ):
+            return False
     if (
         _backend.select_projection_backend(input_value, head_dim=head_dim) is None
         or linear_backend.select_linear_backend(input_value) is None
         or attention_backend.select_attention_backend(input_value) is None
     ):
         return False
-    if q_proj.group_size < 1:
-        return False
-
-    for proj, weight, scale in zip(projections, weights, scales, strict=True):
-        assert weight is not None
-        assert scale is not None
-        if (
-            weight.dtype is not torch.int8
-            or tuple(weight.shape) != (heads * head_dim, input_features)
-            or scale.dtype is not torch.float32
-            or tuple(scale.shape) != (heads * head_dim, 1)
-            or weight.device != input_value.device
-            or scale.device != input_value.device
-        ):
-            return False
-        if proj.bias is not None:
-            bias = preparation_sharing.tensor_metadata(proj.bias)
-            if (
-                bias is None
-                or bias.shape != (output_features,)
-                or not _bias.is_supported_dtype(bias.dtype)
-                or bias.device != input_value.device
-                or bias.layout is not torch.strided
-                or not bias.is_contiguous()
-            ):
-                return False
-
     if not sparse_piper_compile.valid_sparse_piper_attention(
         matched,
         batch=batch,
@@ -204,7 +139,7 @@ def _valid_sparse_piper_projection(  # noqa: PLR0911, PLR0912
         heads=heads,
         device=input_value.device,
         head_dim=head_dim,
-        tile_rows=_TILE_ROWS,
+        tile_rows=TILE_ROWS,
     ):
         return False
     if matched.coarse_node is not None:
@@ -214,11 +149,9 @@ def _valid_sparse_piper_projection(  # noqa: PLR0911, PLR0912
 
 def _replace_sparse_piper_projection(
     graph: torch.fx.Graph,
-    matched: sparse_piper_compile.SparsePiperProjectionMatch,
-    q_proj: _BoundInt8Projection,
-    k_proj: _BoundInt8Projection,
-    v_proj: _BoundInt8Projection,
+    matched_projection: _MatchedProjection,
 ) -> None:
+    matched, q_proj, k_proj, v_proj = matched_projection
     original = matched.output_node
     sparse_input = q_proj.input
     sparse_group_size = q_proj.group_size
@@ -230,7 +163,7 @@ def _replace_sparse_piper_projection(
     head_dim = sparse_piper_compile.attention_head_dim(original)
     assert head_dim is not None
     heads = q_weight_value.shape[0] // head_dim
-    storage_sequence_length = _layout.padded_sequence_length(sequence_length)
+    storage_sequence_length = padded_sequence_length(sequence_length)
     value_format = attention_backend.require_attention_backend(input_value).value_format
     block_length_arguments = () if matched.block_lengths is None else (matched.block_lengths,)
     query_values, key_values, value_values = sparse_piper_compile.sparse_projection_metadata(
@@ -356,26 +289,27 @@ def _replace_sparse_piper_projection(
     sparse_piper_compile.replace_matched_nodes(graph, original, replacement)
 
 
+def _match_sparse_piper_projection(node: torch.fx.Node) -> _MatchedProjection | None:
+    matched = sparse_piper_compile.match_sparse_piper_projection(node)
+    if matched is None:
+        return None
+    q_proj = _compile_fx.BoundLinearNodes.from_call(matched.query_projection)
+    k_proj = _compile_fx.BoundLinearNodes.from_call(matched.key_projection)
+    v_proj = _compile_fx.BoundLinearNodes.from_call(matched.value_projection)
+    if q_proj is None or k_proj is None or v_proj is None:
+        return None
+    if not _valid_sparse_piper_projection(matched, q_proj, k_proj, v_proj):
+        return None
+    return matched, q_proj, k_proj, v_proj
+
+
 def _fold_sparse_piper_projection(graph: torch.fx.Graph) -> bool:
     """Replace compatible materialized sparse-attention projection regions."""
-    changed = False
-    for node in list(graph.nodes):
-        matched = sparse_piper_compile.match_sparse_piper_projection(node)
-        if matched is None:
-            continue
-        q_proj = _parse_int8_projection(matched.query_projection)
-        k_proj = _parse_int8_projection(matched.key_projection)
-        v_proj = _parse_int8_projection(matched.value_projection)
-        if q_proj is None or k_proj is None or v_proj is None:
-            continue
-        if not _valid_sparse_piper_projection(matched, q_proj, k_proj, v_proj):
-            continue
-        _replace_sparse_piper_projection(graph, matched, q_proj, k_proj, v_proj)
-        changed = True
-    if changed:
-        graph.eliminate_dead_code()
-        graph.lint()
-    return changed
+    return sparse_piper_compile.fold_matched_nodes(
+        graph,
+        _match_sparse_piper_projection,
+        _replace_sparse_piper_projection,
+    )
 
 
 _ops = torch.ops.piper_kernels

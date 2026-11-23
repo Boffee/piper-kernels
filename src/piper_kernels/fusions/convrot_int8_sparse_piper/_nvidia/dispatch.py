@@ -73,11 +73,7 @@ def project_query(  # noqa: PLR0913, PLR0917
             rotary_dim=cos.shape[1],
         )
     )
-    launch = (
-        gluon.project_query
-        if plan.kernel in ("gluon_async_copy", "gluon_tma")
-        else projection.project_query
-    )
+    launch = gluon.project_query if plan.uses_gluon else projection.project_query
     launch(
         input_qdata,
         input_scale,
@@ -115,9 +111,7 @@ def partial_row_block_size(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
     )
-    use_gluon = plan.kernel in ("gluon_async_copy", "gluon_tma") and (
-        operation == "key" or value_format is ValueFormat.TRANSPOSED
-    )
+    use_gluon = plan.uses_gluon and (operation == "key" or value_format is ValueFormat.TRANSPOSED)
     if use_gluon:
         return None
     return plan.block_m
@@ -153,7 +147,7 @@ def project_key(  # noqa: PLR0913
             rotary_dim=cos.shape[1],
         )
     )
-    use_gluon = plan.kernel in ("gluon_async_copy", "gluon_tma")
+    use_gluon = plan.uses_gluon
     if start_row_block != 0 or num_row_blocks is not None:
         if use_gluon:
             raise ValueError("Partial key row-block launches require a Triton execution plan")
@@ -215,9 +209,7 @@ def project_value(  # noqa: PLR0913
             input_qdata, weight_qdata, operation="value", head_dim=out[2].shape[-1]
         )
     )
-    use_gluon = (
-        plan.kernel in ("gluon_async_copy", "gluon_tma") and value_format is ValueFormat.TRANSPOSED
-    )
+    use_gluon = plan.uses_gluon and value_format is ValueFormat.TRANSPOSED
     if start_row_block != 0 or num_row_blocks is not None:
         if use_gluon:
             raise ValueError("Partial value row-block launches require a Triton execution plan")

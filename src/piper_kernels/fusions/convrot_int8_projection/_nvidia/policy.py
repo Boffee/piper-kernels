@@ -28,6 +28,10 @@ class NvidiaExecutionPlan(ProjectionExecutionPlan):
 
     kernel: Literal["gluon_async_copy", "gluon_tma", "triton"] = "triton"
 
+    @property
+    def uses_gluon(self) -> bool:
+        return self.kernel in ("gluon_async_copy", "gluon_tma")
+
 
 # SM120's two-head tiles exceed the 99 KiB of shared memory on SM86 and SM89, and its V
 # accumulator spills there. One head per 64-row tile keeps four warps within SM8x's

@@ -404,12 +404,8 @@ def test_peer_exchange_world_size_3_keeps_zero_buffer_alive(
 
 
 def test_partial_kv_launch_validation() -> None:
-    pytest.importorskip("triton")
     from piper_kernels.fusions.convrot_int8_projection._plan import (  # noqa: PLC0415
         ProjectionExecutionPlan,
-    )
-    from piper_kernels.fusions.convrot_int8_sparse_piper import (  # noqa: PLC0415
-        triton as sparse_triton,
     )
 
     plan = ProjectionExecutionPlan(
@@ -419,26 +415,22 @@ def test_partial_kv_launch_validation() -> None:
         num_stages=2,
         block_m=64,
     )
-    launches: list[tuple[tuple[int, int, int], int, bool, bool]] = []
-    q_input = torch.empty((1, 256, 128), dtype=torch.int8)
-    sparse_triton._launch_full_and_tail_blocks(
-        q_input,
+    launches = plan.iter_row_block_launches(
+        1,
+        256,
+        128,
         2,
-        plan,
-        lambda grid, offset, aligned_rows, aligned_proj: launches.append(
-            (grid, offset, aligned_rows, aligned_proj)
-        ),
         start_row_block=1,
         num_row_blocks=None,
     )
-    assert launches == [((3, 2, 1), 1, True, True)]
+    assert launches == (((3, 2, 1), 1, True, True),)
 
     with pytest.raises(ValueError, match="full block_m alignment"):
-        sparse_triton._launch_full_and_tail_blocks(
-            torch.empty((1, 200, 128), dtype=torch.int8),
+        plan.iter_row_block_launches(
+            1,
+            200,
+            128,
             2,
-            plan,
-            lambda *_args: None,
             start_row_block=1,
             num_row_blocks=None,
         )
@@ -448,11 +440,11 @@ def test_partial_kv_launch_validation() -> None:
         (2, 3, "full block_m blocks"),
     ]:
         with pytest.raises(ValueError, match=expected_match):
-            sparse_triton._launch_full_and_tail_blocks(
-                q_input,
+            plan.iter_row_block_launches(
+                1,
+                256,
+                128,
                 2,
-                plan,
-                lambda *_args: None,
                 start_row_block=bad_start,
                 num_row_blocks=bad_count,
             )
