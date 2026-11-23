@@ -85,7 +85,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   decoder linear schedule overrides in favor of `piper_kernels.compile_options(...)`).
   The MiniMax-H3 encoder Conv3D helper
   `minimax_h3_vae_convrot_int8_conv3d_compile_options` remains in
-  `piper_kernels.specializations.minimax_h3_vae` and hooks into the unified pipeline.
+  `piper_kernels.specializations.minimax_h3_vae` and enables the shared Conv3D padding
+  phase. Combining it with `conv3d=True` now runs padding fusion once.
   NVFP4 / ConvRot NVFP4 sparse-Piper attention fusion now also matches semantic linears
   (such as cross-attention query projections or `linear=False`).
   Compiling mixed-format linears now normalizes projection views and shares input

@@ -10,11 +10,11 @@ from piper_kernels.conv3d.convrot.int8 import ConvRotInt8Conv3d, group_norm_silu
 from piper_kernels.specializations.minimax_h3_vae import (
     minimax_h3_vae_convrot_int8_conv3d_compile_options,
 )
-from piper_kernels.specializations.minimax_h3_vae.conv3d._compile import fuse_conv3d
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
 _FUSED = torch.ops.piper_kernels.convrot_int8_group_norm_silu_conv3d.default
+(_H3_PRE_GRAD_PASS,) = minimax_h3_vae_convrot_int8_conv3d_compile_options()["pre_grad_custom_pass"]
 
 
 class _Block(torch.nn.Module):
@@ -80,7 +80,7 @@ def test_export_fuses_framewise_norm_silu_padding_and_residual(padding, standard
         graph_module = torch._dynamo.export(block, assume_static_by_default=static)(
             *args
         ).graph_module
-        fuse_conv3d(graph_module.graph)
+        _H3_PRE_GRAD_PASS(graph_module.graph)
         graph_module.recompile()
         targets = [node.target for node in graph_module.graph.nodes]
         assert targets.count(_FUSED) == 1
@@ -112,7 +112,7 @@ def test_pass_preserves_temporal_group_norm_and_shared_activation(options, stati
         graph_module = torch._dynamo.export(block, assume_static_by_default=static)(
             *args
         ).graph_module
-        fuse_conv3d(graph_module.graph)
+        _H3_PRE_GRAD_PASS(graph_module.graph)
         targets = [node.target for node in graph_module.graph.nodes]
         assert _FUSED not in targets
         assert _CONV in targets
@@ -123,7 +123,7 @@ def test_pass_does_not_rewrite_with_gradients_enabled():
     block = _Block()
     graph_module = torch._dynamo.export(block, assume_static_by_default=True)(*_args()).graph_module
     original = str(graph_module.graph)
-    fuse_conv3d(graph_module.graph)
+    _H3_PRE_GRAD_PASS(graph_module.graph)
     assert str(graph_module.graph) == original
 
 
@@ -212,8 +212,8 @@ def test_compile_options_preserve_existing_pre_grad_pass_and_are_idempotent():
 
     options = minimax_h3_vae_convrot_int8_conv3d_compile_options({"pre_grad_custom_pass": existing})
     repeated = minimax_h3_vae_convrot_int8_conv3d_compile_options(options)
-    expected = minimax_h3_vae_convrot_int8_conv3d_compile_options()["pre_grad_custom_pass"][0]
-    assert repeated["pre_grad_custom_pass"] == (existing, expected)
+    assert repeated == compile_options(options, linear=False, conv3d=True) == options
+    assert repeated["pre_grad_custom_pass"] == (existing, _H3_PRE_GRAD_PASS)
 
 
 def test_encoder_and_decoder_options_are_independent_and_composable():
@@ -257,7 +257,7 @@ def test_dynamic_fusions_reuse_graphs_across_shapes_and_strides(device, tile_vie
         baseline = torch._dynamo.export(block, assume_static_by_default=True)(
             *_args(device=device)
         ).graph_module
-        fuse_conv3d(baseline.graph)
+        _H3_PRE_GRAD_PASS(baseline.graph)
         baseline.recompile()
 
     def check(batch, frames, height, width, border):
@@ -304,7 +304,7 @@ def test_residual_broadcast_stays_outside_fused_convolution(static):
     residual = residual[:, :, :, :1, :1]
     with torch.no_grad():
         gm = torch._dynamo.export(block, assume_static_by_default=static)(x, residual).graph_module
-        fuse_conv3d(gm.graph)
+        _H3_PRE_GRAD_PASS(gm.graph)
         gm.recompile()
         fused = next(node for node in gm.graph.nodes if node.target == _FUSED)
         assert fused.args[-1] is None
