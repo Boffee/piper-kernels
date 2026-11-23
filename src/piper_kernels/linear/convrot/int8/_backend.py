@@ -97,6 +97,32 @@ class _LinearKernels(Protocol):
         target: AcceleratorTarget | None = None,
     ) -> None: ...
 
+    def supports_prepared_swiglu(
+        self,
+        weight_qdata: torch.Tensor,
+        second_weight: torch.Tensor,
+        logical_dtype: torch.dtype,
+        *,
+        execution_plan: LinearExecutionPlan,
+        target: AcceleratorTarget,
+    ) -> bool: ...
+
+    def try_launch_prepared_swiglu(  # noqa: PLR0913
+        self,
+        input_qdata: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_qdata: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor | None,
+        output: torch.Tensor,
+        second_weight: torch.Tensor,
+        second_scale: torch.Tensor,
+        second_bias: torch.Tensor | None,
+        *,
+        execution_plan: LinearExecutionPlan,
+        target: AcceleratorTarget,
+    ) -> bool: ...
+
     def try_launch_prepared_residual(
         self,
         input_qdata: torch.Tensor,
@@ -413,6 +439,115 @@ class LinearBackend:
             second_projection=second_projection,
             target=target,
         )
+
+    def supports_prepared_swiglu(
+        self,
+        weight_qdata: torch.Tensor,
+        second_weight: torch.Tensor,
+        logical_dtype: torch.dtype,
+        *,
+        rows: int | None = None,
+        execution_plan: LinearExecutionPlan | None = None,
+        target: AcceleratorTarget | None = None,
+    ) -> bool:
+        """Return whether paired INT8 inputs can fuse SwiGLU into the projection."""
+        target = AcceleratorTarget.from_device(weight_qdata.device) if target is None else target
+        plan = (
+            execution_plan
+            if execution_plan is not None
+            else self.default_execution_plan(weight_qdata, target=target, rows=rows)
+        )
+        return self.kernels.supports_prepared_swiglu(
+            weight_qdata,
+            second_weight,
+            logical_dtype,
+            execution_plan=plan,
+            target=target,
+        )
+
+    def linear_prepared_swiglu(
+        self,
+        input_qdata: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_qdata: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor | None,
+        second_projection: SecondProjection,
+        logical_dtype: torch.dtype,
+        *,
+        out: torch.Tensor | None = None,
+        execution_plan: LinearExecutionPlan | None = None,
+        target: AcceleratorTarget | None = None,
+    ) -> torch.Tensor:
+        """Project prepared INT8 input through paired up/gate weights and apply SwiGLU."""
+        leading_shape = input_qdata.shape[:-1]
+        m = math.prod(leading_shape)
+        k = input_qdata.shape[-1]
+        n = weight_qdata.shape[0]
+        second_weight, second_scale, second_bias = second_projection
+        if second_weight.shape != weight_qdata.shape:
+            raise ValueError("paired INT8 projections must have matching weight shapes")
+        expected_shape = (*leading_shape, n)
+        if out is None:
+            output = torch.empty((m, n), device=input_qdata.device, dtype=logical_dtype)
+            result = output.reshape(expected_shape)
+        else:
+            if (
+                out.shape != expected_shape
+                or out.dtype is not logical_dtype
+                or out.device != input_qdata.device
+            ):
+                raise ValueError(
+                    "prepared INT8 SwiGLU output must match expected shape "
+                    f"{expected_shape}, dtype {logical_dtype}, and device {input_qdata.device}"
+                )
+            if out.ndim == 0 or out.stride(-1) != 1:
+                raise ValueError("prepared INT8 GEMM output must be column-contiguous")
+            result = out
+            try:
+                output = result.view(m, n)
+            except RuntimeError as error:
+                raise ValueError(
+                    "prepared INT8 SwiGLU output must be viewable as a 2-D row-strided matrix"
+                ) from error
+        if not m or not n:
+            return result
+        target = AcceleratorTarget.from_device(input_qdata.device) if target is None else target
+        plan = (
+            execution_plan
+            if execution_plan is not None
+            else self.default_execution_plan(weight_qdata, target=target, rows=m)
+        )
+        if self.kernels.try_launch_prepared_swiglu(
+            input_qdata.reshape(m, k),
+            input_scale.reshape(m),
+            weight_qdata,
+            weight_scale,
+            bias,
+            output,
+            second_weight,
+            second_scale,
+            second_bias,
+            execution_plan=plan,
+            target=target,
+        ):
+            return result
+        paired = self.execute_prepared_linear(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            bias,
+            logical_dtype,
+            plan,
+            second_projection=second_projection,
+            target=target,
+        )
+        activated = apply_input_activation(paired, "swiglu").to(logical_dtype)
+        if out is None:
+            return activated
+        result.copy_(activated)
+        return result
 
     def linear_prepared_residual(
         self,

@@ -273,7 +273,27 @@ def run_chunked_ffn(
         else residual_add.output
     )
     output_2d = output.view(rows, output_features)
-    projection_features = len(sources) * intermediate_features
+    shared_source = all(
+        same_tensor_storage(sources[0].input_scale, source.input_scale) for source in sources[1:]
+    )
+    second_projection = (
+        (sources[1].weight_qdata, sources[1].weight_scale, sources[1].bias)
+        if shared_source and len(sources) == 2
+        else None
+    )
+    fused_swiglu = (
+        activation_fn == "swiglu"
+        and second_projection is not None
+        and backend.supports_prepared_swiglu(
+            sources[0].weight_qdata,
+            sources[1].weight_qdata,
+            input.dtype,
+            rows=capacity,
+        )
+    )
+    projection_features = (
+        intermediate_features if fused_swiglu else len(sources) * intermediate_features
+    )
     projection_workspace = torch.empty(
         (capacity, projection_features),
         device=input.device,
@@ -292,14 +312,6 @@ def run_chunked_ffn(
         dtype=torch.int8,
     )
     scale_storage = torch.empty(capacity, device=input.device, dtype=torch.float32)
-    shared_source = all(
-        same_tensor_storage(sources[0].input_scale, source.input_scale) for source in sources[1:]
-    )
-    second_projection = (
-        (sources[1].weight_qdata, sources[1].weight_scale, sources[1].bias)
-        if shared_source and len(sources) == 2
-        else None
-    )
     for start in range(0, rows, chunk_rows):
         stop = min(start + chunk_rows, rows)
         chunk_row_count = stop - start
@@ -317,16 +329,29 @@ def run_chunked_ffn(
                 input_scale=source.input_scale,
                 out=(prepared_input, prepared_scale),
             )
-            backend.linear_prepared(
-                prepared_input,
-                prepared_scale,
-                source.weight_qdata,
-                source.weight_scale,
-                source.bias,
-                input.dtype,
-                out=projections,
-                second_projection=second_projection,
-            )
+            if fused_swiglu:
+                assert second_projection is not None
+                backend.linear_prepared_swiglu(
+                    prepared_input,
+                    prepared_scale,
+                    source.weight_qdata,
+                    source.weight_scale,
+                    source.bias,
+                    second_projection,
+                    input.dtype,
+                    out=projections,
+                )
+            else:
+                backend.linear_prepared(
+                    prepared_input,
+                    prepared_scale,
+                    source.weight_qdata,
+                    source.weight_scale,
+                    source.bias,
+                    input.dtype,
+                    out=projections,
+                    second_projection=second_projection,
+                )
         else:
             for index, source in enumerate(sources):
                 backend.prepare_input(
@@ -353,7 +378,7 @@ def run_chunked_ffn(
         backend.prepare_input(
             projections,
             down.group_size,
-            activation_fn=activation_fn,
+            activation_fn=None if fused_swiglu else activation_fn,
             input_scale=down.input_scale,
             out=(prepared_activation, prepared_scale),
         )

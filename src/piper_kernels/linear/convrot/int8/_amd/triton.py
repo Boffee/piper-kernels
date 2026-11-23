@@ -800,6 +800,50 @@ def _amd_int8_residual_matmul_kernel(
         )
 
 
+def supports_prepared_swiglu(
+    weight_qdata: torch.Tensor,
+    second_weight: torch.Tensor,
+    logical_dtype: torch.dtype,
+    *,
+    execution_plan: LinearExecutionPlan,
+    target: AcceleratorTarget,
+) -> bool:
+    """Return whether paired INT8 projections can fuse SwiGLU on this target."""
+    del weight_qdata, second_weight, logical_dtype, execution_plan, target
+    return False
+
+
+def try_launch_prepared_swiglu(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output: torch.Tensor,
+    second_weight: torch.Tensor,
+    second_scale: torch.Tensor,
+    second_bias: torch.Tensor | None,
+    *,
+    execution_plan: LinearExecutionPlan,
+    target: AcceleratorTarget,
+) -> bool:
+    """Launch fused SwiGLU GEMM when supported; return False for fallback."""
+    del (
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        bias,
+        output,
+        second_weight,
+        second_scale,
+        second_bias,
+        execution_plan,
+        target,
+    )
+    return False
+
+
 def try_launch_prepared_residual(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,

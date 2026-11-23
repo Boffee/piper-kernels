@@ -245,6 +245,22 @@ def supports_residual_epilogue(
     )
 
 
+def supports_swiglu_epilogue(
+    target: AcceleratorTarget, plan: NvidiaExecutionPlan, logical_dtype: torch.dtype
+) -> bool:
+    """Use the SM120 dual-accumulator TMA SwiGLU epilogue for 16-bit projections.
+
+    Reuses the 73.7 KiB TMA ring shared memory for two 32 KiB 16-bit tiles so
+    the SwiGLU epilogue stays spill-free while preserving the logical-dtype
+    projection rounding boundary before FP32 SiLU multiplication.
+    """
+    return (
+        target.is_cuda_capability(12, 0)
+        and plan.matmul_kernel == "gluon_tma"
+        and logical_dtype in (torch.float16, torch.bfloat16)
+    )
+
+
 def supports_preparation_target(target: AcceleratorTarget) -> bool:
     """Return whether rotation and quantization can use the NVIDIA implementation."""
     return target.is_nvidia_cuda

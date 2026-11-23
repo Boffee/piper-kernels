@@ -276,6 +276,66 @@ def launch_prepared_linear(
     )
 
 
+def supports_prepared_swiglu(
+    weight_qdata: torch.Tensor,
+    second_weight: torch.Tensor,
+    logical_dtype: torch.dtype,
+    *,
+    execution_plan: LinearExecutionPlan,
+    target: AcceleratorTarget,
+) -> bool:
+    """Return whether paired INT8 projections can fuse SwiGLU via SM120 TMA."""
+    if not isinstance(execution_plan, NvidiaExecutionPlan):
+        raise TypeError("NVIDIA ConvRot execution requires a NvidiaExecutionPlan")
+    return policy.supports_swiglu_epilogue(
+        target, execution_plan, logical_dtype
+    ) and gluon_tma.operands_aligned(weight_qdata, second_weight)
+
+
+def try_launch_prepared_swiglu(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output: torch.Tensor,
+    second_weight: torch.Tensor,
+    second_scale: torch.Tensor,
+    second_bias: torch.Tensor | None,
+    *,
+    execution_plan: LinearExecutionPlan,
+    target: AcceleratorTarget,
+) -> bool:
+    """Launch the SM120 dual-accumulator SwiGLU TMA GEMM when supported; else False."""
+    if not supports_prepared_swiglu(
+        weight_qdata,
+        second_weight,
+        output.dtype,
+        execution_plan=execution_plan,
+        target=target,
+    ):
+        return False
+    if not gluon_tma.operands_aligned(input_qdata):
+        return False
+    m, _k = input_qdata.shape
+    n = weight_qdata.shape[0]
+    if m and n:
+        assert isinstance(execution_plan, NvidiaExecutionPlan)
+        gluon_tma.launch_int8_swiglu_matmul(
+            input_qdata,
+            weight_qdata,
+            output,
+            input_scale,
+            weight_scale,
+            bias,
+            second_weight,
+            second_scale,
+            second_bias,
+            execution_plan=execution_plan,
+        )
+    return True
+
+
 def try_launch_prepared_residual(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,

@@ -1,15 +1,15 @@
-"""NVIDIA SM120 Gluon TMA ring, GEMM, and fused residual epilogue for ConvRot INT8.
+"""NVIDIA SM120 Gluon TMA ring, GEMM, and fused SwiGLU/residual epilogues for ConvRot INT8.
 
 Loads row-major INT8 operands into swizzled shared memory through 2D TMA
 descriptors across an up-to-three-stage mbarrier ring and accumulates exact INT32
-products with m16n8k32 MMAv2 instructions. Both the standalone ``128x256`` linear
-GEMM (``mma_k=64``, 8 warps) and fused D128 Q/K/V projections (``block_n=128``,
-``mma_k=32``, 4 warps) share the parameterized TMA ring (:func:`_accumulate_tma` /
-:func:`accumulate_tma`) and :func:`build_matrix_descriptor`.
+products with m16n8k32 MMAv2 instructions. The standalone ``128x256`` linear GEMM
+(``mma_k=64``, 8 warps), dual-accumulator ``128x128`` SwiGLU GEMM (``mma_k=32``,
+8 warps), and fused D128 Q/K/V projections (``block_n=128``, ``mma_k=32``, 4 warps)
+share :func:`build_matrix_descriptor` and the three-stage mbarrier ring pattern.
 
 TMA launches require contiguous INT8 operands whose pointers and feature width
 ``K`` are positive 16-byte multiples (TMA hardware zero-fills out-of-bounds M, N,
-and K). Both linear kernels keep M unspecialized so one compiled binary serves
+and K). All linear kernels keep M unspecialized so one compiled binary serves
 every row count. Accumulation is exact INT32, and dequantization preserves the
 shared ``(acc * input_scale) * weight_scale`` + explicit FMA bias rounding.
 """
@@ -38,6 +38,9 @@ _BLOCK_M = 128
 _BLOCK_N = 256
 _BLOCK_K = 64
 _MMA_K = 64
+_SWIGLU_BLOCK_N = 128
+_SWIGLU_MMA_K = 32
+_SWIGLU_CHUNK_M = 32
 _WARPS_M = 2
 _WARPS_N = 4
 _NUM_WARPS = _WARPS_M * _WARPS_N
@@ -51,6 +54,9 @@ _GL_BLOCK_M = gl.constexpr(_BLOCK_M)
 _GL_BLOCK_N = gl.constexpr(_BLOCK_N)
 _GL_BLOCK_K = gl.constexpr(_BLOCK_K)
 _GL_MMA_K = gl.constexpr(_MMA_K)
+_GL_SWIGLU_BLOCK_N = gl.constexpr(_SWIGLU_BLOCK_N)
+_GL_SWIGLU_MMA_K = gl.constexpr(_SWIGLU_MMA_K)
+_GL_SWIGLU_CHUNK_M = gl.constexpr(_SWIGLU_CHUNK_M)
 _GL_MAX_STAGES = gl.constexpr(_MAX_STAGES)
 _GL_WARPS_M = gl.constexpr(_WARPS_M)
 _GL_WARPS_N = gl.constexpr(_WARPS_N)
@@ -67,17 +73,25 @@ def _load_operands(
     barrier,
     input_tile,
     weight_tile,
+    second_weight_tile,
     row_m,
     row_n,
     k_offset,
     paired: gl.constexpr,
     second,
+    dual: gl.constexpr = False,
 ):
-    mbarrier.expect(
-        barrier, input_descriptor.block_type.nbytes + weight_descriptor.block_type.nbytes
+    expected_bytes: gl.constexpr = (
+        input_descriptor.block_type.nbytes
+        + weight_descriptor.block_type.nbytes
+        + (second_weight_descriptor.block_type.nbytes if dual else 0)
     )
+    mbarrier.expect(barrier, expected_bytes)
     tma.async_load(input_descriptor, [row_m, k_offset], barrier, input_tile)
-    if paired:
+    if dual:
+        tma.async_load(weight_descriptor, [row_n, k_offset], barrier, weight_tile)
+        tma.async_load(second_weight_descriptor, [row_n, k_offset], barrier, second_weight_tile)
+    elif paired:
         if second:
             tma.async_load(second_weight_descriptor, [row_n, k_offset], barrier, weight_tile)
         else:
@@ -93,10 +107,12 @@ def _accumulate_tile(
     second_weight_descriptor,
     input_ring,
     weight_ring,
+    second_weight_ring,
     barriers,
     row_m,
     row_n,
     accumulator,
+    second_accumulator,
     group,
     slot: gl.constexpr,
     stages: gl.constexpr,
@@ -104,17 +120,24 @@ def _accumulate_tile(
     paired: gl.constexpr,
     second,
     mma_k: gl.constexpr,
+    dual: gl.constexpr = False,
 ):
     input_layout: gl.constexpr = gl.DotOperandLayout(0, accumulator.type.layout, k_width=4)
     weight_layout: gl.constexpr = gl.DotOperandLayout(1, accumulator.type.layout, k_width=4)
     barrier = barriers.index(slot)
     input_tile = input_ring.index(slot)
     weight_tile = weight_ring.index(slot)
+    second_weight_tile = second_weight_ring.index(slot) if dual else weight_tile
     mbarrier.wait(barrier, phase=group & 1)
     for k_slice in gl.static_range(0, _GL_BLOCK_K, mma_k):
         lhs = input_tile.slice(k_slice, mma_k, dim=1).load(input_layout)
         rhs = weight_tile.slice(k_slice, mma_k, dim=1).permute([1, 0]).load(weight_layout)
         accumulator = mma_v2(lhs, rhs, accumulator)
+        if dual:
+            second_rhs = (
+                second_weight_tile.slice(k_slice, mma_k, dim=1).permute([1, 0]).load(weight_layout)
+            )
+            second_accumulator = mma_v2(lhs, second_rhs, second_accumulator)
     gl.barrier()
     if refill:
         _load_operands(
@@ -124,13 +147,166 @@ def _accumulate_tile(
             barrier,
             input_tile,
             weight_tile,
+            second_weight_tile,
             row_m,
             row_n,
             ((group + 1) * stages + slot) * _GL_BLOCK_K,
             paired,
             second,
+            dual,
         )
-    return accumulator
+    return accumulator, second_accumulator
+
+
+@gluon.jit
+def _accumulate_tma_pair(
+    input_descriptor,
+    weight_descriptor,
+    second_weight_descriptor,
+    row_m,
+    row_n,
+    full_groups,
+    mma_layout: gl.constexpr,
+    stages: gl.constexpr,
+    tail_refills: gl.constexpr,
+    paired: gl.constexpr,
+    second,
+    block_n: gl.constexpr = _GL_BLOCK_N,
+    mma_k: gl.constexpr = _GL_MMA_K,
+    dual: gl.constexpr = False,
+):
+    """Accumulate one or two exact INT32 ``[128, block_n]`` tiles through a TMA ring."""
+    # Reuse one weight ring for paired mode and add a second 128x64 ring only in dual mode.
+    input_ring = gl.allocate_shared_memory(
+        gl.int8, [stages, _GL_BLOCK_M, _GL_BLOCK_K], input_descriptor.layout
+    )
+    weight_ring = gl.allocate_shared_memory(
+        gl.int8, [stages, block_n, _GL_BLOCK_K], weight_descriptor.layout
+    )
+    second_weight_ring = (
+        gl.allocate_shared_memory(
+            gl.int8, [stages, block_n, _GL_BLOCK_K], second_weight_descriptor.layout
+        )
+        if dual
+        else weight_ring
+    )
+    barriers = gl.allocate_shared_memory(gl.int64, [stages, 1], mbarrier.MBarrierLayout())
+    for slot in gl.static_range(stages):
+        mbarrier.init(barriers.index(slot), count=1)
+    gl.barrier()
+    for slot in gl.static_range(stages):
+        _load_operands(
+            input_descriptor,
+            weight_descriptor,
+            second_weight_descriptor,
+            barriers.index(slot),
+            input_ring.index(slot),
+            weight_ring.index(slot),
+            second_weight_ring.index(slot) if dual else weight_ring.index(slot),
+            row_m,
+            row_n,
+            slot * _GL_BLOCK_K,
+            paired,
+            second,
+            dual,
+        )
+
+    accumulator = gl.full([_GL_BLOCK_M, block_n], 0, gl.int32, mma_layout)
+    second_accumulator = (
+        gl.full([_GL_BLOCK_M, block_n], 0, gl.int32, mma_layout) if dual else accumulator
+    )
+    for group in range(full_groups):
+        for slot in gl.static_range(stages):
+            accumulator, second_accumulator = _accumulate_tile(
+                input_descriptor,
+                weight_descriptor,
+                second_weight_descriptor,
+                input_ring,
+                weight_ring,
+                second_weight_ring,
+                barriers,
+                row_m,
+                row_n,
+                accumulator,
+                second_accumulator,
+                group,
+                slot,
+                stages,
+                True,
+                paired,
+                second,
+                mma_k,
+                dual,
+            )
+    for slot in gl.static_range(tail_refills):
+        accumulator, second_accumulator = _accumulate_tile(
+            input_descriptor,
+            weight_descriptor,
+            second_weight_descriptor,
+            input_ring,
+            weight_ring,
+            second_weight_ring,
+            barriers,
+            row_m,
+            row_n,
+            accumulator,
+            second_accumulator,
+            full_groups,
+            slot,
+            stages,
+            True,
+            paired,
+            second,
+            mma_k,
+            dual,
+        )
+    for slot in gl.static_range(tail_refills, stages):
+        accumulator, second_accumulator = _accumulate_tile(
+            input_descriptor,
+            weight_descriptor,
+            second_weight_descriptor,
+            input_ring,
+            weight_ring,
+            second_weight_ring,
+            barriers,
+            row_m,
+            row_n,
+            accumulator,
+            second_accumulator,
+            full_groups,
+            slot,
+            stages,
+            False,
+            paired,
+            second,
+            mma_k,
+            dual,
+        )
+        mbarrier.invalidate(barriers.index(slot))
+    for slot in gl.static_range(tail_refills):
+        accumulator, second_accumulator = _accumulate_tile(
+            input_descriptor,
+            weight_descriptor,
+            second_weight_descriptor,
+            input_ring,
+            weight_ring,
+            second_weight_ring,
+            barriers,
+            row_m,
+            row_n,
+            accumulator,
+            second_accumulator,
+            full_groups + 1,
+            slot,
+            stages,
+            False,
+            paired,
+            second,
+            mma_k,
+            dual,
+        )
+        mbarrier.invalidate(barriers.index(slot))
+    return accumulator, second_accumulator
 
 
 @gluon.jit
@@ -149,113 +325,22 @@ def _accumulate_tma(
     block_n: gl.constexpr = _GL_BLOCK_N,
     mma_k: gl.constexpr = _GL_MMA_K,
 ):
-    """Accumulate the exact INT32 ``[128, block_n]`` product through a TMA ring."""
-    # Allocate one shared-memory ring across paired weights so SMEM stays at 73.7 KiB.
-    input_ring = gl.allocate_shared_memory(
-        gl.int8, [stages, _GL_BLOCK_M, _GL_BLOCK_K], input_descriptor.layout
+    accumulator, _ = _accumulate_tma_pair(
+        input_descriptor,
+        weight_descriptor,
+        second_weight_descriptor,
+        row_m,
+        row_n,
+        full_groups,
+        mma_layout,
+        stages,
+        tail_refills,
+        paired,
+        second,
+        block_n,
+        mma_k,
+        False,
     )
-    weight_ring = gl.allocate_shared_memory(
-        gl.int8, [stages, block_n, _GL_BLOCK_K], weight_descriptor.layout
-    )
-    barriers = gl.allocate_shared_memory(gl.int64, [stages, 1], mbarrier.MBarrierLayout())
-    for slot in gl.static_range(stages):
-        mbarrier.init(barriers.index(slot), count=1)
-    gl.barrier()
-    for slot in gl.static_range(stages):
-        _load_operands(
-            input_descriptor,
-            weight_descriptor,
-            second_weight_descriptor,
-            barriers.index(slot),
-            input_ring.index(slot),
-            weight_ring.index(slot),
-            row_m,
-            row_n,
-            slot * _GL_BLOCK_K,
-            paired,
-            second,
-        )
-
-    accumulator = gl.full([_GL_BLOCK_M, block_n], 0, gl.int32, mma_layout)
-    for group in range(full_groups):
-        for slot in gl.static_range(stages):
-            accumulator = _accumulate_tile(
-                input_descriptor,
-                weight_descriptor,
-                second_weight_descriptor,
-                input_ring,
-                weight_ring,
-                barriers,
-                row_m,
-                row_n,
-                accumulator,
-                group,
-                slot,
-                stages,
-                True,
-                paired,
-                second,
-                mma_k,
-            )
-    for slot in gl.static_range(tail_refills):
-        accumulator = _accumulate_tile(
-            input_descriptor,
-            weight_descriptor,
-            second_weight_descriptor,
-            input_ring,
-            weight_ring,
-            barriers,
-            row_m,
-            row_n,
-            accumulator,
-            full_groups,
-            slot,
-            stages,
-            True,
-            paired,
-            second,
-            mma_k,
-        )
-    for slot in gl.static_range(tail_refills, stages):
-        accumulator = _accumulate_tile(
-            input_descriptor,
-            weight_descriptor,
-            second_weight_descriptor,
-            input_ring,
-            weight_ring,
-            barriers,
-            row_m,
-            row_n,
-            accumulator,
-            full_groups,
-            slot,
-            stages,
-            False,
-            paired,
-            second,
-            mma_k,
-        )
-        mbarrier.invalidate(barriers.index(slot))
-    for slot in gl.static_range(tail_refills):
-        accumulator = _accumulate_tile(
-            input_descriptor,
-            weight_descriptor,
-            second_weight_descriptor,
-            input_ring,
-            weight_ring,
-            barriers,
-            row_m,
-            row_n,
-            accumulator,
-            full_groups + 1,
-            slot,
-            stages,
-            False,
-            paired,
-            second,
-            mma_k,
-        )
-        mbarrier.invalidate(barriers.index(slot))
     return accumulator
 
 
@@ -299,6 +384,26 @@ def accumulate_tma(
 
 
 @gluon.jit
+def _cta_tile_coordinates(
+    m,
+    n,
+    block_n: gl.constexpr,
+    group_m: gl.constexpr,
+    paired: gl.constexpr,
+):
+    column_tiles = gl.cdiv(n, block_n)
+    num_pid_n = column_tiles * (2 if paired else 1)
+    group_rows: gl.constexpr = group_m if group_m else 1
+    group_size = group_rows * num_pid_n
+    pid = gl.program_id(0)
+    first_m = (pid // group_size) * group_rows
+    rows_in_group = gl.minimum(gl.cdiv(m, _GL_BLOCK_M) - first_m, group_rows)
+    pid_m = first_m + (pid % group_size) % rows_in_group
+    pid_n = (pid % group_size) // rows_in_group
+    return pid_m, pid_n, column_tiles
+
+
+@gluon.jit
 def _project_tma_tile(
     input_descriptor,
     weight_descriptor,
@@ -320,15 +425,7 @@ def _project_tma_tile(
     output_dtype: gl.constexpr,
 ):
     """Project and dequantize one cache-grouped 128x256 output tile."""
-    column_tiles = gl.cdiv(n, _GL_BLOCK_N)
-    num_pid_n = column_tiles * (2 if paired else 1)
-    group_rows: gl.constexpr = group_m if group_m else 1
-    group_size = group_rows * num_pid_n
-    pid = gl.program_id(0)
-    first_m = (pid // group_size) * group_rows
-    rows_in_group = gl.minimum(gl.cdiv(m, _GL_BLOCK_M) - first_m, group_rows)
-    pid_m = first_m + (pid % group_size) % rows_in_group
-    pid_n = (pid % group_size) // rows_in_group
+    pid_m, pid_n, column_tiles = _cta_tile_coordinates(m, n, _GL_BLOCK_N, group_m, paired)
     second = pid_n >= column_tiles
     if paired:
         pid_n %= column_tiles
@@ -381,11 +478,14 @@ def _project_tma_tile(
 
 
 @gluon.jit
-def _build_store_layout(element_bitwidth: gl.constexpr):
-    """Return a row-major 16-byte vectorized store layout for 256-column tiles."""
+def _build_store_layout(
+    element_bitwidth: gl.constexpr,
+    block_n: gl.constexpr = _GL_BLOCK_N,
+):
+    """Return a row-major 16-byte vectorized store layout for ``block_n``-column tiles."""
     store_width: gl.constexpr = 8 * _GL_COPY_BYTES // element_bitwidth
-    threads_n: gl.constexpr = _GL_BLOCK_N // store_width
-    # Clamp warp width along N to 32 threads (needed for 32-bit outputs across 256 columns).
+    threads_n: gl.constexpr = block_n // store_width
+    # Clamp warp width along N to 32 threads (needed for 32-bit outputs across wide tiles).
     warp_threads_n: gl.constexpr = 32 if threads_n > 32 else threads_n
     warp_threads_m: gl.constexpr = 32 // warp_threads_n
     return gl.BlockedLayout(
@@ -582,6 +682,149 @@ def _int8_tma_residual_matmul_kernel(
         gl.store(output_ptr + offsets, final, mask=valid)
 
 
+@gluon.jit
+def _dequantize_tile(
+    accumulator,
+    input_scale,
+    weight_scale_ptr,
+    bias_ptr,
+    offsets_n,
+    n,
+    has_bias: gl.constexpr,
+    output_dtype: gl.constexpr,
+):
+    weight_scale = gl.load(weight_scale_ptr + offsets_n, mask=offsets_n < n, other=0.0)
+    row_scaled = accumulator.to(gl.float32) * input_scale[:, None]
+    if has_bias:
+        bias = gl.load(bias_ptr + offsets_n, mask=offsets_n < n, other=0.0).to(gl.float32)
+        result = gl.fma(row_scaled, weight_scale[None, :], bias[None, :])
+    else:
+        result = row_scaled * weight_scale[None, :]
+    return result.to(output_dtype)
+
+
+@gluon.jit(do_not_specialize=["m"])
+def _int8_tma_swiglu_matmul_kernel(
+    input_descriptor,
+    weight_descriptor,
+    second_weight_descriptor,
+    output_ptr,
+    input_scale_ptr,
+    weight_scale_ptr,
+    bias_ptr,
+    second_scale_ptr,
+    second_bias_ptr,
+    m,
+    n,
+    output_row_stride,
+    full_groups,
+    stages: gl.constexpr,
+    tail_refills: gl.constexpr,
+    group_m: gl.constexpr,
+    has_bias: gl.constexpr,
+    second_has_bias: gl.constexpr,
+):
+    """Project paired TMA-loaded INT8 weights and fuse 16-bit SwiGLU without spills.
+
+    Preserves the 16-bit projection rounding boundary before FP32 SiLU multiplication
+    and stores the activated output in ``output_ptr.dtype.element_ty`` (matching
+    eager 16-bit SwiGLU).
+    """
+    pid_m, pid_n, _ = _cta_tile_coordinates(m, n, _GL_SWIGLU_BLOCK_N, group_m, False)
+    mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
+        version=[2, 0], warps_per_cta=[_GL_WARPS_M, _GL_WARPS_N], instr_shape=[16, 8]
+    )
+    up_accumulator, gate_accumulator = _accumulate_tma_pair(
+        input_descriptor,
+        weight_descriptor,
+        second_weight_descriptor,
+        pid_m * _GL_BLOCK_M,
+        pid_n * _GL_SWIGLU_BLOCK_N,
+        full_groups,
+        mma_layout,
+        stages,
+        tail_refills,
+        False,
+        False,
+        _GL_SWIGLU_BLOCK_N,
+        _GL_SWIGLU_MMA_K,
+        True,
+    )
+    offsets_m = pid_m * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, mma_layout))
+    offsets_n = pid_n * _GL_SWIGLU_BLOCK_N + gl.arange(
+        0, _GL_SWIGLU_BLOCK_N, gl.SliceLayout(0, mma_layout)
+    )
+    input_scale = gl.load(input_scale_ptr + offsets_m, mask=offsets_m < m, other=0.0)
+    # Store up before dequantizing gate so only one 128x128 FP32 tile is live at a time.
+    projection_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=1, max_phase=8, order=[1, 0]
+    )
+    up_shared = gl.allocate_shared_memory(
+        output_ptr.dtype.element_ty,
+        [_GL_BLOCK_M, _GL_SWIGLU_BLOCK_N],
+        projection_shared_layout,
+    )
+    gate_shared = gl.allocate_shared_memory(
+        output_ptr.dtype.element_ty,
+        [_GL_BLOCK_M, _GL_SWIGLU_BLOCK_N],
+        projection_shared_layout,
+    )
+    up_shared.store(
+        _dequantize_tile(
+            up_accumulator,
+            input_scale,
+            weight_scale_ptr,
+            bias_ptr,
+            offsets_n,
+            n,
+            has_bias,
+            output_ptr.dtype.element_ty,
+        )
+    )
+    gate_shared.store(
+        _dequantize_tile(
+            gate_accumulator,
+            input_scale,
+            second_scale_ptr,
+            second_bias_ptr,
+            offsets_n,
+            n,
+            second_has_bias,
+            output_ptr.dtype.element_ty,
+        )
+    )
+    gl.barrier()
+
+    chunk_layout: gl.constexpr = _build_store_layout(
+        output_ptr.dtype.element_ty.primitive_bitwidth, _GL_SWIGLU_BLOCK_N
+    )
+    columns = pid_n * _GL_SWIGLU_BLOCK_N + gl.arange(
+        0, _GL_SWIGLU_BLOCK_N, gl.SliceLayout(0, chunk_layout)
+    )
+    column_valid = columns < n
+    for chunk_row in gl.static_range(0, _GL_BLOCK_M, _GL_SWIGLU_CHUNK_M):
+        up_chunk = (
+            up_shared.slice(chunk_row, _GL_SWIGLU_CHUNK_M, dim=0).load(chunk_layout).to(gl.float32)
+        )
+        gate_chunk = (
+            gate_shared.slice(chunk_row, _GL_SWIGLU_CHUNK_M, dim=0)
+            .load(chunk_layout)
+            .to(gl.float32)
+        )
+        activated = (up_chunk * (gate_chunk / (1.0 + gl.exp(-gate_chunk)))).to(
+            output_ptr.dtype.element_ty
+        )
+        rows = (
+            pid_m * _GL_BLOCK_M
+            + chunk_row
+            + gl.arange(0, _GL_SWIGLU_CHUNK_M, gl.SliceLayout(1, chunk_layout))
+        )
+        output_pointers = (
+            output_ptr + rows.to(gl.int64)[:, None] * output_row_stride + columns[None, :]
+        )
+        gl.store(output_pointers, activated, mask=(rows[:, None] < m) & column_valid[None, :])
+
+
 def operands_aligned(*operands: torch.Tensor) -> bool:
     """Return whether 2-D INT8 GEMM operands satisfy TMA contiguity and 16-byte alignment."""
     return all(
@@ -715,5 +958,50 @@ def launch_int8_residual_matmul(
             0 if reusable is None else reusable.gate.stride(0),
             reusable is not None,
             residual_add.python_indexing,
+            num_warps=_NUM_WARPS,
+        )
+
+
+def launch_int8_swiglu_matmul(
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    output: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    second_weight: torch.Tensor,
+    second_scale: torch.Tensor,
+    second_bias: torch.Tensor | None,
+    *,
+    execution_plan: NvidiaExecutionPlan,
+) -> None:
+    """Launch one dual-accumulator SM120 TMA GEMM with fused BF16/FP16 SwiGLU."""
+    m, k = input_qdata.shape
+    n = weight_qdata.shape[0]
+    stages, full_groups, tail_refills = _compute_k_schedule(k)
+    input_descriptor = build_matrix_descriptor(input_qdata, _BLOCK_M)
+    weight_descriptor = build_matrix_descriptor(weight_qdata, _SWIGLU_BLOCK_N)
+    second_weight_descriptor = build_matrix_descriptor(second_weight, _SWIGLU_BLOCK_N)
+    grid = (triton.cdiv(m, _BLOCK_M) * triton.cdiv(n, _SWIGLU_BLOCK_N),)
+    with device_context(input_qdata.device):
+        _int8_tma_swiglu_matmul_kernel[grid](
+            input_descriptor,
+            weight_descriptor,
+            second_weight_descriptor,
+            output,
+            input_scale,
+            weight_scale,
+            bias if bias is not None else output,
+            second_scale,
+            second_bias if second_bias is not None else output,
+            m,
+            n,
+            output.stride(0),
+            full_groups,
+            stages,
+            tail_refills,
+            execution_plan.matmul_group_m,
+            bias is not None,
+            second_bias is not None,
             num_warps=_NUM_WARPS,
         )
