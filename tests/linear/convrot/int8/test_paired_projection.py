@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import exact_sm120_available, sm8x_available
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.linear.convrot.int8._backend import require_linear_backend
@@ -110,7 +110,7 @@ def test_prepared_swiglu_matches_paired_reference(shape, dtype, bias_dtypes) -> 
     ]
     implementation = require_linear_backend(qdata)
     expected_fused = (
-        exact_sm120_available()
+        (exact_sm120_available() or sm8x_available())
         and rows >= 1_024
         and features % 16 == 0
         and dtype in (torch.float16, torch.bfloat16)
@@ -202,7 +202,7 @@ def test_prepared_swiglu_validates_outputs_handles_3d_and_empty() -> None:
     expected = (up_part.float() * F.silu(gate_part.float())).to(dtype)
     actual = implementation.linear_prepared_swiglu(*args)
     assert actual.shape == (batch, seq, width)
-    if exact_sm120_available():
+    if exact_sm120_available() or sm8x_available():
         torch.testing.assert_close(
             actual,
             expected,

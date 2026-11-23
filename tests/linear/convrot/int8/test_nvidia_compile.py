@@ -427,6 +427,129 @@ def test_sm120_tma_swiglu_ragged_stride_compiles_without_spills(output):
     )
 
 
+def _async_copy_swiglu_source(
+    *,
+    block_m: int,
+    stages: int,
+    output: str,
+    has_bias: bool,
+    second_has_bias: bool,
+    whole_k_tiles: bool,
+    divisible_stride: bool,
+    group_m: int = 8,
+):
+    kernel = gluon._int8_swiglu_matmul_kernel
+    signature = {
+        "input_ptr": "*i8",
+        "weight_ptr": "*i8",
+        "second_weight_ptr": "*i8",
+        "output_ptr": output,
+        "input_scale_ptr": "*fp32",
+        "weight_scale_ptr": "*fp32",
+        "bias_ptr": "*fp32" if has_bias else output,
+        "second_scale_ptr": "*fp32",
+        "second_bias_ptr": "*fp16" if second_has_bias else output,
+        "m": "i32",
+        "n": "i32",
+        "k": "i32",
+        "output_row_stride": "i32",
+    }
+    aligned = ["input_ptr", "weight_ptr", "second_weight_ptr", "k"]
+    if divisible_stride:
+        aligned.append("output_row_stride")
+    return GluonASTSource(
+        kernel,
+        signature,
+        attrs={(kernel.arg_names.index(name),): [["tt.divisibility", 16]] for name in aligned},
+        constexprs={
+            "block_m": block_m,
+            "block_k": 64,
+            "stages": stages,
+            "group_m": group_m,
+            "has_bias": has_bias,
+            "second_has_bias": second_has_bias,
+            "whole_k_tiles": whole_k_tiles,
+        },
+    )
+
+
+def _assert_async_copy_swiglu_zero_spills(architecture: int, source: GluonASTSource) -> None:
+    compiled, spill_stores = compile_with_spill_stores(
+        source,
+        GPUTarget("cuda", architecture, 32),
+        {"num_warps": gluon._SWIGLU_NUM_WARPS},
+    )
+    assert compiled.asm["cubin"]
+    assert "mma.sync" in compiled.asm["ptx"]
+    assert compiled.metadata.shared <= _SM8X_SHARED_MEMORY_LIMIT
+    assert spill_stores == 0
+
+
+@pytest.mark.parametrize("architecture", [80, 86, 89, 120])
+@pytest.mark.parametrize(("block_m", "stages"), [(128, 3), (128, 4), (256, 3), (256, 4)])
+@pytest.mark.parametrize("output", ["*fp16", "*bf16"])
+def test_async_copy_swiglu_schedules_compile_without_spills(architecture, block_m, stages, output):
+    _assert_async_copy_swiglu_zero_spills(
+        architecture,
+        _async_copy_swiglu_source(
+            block_m=block_m,
+            stages=stages,
+            output=output,
+            has_bias=True,
+            second_has_bias=True,
+            whole_k_tiles=True,
+            divisible_stride=True,
+        ),
+    )
+
+
+@pytest.mark.parametrize("architecture", [86, 89, 120])
+@pytest.mark.parametrize(("block_m", "stages"), [(128, 3), (256, 4)])
+@pytest.mark.parametrize(
+    "biases",
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["no-bias", "up-bias", "gate-bias", "both-biases"],
+)
+@pytest.mark.parametrize("whole_k_tiles", [True, False], ids=["whole-k", "tail-k"])
+@pytest.mark.parametrize("divisible_stride", [True, False], ids=["aligned-stride", "ragged-stride"])
+def test_async_copy_swiglu_variants_compile_without_spills(
+    architecture, block_m, stages, biases, whole_k_tiles, divisible_stride
+):
+    has_bias, second_has_bias = biases
+    _assert_async_copy_swiglu_zero_spills(
+        architecture,
+        _async_copy_swiglu_source(
+            block_m=block_m,
+            stages=stages,
+            output="*bf16",
+            has_bias=has_bias,
+            second_has_bias=second_has_bias,
+            whole_k_tiles=whole_k_tiles,
+            divisible_stride=divisible_stride,
+        ),
+    )
+
+
+@pytest.mark.parametrize("architecture", [86, 89, 120])
+@pytest.mark.parametrize(("block_m", "stages"), [(128, 3), (256, 4)])
+def test_async_copy_swiglu_fp16_tail_ragged_ungrouped_compiles_without_spills(
+    architecture, block_m, stages
+):
+    _assert_async_copy_swiglu_zero_spills(
+        architecture,
+        _async_copy_swiglu_source(
+            block_m=block_m,
+            stages=stages,
+            output="*fp16",
+            has_bias=True,
+            second_has_bias=True,
+            whole_k_tiles=False,
+            divisible_stride=False,
+            group_m=0,
+        ),
+    )
+
+
 def _compile_int8_matmul(
     plan, architecture, *, output, biases, paired, aligned_m, aligned_nk, group_m
 ):

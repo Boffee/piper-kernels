@@ -253,12 +253,11 @@ def launch_prepared_linear(
     plan = execution_plan
     launcher = launch_int8_matmul
     if plan.matmul_kernel in ("gluon_async_copy", "gluon_tma"):
-        gluon_module = gluon_tma if plan.matmul_kernel == "gluon_tma" else gluon_async_copy
-        aligned = gluon_module.operands_aligned(input_qdata, weight_qdata)
+        aligned = _gluon_operands_supported(plan, input_qdata, weight_qdata)
         if paired:
-            aligned = aligned and gluon_module.operands_aligned(second_weight)
+            aligned = aligned and _gluon_operands_supported(plan, second_weight)
         if aligned:
-            launcher = gluon_module.launch_int8_matmul
+            launcher = _gluon_module(plan).launch_int8_matmul
         else:
             plan = policy.grouped_triton_plan(plan)
     launcher(
@@ -276,6 +275,28 @@ def launch_prepared_linear(
     )
 
 
+def _gluon_module(execution_plan: NvidiaExecutionPlan):
+    if execution_plan.matmul_kernel == "gluon_tma":
+        return gluon_tma
+    if execution_plan.matmul_kernel == "gluon_async_copy":
+        return gluon_async_copy
+    raise ValueError(f"Unsupported Gluon matmul kernel: {execution_plan.matmul_kernel!r}")
+
+
+def _gluon_operands_supported(execution_plan: NvidiaExecutionPlan, *operands: torch.Tensor) -> bool:
+    if not _gluon_module(execution_plan).operands_aligned(*operands):
+        return False
+    if execution_plan.matmul_kernel == "gluon_tma":
+        return True
+    return all(
+        operand.ndim == 2
+        and operand.is_contiguous()
+        and operand.shape[1] > 0
+        and operand.shape[1] % 16 == 0
+        for operand in operands
+    )
+
+
 def supports_prepared_swiglu(
     weight_qdata: torch.Tensor,
     second_weight: torch.Tensor,
@@ -284,12 +305,12 @@ def supports_prepared_swiglu(
     execution_plan: LinearExecutionPlan,
     target: AcceleratorTarget,
 ) -> bool:
-    """Return whether paired INT8 projections can fuse SwiGLU via SM120 TMA."""
+    """Return whether paired INT8 projections can fuse SwiGLU via Gluon TMA or async copy."""
     if not isinstance(execution_plan, NvidiaExecutionPlan):
         raise TypeError("NVIDIA ConvRot execution requires a NvidiaExecutionPlan")
-    return policy.supports_swiglu_epilogue(
-        target, execution_plan, logical_dtype
-    ) and gluon_tma.operands_aligned(weight_qdata, second_weight)
+    if not policy.supports_swiglu_epilogue(target, execution_plan, logical_dtype):
+        return False
+    return _gluon_operands_supported(execution_plan, weight_qdata, second_weight)
 
 
 def try_launch_prepared_swiglu(
@@ -306,7 +327,7 @@ def try_launch_prepared_swiglu(
     execution_plan: LinearExecutionPlan,
     target: AcceleratorTarget,
 ) -> bool:
-    """Launch the SM120 dual-accumulator SwiGLU TMA GEMM when supported; else False."""
+    """Launch the dual-accumulator Gluon SwiGLU GEMM when supported; else False."""
     if not supports_prepared_swiglu(
         weight_qdata,
         second_weight,
@@ -315,13 +336,13 @@ def try_launch_prepared_swiglu(
         target=target,
     ):
         return False
-    if not gluon_tma.operands_aligned(input_qdata):
+    assert isinstance(execution_plan, NvidiaExecutionPlan)
+    if not _gluon_operands_supported(execution_plan, input_qdata):
         return False
     m, _k = input_qdata.shape
     n = weight_qdata.shape[0]
     if m and n:
-        assert isinstance(execution_plan, NvidiaExecutionPlan)
-        gluon_tma.launch_int8_swiglu_matmul(
+        _gluon_module(execution_plan).launch_int8_swiglu_matmul(
             input_qdata,
             weight_qdata,
             output,
