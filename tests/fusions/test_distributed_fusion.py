@@ -514,23 +514,24 @@ def test_kv_gather_fake_validation() -> None:
 
 
 @pytest.mark.parametrize("world_size", [2, 3])
+@pytest.mark.parametrize("reuse_direct_receive", [True, False])
 def test_peer_exchange_multi_chunk_ping_pong(
     monkeypatch: pytest.MonkeyPatch,
     world_size: int,
+    reuse_direct_receive: bool,
 ) -> None:
-    class _FakeGroup:
-        def rank(self) -> int:
-            return 0
-
-        def size(self) -> int:
-            return world_size
+    events: list[tuple[Any, ...]] = []
+    recv_ptrs: list[int] = []
+    fake_pg = SimpleNamespace(rank=lambda: 0, size=lambda: world_size)
 
     class _FakeWork:
-        def __init__(self) -> None:
+        def __init__(self, idx: int) -> None:
+            self.idx = idx
             self.waited = False
 
         def wait(self) -> bool:
             self.waited = True
+            events.append(("wait", self.idx))
             return True
 
     issued: list[tuple[_FakeWork, torch.Tensor | None]] = []
@@ -539,7 +540,12 @@ def test_peer_exchange_multi_chunk_ping_pong(
         *args: Any,
         **_kwargs: Any,
     ) -> _FakeWork:
-        work = _FakeWork()
+        idx = len(issued)
+        work = _FakeWork(idx)
+        recv_tensor = args[0][1] if world_size == 2 else args[0]
+        assert isinstance(recv_tensor, torch.Tensor)
+        recv_ptrs.append(recv_tensor.untyped_storage().data_ptr())
+        events.append(("start", idx))
         zero_or_send = args[1] if world_size == 3 else None
         buf = zero_or_send[0] if isinstance(zero_or_send, list) else None
         issued.append((work, buf))
@@ -558,9 +564,11 @@ def test_peer_exchange_multi_chunk_ping_pong(
     )
 
     output = torch.empty((1, 192, 128), dtype=torch.bfloat16)
-    applied: list[tuple[int, int]] = []
-    fake_pg = _FakeGroup()
-    work, offset, rows, _recv, keepalive = distributed_output._run_peer_attention_exchange(
+
+    def record_apply(_tensor: torch.Tensor, off: int, cnt: int) -> None:
+        events.append(("apply", off, cnt))
+
+    work, offset, rows, recv, keepalive = distributed_output._run_peer_attention_exchange(
         fake_pg,  # type: ignore[arg-type]
         SimpleNamespace(quantized_context=None, coarse_gate=None),  # type: ignore[arg-type]
         (1, 1, 128),
@@ -568,19 +576,34 @@ def test_peer_exchange_multi_chunk_ping_pong(
         64,
         lambda _s, _r: (output, output, output),
         None,
-        lambda _t, off, cnt: applied.append((off, cnt)),
+        record_apply,
         lambda _a, buf, _s, _r: buf.zero_(),
-        reuse_direct_receive=True,
+        reuse_direct_receive=reuse_direct_receive,
     )
     gc.collect()
     assert len(issued) == 3
     assert [w.waited for w, _ in issued[:2]] == [True, True]
     assert not issued[2][0].waited
-    assert applied == [(0, 64), (64, 64)]
     assert (offset, rows) == (128, 64)
     assert len(keepalive) == (1 if world_size == 2 else 3)
     work.wait()
     assert issued[2][0].waited
+    record_apply(recv, offset, rows)
+
+    assert len(set(recv_ptrs)) == 1
+    assert recv.untyped_storage().data_ptr() == recv_ptrs[0]
+    assert (recv_ptrs[0] == output.untyped_storage().data_ptr()) is reuse_direct_receive
+    assert events == [
+        ("start", 0),
+        ("wait", 0),
+        ("apply", 0, 64),
+        ("start", 1),
+        ("wait", 1),
+        ("apply", 64, 64),
+        ("start", 2),
+        ("wait", 2),
+        ("apply", 128, 64),
+    ]
 
     # Exception on chunk 1 drains in-flight chunk 0 collective before unwinding.
     issued.clear()
@@ -606,10 +629,179 @@ def test_peer_exchange_multi_chunk_ping_pong(
             None,
             lambda *_args: None,
             lambda _a, buf, _s, _r: buf.zero_(),
-            reuse_direct_receive=True,
+            reuse_direct_receive=reuse_direct_receive,
         )
     assert len(issued) == 1
     assert issued[0][0].waited
+
+
+@pytest.mark.parametrize(
+    (
+        "local_seq",
+        "query_chunk_rows",
+        "tile_rows",
+        "batch",
+        "output_features",
+        "element_size",
+        "world_size",
+        "reuse_direct_receive",
+    ),
+    [
+        (8192, 8192, 64, 1, 5376, 2, 2, False),
+        (8448, 8192, 128, 1, 6144, 2, 2, False),
+        (10240, 8192, 64, 1, 5376, 2, 2, False),
+        (55296, 8192, 64, 1, 5376, 2, 2, False),
+        (27648, 8192, 64, 1, 5376, 2, 4, False),
+        (13824, 8192, 64, 1, 5376, 2, 8, False),
+        (10240, 8192, 64, 4, 5376, 2, 2, False),
+        (16384, 8192, 64, 1, 12288, 2, 2, False),
+        (16384, 8192, 64, 1, 12288, 2, 2, True),
+        (16384, 8192, 64, 1, 5376, 4, 2, False),
+        (128, 64, 64, 1, 512, 2, 2, False),
+    ],
+)
+def test_choose_distributed_chunk_rows_bounds_comm_workspace(
+    local_seq: int,
+    query_chunk_rows: int,
+    tile_rows: int,
+    batch: int,
+    output_features: int,
+    element_size: int,
+    world_size: int,
+    reuse_direct_receive: bool,
+) -> None:
+    rows = peer_exchange.choose_distributed_chunk_rows(
+        local_seq,
+        query_chunk_rows,
+        tile_rows=tile_rows,
+        batch=batch,
+        output_features=output_features,
+        element_size=element_size,
+        world_size=world_size,
+        reuse_direct_receive=reuse_direct_receive,
+    )
+    limit = 256 * 1024 * 1024
+    peer_count = max(1, world_size - 1)
+    fixed_buffers = (0 if reuse_direct_receive else 1) + (0 if world_size <= 2 else 1)
+    row_bytes = batch * output_features * element_size
+
+    assert tile_rows <= rows <= min(local_seq, query_chunk_rows)
+    assert rows % tile_rows == 0
+    buffers = (
+        (peer_count + fixed_buffers) if rows == local_seq else (2 * peer_count + fixed_buffers)
+    )
+    assert rows * row_bytes * buffers <= limit
+
+    budget_rows = limit // (row_bytes * (2 * peer_count + fixed_buffers))
+    cap = max(tile_rows, (min(local_seq, query_chunk_rows, budget_rows) // tile_rows) * tile_rows)
+    expected_chunks = (local_seq + cap - 1) // cap
+    actual_chunks = (local_seq + rows - 1) // rows
+    assert actual_chunks == expected_chunks
+    balanced = (local_seq + expected_chunks - 1) // expected_chunks
+    assert rows == local_seq or rows <= balanced + tile_rows - 1
+
+
+def test_choose_distributed_chunk_rows_boundaries_and_scaling() -> None:
+    assert (
+        peer_exchange.choose_distributed_chunk_rows(
+            32,
+            64,
+            tile_rows=64,
+            batch=1,
+            output_features=512,
+            element_size=2,
+            world_size=2,
+        )
+        == 32
+    )
+    unaligned = peer_exchange.choose_distributed_chunk_rows(
+        150,
+        256,
+        tile_rows=64,
+        batch=1,
+        output_features=512,
+        element_size=2,
+        world_size=2,
+    )
+    assert unaligned % 64 == 0
+    assert 64 <= unaligned <= 150
+    assert (
+        peer_exchange.choose_distributed_chunk_rows(
+            1024,
+            8192,
+            tile_rows=64,
+            batch=1,
+            output_features=512,
+            element_size=2,
+            world_size=2,
+            max_comm_bytes=1,
+        )
+        == 64
+    )
+
+    wide_with_recv = peer_exchange.choose_distributed_chunk_rows(
+        16384,
+        8192,
+        tile_rows=64,
+        batch=1,
+        output_features=12288,
+        element_size=2,
+        world_size=2,
+        reuse_direct_receive=False,
+    )
+    wide_direct_recv = peer_exchange.choose_distributed_chunk_rows(
+        16384,
+        8192,
+        tile_rows=64,
+        batch=1,
+        output_features=12288,
+        element_size=2,
+        world_size=2,
+        reuse_direct_receive=True,
+    )
+    assert wide_direct_recv > wide_with_recv
+
+    world_2, world_4, world_8 = (
+        peer_exchange.choose_distributed_chunk_rows(
+            27648,
+            8192,
+            tile_rows=64,
+            batch=1,
+            output_features=5376,
+            element_size=2,
+            world_size=ws,
+        )
+        for ws in (2, 4, 8)
+    )
+    assert world_2 > world_4 > world_8
+
+    batch_1, batch_4 = (
+        peer_exchange.choose_distributed_chunk_rows(
+            10240,
+            8192,
+            tile_rows=64,
+            batch=bs,
+            output_features=5376,
+            element_size=2,
+            world_size=2,
+        )
+        for bs in (1, 4)
+    )
+    assert batch_1 > batch_4
+
+    bf16_rows, fp32_rows = (
+        peer_exchange.choose_distributed_chunk_rows(
+            16384,
+            8192,
+            tile_rows=64,
+            batch=1,
+            output_features=5376,
+            element_size=elem,
+            world_size=2,
+        )
+        for elem in (2, 4)
+    )
+    assert bf16_rows > fp32_rows
 
 
 def _make_distributed_output_meta_args(

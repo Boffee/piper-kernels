@@ -15,6 +15,8 @@ from . import _comm as distributed_comm
 type PeerExchangeHandle = tuple[dist.Work, int, int, torch.Tensor, tuple[torch.Tensor, ...]]
 type ApplyReceived = Callable[[torch.Tensor, int, int], None]
 
+_COMM_WORKSPACE_LIMIT_BYTES = 256 * 1024 * 1024
+
 
 def contiguous_chunk_view(
     buffer: torch.Tensor,
@@ -84,13 +86,34 @@ def choose_distributed_chunk_rows(
     query_chunk_rows: int,
     *,
     tile_rows: int,
-    max_chunk_rows: int = 4096,
+    batch: int,
+    output_features: int,
+    element_size: int,
+    world_size: int,
+    reuse_direct_receive: bool = False,
+    max_comm_bytes: int = _COMM_WORKSPACE_LIMIT_BYTES,
 ) -> int:
-    """Choose a tile-aligned peer exchange window up to ``max_chunk_rows``."""
+    """Choose a balanced, tile-aligned peer exchange window bounded by comm VRAM."""
     if local_sequence_length < tile_rows:
         return local_sequence_length
-    target = min(local_sequence_length, query_chunk_rows, max_chunk_rows)
-    return max(tile_rows, (target // tile_rows) * tile_rows)
+    peer_count = max(1, world_size - 1)
+    fixed_buffers = (0 if reuse_direct_receive else 1) + (0 if world_size <= 2 else 1)
+    row_bytes = max(1, batch * output_features * element_size)
+    single_buffers = peer_count + fixed_buffers
+    if (
+        local_sequence_length <= query_chunk_rows
+        and local_sequence_length % tile_rows == 0
+        and local_sequence_length * row_bytes * single_buffers <= max_comm_bytes
+    ):
+        return local_sequence_length
+    multi_buffers = 2 * peer_count + fixed_buffers
+    budget_rows = max_comm_bytes // (row_bytes * multi_buffers)
+    cap = min(local_sequence_length, query_chunk_rows, budget_rows)
+    cap = max(tile_rows, (cap // tile_rows) * tile_rows)
+    chunks = (local_sequence_length + cap - 1) // cap
+    rows = (local_sequence_length + chunks - 1) // chunks
+    aligned = ((rows + tile_rows - 1) // tile_rows) * tile_rows
+    return min(cap, max(tile_rows, aligned))
 
 
 def apply_received_chunk(
@@ -162,8 +185,8 @@ def allocate_peer_comm_slots(
     device: torch.device,
     output_dtype: torch.dtype,
     reuse_direct_receive: bool,
-) -> tuple[list[list[torch.Tensor]], list[torch.Tensor | None], torch.Tensor | None]:
-    """Allocate double-buffered send/receive scratch slots for bounded peer exchanges."""
+) -> tuple[list[list[torch.Tensor]], torch.Tensor | None, torch.Tensor | None]:
+    """Allocate double-buffered send slots and a single reused receive scratch buffer."""
     send_slots: list[list[torch.Tensor]] = [
         [
             torch.empty((batch, capacity, output_features), device=device, dtype=output_dtype)
@@ -171,18 +194,19 @@ def allocate_peer_comm_slots(
         ]
         for _ in range(slots)
     ]
-    receive_slots: list[torch.Tensor | None] = [
+    # Safe to reuse one receive buffer across chunks: each loop waits on the previous
+    # collective and consumes its received chunk on the current stream before issuing the next.
+    receive_buffer = (
         None
         if reuse_direct_receive
         else torch.empty((batch, capacity, output_features), device=device, dtype=output_dtype)
-        for _ in range(slots)
-    ]
+    )
     zero_local_buffer = (
         None
         if world_size == 2
         else torch.zeros((batch, capacity, output_features), device=device, dtype=output_dtype)
     )
-    return send_slots, receive_slots, zero_local_buffer
+    return send_slots, receive_buffer, zero_local_buffer
 
 
 def run_peer_chunk_exchange(
@@ -205,7 +229,7 @@ def run_peer_chunk_exchange(
     slots = min(2, len(sub_ranges))
     peer_ranks = tuple(peer for peer in range(world_size) if peer != process_group.rank())
 
-    send_slots, receive_slots, zero_local_buffer = allocate_peer_comm_slots(
+    send_slots, receive_buffer, zero_local_buffer = allocate_peer_comm_slots(
         world_size,
         peer_ranks,
         batch,
@@ -237,9 +261,8 @@ def run_peer_chunk_exchange(
             if reuse_direct_receive:
                 receive_view = output[:, local_offset : local_offset + rows]
             else:
-                receive_slot = receive_slots[slot]
-                assert receive_slot is not None
-                receive_view = contiguous_chunk_view(receive_slot, batch, rows, output_features)
+                assert receive_buffer is not None
+                receive_view = contiguous_chunk_view(receive_buffer, batch, rows, output_features)
             zero_view = (
                 None
                 if zero_local_buffer is None
@@ -366,17 +389,22 @@ def run_overlapped_distributed_output(
             residual_add,
         )
 
+    reuse_direct_receive = residual_add is None and batch == 1
     comm_chunk_rows = choose_distributed_chunk_rows(
         local_sequence_length,
         query_chunk_rows,
         tile_rows=tile_rows,
+        batch=batch,
+        output_features=output_features,
+        element_size=output_dtype.itemsize,
+        world_size=process_group.size(),
+        reuse_direct_receive=reuse_direct_receive,
     )
     output = (
         residual_add.base
         if residual_add is not None
         else torch.empty(output_shape, device=device, dtype=output_dtype)
     )
-    reuse_direct_receive = residual_add is None and batch == 1
 
     def apply_received(receive_tensor: torch.Tensor, local_offset: int, rows: int) -> None:
         apply_received_chunk(
