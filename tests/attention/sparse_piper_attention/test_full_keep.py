@@ -2,9 +2,11 @@
 
 import pytest
 import torch
+from _accelerators import forbid_triton_driver
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels import SparsePiperAttention
-from piper_kernels.attention.sparse_piper_attention import _backend, _routes, _routing
+from piper_kernels.attention.sparse_piper_attention import _backend, _routing
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
@@ -21,56 +23,111 @@ requires_native = pytest.mark.skipif(
     reason="requires native sparse attention",
 )
 
+_SELECTION_OPS = frozenset(
+    {
+        torch.ops.aten.topk.default,
+        torch.ops.aten.sort.default,
+        torch.ops.aten.sort.stable,
+        torch.ops.aten.argsort.default,
+        torch.ops.aten.argsort.stable,
+    }
+)
+_SCORE_AND_SUMMARY_OPS = _SELECTION_OPS | frozenset(
+    {
+        torch.ops.aten.mm.default,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.matmul.default,
+        torch.ops.aten.baddbmm.default,
+        torch.ops.aten.mean.dim,
+        torch.ops.aten.amax.default,
+        torch.ops.aten.amin.default,
+    }
+)
 
-def _unexpected(*args, **kwargs):
-    raise AssertionError("full keep must not run routing selection")
+
+class _ForbidRoutingOps(TorchDispatchMode):
+    def __init__(
+        self,
+        forbidden_ops: frozenset[object],
+        *,
+        forbid_float_alloc: bool = False,
+        forbidden_fp32_4d_dims: tuple[int, ...] = (),
+    ) -> None:
+        self._forbidden_ops = forbidden_ops
+        self._forbid_float_alloc = forbid_float_alloc
+        self._forbidden_fp32_4d_dims = forbidden_fp32_4d_dims
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        assert func not in self._forbidden_ops, f"full keep ran routing/selection op {func}"
+        result = func(*args, **(kwargs or {}))
+        if isinstance(result, torch.Tensor):
+            if self._forbid_float_alloc:
+                assert not result.is_floating_point(), (
+                    f"full keep produced floating tensor via {func}"
+                )
+            if (
+                func in (torch.ops.aten.empty.memory_format, torch.ops.aten.new_empty.default)
+                and result.dtype is torch.float32
+                and result.ndim == 4
+                and result.shape[:2] == (1, 2)
+                and result.shape[3] in self._forbidden_fp32_4d_dims
+            ):
+                raise AssertionError(
+                    f"full keep allocated routing summary/score buffer {tuple(result.shape)}"
+                )
+        return result
 
 
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("ratio", [0.999, 1.0])
-def test_full_keep_skips_summaries_and_scores(monkeypatch, routing_mode, head_dim, ratio):
+def test_full_keep_skips_summaries_and_scores(routing_mode, head_dim, ratio):
     query = torch.randn(2, 3, 193, head_dim)
     key = torch.randn(2, 3, 192, head_dim)
     # A rounded physical budget can be full even if its semantic ratio is not 1.
     layout = _resolve_route_layout(_normalize_head_keep_ratios([ratio] * 3), 3, query.device)
-    monkeypatch.setattr(_routing, "sequence_block_summaries", _unexpected)
-    monkeypatch.setattr(_routing, "score_chunks", _unexpected)
-    result = _routing.packed_routes_from_sequences(query, key, layout, routing_mode)
+    with (
+        forbid_triton_driver("full keep invoked GPU kernels"),
+        _ForbidRoutingOps(_SCORE_AND_SUMMARY_OPS, forbid_float_alloc=True),
+    ):
+        result = _routing.packed_routes_from_sequences(query, key, layout, routing_mode)
     expected = torch.tensor([0, 1, 2] * 3, dtype=torch.uint16).expand(2, 4, 9)
     torch.testing.assert_close(result.indices, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_full_keep_from_summaries_skips_score_chunks(monkeypatch, routing_mode, head_dim):
+def test_full_keep_from_summaries_skips_score_chunks(routing_mode, head_dim):
     query = torch.randn(1, 2, 4, head_dim)
     key = torch.randn(1, 2, 3, head_dim)
     auxiliary = key[:, :, :0] if routing_mode == _MEAN_ROUTING else torch.randn_like(key)
     layout = _resolve_route_layout(_normalize_head_keep_ratios([1.0] * 2), 3, query.device)
-    monkeypatch.setattr(_routing, "score_chunks", _unexpected)
-    result = _routing.packed_routes_from_summaries(query, key, auxiliary, layout, routing_mode)
+    with (
+        forbid_triton_driver("full keep invoked GPU kernels"),
+        _ForbidRoutingOps(_SCORE_AND_SUMMARY_OPS, forbid_float_alloc=True),
+    ):
+        result = _routing.packed_routes_from_summaries(query, key, auxiliary, layout, routing_mode)
     expected = torch.tensor([0, 1, 2] * 2, dtype=torch.uint16).expand(1, 4, 6)
     torch.testing.assert_close(result.indices, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_full_keep_preserves_coarse_scores_and_output(monkeypatch, head_dim):
+def test_full_keep_preserves_coarse_scores_and_output(head_dim):
     query = torch.randn(1, 2, 4, head_dim)
     key = torch.randn(1, 2, 3, head_dim)
     value = torch.randn(1, 2, 3, head_dim)
     layout = _resolve_route_layout(_normalize_head_keep_ratios([1.0] * 2), 2, query.device)
-    monkeypatch.setattr(_routes, "_select_portable_routes", _unexpected)
-    result = _routing.packed_routes_and_coarse_from_summaries(
-        query,
-        key,
-        key[:, :, :0],
-        value,
-        layout,
-        sparse_key_blocks=2,
-        coarse_scale=0.125,
-        routing_mode=_MEAN_ROUTING,
-    )
+    with _ForbidRoutingOps(_SELECTION_OPS):
+        result = _routing.packed_routes_and_coarse_from_summaries(
+            query,
+            key,
+            key[:, :, :0],
+            value,
+            layout,
+            sparse_key_blocks=2,
+            coarse_scale=0.125,
+            routing_mode=_MEAN_ROUTING,
+        )
     expected = torch.softmax((query @ key.mT) * 0.125, dim=-1) @ value
     torch.testing.assert_close(result.coarse_output, expected)
     expected_routes = torch.tensor([0, 1] * 2, dtype=torch.uint16).expand(1, 4, 4)
@@ -117,7 +174,10 @@ def test_full_keep_attention_matches_score_selected_routes(
     with monkeypatch.context() as control:
         control.setattr(_ResolvedRouteLayout, "keeps_all_blocks", lambda *_: False)
         expected = attention(*operands, sparse_key_blocks=sequence // 64)
-    monkeypatch.setattr(_routing, "sequence_block_summaries", _unexpected)
-    monkeypatch.setattr(_routing, "score_chunks", _unexpected)
-    actual = attention(*operands, sparse_key_blocks=sequence // 64)
+    sparse_key_blocks = sequence // 64
+    with _ForbidRoutingOps(
+        _SCORE_AND_SUMMARY_OPS,
+        forbidden_fp32_4d_dims=(head_dim, sparse_key_blocks),
+    ):
+        actual = attention(*operands, sparse_key_blocks=sparse_key_blocks)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -7,12 +7,12 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from piper_kernels.attention.kernels.sparse_piper.layout import padded_sequence_length
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import key as key_fusion
-from piper_kernels.fusions.convrot_int8_sparse_piper._layout import padded_sequence_length
 
 from ._helpers import projection_available
 from ._reference import (

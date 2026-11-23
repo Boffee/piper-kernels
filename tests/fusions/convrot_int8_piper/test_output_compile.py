@@ -2,8 +2,9 @@
 
 import pytest
 import torch
+from _accelerators import mock_cuda_target
 
-from piper_kernels.fusions.convrot_int8_piper import _backend, _compile, _output_compile, output
+from piper_kernels.fusions.convrot_int8_piper import _compile, _output_compile, output
 from piper_kernels.linear.convrot.int8 import _ops
 
 from .test_compile import (
@@ -90,8 +91,8 @@ def test_compiler_folds_complete_dense_attention_output(head_dim, causal, dtype,
     assert torch.ops.piper_kernels.piper_attention_from_quantized.default not in capture.targets
 
 
-def _semantic_output_graph():
-    graph = _qkv_semantic_graph()
+def _semantic_output_graph(device="cuda:0"):
+    graph = _qkv_semantic_graph(device=device)
     old_output = next(node for node in graph.nodes if node.op == "output")
     attention = old_output.args[0]
     with graph.inserting_before(attention):
@@ -99,9 +100,9 @@ def _semantic_output_graph():
         scale = graph.placeholder("output_scale")
         bias = graph.placeholder("output_bias")
     with attention.meta["val"].fake_mode:
-        weight.meta["val"] = torch.empty(80, 256, dtype=torch.int8)
-        scale.meta["val"] = torch.empty(80, 1)
-        bias.meta["val"] = torch.empty(80, dtype=torch.bfloat16)
+        weight.meta["val"] = torch.empty(80, 256, device=device, dtype=torch.int8)
+        scale.meta["val"] = torch.empty(80, 1, device=device)
+        bias.meta["val"] = torch.empty(80, device=device, dtype=torch.bfloat16)
         with graph.inserting_before(old_output):
             transposed = graph.call_function(torch.ops.aten.transpose.int, args=(attention, 1, 2))
             transposed.meta["val"] = attention.meta["val"].transpose(1, 2)
@@ -115,7 +116,7 @@ def _semantic_output_graph():
                 torch.ops.piper_kernels.convrot_int8_linear.default,
                 args=(shaped, weight, scale, bias, 64, None, None),
             )
-            linear.meta["val"] = torch.empty(2, 65, 80, dtype=torch.bfloat16)
+            linear.meta["val"] = torch.empty(2, 65, 80, device=device, dtype=torch.bfloat16)
     old_output.args = (linear,)
     graph.lint()
     return graph, attention, transposed, linear, old_output
@@ -135,13 +136,8 @@ def _semantic_output_graph():
     ],
 )
 def test_output_rewrite_preserves_unsupported_or_escaping_regions(monkeypatch, unsupported):
+    mock_cuda_target(monkeypatch, (12, 0))
     graph, attention, transposed, linear, old_output = _semantic_output_graph()
-    monkeypatch.setattr(_backend, "select_projection_backend", lambda *a, **kw: object())
-    monkeypatch.setattr(
-        _output_compile.linear_backend,
-        "select_linear_backend",
-        lambda *a, **kw: None if unsupported == "backend" else object(),
-    )
     if unsupported == "attention_escape":
         old_output.args = ((linear, attention),)
     elif unsupported == "query_escape":
@@ -151,10 +147,13 @@ def test_output_rewrite_preserves_unsupported_or_escaping_regions(monkeypatch, u
     elif unsupported == "activation":
         linear.args = (*linear.args[:5], "silu", None)
     elif unsupported == "weight":
-        linear.args[1].meta["val"] = torch.empty(80, 128, dtype=torch.int8)
+        with attention.meta["val"].fake_mode:
+            linear.args[1].meta["val"] = torch.empty(80, 128, device="cuda:0", dtype=torch.int8)
     elif unsupported == "metadata":
         linear.args[2].meta["val"] = None
     _compile.fold_attention_projections(graph)
+    if unsupported == "backend":
+        mock_cuda_target(monkeypatch, (7, 0))
     _compile.fold_attention_output(graph)
     graph.lint()
     targets = [node.target for node in graph.nodes]
@@ -167,11 +166,8 @@ def test_output_rewrite_preserves_unsupported_or_escaping_regions(monkeypatch, u
 
 
 def test_output_rewrite_keeps_a_different_logical_query_extent(monkeypatch):
+    mock_cuda_target(monkeypatch, (12, 0))
     graph, _, transposed, linear, _ = _semantic_output_graph()
-    monkeypatch.setattr(_backend, "select_projection_backend", lambda *a, **kw: object())
-    monkeypatch.setattr(
-        _output_compile.linear_backend, "select_linear_backend", lambda *a, **kw: object()
-    )
     _compile.fold_attention_projections(graph)
     attention = next(
         node
@@ -184,11 +180,11 @@ def test_output_rewrite_keeps_a_different_logical_query_extent(monkeypatch):
     reshaped = linear.args[0]
     cloned = reshaped.args[0]
     with attention.meta["val"].fake_mode:
-        attention.meta["val"] = torch.empty(2, 4, 96, 64, dtype=torch.bfloat16)
+        attention.meta["val"] = torch.empty(2, 4, 96, 64, device="cuda:0", dtype=torch.bfloat16)
         transposed.meta["val"] = attention.meta["val"].transpose(1, 2)
         cloned.meta["val"] = transposed.meta["val"].contiguous()
         reshaped.args = (cloned, (2, 96, 256))
         reshaped.meta["val"] = cloned.meta["val"].reshape(2, 96, 256)
-        linear.meta["val"] = torch.empty(2, 96, 80, dtype=torch.bfloat16)
+        linear.meta["val"] = torch.empty(2, 96, 80, device="cuda:0", dtype=torch.bfloat16)
     graph.lint()
     assert not _output_compile.fold_attention_output(graph)

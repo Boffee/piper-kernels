@@ -6,7 +6,7 @@ from _accelerators import exact_sm120_available
 from gguf_format._fixtures import finite_packed, reference_case
 
 from piper_kernels.gguf import GGUFQuantizationType
-from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
+from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 from piper_kernels.weights.convrot import triton as convrot_backend
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
@@ -14,7 +14,7 @@ from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 def _materialized_reference(dense: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rotated = torch.empty_like(dense)
     convrot_backend.rotate_input(dense, rotated, 64, num_warps=4)
-    return nvfp4_ops._compiled_prepare_dynamic(rotated, None)
+    return nvfp4_triton.prepare_dynamic(rotated, None)
 
 
 @pytest.mark.gpu

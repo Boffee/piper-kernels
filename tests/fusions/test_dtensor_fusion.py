@@ -19,7 +19,6 @@ from piper_kernels import compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
-from piper_kernels.weights.nvfp4._layout import swap_packed_pairs
 
 from .convrot_int8_sparse_piper.test_compile import _MeanPoolSparseProjectionAttentionOutput
 from .nvfp4_sparse_piper.test_compile import _SparseProjectionAttentionOutput
@@ -207,7 +206,7 @@ def _weight(format_name, source, *, high_first=False):
         **({"group_size": 64} if cls is ConvRotNVFP4Tensor else {}),
     )
     if high_first:
-        weight.qdata = swap_packed_pairs(weight.qdata)
+        weight.qdata = (((weight.qdata & 0x0F) << 4) | (weight.qdata >> 4)).to(torch.uint8)
         weight.high_first = True
     return weight
 

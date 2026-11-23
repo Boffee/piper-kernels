@@ -5,7 +5,7 @@ import torch
 from _accelerators import forbid_device_probes, mock_cuda_target
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from piper_kernels.fusions.convrot_int8_piper import _backend, output
+from piper_kernels.fusions.convrot_int8_piper import output
 
 from .test_context_validation import _MetadataOnly, _OutputOnly
 from .test_output import _arguments
@@ -46,16 +46,12 @@ def test_output_rejects_invalid_metadata_without_tensor_operations(invalid):
 def test_output_fake_allocates_only_final_output_and_empty_batch_skips_hardware(monkeypatch, batch):
     mock_cuda_target(monkeypatch, (12, 0))
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("metadata path probed hardware")
-
     with FakeTensorMode():
         args = list(_arguments(device="cuda:0", sequence=65))
         for index in (0, 1, 10, 11, 12, 13, 14, 15, 16):
             args[index] = args[index][:batch]
 
         forbid_device_probes(monkeypatch, "metadata path probed hardware")
-        monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
         with _OutputOnly():
             result = output._projected_query_attention_output_op_fake(*args, head_dim=64)
         assert result.shape == (batch, 65, 80)

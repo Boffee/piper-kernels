@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-import piper_kernels.attention.sparse_piper_attention._routing as routing_module
 from piper_kernels import (
     apply_coarse_attention_residual,
     coarse_attention,
@@ -82,12 +81,9 @@ def test_coarse_attention_uses_caller_supplied_block_logits() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def test_sparse_piper_coarse_residual_matches_explicit_mean_composition(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(routing_module, "_QUERY_CHUNK_BLOCKS", 2)
+def test_sparse_piper_coarse_residual_matches_explicit_mean_composition() -> None:
     generator = torch.Generator().manual_seed(918)
-    shape = (1, 129, 2, 8)
+    shape = (1, 385 * 64 + 1, 2, 8)
     query = torch.randn(shape, generator=generator)
     key = torch.randn(shape, generator=generator)
     value = torch.randn(shape, generator=generator)

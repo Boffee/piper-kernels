@@ -4,11 +4,11 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import rdna4_available
 from lib.sparse_piper import reference_value_storage
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.piper._amd.fragments import (
     MMA_LAYOUT,
     pack_probabilities,
@@ -29,11 +29,7 @@ from piper_kernels.attention.sparse_piper_attention._prepared import (
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available()
-        or not AcceleratorTarget.from_device(torch.device("cuda")).is_amd_hip
-        or not AcceleratorTarget.from_device(torch.device("cuda")).is_architecture(
-            "gfx1200", "gfx1201"
-        ),
+        not rdna4_available(),
         reason="requires an RDNA4 ROCm GPU",
     ),
 ]

@@ -12,7 +12,6 @@ from piper_kernels import (
     compile_options,
     sparse_piper_coarse_residual,
 )
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 from piper_kernels.attention.sparse_piper_attention import _backend as attention_backend
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
@@ -35,8 +34,11 @@ _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
 def _reset_attention_kernel_cache():
     """Clear and return the active backend's attention kernel."""
-    target = AcceleratorTarget.from_device(torch.device("cuda"))
-    module = attention_backend.amd_gluon if target.is_amd_hip else attention_backend.nvidia_gluon
+    module = (
+        attention_backend.amd_gluon
+        if torch.version.hip is not None
+        else attention_backend.nvidia_gluon
+    )
     assert module is not None
     kernel = module._sparse_piper_attention_kernel
     kernel.device_caches.clear()
@@ -56,7 +58,7 @@ def _expected_specialization_count(cases) -> int:
     per alignment class; masking unconditionally instead costs roughly 3% of
     dense attention throughput. AMD masks unconditionally and compiles one.
     """
-    if AcceleratorTarget.from_device(torch.device("cuda")).is_amd_hip:
+    if torch.version.hip is not None:
         return 1
     return len({sequence % TILE_ROWS == 0 for sequence, _ in cases})
 

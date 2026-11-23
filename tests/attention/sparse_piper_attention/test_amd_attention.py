@@ -2,9 +2,9 @@
 
 import pytest
 import torch
+from _accelerators import rdna4_available
 from lib.sparse_piper import reference_prepared_query, reference_value_storage
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.attention.sparse_piper_attention._backend import require_attention_backend
 from piper_kernels.attention.sparse_piper_attention._budget import (
@@ -28,11 +28,7 @@ from piper_kernels.attention.sparse_piper_attention.reference import (
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available()
-        or not AcceleratorTarget.from_device(torch.device("cuda")).is_amd_hip
-        or not AcceleratorTarget.from_device(torch.device("cuda")).is_architecture(
-            "gfx1200", "gfx1201"
-        ),
+        not rdna4_available(),
         reason="requires an RDNA4 ROCm GPU",
     ),
 ]

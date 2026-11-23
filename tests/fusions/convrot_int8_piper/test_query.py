@@ -7,7 +7,12 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import triton
-from _accelerators import mock_rocm_target, rocm_fences_only_lds
+from _accelerators import (
+    forbid_device_probes,
+    forbid_triton_driver,
+    mock_rocm_target,
+    rocm_fences_only_lds,
+)
 from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
@@ -197,41 +202,55 @@ def test_query_boundary_opcheck_compile_and_cuda_graph_replay():
 def test_fake_query_validates_metadata_without_target_probes(
     monkeypatch, head_dim, affine, granularity, scales_per_head
 ):
-    def forbidden(*args, **kwargs):
-        pytest.fail("fake query projection inspected hardware")
-
-    monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
-    operands = _operands("meta", head_dim=head_dim, affine=affine)
-    codes, scales = query._project_query_op(
-        *operands, 1e-6, head_dim**-0.5, head_dim=head_dim, qk_quantization=granularity
-    )
-    assert codes.shape == (2, 3, 128, head_dim)
-    assert scales.shape == (2, 3, scales_per_head)
-    assert codes.dtype is torch.int8
-    assert scales.dtype is torch.float32
-    assert codes.device.type == "meta"
-    assert scales.device.type == "meta"
+    forbid_device_probes(monkeypatch, "fake query projection inspected hardware")
+    with forbid_triton_driver("fake query projection launched Triton"):
+        for device, use_fake_mode in (("meta", False), ("cuda:0", True)):
+            if use_fake_mode:
+                with FakeTensorMode():
+                    operands = _operands(device, head_dim=head_dim, affine=affine)
+                    codes, scales = query._project_query_op(
+                        *operands,
+                        1e-6,
+                        head_dim**-0.5,
+                        head_dim=head_dim,
+                        qk_quantization=granularity,
+                    )
+            else:
+                operands = _operands(device, head_dim=head_dim, affine=affine)
+                codes, scales = query._project_query_op(
+                    *operands, 1e-6, head_dim**-0.5, head_dim=head_dim, qk_quantization=granularity
+                )
+            assert codes.shape == (2, 3, 128, head_dim)
+            assert scales.shape == (2, 3, scales_per_head)
+            assert codes.dtype is torch.int8
+            assert scales.dtype is torch.float32
+            assert codes.device.type == ("cuda" if use_fake_mode else "meta")
+            assert scales.device.type == ("cuda" if use_fake_mode else "meta")
 
 
 def test_empty_batch_skips_target_probe_and_accepts_learned_norm_under_no_grad(monkeypatch):
-    def forbidden(*args, **kwargs):
-        pytest.fail("empty query projection inspected hardware")
+    forbid_device_probes(monkeypatch, "empty query projection inspected hardware")
 
-    monkeypatch.setattr(_backend, "select_projection_backend", forbidden)
-    operands = list(_operands("cpu"))
-    operands[0] = operands[0][:0]
-    operands[1] = operands[1][:0]
-    operands[4].requires_grad_()
-    with pytest.raises(RuntimeError, match="inference-only"):
-        query._launch_query_projection(*operands, 1e-6, 64**-0.5, qk_quantization="per_warp")
-    with torch.no_grad():
-        codes, scales = query._launch_query_projection(
-            *operands, 1e-6, 64**-0.5, qk_quantization="per_warp"
-        )
-    assert codes.shape == (0, 3, 128, 64)
-    assert scales.shape == (0, 3, 4)
-    assert codes.dtype is torch.int8
-    assert scales.dtype is torch.float32
+    def exercise(device):
+        operands = list(_operands(device))
+        operands[0] = operands[0][:0]
+        operands[1] = operands[1][:0]
+        operands[4].requires_grad_()
+        with pytest.raises(RuntimeError, match="inference-only"):
+            query._launch_query_projection(*operands, 1e-6, 64**-0.5, qk_quantization="per_warp")
+        with torch.no_grad():
+            codes, scales = query._launch_query_projection(
+                *operands, 1e-6, 64**-0.5, qk_quantization="per_warp"
+            )
+        assert codes.shape == (0, 3, 128, 64)
+        assert scales.shape == (0, 3, 4)
+        assert codes.dtype is torch.int8
+        assert scales.dtype is torch.float32
+
+    with forbid_triton_driver("empty query projection launched Triton"):
+        exercise("cpu")
+        with FakeTensorMode():
+            exercise("cuda:0")
 
 
 @pytest.mark.parametrize(

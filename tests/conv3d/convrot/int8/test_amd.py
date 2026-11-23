@@ -4,9 +4,9 @@ from dataclasses import replace
 
 import pytest
 import torch
+from _accelerators import rdna4_available
 from torch.nn import functional
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.conv3d.convrot.int8 import _policy, conv3d, group_norm_silu_conv3d, reference
 from piper_kernels.conv3d.convrot.int8 import triton as shared
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -20,8 +20,7 @@ _CAUSAL_PADDING = {
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available()
-        or not _policy._supports_amd(AcceleratorTarget.from_device(torch.device("cuda"))),
+        not rdna4_available(),
         reason="requires RDNA4 ROCm",
     ),
 ]
@@ -125,7 +124,6 @@ def test_native_dispatch_and_graph_capture_use_live_scale(monkeypatch, fused, ch
     )
     norm_weight = torch.randn(channels, device="cuda")
     norm_bias = torch.randn(channels, device="cuda")
-    assert _policy._supports_amd(AcceleratorTarget.from_device(activation.device))
 
     def run():
         if fused:

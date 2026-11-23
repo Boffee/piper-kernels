@@ -9,7 +9,6 @@ from torch.nn import functional as F  # noqa: N812
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
-from piper_kernels.weights.nvfp4._layout import swap_packed_pairs
 
 _WEIGHT_FORMATS = [
     pytest.param(ConvRotInt8Tensor, False, id="int8"),
@@ -26,7 +25,7 @@ def _weight(cls, high_first=False):
     source = torch.randn(7, 64, dtype=torch.bfloat16)
     result = cls.from_hp(source, **({} if cls is PiperNVFP4Tensor else {"group_size": 64}))
     if high_first:
-        result.qdata = swap_packed_pairs(result.qdata)
+        result.qdata = (((result.qdata & 0x0F) << 4) | (result.qdata >> 4)).to(torch.uint8)
         result.high_first = True
     return result
 

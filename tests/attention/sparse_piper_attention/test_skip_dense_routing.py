@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels.attention.sparse_piper_attention import _routing
 from piper_kernels.attention.sparse_piper_attention._budget import (
@@ -17,20 +18,23 @@ from piper_kernels.attention.sparse_piper_attention.reference import (
 )
 
 
-def _unexpected(*args, **kwargs):
-    raise AssertionError("full keep must not run routing selection")
+class _EmptyRoutesOnly(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        assert func is torch.ops.aten.empty.memory_format, (
+            f"skip_dense_routing executed unexpected op {func}"
+        )
+        return func(*args, **(kwargs or {}))
 
 
 @pytest.mark.parametrize("routing_mode", [_MINMAX_ROUTING, _MEAN_ROUTING])
-def test_skip_dense_routing_skips_summaries_and_scores(monkeypatch, routing_mode):
+def test_skip_dense_routing_skips_summaries_and_scores(routing_mode):
     query = torch.randn(2, 3, 193, 64)
     key = torch.randn(2, 3, 192, 64)
     layout = _resolve_route_layout(_normalize_head_keep_ratios([0.999] * 3), 3, query.device)
-    monkeypatch.setattr(_routing, "sequence_block_summaries", _unexpected)
-    monkeypatch.setattr(_routing, "score_chunks", _unexpected)
-    result = _routing.packed_routes_from_sequences(
-        query, key, layout, routing_mode, skip_dense_routing=True
-    )
+    with _EmptyRoutesOnly():
+        result = _routing.packed_routes_from_sequences(
+            query, key, layout, routing_mode, skip_dense_routing=True
+        )
     assert result.indices.shape == (2, 4, 0)
 
 

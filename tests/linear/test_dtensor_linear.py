@@ -18,7 +18,6 @@ from piper_kernels import compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
-from piper_kernels.weights.nvfp4._layout import swap_packed_pairs
 from piper_kernels.weights.sharding import shard_quantized_weight
 
 _FORMATS = {
@@ -46,7 +45,7 @@ def _weight(format_name, source, *, high_first=False, dynamic=True):
         **({"group_size": 64} if cls is ConvRotNVFP4Tensor else {}),
     )
     if high_first:
-        result.qdata = swap_packed_pairs(result.qdata)
+        result.qdata = (((result.qdata & 0x0F) << 4) | (result.qdata >> 4)).to(torch.uint8)
         result.high_first = True
     return result
 

@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import forbid_triton_driver
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels.attention.piper_attention._amd import gluon as backend
@@ -103,13 +104,13 @@ def test_launch_rejects_incompatible_output_metadata_before_kernel_entry(monkeyp
             output = torch.empty((1, 6, 65, 64), dtype=query.dtype, device="cuda:0").expand(
                 query.shape
             )
-    kernel = _RecordingKernel()
     guard = Mock(side_effect=AssertionError("invalid output entered a device context"))
-    monkeypatch.setattr(backend, "_dense_piper_kernel", kernel)
     monkeypatch.setattr(torch.cuda, "device", guard)
-    with pytest.raises(ValueError, match="Piper Attention output"):
+    with (
+        forbid_triton_driver("invalid output launched Triton"),
+        pytest.raises(ValueError, match="Piper Attention output"),
+    ):
         backend.launch_attention_into(context, query, output)
-    assert not kernel.calls
     guard.assert_not_called()
 
 
@@ -117,12 +118,10 @@ def test_empty_batch_returns_output_without_device_or_kernel_entry(monkeypatch):
     with FakeTensorMode():
         context, query = _prepared(batch=0, device="cuda:0")
         output = torch.empty(query.shape, dtype=query.dtype, device="cuda:0")
-    kernel = _RecordingKernel()
     guard = Mock(side_effect=AssertionError("empty batch entered a device context"))
-    monkeypatch.setattr(backend, "_dense_piper_kernel", kernel)
     monkeypatch.setattr(torch.cuda, "device", guard)
-    assert backend.launch_attention_into(context, query, output) is output
-    assert not kernel.calls
+    with forbid_triton_driver("empty batch launched Triton"):
+        assert backend.launch_attention_into(context, query, output) is output
     guard.assert_not_called()
 
 

@@ -2,16 +2,15 @@
 
 import pytest
 import torch
+from _accelerators import uint8_int8_mma_available
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.piper_attention._nvidia import triton as backend
 from piper_kernels.fusions.attention._output import run_chunked_attention_output
 
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
-        not torch.cuda.is_available()
-        or not AcceleratorTarget.from_device(torch.device("cuda")).supports_uint8_int8_mma,
+        not uint8_int8_mma_available(),
         reason="requires NVIDIA mixed-sign MMA",
     ),
 ]

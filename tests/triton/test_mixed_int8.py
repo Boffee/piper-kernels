@@ -9,6 +9,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from _accelerators import uint8_int8_mma_available
 from _triton_inspection import compiled_artifact
 
 from piper_kernels._triton import mixed_int8
@@ -18,9 +19,6 @@ from piper_kernels._triton.mixed_int8 import (
     rewrite_uint8_int8_dot_llvm,
     uint8_int8_dot,
 )
-from piper_kernels._triton.targets import AcceleratorTarget
-
-_NVIDIA_GPU_AVAILABLE = torch.cuda.is_available() and torch.version.cuda is not None
 
 _MMA_PREFIX = (
     "  {name} = tail call {{ i32, i32, i32, i32 }} asm sideeffect "
@@ -237,10 +235,11 @@ assert not torch.cuda.is_initialized()
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _NVIDIA_GPU_AVAILABLE, reason="requires an NVIDIA GPU")
+@pytest.mark.skipif(
+    not uint8_int8_mma_available(),
+    reason="requires Piper Attention's supported MMAv2 lowering",
+)
 def test_uint8_int8_dot_is_exact_above_signed_range() -> None:
-    if not AcceleratorTarget.from_device(torch.device("cuda")).supports_uint8_int8_mma:
-        pytest.skip("requires Piper Attention's supported MMAv2 lowering")
     lhs = torch.arange(64 * 64, device="cuda", dtype=torch.int64)
     lhs = lhs.remainder(256).to(torch.uint8).reshape(64, 64)
     generator = torch.Generator(device="cuda").manual_seed(912)
@@ -263,10 +262,11 @@ def test_uint8_int8_dot_is_exact_above_signed_range() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not _NVIDIA_GPU_AVAILABLE, reason="requires an NVIDIA GPU")
+@pytest.mark.skipif(
+    not uint8_int8_mma_available(),
+    reason="requires Piper Attention's supported MMAv2 lowering",
+)
 def test_generated_ptx_changes_only_the_marked_dot() -> None:
-    if not AcceleratorTarget.from_device(torch.device("cuda")).supports_uint8_int8_mma:
-        pytest.skip("requires Piper Attention's supported MMAv2 lowering")
     unsigned_lhs = torch.zeros((64, 64), device="cuda", dtype=torch.uint8)
     signed_lhs = torch.zeros((64, 64), device="cuda", dtype=torch.int8)
     rhs = torch.zeros((64, 64), device="cuda", dtype=torch.int8)

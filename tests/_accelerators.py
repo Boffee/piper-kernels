@@ -50,6 +50,21 @@ def exact_gfx1201_available() -> bool:
     return target.is_amd_hip and target.is_architecture("gfx1201")
 
 
+def blackwell_cuda_available() -> bool:
+    """Return whether the default CUDA device is an NVIDIA Blackwell (SM10x+) GPU."""
+    return torch.cuda.is_available() and AcceleratorTarget.from_device(
+        torch.device("cuda")
+    ).cuda_capability_at_least(10)
+
+
+def uint8_int8_mma_available() -> bool:
+    """Return whether the default CUDA device supports NVIDIA UINT8-by-INT8 MMAv2."""
+    return (
+        torch.cuda.is_available()
+        and AcceleratorTarget.from_device(torch.device("cuda")).supports_uint8_int8_mma
+    )
+
+
 def rocm_fences_only_lds() -> bool:
     """Return whether opted-in RDNA kernels compile here with LDS-only barrier fences.
 

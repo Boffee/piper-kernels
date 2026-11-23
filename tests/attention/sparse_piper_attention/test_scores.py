@@ -4,15 +4,14 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _accelerators import exact_sm120_available, rdna4_available
 
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.sparse_piper_attention import _backend
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
 )
 from piper_kernels.attention.sparse_piper_attention._contracts import _MINMAX_ROUTING
-from piper_kernels.attention.sparse_piper_attention._nvidia import policy as nvidia_policy
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_from_summaries,
     routing_scores,
@@ -23,10 +22,7 @@ pytestmark = pytest.mark.gpu
 
 @pytest.fixture
 def generator():
-    if not torch.cuda.is_available():
-        pytest.skip("requires RDNA4 or SM120 scoring")
-    target = AcceleratorTarget.from_device(torch.device("cuda"))
-    if not (_backend.supports_amd_target(target) or nvidia_policy.supports_minmax_scores(target)):
+    if not (exact_sm120_available() or rdna4_available()):
         pytest.skip("requires RDNA4 or SM120 scoring")
     return torch.Generator(device="cuda").manual_seed(671)
 
