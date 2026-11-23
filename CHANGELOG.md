@@ -10,8 +10,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Sequence-sharded (`Shard(1)`) ConvRot INT8 linears and fused dense
   (`compile_options(attention_output=True)`) or sparse Piper attention blocks now fold
   PyTorch TP+SP collective boundaries automatically, including two-step in-place residual
-  add folding when paired with `residual_updates=True`. Measured faster with lower peak
-  memory across 2× RX 9070 XT dense and sparse attention blocks.
+  add folding when paired with `residual_updates=True`, with balanced peer-exchange
+  chunking under a 256 MiB communication scratch cap and a single reused receive buffer.
+  Measured faster with lower peak memory across 2× RX 9070 XT dense and sparse attention
+  blocks.
 
 ### Changed
 
