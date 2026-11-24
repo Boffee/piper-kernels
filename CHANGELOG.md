@@ -5,6 +5,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.8.0rc7] - 2026-11-24
+
 ### Added
 
 - Variable-row trellis decoding in `ConvRotInt8Tensor.from_trellis` and
@@ -1227,7 +1229,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc6...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc7...HEAD
+[0.8.0rc7]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc6...v0.8.0rc7
 [0.8.0rc6]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc5...v0.8.0rc6
 [0.8.0rc5]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc4...v0.8.0rc5
 [0.8.0rc4]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc3...v0.8.0rc4
