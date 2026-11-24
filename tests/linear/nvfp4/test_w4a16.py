@@ -645,7 +645,7 @@ def test_w4a16_workloads_compile_without_vgpr_spills(
     )
     assert compiled
     if rows > 16:
-        assert set(compiled) == {"dequant"}
+        assert "dequant" in compiled
     else:
         assert "gemv" in compiled
     for kernel in compiled.values():
@@ -942,6 +942,52 @@ def test_gpu_w4a16_convrot_fp16_preserves_rotation_range(rows: int) -> None:
     assert actual.dtype is torch.float16
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+def test_gpu_w4a16_large_m_preserves_weight_scale_and_gemm_range() -> None:
+    # Case 1: large global weight scale with small FP16 activations.
+    q_small = torch.full((16, 8), 0x22, dtype=torch.uint8, device="cuda")
+    s_ones = torch.ones((32, 16), dtype=torch.float8_e4m3fn, device="cuda")
+    gs_huge = torch.tensor(100_000.0, dtype=torch.float32, device="cuda")
+    w_huge = PiperNVFP4Tensor(q_small, s_ones, 16, torch.float16, gs_huge, None, True, False, None)
+    x_small = torch.full((17, 16), 0.001, device="cuda", dtype=torch.float16)
+    actual_1 = F.linear(x_small, w_huge)
+    expected_1 = nvfp4_reference.linear_w4a16(
+        x_small.cpu(), q_small.cpu(), s_ones.cpu(), gs_huge.cpu(), None
+    ).cuda()
+    assert actual_1.dtype is torch.float16
+    assert torch.isfinite(actual_1).all()
+    torch.testing.assert_close(actual_1, expected_1, rtol=1e-2, atol=1.0)
+
+    # Case 2: large unbiased FP16 dot product scaled down by fractional global scale.
+    q_wide = torch.full((16, 16), 0x22, dtype=torch.uint8, device="cuda")
+    gs_frac = torch.tensor(1.0 / 16.0, dtype=torch.float32, device="cuda")
+    w_frac = PiperNVFP4Tensor(q_wide, s_ones, 16, torch.float16, gs_frac, None, True, False, None)
+    x_large = torch.full((17, 32), 3000.0, device="cuda", dtype=torch.float16)
+    actual_2 = F.linear(x_large, w_frac)
+    expected_2 = nvfp4_reference.linear_w4a16(
+        x_large.cpu(), q_wide.cpu(), s_ones.cpu(), gs_frac.cpu(), None
+    ).cuda()
+    assert actual_2.dtype is torch.float16
+    assert torch.isfinite(actual_2).all()
+    torch.testing.assert_close(actual_2, expected_2, rtol=1e-3, atol=1e-3)
+
+    # Case 3: extreme BF16 product of block scale and global scale with tiny activations.
+    s_max = torch.full((32, 16), 448.0, dtype=torch.float8_e4m3fn, device="cuda")
+    gs_extreme = torch.tensor(1e37, dtype=torch.float32, device="cuda")
+    w_extreme = PiperNVFP4Tensor(
+        q_small, s_max, 16, torch.bfloat16, gs_extreme, None, True, False, None
+    )
+    x_tiny = torch.full((17, 16), 1e-37, device="cuda", dtype=torch.bfloat16)
+    actual_3 = F.linear(x_tiny, w_extreme)
+    expected_3 = nvfp4_reference.linear_w4a16(
+        x_tiny.cpu(), q_small.cpu(), s_max.cpu(), gs_extreme.cpu(), None
+    ).cuda()
+    assert actual_3.dtype is torch.bfloat16
+    assert torch.isfinite(actual_3).all()
+    torch.testing.assert_close(actual_3, expected_3, rtol=1.6e-2, atol=1e-3)
 
 
 @pytest.mark.gpu
