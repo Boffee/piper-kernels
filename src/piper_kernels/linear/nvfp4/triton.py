@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 from torch.nn import functional as F  # noqa: N812
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
 
 from piper_kernels import _input_activations as input_activations
 from piper_kernels._input_activations import triton as triton_input_activations
@@ -1097,16 +1099,21 @@ def _select_w4a16_split_k(
     return int(min(desired, max_for_k, _W4A16_MAX_SPLIT_K))
 
 
-def _select_w4a16_gemv_config(
-    device: torch.device,
+_TRITON_FLOAT_POINTER_TYPES = {
+    torch.float16: "*fp16",
+    torch.bfloat16: "*bf16",
+    torch.float32: "*fp32",
+}
+
+
+def _select_w4a16_gemv_config_for_sms(
+    num_sms: int,
     rows: int,
     input_dtype: torch.dtype,
     out_features: int,
     input_features: int,
 ) -> tuple[int, int, int, int, bool, int]:
     """Select ``(block_m, block_n, block_k, num_warps, use_dot, split_k)``."""
-    device_index = torch.cuda.current_device() if device.index is None else int(device.index)
-    num_sms = _device_sm_count(device_index)
     weight_bytes = out_features * (input_features // 2)
     if rows == 1:
         if (
@@ -1140,6 +1147,134 @@ def _select_w4a16_gemv_config(
         block_k=_W4A16_DOT_BLOCK_K,
     )
     return (_W4A16_GEMV_MAX_ROWS, _W4A16_DOT_BLOCK_N, _W4A16_DOT_BLOCK_K, 4, True, split_k)
+
+
+def _select_w4a16_gemv_config(
+    device: torch.device,
+    rows: int,
+    input_dtype: torch.dtype,
+    out_features: int,
+    input_features: int,
+) -> tuple[int, int, int, int, bool, int]:
+    device_index = torch.cuda.current_device() if device.index is None else int(device.index)
+    return _select_w4a16_gemv_config_for_sms(
+        _device_sm_count(device_index),
+        rows,
+        input_dtype,
+        out_features,
+        input_features,
+    )
+
+
+def compile_w4a16_kernels(
+    target: GPUTarget,
+    *,
+    rows: int,
+    out_features: int,
+    input_features: int,
+    input_dtype: torch.dtype,
+    bias_dtype: torch.dtype | None = None,
+    high_first: bool = False,
+    has_weight_per_tensor_scale: bool = True,
+    num_sms: int = 64,
+) -> dict[str, triton.compiler.CompiledKernel]:
+    """Compile the production W4A16 Triton kernels selected for one workload."""
+    if rows <= 0 or out_features <= 0 or input_features <= 0 or num_sms <= 0:
+        raise ValueError("Workload dimensions and SM count must be positive integers")
+    if input_dtype not in _TRITON_FLOAT_POINTER_TYPES:
+        raise ValueError(f"Unsupported W4A16 input dtype: {input_dtype}")
+    if bias_dtype is not None and bias_dtype not in _TRITON_FLOAT_POINTER_TYPES:
+        raise ValueError(f"Unsupported W4A16 bias dtype: {bias_dtype}")
+
+    in_ty = _TRITON_FLOAT_POINTER_TYPES[input_dtype]
+    mixed_bias = bias_dtype is not None and bias_dtype is not input_dtype
+    if rows > _W4A16_GEMV_MAX_ROWS:
+        dequant_ty = "*fp32" if mixed_bias else in_ty
+        dequant = triton.compile(
+            ASTSource(
+                dequantize_nvfp4_swizzled_kernel,
+                {
+                    "weight_ptr": "*u8",
+                    "weight_scale_ptr": "*u8",
+                    "weight_per_tensor_scale_ptr": "*fp32",
+                    "output_ptr": dequant_ty,
+                    "out_features": "i32",
+                    "input_features": "i32",
+                    "scale_column_blocks": "i32",
+                },
+                constexprs={
+                    "block_n": _W4A16_DEQUANT_BLOCK_N,
+                    "block_k": _W4A16_DEQUANT_BLOCK_K,
+                    "high_first": high_first,
+                    "has_weight_per_tensor_scale": has_weight_per_tensor_scale,
+                },
+            ),
+            target=target,
+            options={"num_warps": 4},
+        )
+        return {"dequant": dequant}
+
+    block_m, block_n, block_k, num_warps, use_dot, split_k = _select_w4a16_gemv_config_for_sms(
+        num_sms, rows, input_dtype, out_features, input_features
+    )
+    bias_ty = in_ty if bias_dtype is None else _TRITON_FLOAT_POINTER_TYPES[bias_dtype]
+    is_splitk = split_k > 1
+    has_bias = bias_dtype is not None
+    compiled: dict[str, triton.compiler.CompiledKernel] = {
+        "gemv": triton.compile(
+            ASTSource(
+                w4a16_gemv_splitk_kernel,
+                {
+                    "input_ptr": in_ty,
+                    "weight_ptr": "*u8",
+                    "weight_scale_ptr": "*u8",
+                    "weight_per_tensor_scale_ptr": "*fp32",
+                    "bias_ptr": bias_ty,
+                    "output_ptr": "*fp32" if is_splitk else in_ty,
+                    "rows": "i32",
+                    "out_features": "i32",
+                    "input_features": "i32",
+                    "scale_column_blocks": "i32",
+                    "split_k": "i32",
+                },
+                constexprs={
+                    "block_m": block_m,
+                    "block_n": block_n,
+                    "block_k": block_k,
+                    "high_first": high_first,
+                    "has_weight_per_tensor_scale": has_weight_per_tensor_scale,
+                    "has_bias": has_bias,
+                    "is_splitk": is_splitk,
+                    "use_dot": use_dot,
+                },
+            ),
+            target=target,
+            options={"num_warps": num_warps},
+        )
+    }
+    if is_splitk:
+        compiled["reduce"] = triton.compile(
+            ASTSource(
+                w4a16_splitk_reduce_kernel,
+                {
+                    "partial_ptr": "*fp32",
+                    "weight_per_tensor_scale_ptr": "*fp32",
+                    "bias_ptr": bias_ty,
+                    "output_ptr": in_ty,
+                    "rows": "i32",
+                    "out_features": "i32",
+                    "split_k": "i32",
+                },
+                constexprs={
+                    "block_n": _W4A16_REDUCE_BLOCK_N,
+                    "has_weight_per_tensor_scale": has_weight_per_tensor_scale,
+                    "has_bias": has_bias,
+                },
+            ),
+            target=target,
+            options={"num_warps": 4},
+        )
+    return compiled
 
 
 def _dequantize_nvfp4_swizzled(
@@ -1215,21 +1350,19 @@ def _linear_w4a16(
         active_2d = input_2d
 
     if rows > _W4A16_GEMV_MAX_ROWS:
+        mixed_bias = bias is not None and bias.dtype is not input.dtype
         dequant_weight = _dequantize_nvfp4_swizzled(
             weight_qdata,
             weight_scale,
             weight_per_tensor_scale,
             high_first=high_first,
-            output_dtype=input.dtype,
+            output_dtype=torch.float32 if mixed_bias else input.dtype,
         )
-        if bias is None or bias.dtype is input.dtype:
-            result = F.linear(
-                active_2d,
-                dequant_weight,
-                bias,
-            )
+        if mixed_bias:
+            assert bias is not None
+            result = F.linear(active_2d.float(), dequant_weight, bias.float()).to(input.dtype)
         else:
-            result = (F.linear(active_2d, dequant_weight).float() + bias.float()).to(input.dtype)
+            result = F.linear(active_2d, dequant_weight, bias)
         return result.reshape(*input.shape[:-1], out_features)
 
     output = torch.empty((rows, out_features), device=input.device, dtype=input.dtype)
@@ -1291,7 +1424,7 @@ def _linear_w4a16(
 
 __all__ = [
     "add_bias_out",
-    "dequantize_nvfp4_swizzled_kernel",
+    "compile_w4a16_kernels",
     "dynamic_scale",
     "encode_nvfp4_blocks",
     "linear_mean",
@@ -1300,6 +1433,4 @@ __all__ = [
     "prepare_static",
     "prepare_static_out",
     "swizzled_scale_offsets",
-    "w4a16_gemv_splitk_kernel",
-    "w4a16_splitk_reduce_kernel",
 ]

@@ -1,4 +1,4 @@
-"""Semantic NVFP4 W4A4 operators with reusable activation preparation."""
+"""Semantic NVFP4 linear operators with reusable activation preparation."""
 
 from __future__ import annotations
 
@@ -7,8 +7,7 @@ import torch
 from piper_kernels import _input_activations as input_activations
 from piper_kernels.weights.convrot._rotation import validate_group_size
 
-from . import _projection, _validation, reference
-from . import triton as nvfp4_triton
+from . import _validation, reference
 from ._storage import prepared_input_metadata
 
 
@@ -34,6 +33,8 @@ def _prepare_compiled(
             group_size=group_size or 0,
         )
     if group_size is None:
+        from . import triton as nvfp4_triton  # noqa: PLC0415
+
         input_activations.validate_input_activation(activation_fn)
         if dynamic_activation_scale:
             return nvfp4_triton.prepare_dynamic(input, activation_fn, high_first=high_first)
@@ -71,6 +72,8 @@ def _execute_prepared(
     )
     if input_qdata.shape[0] == 0:
         return output
+    from . import _projection  # noqa: PLC0415
+
     return _projection.matmul_prepared_chunk_affine_out(
         input_qdata,
         input_scale,
@@ -113,6 +116,8 @@ def linear(
         )
         if shape.rows == 0:
             return input.new_empty((*input.shape[:-1], shape.output_features))
+        from . import triton as nvfp4_triton  # noqa: PLC0415
+
         return nvfp4_triton._linear_w4a16(
             input,
             weight_qdata,

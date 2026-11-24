@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
-from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 from piper_kernels.weights.convrot._rotation import validate_group_size
 
 
@@ -62,6 +60,8 @@ def linear(
                 high_first=high_first,
                 group_size=group_size,
             )
+        from piper_kernels.linear.nvfp4 import triton as nvfp4_triton  # noqa: PLC0415
+
         return nvfp4_triton._linear_w4a16(
             input,
             weight_qdata,
@@ -71,6 +71,8 @@ def linear(
             high_first=high_first,
             group_size=group_size,
         )
+
+    from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops  # noqa: PLC0415
 
     input_qdata, input_scale, input_per_tensor_scale = nvfp4_ops._prepare_compiled(
         input,

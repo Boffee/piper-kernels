@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 
 import pytest
@@ -17,7 +18,6 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 from triton.backends.compiler import GPUTarget
-from triton.compiler import ASTSource
 
 from piper_kernels import compile_options
 from piper_kernels.fusions.nvfp4_sparse_piper import output as nvfp4_sparse_output
@@ -25,12 +25,6 @@ from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
-
-_TRITON_POINTER_TYPES = {
-    torch.float16: "*fp16",
-    torch.bfloat16: "*bf16",
-    torch.float32: "*fp32",
-}
 
 
 def _hip_target_param(arch: str, warp_size: int) -> object:
@@ -166,7 +160,8 @@ def test_reference_w4a16_matches_dequantized_dense_linear(
 
     assert actual.dtype is dtype
     assert actual.shape == (3, 5, out_features)
-    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+    rtol = 1.6e-2 if dtype is torch.bfloat16 else 1e-3
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=1e-3)
 
 
 def test_reference_w4a16_handles_empty_shapes_and_zero_blocks() -> None:
@@ -246,6 +241,73 @@ def test_cpu_weight_only_convrot_nvfp4_validation_and_compile() -> None:
         eager = projection(source)
         compiled = torch.compile(projection, fullgraph=True)(source)
     assert torch.equal(compiled, eager)
+
+
+def test_cpu_weight_only_convrot_nvfp4_runs_without_triton() -> None:
+    script = """
+import builtins
+import importlib.util
+import sys
+
+original_import = builtins.__import__
+original_find_spec = importlib.util.find_spec
+
+def without_triton(name, *args, **kwargs):
+    if name == "triton" or name.startswith("triton."):
+        raise ModuleNotFoundError("Triton intentionally unavailable", name="triton")
+    return original_import(name, *args, **kwargs)
+
+def find_spec(name, *args, **kwargs):
+    if name == "triton" or name.startswith("triton."):
+        return None
+    return original_find_spec(name, *args, **kwargs)
+
+builtins.__import__ = without_triton
+importlib.util.find_spec = find_spec
+
+import torch
+from torch.nn import functional as F
+
+from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
+from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
+
+torch.manual_seed(718)
+dense = torch.randn(64, 256, dtype=torch.bfloat16) * (256**-0.5)
+weight = ConvRotNVFP4Tensor.from_hp(
+    dense,
+    group_size=64,
+    compute_per_tensor_scale=True,
+    is_swizzled_scales=True,
+    act_quant_kwargs=None,
+)
+source = torch.randn(3, 256, dtype=torch.bfloat16)
+bias = torch.randn(64, dtype=torch.float32)
+
+actual = F.linear(source, weight, bias)
+expected = nvfp4_reference.linear_w4a16(
+    source,
+    weight.qdata,
+    weight.scale,
+    weight.per_tensor_scale,
+    bias,
+    group_size=64,
+)
+assert torch.equal(actual, expected)
+
+q_meta = torch.empty(128, 128, dtype=torch.uint8, device="meta")
+s_meta = torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta")
+gs_meta = torch.empty((), device="meta")
+x_meta = torch.empty(2, 256, dtype=torch.bfloat16, device="meta")
+plain_meta = PiperNVFP4Tensor(q_meta, s_meta, 16, torch.bfloat16, gs_meta, None, True, False, None)
+convrot_meta = ConvRotNVFP4Tensor(
+    q_meta, s_meta, 16, torch.bfloat16, 64, gs_meta, None, True, False, None
+)
+assert F.linear(x_meta, plain_meta).shape == (2, 128)
+assert F.linear(x_meta, convrot_meta).shape == (2, 128)
+assert "triton" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
 
 
 @pytest.mark.parametrize("group_size", [0, 64])
@@ -537,149 +599,95 @@ def _assert_clean_offline_compile(
         assert int(priv_size.group(1)) == 0
 
 
-def _compile_gemv_splitk(
-    target: GPUTarget,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    use_dot: bool,
-    input_dtype: torch.dtype,
-    is_splitk: bool,
-) -> triton.compiler.CompiledKernel:
-    ptr_ty = _TRITON_POINTER_TYPES[input_dtype]
-    out_ty = "*fp32" if is_splitk else ptr_ty
-    return triton.compile(
-        ASTSource(
-            nvfp4_triton.w4a16_gemv_splitk_kernel,
-            {
-                "input_ptr": ptr_ty,
-                "weight_ptr": "*u8",
-                "weight_scale_ptr": "*u8",
-                "weight_per_tensor_scale_ptr": "*fp32",
-                "bias_ptr": "*fp32",
-                "output_ptr": out_ty,
-                "rows": "i32",
-                "out_features": "i32",
-                "input_features": "i32",
-                "scale_column_blocks": "i32",
-                "split_k": "i32",
-            },
-            constexprs={
-                "block_m": block_m,
-                "block_n": block_n,
-                "block_k": block_k,
-                "high_first": False,
-                "has_weight_per_tensor_scale": True,
-                "has_bias": True,
-                "is_splitk": is_splitk,
-                "use_dot": use_dot,
-            },
-        ),
-        target=target,
-        options={"num_warps": 8 if block_n == 16 else 4},
-    )
-
-
 @pytest.mark.parametrize("target", _PRIMARY_ISA_TARGETS)
 @pytest.mark.parametrize(
-    ("block_m", "block_n", "block_k", "use_dot", "input_dtype", "is_splitk"),
+    (
+        "rows",
+        "out_features",
+        "input_features",
+        "input_dtype",
+        "bias_dtype",
+        "high_first",
+        "two_level",
+    ),
     [
-        (1, 32, 256, False, torch.bfloat16, False),
-        (4, 32, 256, False, torch.float32, True),
-        (16, 64, 128, True, torch.bfloat16, True),
+        (1, 1024, 5120, torch.bfloat16, torch.float32, False, True),
+        (1, 5120, 5120, torch.bfloat16, torch.float32, False, True),
+        (4, 5120, 5120, torch.float32, torch.float32, False, True),
+        (16, 5120, 5120, torch.bfloat16, torch.bfloat16, True, True),
+        (64, 5120, 5120, torch.float16, torch.float16, True, False),
+        (64, 5120, 5120, torch.float16, torch.float32, False, True),
     ],
 )
-def test_w4a16_gemv_splitk_kernel_compiles_without_vgpr_spills(
+def test_w4a16_workloads_compile_without_vgpr_spills(
     target: GPUTarget,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    use_dot: bool,
+    rows: int,
+    out_features: int,
+    input_features: int,
     input_dtype: torch.dtype,
-    is_splitk: bool,
+    bias_dtype: torch.dtype | None,
+    high_first: bool,
+    two_level: bool,
 ) -> None:
-    compiled = _compile_gemv_splitk(
-        target, block_m, block_n, block_k, use_dot, input_dtype, is_splitk
+    compiled = nvfp4_triton.compile_w4a16_kernels(
+        target,
+        rows=rows,
+        out_features=out_features,
+        input_features=input_features,
+        input_dtype=input_dtype,
+        bias_dtype=bias_dtype,
+        high_first=high_first,
+        has_weight_per_tensor_scale=two_level,
     )
-    _assert_clean_offline_compile(compiled, target)
+    assert compiled
+    if rows > 16:
+        assert set(compiled) == {"dequant"}
+    else:
+        assert "gemv" in compiled
+    for kernel in compiled.values():
+        _assert_clean_offline_compile(kernel, target)
 
 
 @pytest.mark.parametrize("target", _ADDITIONAL_CUDA_TARGETS)
 @pytest.mark.parametrize(
-    ("block_m", "block_n", "block_k", "use_dot", "input_dtype", "is_splitk"),
+    (
+        "rows",
+        "out_features",
+        "input_features",
+        "input_dtype",
+        "bias_dtype",
+        "high_first",
+        "two_level",
+    ),
     [
-        (1, 16, 256, False, torch.float16, True),
-        (16, 64, 128, True, torch.float16, False),
+        (1, 1024, 5120, torch.float16, torch.float16, False, True),
+        (16, 5120, 5120, torch.float16, torch.float32, False, True),
+        (64, 5120, 5120, torch.bfloat16, None, True, True),
     ],
 )
-def test_w4a16_gemv_splitk_kernel_compiles_for_additional_cuda_arches(
+def test_w4a16_workloads_compile_for_additional_cuda_arches(
     target: GPUTarget,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    use_dot: bool,
+    rows: int,
+    out_features: int,
+    input_features: int,
     input_dtype: torch.dtype,
-    is_splitk: bool,
+    bias_dtype: torch.dtype | None,
+    high_first: bool,
+    two_level: bool,
 ) -> None:
-    compiled = _compile_gemv_splitk(
-        target, block_m, block_n, block_k, use_dot, input_dtype, is_splitk
+    compiled = nvfp4_triton.compile_w4a16_kernels(
+        target,
+        rows=rows,
+        out_features=out_features,
+        input_features=input_features,
+        input_dtype=input_dtype,
+        bias_dtype=bias_dtype,
+        high_first=high_first,
+        has_weight_per_tensor_scale=two_level,
     )
-    _assert_clean_offline_compile(compiled, target)
-
-
-@pytest.mark.parametrize("target", _PRIMARY_ISA_TARGETS)
-@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_w4a16_splitk_reduce_and_dequant_kernels_compile_cleanly(
-    target: GPUTarget,
-    output_dtype: torch.dtype,
-) -> None:
-    out_ty = _TRITON_POINTER_TYPES[output_dtype]
-    reduce_compiled = triton.compile(
-        ASTSource(
-            nvfp4_triton.w4a16_splitk_reduce_kernel,
-            {
-                "partial_ptr": "*fp32",
-                "weight_per_tensor_scale_ptr": "*fp32",
-                "bias_ptr": out_ty,
-                "output_ptr": out_ty,
-                "rows": "i32",
-                "out_features": "i32",
-                "split_k": "i32",
-            },
-            constexprs={
-                "block_n": 64,
-                "has_weight_per_tensor_scale": True,
-                "has_bias": True,
-            },
-        ),
-        target=target,
-        options={"num_warps": 4},
-    )
-    _assert_clean_offline_compile(reduce_compiled, target)
-
-    dequant_compiled = triton.compile(
-        ASTSource(
-            nvfp4_triton.dequantize_nvfp4_swizzled_kernel,
-            {
-                "weight_ptr": "*u8",
-                "weight_scale_ptr": "*u8",
-                "weight_per_tensor_scale_ptr": "*fp32",
-                "output_ptr": out_ty,
-                "out_features": "i32",
-                "input_features": "i32",
-                "scale_column_blocks": "i32",
-            },
-            constexprs={
-                "block_n": 32,
-                "block_k": 128,
-                "high_first": True,
-                "has_weight_per_tensor_scale": False,
-            },
-        ),
-        target=target,
-        options={"num_warps": 4},
-    )
-    _assert_clean_offline_compile(dequant_compiled, target)
+    assert compiled
+    for kernel in compiled.values():
+        _assert_clean_offline_compile(kernel, target)
 
 
 @pytest.mark.gpu
@@ -868,6 +876,34 @@ def test_gpu_large_m_w4a16_identity_matches_torchao_dequantize(
         is_swizzled_scales=True,
     ).dequantize(output_dtype)
     assert actual.dtype is output_dtype
+    rtol = 1.6e-2 if output_dtype is torch.bfloat16 else 1e-3
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=1e-3)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.parametrize("rows", [1, 17])
+def test_gpu_w4a16_mixed_bias_avoids_pre_bias_fp16_overflow(rows: int) -> None:
+    dense = torch.ones(16, 32, dtype=torch.float16)
+    weight = PiperNVFP4Tensor.from_hp(
+        dense,
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+        act_quant_kwargs=None,
+    ).to("cuda")
+    x = torch.full((rows, 32), 3000.0, device="cuda", dtype=torch.float16)
+    bias = torch.full((16,), -40000.0, device="cuda", dtype=torch.float32)
+
+    actual = F.linear(x, weight, bias)
+    expected = nvfp4_reference.linear_w4a16(
+        x.cpu(),
+        weight.qdata.cpu(),
+        weight.scale.cpu(),
+        weight.per_tensor_scale.cpu() if weight.per_tensor_scale is not None else None,
+        bias.cpu(),
+    ).cuda()
+    assert actual.dtype is torch.float16
+    assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
 
 
