@@ -6,46 +6,7 @@ import torch
 
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import _validation as nvfp4_validation
-from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
-from piper_kernels.linear.nvfp4._storage import prepared_input_metadata
 from piper_kernels.weights.convrot._rotation import validate_group_size
-
-from . import triton as convrot_nvfp4
-
-
-def _prepare_input(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    activation_per_tensor_scale: torch.Tensor | None,
-    dynamic_activation_scale: bool,
-    group_size: int,
-    activation_fn: str | None = None,
-    high_first: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if input.numel() == 0:
-        return nvfp4_reference.prepare_input(
-            input,
-            activation_per_tensor_scale,
-            dynamic_activation_scale,
-            activation_fn,
-            high_first,
-            group_size=group_size,
-        )
-    if dynamic_activation_scale:
-        return convrot_nvfp4.prepare_dynamic(
-            input,
-            group_size,
-            activation_fn,
-            high_first=high_first,
-        )
-    if activation_per_tensor_scale is None:
-        activation_per_tensor_scale = input.new_ones((), dtype=torch.float32)
-    return convrot_nvfp4.prepare_static(
-        input,
-        activation_per_tensor_scale,
-        group_size,
-        activation_fn,
-        high_first=high_first,
-    )
 
 
 @torch.library.custom_op("piper_kernels::convrot_nvfp4_linear", mutates_args=())
@@ -84,12 +45,12 @@ def linear(
     if shape.rows == 0:
         return input.new_empty((*input.shape[:-1], shape.output_features))
 
-    input_qdata, input_scale, input_per_tensor_scale = _prepare_input(
+    input_qdata, input_scale, input_per_tensor_scale = nvfp4_ops._prepare_compiled(
         input,
         activation_per_tensor_scale,
         dynamic_activation_scale,
-        group_size,
         high_first=high_first,
+        group_size=group_size,
     )
     result = nvfp4_ops._execute_prepared(
         input_qdata,
@@ -126,42 +87,4 @@ def _linear_fake(
     return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
 
 
-@torch.library.custom_op("piper_kernels::convrot_nvfp4_prepare_input", mutates_args=())
-def prepare_input(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    activation_per_tensor_scale: torch.Tensor | None,
-    dynamic_activation_scale: bool,
-    group_size: int,
-    activation_fn: str | None = None,
-    high_first: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Apply an optional activation and prepare it in the ConvRot NVFP4 basis."""
-    validate_group_size(group_size)
-    return _prepare_input(
-        input,
-        activation_per_tensor_scale,
-        dynamic_activation_scale,
-        group_size,
-        activation_fn,
-        high_first,
-    )
-
-
-@prepare_input.register_fake  # pyright: ignore[reportFunctionMemberAccess]
-def _prepare_input_fake(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    activation_per_tensor_scale: torch.Tensor | None,
-    _dynamic_activation_scale: bool,
-    group_size: int,
-    activation_fn: str | None = None,
-    _high_first: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    validate_group_size(group_size)
-    if input.ndim == 0:
-        raise ValueError("ConvRot NVFP4 input must be non-scalar")
-    return prepared_input_metadata(
-        input, activation_per_tensor_scale, activation_fn, group_size=group_size
-    )
-
-
-__all__ = ["linear", "prepare_input"]
+__all__ = ["linear"]

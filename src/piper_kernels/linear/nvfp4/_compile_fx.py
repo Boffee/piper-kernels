@@ -293,17 +293,18 @@ def emit_prepared_input(
     """Emit ordinary or ConvRot NVFP4 preparation with metadata on each tuple output."""
     input_value = preparation_sharing.tensor_metadata(input_node)
     assert input_value is not None
-    args: tuple[object, ...] = (input_node, activation_per_tensor_scale, dynamic_activation_scale)
-    if group_size is None:
-        target = torch.ops.piper_kernels.nvfp4_prepare_input.default
-    else:
-        target = torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
-        args = (*args, group_size)
     qdata, scale, global_scale = linear_fx.emit_tuple_result(
         graph,
-        target,
-        (*args, activation_fn, high_first),
+        torch.ops.piper_kernels.nvfp4_prepare_input.default,
+        (
+            input_node,
+            activation_per_tensor_scale,
+            dynamic_activation_scale,
+            activation_fn,
+            high_first,
+        ),
         prepared_input_metadata(input_value, _metadata(activation_per_tensor_scale), activation_fn),
+        kwargs={"group_size": group_size},
     )
     return qdata, scale, global_scale, tuple(input_value.shape[:-1])
 

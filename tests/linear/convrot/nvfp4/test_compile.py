@@ -39,22 +39,18 @@ def _linear(
     activation_scale: torch.fx.Node | None,
     *,
     dynamic: bool = False,
-    group_size: int | bool = 16,
+    group_size: int | None = 16,
+    high_first: bool = False,
 ) -> torch.fx.Node:
-    node = graph.call_function(
-        torch.ops.piper_kernels.convrot_nvfp4_linear.default,
-        args=(
-            input,
-            qdata,
-            scale,
-            global_scale,
-            activation_scale,
-            None,
-            dynamic,
-            group_size,
-            False,
-        ),
-    )
+    args = (input, qdata, scale, global_scale, activation_scale, None, dynamic)
+    if group_size is None:
+        node = graph.call_function(
+            torch.ops.piper_kernels.nvfp4_linear.default, (*args, high_first)
+        )
+    else:
+        node = graph.call_function(
+            torch.ops.piper_kernels.convrot_nvfp4_linear.default, (*args, group_size, high_first)
+        )
     input_value = input.meta.get("val")
     qdata_value = qdata.meta["val"]
     if isinstance(input_value, torch.Tensor):
@@ -118,7 +114,7 @@ def test_pass_shares_compatible_preparation_and_canonicalizes_scale_variants() -
     _run_compile_pass(graph)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    assert targets.count(torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default) == 2
+    assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == 2
     assert targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 3
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in targets
     assert targets.count(torch.ops.aten.reshape.default) == 3
@@ -147,9 +143,45 @@ def test_pass_never_shares_different_rotation_groups() -> None:
     _run_compile_pass(graph)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    assert targets.count(torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default) == 1
+    assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 2
     assert targets.count(torch.ops.piper_kernels.convrot_nvfp4_linear.default) == 1
+    graph.lint()
+
+
+def test_mixed_projections_share_only_matching_basis_scale_mode_and_nibble_order() -> None:
+    graph = torch.fx.Graph()
+    *storage, _ = _operands(graph, torch.empty(17, 256, device="meta", dtype=torch.bfloat16))
+    settings = [
+        (None, False, False),
+        (16, False, False),
+        (64, False, False),
+        (64, True, False),
+        (64, False, True),
+    ]
+    graph.output(
+        tuple(
+            _linear(graph, *storage, None, group_size=group, dynamic=dynamic, high_first=high_first)
+            for group, dynamic, high_first in settings
+            for _ in range(2)
+        )
+    )
+
+    _run_compile_pass(graph)
+
+    preparations = graph.find_nodes(
+        op="call_function", target=torch.ops.piper_kernels.nvfp4_prepare_input.default
+    )
+    assert len(preparations) == len(settings)
+    assert {(n.kwargs.get("group_size"), n.args[2], n.args[4]) for n in preparations} == set(
+        settings
+    )
+    projections = graph.find_nodes(
+        op="call_function", target=torch.ops.piper_kernels.nvfp4_linear_prepared.default
+    )
+    assert len(projections) == 2 * len(settings)
+    for prepare in preparations:
+        assert sum(node.args[0].args[0] is prepare for node in projections) == 2
     graph.lint()
 
 
@@ -166,7 +198,7 @@ def test_pass_leaves_eligible_singleton_semantic() -> None:
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
     assert targets.count(torch.ops.piper_kernels.convrot_nvfp4_linear.default) == 1
-    assert torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default not in targets
+    assert torch.ops.piper_kernels.nvfp4_prepare_input.default not in targets
     assert torch.ops.piper_kernels.nvfp4_linear_prepared.default not in targets
     graph.lint()
 
@@ -254,7 +286,7 @@ def test_pass_coalesces_duplicate_input_casts_and_shares_preparation(
     assert targets.count(torch.ops.prims.convert_element_type.default) == (
         2 if external_consumer else 1
     )
-    assert targets.count(torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default) == (
+    assert targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == (
         0 if external_consumer else 1
     )
     assert targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == (
@@ -323,6 +355,6 @@ def test_cuda_compile_shares_three_projections(dynamic: bool, group_size: int) -
 
     for reference, result in zip(expected, actual, strict=True):
         assert torch.equal(result, reference)
-    assert capture.targets.count(torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default) == 1
+    assert capture.targets.count(torch.ops.piper_kernels.nvfp4_prepare_input.default) == 1
     assert capture.targets.count(torch.ops.piper_kernels.nvfp4_linear_prepared.default) == 3
     assert torch.ops.piper_kernels.convrot_nvfp4_linear.default not in capture.targets
