@@ -174,6 +174,27 @@ def test_from_hp_encodes_outlier_rows() -> None:
 
 @pytest.mark.gpu
 @_nvidia
+def test_row_encodings_are_independent_of_neighboring_rows() -> None:
+    # At group size 16 a lone impulse spreads over 16 of the block's 256 weights.
+    # Its peak seed exceeds its RMS seed, while a constant row has just one seed.
+    flat = torch.full((1, 256), 0.02, device="cuda")
+    impulse = torch.zeros_like(flat)
+    impulse[0, 0] = 1
+    flat_storage, impulse_storage = (
+        TrellisStorage.from_hp(row, group_size=16, bits_per_weight=4.5) for row in (flat, impulse)
+    )
+    separate = (flat_storage, impulse_storage, flat_storage)
+    mixed = TrellisStorage.from_hp(
+        torch.cat((flat, impulse, flat)), group_size=16, bits_per_weight=4.5
+    )
+
+    assert torch.equal(mixed.bitstreams, torch.cat([s.bitstreams for s in separate]))
+    assert torch.equal(mixed.block_scales, torch.cat([s.block_scales for s in separate]))
+    assert torch.equal(mixed.scale, torch.cat([s.scale for s in separate]))
+
+
+@pytest.mark.gpu
+@_nvidia
 def test_from_hp_encodes_zero_rows_and_no_rows() -> None:
     weight = torch.zeros(3, 256, device="cuda")
 
