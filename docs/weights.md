@@ -171,7 +171,8 @@ renormalization and transposed weights raise `NotImplementedError`.
 
 ## Run a quantized MoE FFN
 
-`piper_kernels.moe` provides offload-first single-token (`M = 1`) decode execution across
+`piper_kernels.moe` provides offload-first single-token (`M = 1`) and small-batch (`M > 1`)
+decode execution across
 expert-major quantized slabs stored as `[num_slots, ...]`: NVFP4 W4A16 (`"nvfp4_w4a16"`),
 ConvRot NVFP4 W4A16 (`"convrot_nvfp4_w4a16"`), and ConvRot INT8 W8A8 (`"convrot_int8"`). Each
 contiguous slab holds `up_gate_qdata`, `up_gate_scale`, `down_qdata`, `down_scale`, and optional
@@ -232,8 +233,9 @@ convention), and pass `activation_fn="gelu_tanh"` for `tanh`-GELU experts withou
 projection. `prepare_moe_input` returns an independent snapshot safe to reuse across waves
 even when accumulating into `out=input` (storing FP32 rotated activations for
 `"convrot_nvfp4_w4a16"` across FP16, BF16, and FP32 inputs). Calling `moe_ffn`
-without `out` returns a freshly allocated contiguous tensor; multiple rows
-(`M > 1`) are supported by row-looping. Caller-supplied `out` must match input
+without `out` returns a freshly allocated contiguous tensor; multiple rows (`M > 1`)
+batch active expert slots on-device across NVFP4 W4A16 and ConvRot INT8.
+Caller-supplied `out` must match input
 shape/dtype/device, have `stride(-1) == 1` with disjoint rows (`out.view(rows, H).stride(0) >= H`
 when `rows > 1`), must not use negated/conjugated views or alias weight storage, and must be
 writable in the active inference/autograd mode (`out is input` is supported zero-copy at `M = 1`).

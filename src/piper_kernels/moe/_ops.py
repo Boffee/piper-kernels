@@ -72,8 +72,10 @@ def _validate_weight_storage(
     parse_input_activation(activation_fn, name="MoE")
     if not isinstance(gate_first, bool) or not isinstance(high_first, bool):
         raise TypeError("MoE gate_first and high_first must be booleans")
-    if isinstance(group_size, bool) or not isinstance(group_size, int):
+    if isinstance(group_size, bool) or not isinstance(group_size, (int, torch.SymInt)):
         raise TypeError(f"MoE group_size must be an integer, got {group_size!r}")
+    if isinstance(group_size, torch.SymInt):
+        group_size = int(group_size)
     if up_gate_qdata.ndim != 3 or down_qdata.ndim != 3:
         raise ValueError("MoE qdata tensors must be 3-D [num_slots, out, in]")
     if up_gate_qdata.shape[0] != down_qdata.shape[0]:
@@ -192,8 +194,12 @@ def _validate_op_operands(
 ) -> tuple[bool, int, int]:
     if not isinstance(accumulate, bool):
         raise TypeError("MoE accumulate must be a bool")
-    if isinstance(active_slots_hint, bool) or not isinstance(active_slots_hint, int):
+    if isinstance(active_slots_hint, bool) or not isinstance(
+        active_slots_hint, (int, torch.SymInt)
+    ):
         raise TypeError("MoE active_slots_hint must be an integer")
+    if isinstance(active_slots_hint, torch.SymInt):
+        active_slots_hint = int(active_slots_hint)
     if active_slots_hint < 0:
         raise ValueError("MoE active_slots_hint must be non-negative")
 

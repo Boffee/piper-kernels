@@ -7,16 +7,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
-- Offload-first single-token (`M = 1`) quantized MoE FFN execution (`piper_kernels.moe`:
-  `MoEWeights`, `PreparedMoEInput`, `prepare_moe_input`, and `moe_ffn`) across
-  expert-major `[num_slots, ...]` slabs for NVFP4 W4A16, ConvRot NVFP4 W4A16, and
-  ConvRot INT8 W8A8, with on-device `expert_to_slot` miss skipping in the native GPU kernels
-  (and graph-safe masked fallback elsewhere), SwiGLU (`gate_first` configurable) and
-  `tanh`-GELU activations, reusable input preparation, and optional caller-owned `out=`
-  accumulation. Validated on CPU and AMD RX 9070 XT (`gfx1201`) across eager execution,
-  `torch.compile(fullgraph=True)`, and CUDA Graph replay; NVIDIA
-  `sm75`/`sm80`/`sm89`/`sm120` and AMD `gfx942`/`gfx1100`/`gfx1151` targets validated via
-  offline compilation.
+- Offload-first single-token (`M = 1`) and small-batch (`M > 1`) quantized MoE FFN execution
+  (`piper_kernels.moe`: `MoEWeights`, `PreparedMoEInput`, `prepare_moe_input`, and
+  `moe_ffn`) across expert-major `[num_slots, ...]` slabs for NVFP4 W4A16, ConvRot NVFP4
+  W4A16, and ConvRot INT8 W8A8, with on-device slot bucketing and `expert_to_slot` miss
+  skipping in native GPU kernels (and graph-safe masked fallback elsewhere), SwiGLU
+  (`gate_first` configurable) and `tanh`-GELU activations, reusable input preparation, and
+  optional caller-owned `out=` accumulation. Validated on CPU and AMD RX 9070 XT (`gfx1201`)
+  across eager execution, `torch.compile(fullgraph=True, dynamic=True)`, and CUDA Graph
+  replay; NVIDIA `sm75`/`sm80`/`sm89`/`sm120` and AMD `gfx942`/`gfx1100`/`gfx1151` targets
+  validated via offline compilation.
 
 ### Changed
 
