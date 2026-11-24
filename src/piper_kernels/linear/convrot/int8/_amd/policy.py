@@ -8,9 +8,11 @@ Unknown targets fall back to the portable reference path.
 Preparation chooses up to three group-aligned power-of-two segments, fusing
 rotation and quantization through 16,384 input features before falling back to a
 split path. On ``gfx1201``, short batches with known ``out_features`` use
-single-row-tile schedules (``(32, 128, 64)`` / 4 warps for ``1..32`` rows and
-``(64, 128, 64)`` / 4 warps for ``33..64`` rows) so uncached weights stream once
-while doubling N parallelism. Above 64 rows, GEMMs use ``(128, 256, 64)`` tiles
+single-M-tile schedules (``(16, 64, 256)`` / 4 warps for ``1..16`` rows, paired
+with Split-K when column parallelism alone cannot saturate the GPU;
+``(32, 128, 64)`` / 4 warps for ``17..32`` rows; and ``(64, 128, 64)`` / 4 warps
+for ``33..64`` rows) so uncached weights stream cleanly across compute units.
+Above 64 rows, GEMMs use ``(128, 256, 64)`` tiles
 (8 warps, 2 stages, ``group_m=8``), switching to ``(128, 128, 128)`` when
 ``in_features`` is a multiple of 8,192 and the launch fills at least two
 workgroups per WGP (64 tiles).
@@ -262,12 +264,16 @@ def select_execution_plan(
     matmul_warps = 8 if rdna4 else 4
     if wide_k:
         block_n, block_k = 128, 128
-    # Keep short batches (rows <= 64) on a single M tile with 128-column blocks
-    # so weights exceeding the 64 MiB Infinity Cache stream once while doubling
-    # N parallelism across the 32 WGPs. Above 64 rows, keep 128-row plans so
-    # paired and fused-residual fast paths apply uniformly.
+    # Keep short batches (rows <= 64) on a single M tile so weights exceeding the
+    # 64 MiB Infinity Cache stream once: 1..16 rows use (16, 64, 256) (cold-DRAM
+    # multi-layer streaming favors 16x64x256 across both narrow and wide outputs,
+    # paired with Split-K when N is narrow), while 17..32 and 33..64 rows use
+    # 128-column blocks. Above 64 rows, keep 128-row plans so paired and
+    # fused-residual fast paths apply uniformly.
     if target.is_architecture("gfx1201") and rows is not None and out_features is not None:
-        if 1 <= rows <= 32:
+        if 1 <= rows <= 16:
+            block_m, block_n, block_k, matmul_warps = 16, 64, 256, 4
+        elif 17 <= rows <= 32:
             block_m, block_n, block_k, matmul_warps = 32, 128, 64, 4
         elif 33 <= rows <= 64:
             block_m, block_n, block_k, matmul_warps = 64, 128, 64, 4

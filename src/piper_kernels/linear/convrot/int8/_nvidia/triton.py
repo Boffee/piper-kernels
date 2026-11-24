@@ -23,7 +23,11 @@ from piper_kernels.weights.convrot.int8.triton import (
 )
 
 from .._plan import LinearExecutionPlan
-from ..triton import int8_matmul_kernel, int8_residual_matmul_kernel
+from ..triton import (
+    int8_matmul_kernel,
+    int8_residual_matmul_kernel,
+    try_launch_int8_matmul_splitk,
+)
 from . import gluon_async_copy, gluon_tma, policy
 from .policy import NvidiaExecutionPlan
 
@@ -128,9 +132,29 @@ def launch_int8_matmul(
     plan = execution_plan
     m, k = input_qdata.shape
     n = weight_qdata.shape[0]
+    group_m = plan.matmul_group_m
+    if try_launch_int8_matmul_splitk(
+        input_qdata,
+        weight_qdata,
+        output,
+        input_scale,
+        weight_scale,
+        bias,
+        second_weight,
+        second_scale,
+        second_bias,
+        paired=paired,
+        block_m=plan.matmul_block_m,
+        block_n=plan.matmul_block_n,
+        block_k=plan.matmul_block_k,
+        group_m=group_m,
+        explicit_bias_fma=plan.matmul_explicit_bias_fma,
+        num_warps=plan.matmul_num_warps,
+        num_stages=plan.matmul_num_stages,
+    ):
+        return
     num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
     row_block_count = triton.cdiv(m, plan.matmul_block_m)
-    group_m = plan.matmul_group_m
     grid = (row_block_count * num_n_tiles,) if group_m else (row_block_count, num_n_tiles)
     kernel = int8_matmul_kernel if plan.matmul_specialize_m else dynamic_m_int8_matmul_kernel
     with device_context(input_qdata.device):

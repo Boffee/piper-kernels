@@ -10,7 +10,16 @@ from piper_kernels.linear.convrot.int8._backend import require_linear_backend
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU is not available")
-@pytest.mark.parametrize("shape", [(1, 256, 384), (385, 512, 300), (129, 5376, 768)])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 256, 384),
+        (1, 16384, 256),
+        (3, 16384, 300),
+        (385, 512, 300),
+        (129, 5376, 768),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "bias_dtypes",

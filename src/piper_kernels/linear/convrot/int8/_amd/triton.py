@@ -33,7 +33,7 @@ from piper_kernels.weights.convrot.int8.triton import (
 )
 
 from .._plan import LinearExecutionPlan
-from ..triton import int8_matmul_kernel
+from ..triton import int8_matmul_kernel, try_launch_int8_matmul_splitk
 from . import policy
 
 
@@ -668,6 +668,28 @@ def launch_prepared_linear(
     group_m = policy.matmul_group_m(plan)
     row_block_count = triton.cdiv(m, plan.matmul_block_m)
     output_tiles = row_block_count * num_n_tiles
+    if try_launch_int8_matmul_splitk(
+        input_qdata,
+        weight_qdata,
+        output,
+        input_scale,
+        weight_scale,
+        bias,
+        second_weight,
+        second_scale,
+        second_bias,
+        paired=paired,
+        block_m=plan.matmul_block_m,
+        block_n=plan.matmul_block_n,
+        block_k=plan.matmul_block_k,
+        group_m=group_m,
+        explicit_bias_fma=False,
+        num_warps=plan.matmul_num_warps,
+        num_stages=plan.matmul_num_stages,
+        target=target,
+        compiler_options=compiler_options,
+    ):
+        return
     grid = (output_tiles,) if group_m else (row_block_count, num_n_tiles)
     with device_context(input_qdata.device):
         int8_matmul_kernel[grid](

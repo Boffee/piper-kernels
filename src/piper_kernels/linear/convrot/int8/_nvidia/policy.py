@@ -302,8 +302,10 @@ def _sm120_matmul_schedule(rows: int | None, out_features: int | None) -> Matmul
 def _sm8x_matmul_schedule(rows: int | None, out_features: int | None) -> MatmulSchedule:
     """Select Triton for short/narrow work and Gluon when enough wide tiles are useful.
 
-    Each output width uses at most three schedules as rows increase. All SM8x
-    schedules use dynamic M, bounding the number of compiled GEMMs per layer.
+    Each output width uses at most three unsplit schedules as rows increase
+    (plus at most one dynamic-M/dynamic-split_k Split-K GEMM and shared reducer
+    when eligible <=16-row batches split across SMs), bounding compiled kernels
+    per layer.
     """
     if not rows or not out_features:
         return _SM8X_GLUON_LARGE
