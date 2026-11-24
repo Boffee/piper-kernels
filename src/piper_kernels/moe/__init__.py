@@ -538,11 +538,13 @@ def moe_ffn(
     if active_slots_hint is None:
         hint = 0
     else:
-        if isinstance(active_slots_hint, bool) or not isinstance(active_slots_hint, int):
+        if isinstance(active_slots_hint, bool) or not isinstance(
+            active_slots_hint, (int, torch.SymInt)
+        ):
             raise TypeError("MoE active_slots_hint must be an integer or None")
         if active_slots_hint <= 0:
             raise ValueError("MoE active_slots_hint must be positive")
-        hint = active_slots_hint
+        hint = int(active_slots_hint)
 
     if out is None:
         return _ops.moe_ffn(
