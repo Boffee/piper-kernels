@@ -32,7 +32,7 @@ def _materialized_optimized_preparation(
         group_size,
         num_warps=4,
     )
-    return nvfp4_ops._compiled_prepare_dynamic(rotated, None)
+    return nvfp4_ops.prepare_input(rotated, None, True)
 
 
 @pytest.mark.parametrize(
@@ -205,8 +205,8 @@ def test_dynamic_preparation_runs_existing_nvfp4_gemm() -> None:
     input = torch.randn((257, 256), device="cuda", dtype=torch.bfloat16)  # noqa: A001
     weight = torch.randn((128, 256), device="cuda", dtype=torch.bfloat16)
     rotated_weight = rotate_groups(weight, 16)
-    weight_qdata, weight_scale, weight_per_tensor_scale = nvfp4_ops._compiled_prepare_dynamic(
-        rotated_weight, None
+    weight_qdata, weight_scale, weight_per_tensor_scale = nvfp4_ops.prepare_input(
+        rotated_weight, None, True
     )
 
     expected = nvfp4_ops._execute_prepared(
@@ -245,7 +245,7 @@ def test_swiglu_preparation_matches_materialized_activation(
     convrot_backend.rotate_input(activated, rotated, group_size, num_warps=4)
 
     if dynamic:
-        expected = nvfp4_ops._compiled_prepare_dynamic(rotated, None)
+        expected = nvfp4_ops.prepare_input(rotated, None, True)
         actual = convrot_nvfp4.prepare_dynamic(input, group_size, "swiglu")
     else:
         per_tensor_scale = torch.tensor(1.0 / 448.0, device="cuda", dtype=torch.float32)

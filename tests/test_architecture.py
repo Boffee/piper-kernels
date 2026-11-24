@@ -15,7 +15,7 @@ _BENCHMARKS_ROOT = _REPO_ROOT / "benchmarks"
 
 # Legacy surface-area ceilings in src/piper_kernels (lower as refactors land).
 _MAX_FUSION_PACKAGES = 7
-_MAX_CUSTOM_OPS = 51
+_MAX_CUSTOM_OPS = 50
 _MAX_COMPILER_PASSES = 2
 _MAX_PATTERN_MATCHER_PASSES = 0
 
@@ -37,7 +37,7 @@ _BENCHMARK_PRIVATE_IMPORT_MAX: dict[str, int] = {
 
 # Legacy private piper_kernels import totals in tests/ (lower as tests decouple).
 _MAX_TEST_PRIVATE_IMPORT_FILES = 143
-_MAX_TEST_PRIVATE_IMPORTS = 582
+_MAX_TEST_PRIVATE_IMPORTS = 580
 
 # Legacy private-global monkeypatch totals in tests/ (lower as tests decouple).
 _MAX_TEST_PRIVATE_MONKEYPATCH_FILES = 42

@@ -402,25 +402,15 @@ def _prepare_nvfp4_input(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
-    assert isinstance(weight, TorchAONVFP4Tensor)
+    assert isinstance(weight, (PiperNVFP4Tensor, ConvRotNVFP4Tensor))
     quantization = weight.act_quant_kwargs
     assert quantization is not None
-    if isinstance(weight, ConvRotNVFP4Tensor):
-        return convrot_nvfp4_ops.prepare_input(
-            hidden_states,
-            weight.act_per_tensor_scale,
-            quantization.use_dynamic_per_tensor_scale,
-            weight.group_size,
-            None,
-            weight.high_first,
-        )
-    assert isinstance(weight, PiperNVFP4Tensor)
     return nvfp4_ops.prepare_input(
         hidden_states,
         weight.act_per_tensor_scale,
         quantization.use_dynamic_per_tensor_scale,
-        None,
-        weight.high_first,
+        high_first=weight.high_first,
+        group_size=weight.group_size if isinstance(weight, ConvRotNVFP4Tensor) else None,
     )
 
 
@@ -595,17 +585,14 @@ def test_prepared_projection_family_fuses_without_materializing_linears(
 
     (linear_pass,) = compile_options()[_POST_GRAD_PRE_PASS]
     linear_pass(graph, is_inference=True)
-    expected_prepare = (
-        torch.ops.piper_kernels.nvfp4_prepare_input.default
-        if group_size is None
-        else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
-    )
+    expected_prepare = torch.ops.piper_kernels.nvfp4_prepare_input.default
     prepared_targets = [node.target for node in graph.nodes if node.op == "call_function"]
     preparations = graph.find_nodes(op="call_function", target=expected_prepare)
     assert len(preparations) == preparation_count
     for node in preparations:
         fake_args = torch.fx.map_arg(node.args, lambda arg: arg.meta["val"])
-        expected = expected_prepare(*fake_args)
+        assert node.kwargs.get("group_size") == group_size
+        expected = expected_prepare(*fake_args, **node.kwargs)
         for value, output in zip(node.meta["val"], expected, strict=True):
             assert (value.shape, value.dtype) == (output.shape, output.dtype)
         for getitem in node.users:
@@ -656,11 +643,7 @@ def test_semantic_and_cross_attention_projections_fuse_cleanly(
     run_nvfp4_passes(graph, monkeypatch, linear=linear_enabled)
 
     targets = [node.target for node in graph.nodes if node.op == "call_function"]
-    expected_prepare = (
-        torch.ops.piper_kernels.nvfp4_prepare_input.default
-        if group_size is None
-        else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
-    )
+    expected_prepare = torch.ops.piper_kernels.nvfp4_prepare_input.default
     assert targets.count(expected_prepare) == expected_prepares
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_key.default) == 1
     assert targets.count(torch.ops.piper_kernels.nvfp4_sparse_piper_project_value.default) == 1
@@ -733,11 +716,7 @@ def test_static_output_fuses_after_prepared_sparse_projection(
 
     call_nodes = [node for node in graph.nodes if node.op == "call_function"]
     targets = [node.target for node in call_nodes]
-    expected_prepare = (
-        torch.ops.piper_kernels.nvfp4_prepare_input.default
-        if group_size is None
-        else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
-    )
+    expected_prepare = torch.ops.piper_kernels.nvfp4_prepare_input.default
     assert targets.count(expected_prepare) == preparation_count
     projected_output = (
         torch.ops.piper_kernels.nvfp4_sparse_piper_projected_query_attention_output.default
@@ -1058,11 +1037,7 @@ def test_cuda_compile_fuses_nvfp4_attention_output(
             options=capture.wrap_options(compile_options(attention=True)),
         )(hidden_states)
 
-    expected_prepare = (
-        torch.ops.piper_kernels.nvfp4_prepare_input.default
-        if group_size is None
-        else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
-    )
+    expected_prepare = torch.ops.piper_kernels.nvfp4_prepare_input.default
     assert actual.dtype is dtype
     assert_fusion_output_close(actual, expected)
     assert capture.targets.count(expected_prepare) == preparation_count
@@ -1247,11 +1222,7 @@ def test_cuda_compile_lifetime_chunks_a_projected_coarse_gate(
             options=capture.wrap_options(compile_options(attention=True)),
         )(hidden_states, block_lengths, 2)
 
-    expected_prepare = (
-        torch.ops.piper_kernels.nvfp4_prepare_input.default
-        if group_size is None
-        else torch.ops.piper_kernels.convrot_nvfp4_prepare_input.default
-    )
+    expected_prepare = torch.ops.piper_kernels.nvfp4_prepare_input.default
     assert actual.dtype is dtype
     # 1-ULP FP32 differences across chunked coarse_attention can flip one 4-bit
     # NVFP4 block on dynamic outputs; static outputs retain the 1e-3 bound.

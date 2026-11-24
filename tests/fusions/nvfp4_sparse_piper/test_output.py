@@ -18,7 +18,6 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
 )
 from piper_kernels.fusions.nvfp4_sparse_piper import key, output, query, value
-from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
 from piper_kernels.linear.nvfp4 import _ops, _projection, reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
 
@@ -40,23 +39,9 @@ def _affine_nvfp4_linear(
     group_size: int | None = None,
 ) -> torch.Tensor:
     """Compare affine arithmetic independently on the integration test's prepared input."""
-    if group_size is None:
-        input_qdata, input_scale, input_per_tensor_scale = _ops.prepare_input(
-            input,
-            activation_scale,
-            False,
-            None,
-            False,
-        )
-    else:
-        input_qdata, input_scale, input_per_tensor_scale = convrot_nvfp4_ops.prepare_input(
-            input,
-            activation_scale,
-            False,
-            group_size,
-            None,
-            False,
-        )
+    input_qdata, input_scale, input_per_tensor_scale = _ops.prepare_input(
+        input, activation_scale, False, group_size=group_size
+    )
     result = reference.linear_prepared(
         input_qdata,
         input_scale,
@@ -306,17 +291,7 @@ def _projected_gate_arguments(
         device="cuda",
         dtype=torch.float32,
     )
-    if group_size is None:
-        gate_input = _ops.prepare_input(hidden, activation_scale, False, None, False)
-    else:
-        gate_input = convrot_nvfp4_ops.prepare_input(
-            hidden,
-            activation_scale,
-            False,
-            group_size,
-            None,
-            False,
-        )
+    gate_input = _ops.prepare_input(hidden, activation_scale, False, group_size=group_size)
     with torch.no_grad():
         coarse_gate = _ops.linear_prepared(
             *gate_input,

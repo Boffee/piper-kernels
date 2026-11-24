@@ -5,19 +5,11 @@ from __future__ import annotations
 import torch
 
 from piper_kernels import _input_activations as input_activations
+from piper_kernels.weights.convrot._rotation import validate_group_size
 
 from . import _projection, _validation, reference
 from . import triton as nvfp4_triton
 from ._storage import prepared_input_metadata
-
-
-def _compiled_prepare_dynamic(
-    input: torch.Tensor,  # noqa: A002
-    activation_fn: str | None,
-    high_first: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prepare dynamic activations directly in Triton."""
-    return nvfp4_triton.prepare_dynamic(input, activation_fn, high_first=high_first)
 
 
 def _prepare_compiled(
@@ -26,19 +18,39 @@ def _prepare_compiled(
     dynamic_activation_scale: bool,
     activation_fn: str | None = None,
     high_first: bool = False,
+    *,
+    group_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    input_activations.validate_input_activation(activation_fn)
+    """Apply the activation and pack NVFP4 input in the requested rotation basis."""
     if input.numel() == 0:
+        if group_size is not None:
+            validate_group_size(group_size)
         return reference.prepare_input(
-            input, activation_per_tensor_scale, dynamic_activation_scale, activation_fn, high_first
+            input,
+            activation_per_tensor_scale,
+            dynamic_activation_scale,
+            activation_fn,
+            high_first,
+            group_size=group_size or 0,
         )
+    if group_size is None:
+        input_activations.validate_input_activation(activation_fn)
+        if dynamic_activation_scale:
+            return nvfp4_triton.prepare_dynamic(input, activation_fn, high_first=high_first)
+        return nvfp4_triton.prepare_static(
+            input, activation_per_tensor_scale, activation_fn, high_first
+        )
+
+    from piper_kernels.linear.convrot.nvfp4 import triton as convrot_triton  # noqa: PLC0415
+
     if dynamic_activation_scale:
-        return _compiled_prepare_dynamic(input, activation_fn, high_first)
-    return nvfp4_triton.prepare_static(
-        input,
-        activation_per_tensor_scale,
-        activation_fn,
-        high_first,
+        return convrot_triton.prepare_dynamic(
+            input, group_size, activation_fn, high_first=high_first
+        )
+    if activation_per_tensor_scale is None:
+        activation_per_tensor_scale = input.new_ones((), dtype=torch.float32)
+    return convrot_triton.prepare_static(
+        input, activation_per_tensor_scale, group_size, activation_fn, high_first
     )
 
 
@@ -131,33 +143,28 @@ def _linear_fake(
     return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
 
 
-@torch.library.custom_op("piper_kernels::nvfp4_prepare_input", mutates_args=())
-def prepare_input(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    activation_per_tensor_scale: torch.Tensor | None,
-    dynamic_activation_scale: bool,
-    activation_fn: str | None = None,
-    high_first: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Apply an optional portable activation and prepare it for NVFP4 projections."""
-    return _prepare_compiled(
-        input,
-        activation_per_tensor_scale,
-        dynamic_activation_scale,
-        activation_fn,
-        high_first,
-    )
+prepare_input = torch.library.custom_op(
+    "piper_kernels::nvfp4_prepare_input", _prepare_compiled, mutates_args=()
+)
 
 
-@prepare_input.register_fake  # pyright: ignore[reportFunctionMemberAccess]
+@prepare_input.register_fake
 def _prepare_input_fake(
     input: torch.Tensor,  # noqa: A002
     activation_per_tensor_scale: torch.Tensor | None,
     _dynamic_activation_scale: bool,
     activation_fn: str | None = None,
     _high_first: bool = False,
+    *,
+    group_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return prepared_input_metadata(input, activation_per_tensor_scale, activation_fn)
+    if group_size is not None:
+        validate_group_size(group_size)
+        if input.ndim == 0:
+            raise ValueError("ConvRot NVFP4 input must be non-scalar")
+    return prepared_input_metadata(
+        input, activation_per_tensor_scale, activation_fn, group_size=group_size
+    )
 
 
 @torch.library.custom_op("piper_kernels::nvfp4_linear_prepared", mutates_args=())
