@@ -22,6 +22,8 @@ def test_enumeration_does_not_construct_or_substitute_workloads(monkeypatch):
         "convrot_int8",
         "nvfp4",
         "convrot_nvfp4",
+        "nvfp4_w4a16",
+        "convrot_nvfp4_w4a16",
     ]
     assert choices[0].unsupported_reason is None
     assert all(choice.unsupported_reason for choice in choices[1:])

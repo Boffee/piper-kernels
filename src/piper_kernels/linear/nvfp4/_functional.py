@@ -7,30 +7,56 @@ import torch
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
 from torchao.prototype.mx_formats.nvfp4_tensor import nvfp4_linear as torchao_nvfp4_linear
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._dispatch import apply_linear_autocast, bind_linear_arguments
 from piper_kernels.weights._views import require_untransposed
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor, _layout
 
 
-def supports_semantic_linear(input: object, weight: PiperNVFP4Tensor) -> bool:  # noqa: A002
+def _supports_common_nvfp4_linear(input: object, weight: PiperNVFP4Tensor) -> bool:  # noqa: A002
     if not isinstance(input, torch.Tensor):
         return False
     tensor_input = cast(torch.Tensor, input)
     if isinstance(input, TorchAONVFP4Tensor):
         return False
-    quantization = weight.act_quant_kwargs
     return (
         tensor_input.ndim > 0
         and tensor_input.dtype is weight.orig_dtype
-        and tensor_input.device.type in ("cuda", "meta")
+        and tensor_input.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and tensor_input.layout is torch.strided
+        and weight.ndim == 2
         and weight.block_size == _layout.BLOCK_SIZE
         and weight.is_swizzled_scales
         and not weight.use_triton_kernel
+        and (weight.per_tensor_scale is None or weight.per_tensor_scale.ndim == 0)
+    )
+
+
+def supports_semantic_linear(input: object, weight: PiperNVFP4Tensor) -> bool:  # noqa: A002
+    if not _supports_common_nvfp4_linear(input, weight):
+        return False
+    tensor_input = cast(torch.Tensor, input)
+    quantization = weight.act_quant_kwargs
+    return (
+        tensor_input.device.type in ("cuda", "meta")
         and quantization is not None
         and quantization.block_size == _layout.BLOCK_SIZE
         and quantization.is_swizzled_scales
         and not quantization.use_triton_kernel
-        and (weight.per_tensor_scale is None or weight.per_tensor_scale.ndim == 0)
+    )
+
+
+def supports_weight_only_linear(input: object, weight: PiperNVFP4Tensor) -> bool:  # noqa: A002
+    """Return whether ``input`` and ``weight`` qualify for weight-only W4A16 execution."""
+    if not _supports_common_nvfp4_linear(input, weight):
+        return False
+    tensor_input = cast(torch.Tensor, input)
+    if weight.act_quant_kwargs is not None or weight.act_per_tensor_scale is not None:
+        return False
+    if tensor_input.device.type == "meta":
+        return True
+    return tensor_input.device.type == "cuda" and (
+        AcceleratorTarget.from_device(tensor_input.device).supports_nvfp4_w4a16
     )
 
 
@@ -51,22 +77,35 @@ def linear_dispatch(
     assert isinstance(converted_weight, PiperNVFP4Tensor)
     weight = converted_weight
     normalized_args = (converted_input, weight, bias)
-    supported = supports_semantic_linear(converted_input, weight)
-    if not supported:
-        if weight.high_first:
-            return torch.nn.functional.linear(converted_input, weight.dequantize(), bias)
-        return torchao_nvfp4_linear(func, types, normalized_args, {})
-    quantization = weight.act_quant_kwargs
-    assert quantization is not None
-    from . import _ops  # noqa: PLC0415
+    if supports_semantic_linear(converted_input, weight):
+        quantization = weight.act_quant_kwargs
+        assert quantization is not None
+        from . import _ops  # noqa: PLC0415
 
-    return _ops.linear(
-        converted_input,
-        weight.qdata,
-        weight.scale,
-        weight.per_tensor_scale,
-        weight.act_per_tensor_scale,
-        bias,
-        quantization.use_dynamic_per_tensor_scale,
-        weight.high_first,
-    )
+        return _ops.linear(
+            converted_input,
+            weight.qdata,
+            weight.scale,
+            weight.per_tensor_scale,
+            weight.act_per_tensor_scale,
+            bias,
+            quantization.use_dynamic_per_tensor_scale,
+            weight.high_first,
+        )
+    if supports_weight_only_linear(converted_input, weight):
+        from . import _ops  # noqa: PLC0415
+
+        return _ops.linear(
+            converted_input,
+            weight.qdata,
+            weight.scale,
+            weight.per_tensor_scale,
+            None,
+            bias,
+            False,
+            weight.high_first,
+            True,
+        )
+    if weight.high_first:
+        return torch.nn.functional.linear(converted_input, weight.dequantize(), bias)
+    return torchao_nvfp4_linear(func, types, normalized_args, {})

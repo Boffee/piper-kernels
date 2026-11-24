@@ -57,6 +57,14 @@ def blackwell_cuda_available() -> bool:
     ).cuda_capability_at_least(10)
 
 
+def w4a16_nvfp4_available() -> bool:
+    """Return whether the default GPU supports weight-only W4A16 NVFP4 execution."""
+    return (
+        torch.cuda.is_available()
+        and AcceleratorTarget.from_device(torch.device("cuda")).supports_nvfp4_w4a16
+    )
+
+
 def uint8_int8_mma_available() -> bool:
     """Return whether the default CUDA device supports NVIDIA UINT8-by-INT8 MMAv2."""
     return (

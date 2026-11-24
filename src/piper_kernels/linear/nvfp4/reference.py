@@ -118,4 +118,35 @@ def linear(
     ).reshape(*input.shape[:-1], weight_qdata.shape[0])
 
 
-__all__ = ["linear", "linear_prepared", "prepare_input"]
+def linear_w4a16(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    high_first: bool = False,
+    *,
+    group_size: int = 0,
+) -> torch.Tensor:
+    """Dequantize swizzled NVFP4 weights and apply a floating activation, optionally rotated."""
+    if input.numel() == 0 or weight_qdata.shape[0] == 0:
+        return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
+    active = rotate_groups(input.float(), group_size) if group_size else input.float()
+    flattened = active.reshape(-1, active.shape[-1])
+    packed_weight = _layout.swap_packed_pairs(weight_qdata) if high_first else weight_qdata
+    weight = TorchAONVFP4Tensor(
+        packed_weight,
+        weight_scale,
+        _layout.BLOCK_SIZE,
+        torch.float32,
+        is_swizzled_scales=True,
+    ).dequantize(torch.float32)
+    result = flattened @ weight.T
+    if weight_per_tensor_scale is not None:
+        result.mul_(weight_per_tensor_scale)
+    if bias is not None:
+        result.add_(bias.float())
+    return result.to(input.dtype).reshape(*input.shape[:-1], weight_qdata.shape[0])
+
+
+__all__ = ["linear", "linear_prepared", "linear_w4a16", "prepare_input"]

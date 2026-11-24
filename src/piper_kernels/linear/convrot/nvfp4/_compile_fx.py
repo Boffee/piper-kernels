@@ -23,7 +23,7 @@ class SemanticLinearNodes:
     def from_call(cls, node: torch.fx.Node) -> SemanticLinearNodes | None:
         """Parse one schema-bound ConvRot NVFP4 semantic-linear call."""
         bound = linear_fx.bind_call(node, torch.ops.piper_kernels.convrot_nvfp4_linear.default)
-        if bound is None:
+        if bound is None or bound.get("weight_only") is True:
             return None
         group_size = bound["group_size"]
         if not isinstance(group_size, int) or isinstance(group_size, bool):

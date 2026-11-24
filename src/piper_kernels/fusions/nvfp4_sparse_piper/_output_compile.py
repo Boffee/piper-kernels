@@ -154,7 +154,7 @@ def _match_attention_output(linear_node: torch.fx.Node) -> _MatchedAttentionOutp
         return None
     is_convrot = op_name == _CONVROT_NVFP4_LINEAR
     linear_args = linear_fx.bind_arguments(linear_node)
-    if linear_args is None:
+    if linear_args is None or linear_args.get("weight_only") is True:
         return None
 
     reshaped_match = sparse_piper_compile.match_reshaped_quantized_attention(linear_args["input"])
