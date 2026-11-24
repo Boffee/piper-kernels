@@ -634,3 +634,205 @@ def _compile_int8_matmul(
         target=target,
         options={"num_warps": plan.matmul_num_warps, "num_stages": plan.matmul_num_stages},
     )
+
+
+def _splitk_attrs(out_features: int, in_features: int, *, paired: bool) -> tuple[dict, dict]:
+    matmul_divisible = [0, 1, 2, 3]
+    if out_features % 16 == 0:
+        matmul_divisible.append(5)
+    if in_features % 16 == 0:
+        matmul_divisible.append(6)
+    reduce_divisible = [0, 1, 2, 3, 4, 5, 6]
+    if out_features % 16 == 0:
+        reduce_divisible.append(8)
+    if (out_features * (2 if paired else 1)) % 16 == 0:
+        reduce_divisible.append(10)
+    return (
+        {(index,): [["tt.divisibility", 16]] for index in matmul_divisible},
+        {(index,): [["tt.divisibility", 16]] for index in reduce_divisible},
+    )
+
+
+def _compile_nvidia_splitk_kernels(
+    architecture: int,
+    *,
+    rows: int,
+    out_features: int,
+    in_features: int,
+    output_ty: str = "*bf16",
+    bias_ty: str | None = None,
+    paired: bool = False,
+    second_bias_ty: str | None = None,
+    num_sms: int = 128,
+) -> dict[str, tuple[triton.compiler.CompiledKernel, int]]:
+    target = GPUTarget("cuda", architecture, 32)
+    accel_target = AcceleratorTarget.from_compiler_target(target)
+    plan = policy.select_execution_plan(
+        accel_target, in_features=in_features, rows=rows, out_features=out_features
+    )
+    if plan.matmul_kernel in ("gluon_async_copy", "gluon_tma"):
+        plan = policy.grouped_triton_plan(plan)
+    split_k = kernels.select_int8_split_k(
+        num_sms,
+        rows=rows,
+        out_features=out_features,
+        in_features=in_features,
+        block_m=plan.matmul_block_m,
+        block_n=plan.matmul_block_n,
+        block_k=plan.matmul_block_k,
+        paired=paired,
+        group_m=plan.matmul_group_m,
+    )
+    if split_k <= 1:
+        return {}
+    matmul_attrs, reduce_attrs = _splitk_attrs(out_features, in_features, paired=paired)
+    matmul_compiled = compile_with_spill_stores(
+        ASTSource(
+            kernels.int8_matmul_splitk_kernel,
+            {
+                "input_ptr": "*i8",
+                "weight_ptr": "*i8",
+                "second_weight_ptr": "*i8",
+                "partial_ptr": "*i32",
+                "m": "i32",
+                "n": "i32",
+                "k": "i32",
+                "split_k": "i32",
+            },
+            attrs=matmul_attrs,
+            constexprs={
+                "block_m": plan.matmul_block_m,
+                "block_n": plan.matmul_block_n,
+                "block_k": plan.matmul_block_k,
+                "paired": paired,
+                "aligned_nk": (
+                    out_features % plan.matmul_block_n == 0
+                    and in_features % plan.matmul_block_k == 0
+                ),
+                "accumulator_seed": 0,
+            },
+        ),
+        target,
+        {"num_warps": plan.matmul_num_warps, "num_stages": plan.matmul_num_stages},
+    )
+    has_bias = bias_ty is not None
+    second_has_bias = paired and second_bias_ty is not None
+    second_bias_ptr = (
+        second_bias_ty if second_has_bias and second_bias_ty is not None else output_ty
+    )
+    reduce_compiled = compile_with_spill_stores(
+        ASTSource(
+            kernels.int8_splitk_reduce_kernel,
+            {
+                "partial_ptr": "*i32",
+                "input_scale_ptr": "*fp32",
+                "weight_scale_ptr": "*fp32",
+                "bias_ptr": output_ty if bias_ty is None else bias_ty,
+                "second_scale_ptr": "*fp32",
+                "second_bias_ptr": second_bias_ptr,
+                "output_ptr": output_ty,
+                "m": "i32",
+                "n": "i32",
+                "split_k": "i32",
+                "output_row_stride": "i32",
+            },
+            attrs=reduce_attrs,
+            constexprs={
+                "block_n": kernels.INT8_SPLITK_REDUCE_BLOCK_N,
+                "has_bias": has_bias,
+                "paired": paired,
+                "second_has_bias": second_has_bias,
+                "explicit_bias_fma": plan.matmul_explicit_bias_fma,
+            },
+        ),
+        target,
+        {"num_warps": 4},
+    )
+    return {"splitk_matmul": matmul_compiled, "splitk_reduce": reduce_compiled}
+
+
+@pytest.mark.parametrize("architecture", [80, 86, 89, 120])
+@pytest.mark.parametrize("paired", [False, True])
+@pytest.mark.parametrize(
+    ("rows", "out_features", "in_features", "bias_ty", "second_bias_ty"),
+    [
+        (1, 512, 16384, None, None),
+        (1, 515, 16392, "*fp16", "*fp32"),
+    ],
+)
+def test_nvidia_splitk_kernels_compile_within_resources(
+    architecture: int,
+    paired: bool,
+    rows: int,
+    out_features: int,
+    in_features: int,
+    bias_ty: str | None,
+    second_bias_ty: str | None,
+) -> None:
+    compiled = _compile_nvidia_splitk_kernels(
+        architecture,
+        rows=rows,
+        out_features=out_features,
+        in_features=in_features,
+        bias_ty=bias_ty,
+        paired=paired,
+        second_bias_ty=second_bias_ty if paired else None,
+        num_sms=128,
+    )
+    assert set(compiled) == {"splitk_matmul", "splitk_reduce"}
+    matmul_kernel, matmul_spills = compiled["splitk_matmul"]
+    _reduce_kernel, reduce_spills = compiled["splitk_reduce"]
+    matmul_ptx = matmul_kernel.asm["ptx"]
+    assert "mma.sync" in matmul_ptx
+    if out_features % 16 == 0 and in_features % 16 == 0:
+        assert "cp.async" in matmul_ptx
+    assert matmul_kernel.metadata.shared <= 99 * 1024
+    assert matmul_spills == 0
+    assert reduce_spills == 0
+
+
+def test_sm120_square_decode_compiles_splitk() -> None:
+    compiled = _compile_nvidia_splitk_kernels(
+        120,
+        rows=1,
+        out_features=5120,
+        in_features=5120,
+        num_sms=170,
+    )
+    assert set(compiled) == {"splitk_matmul", "splitk_reduce"}
+    matmul_kernel, matmul_spills = compiled["splitk_matmul"]
+    _reduce_kernel, reduce_spills = compiled["splitk_reduce"]
+    matmul_ptx = matmul_kernel.asm["ptx"]
+    assert "mma.sync" in matmul_ptx
+    assert "cp.async" in matmul_ptx
+    assert matmul_spills == 0
+    assert reduce_spills == 0
+
+
+@pytest.mark.parametrize(
+    ("architecture", "rows", "out_features", "in_features", "num_sms"),
+    [
+        (75, 1, 512, 16384, 128),
+        (120, 32, 512, 16384, 170),
+        (120, 64, 512, 16384, 170),
+        (120, 1, 512, 512, 170),
+        (120, 1, 2, 4_194_304, 170),
+    ],
+)
+def test_nvidia_non_splitk_workloads_skip_splitk_compilation(
+    architecture: int,
+    rows: int,
+    out_features: int,
+    in_features: int,
+    num_sms: int,
+) -> None:
+    assert (
+        _compile_nvidia_splitk_kernels(
+            architecture,
+            rows=rows,
+            out_features=out_features,
+            in_features=in_features,
+            num_sms=num_sms,
+        )
+        == {}
+    )

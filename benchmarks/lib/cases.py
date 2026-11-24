@@ -199,6 +199,8 @@ def diagnostic_cases() -> tuple[BenchmarkCase, ...]:
         LinearCase(id="linear-decode-m1-narrow", rows=1, in_features=5120, out_features=1024),
         LinearCase(id="linear-decode-m8-square", rows=8, in_features=5120, out_features=5120),
         LinearCase(id="linear-decode-m16-square", rows=16, in_features=5120, out_features=5120),
+        LinearCase(id="linear-decode-m1-down", rows=1, in_features=17408, out_features=5120),
+        LinearCase(id="linear-decode-m1-tall-narrow", rows=1, in_features=16384, out_features=1024),
         FFNCase(id="ffn-small-gelu", rows=64, width=256, intermediate=512),
         FFNCase(id="ffn-small-swiglu", rows=64, width=256, intermediate=512, activation="swiglu"),
         Conv3DCase(

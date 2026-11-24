@@ -1020,14 +1020,18 @@ def test_sm8x_schedules_match_base_schedule_with_tails(rows, k, n, dtype, paired
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _mma_v2_available(), reason="requires NVIDIA SM80 or newer")
-@pytest.mark.parametrize(("k", "n"), [(256, 1024), (256, 2048), (512, 96)])
+@pytest.mark.parametrize(("k", "n"), [(256, 1024), (256, 2048), (512, 96), (8192, 1024)])
 def test_sm8x_layer_compiles_at_most_three_gemms_across_row_counts(k, n):
     # Clear in-memory caches so earlier tests cannot hide a per-row-count compile.
-    kernels = (
+    unsplit_kernels = (
         int8_nvidia.kernels.dynamic_m_int8_matmul_kernel,
         int8_nvidia.kernels.gluon_async_copy._int8_matmul_kernel,
     )
-    for kernel in kernels:
+    splitk_kernels = (
+        int8_kernels.int8_matmul_splitk_kernel,
+        int8_kernels.int8_splitk_reduce_kernel,
+    )
+    for kernel in (*unsplit_kernels, *splitk_kernels):
         kernel.device_caches.clear()
     torch.manual_seed(k + n)
     weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
@@ -1043,8 +1047,25 @@ def test_sm8x_layer_compiles_at_most_three_gemms_across_row_counts(k, n):
             value, row_scale, weight, scale, None, torch.bfloat16, plan
         )
         tiles.add((plan.matmul_block_m, plan.matmul_block_n))
-    compiled = sum(len(cache[0]) for kernel in kernels for cache in kernel.device_caches.values())
-    assert len(tiles) == compiled == 3
+    unsplit_compiled = sum(
+        len(cache[0]) for kernel in unsplit_kernels for cache in kernel.device_caches.values()
+    )
+    splitk_compiled = sum(
+        len(cache[0]) for cache in int8_kernels.int8_matmul_splitk_kernel.device_caches.values()
+    )
+    reduce_compiled = sum(
+        len(cache[0]) for cache in int8_kernels.int8_splitk_reduce_kernel.device_caches.values()
+    )
+    assert len(tiles) == 3
+    assert unsplit_compiled <= 3
+    if k < 8192:
+        assert unsplit_compiled == 3
+        assert splitk_compiled == 0
+        assert reduce_compiled == 0
+    else:
+        assert splitk_compiled <= 1
+        assert reduce_compiled <= 1
+        assert unsplit_compiled + splitk_compiled <= 4
 
 
 @pytest.mark.gpu

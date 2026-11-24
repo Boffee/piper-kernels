@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 import triton
 import triton.language as tl
@@ -17,6 +15,7 @@ from piper_kernels import _input_activations as input_activations
 from piper_kernels._input_activations import triton as triton_input_activations
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.linear import _bias
+from piper_kernels.linear._splitk import device_sm_count, select_split_k
 from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
 from piper_kernels.weights.convrot._rotation import validate_group_size
 from piper_kernels.weights.nvfp4 import _layout
@@ -915,9 +914,10 @@ def w4a16_gemv_splitk_kernel(
     block_packed_k: tl.constexpr = block_k // 2
 
     total_k_tiles = tl.cdiv(input_features, block_k)
-    tiles_per_split = tl.cdiv(total_k_tiles, split_k)
-    k_tile_start = pid_k * tiles_per_split
-    k_tile_end = tl.minimum(total_k_tiles, k_tile_start + tiles_per_split)
+    base_tiles = total_k_tiles // split_k
+    remainder_tiles = total_k_tiles % split_k
+    k_tile_start = pid_k * base_tiles + tl.minimum(pid_k, remainder_tiles)
+    k_tile_end = k_tile_start + base_tiles + tl.where(pid_k < remainder_tiles, 1, 0)
 
     acc = (
         tl.zeros((block_n,), dtype=tl.float32)
@@ -1070,11 +1070,6 @@ def dequantize_nvfp4_swizzled_kernel(
     )
 
 
-@lru_cache(maxsize=16)
-def _device_sm_count(device_index: int) -> int:
-    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
-
-
 def _select_w4a16_split_k(
     num_sms: int,
     out_features: int,
@@ -1084,17 +1079,17 @@ def _select_w4a16_split_k(
     block_k: int,
     cta_multiplier: int = 8,
 ) -> int:
-    weight_bytes = out_features * (input_features // 2)
-    n_tiles = int(triton.cdiv(out_features, block_n))
-    k_tiles = int(triton.cdiv(input_features, block_k))
-    if n_tiles < 1 or k_tiles < 8 or weight_bytes < _W4A16_MIN_SPLITK_WEIGHT_BYTES:
-        return 1
-    target_ctas = max(1, cta_multiplier * num_sms)
-    if n_tiles >= target_ctas:
-        return 1
-    desired = triton.cdiv(target_ctas, n_tiles)
-    max_for_k = max(1, k_tiles // 4)
-    return int(min(desired, max_for_k, _W4A16_MAX_SPLIT_K))
+    return select_split_k(
+        num_sms,
+        output_tiles=int(triton.cdiv(out_features, block_n)),
+        k_tiles=int(triton.cdiv(input_features, block_k)),
+        weight_bytes=out_features * (input_features // 2),
+        min_weight_bytes=_W4A16_MIN_SPLITK_WEIGHT_BYTES,
+        max_split_k=_W4A16_MAX_SPLIT_K,
+        cta_multiplier=cta_multiplier,
+        min_k_tiles=8,
+        min_tiles_per_split=4,
+    )
 
 
 _TRITON_FLOAT_POINTER_TYPES = {
@@ -1154,9 +1149,8 @@ def _select_w4a16_gemv_config(
     out_features: int,
     input_features: int,
 ) -> tuple[int, int, int, int, bool, int]:
-    device_index = torch.cuda.current_device() if device.index is None else int(device.index)
     return _select_w4a16_gemv_config_for_sms(
-        _device_sm_count(device_index),
+        device_sm_count(device),
         rows,
         input_dtype,
         out_features,

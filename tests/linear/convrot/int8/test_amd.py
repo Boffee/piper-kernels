@@ -115,31 +115,40 @@ def test_amd_matmul_selects_wide_k_for_aligned_strides(
     assert policy.matmul_group_m(plan) == 8
 
 
-@pytest.mark.parametrize(
-    ("architecture", "rows", "outputs", "width", "expected"),
-    [
-        ("gfx1201", 1, 5376, 5376, (32, 128, 64, 4)),
-        ("gfx1201", 32, 14336, 5376, (32, 128, 64, 4)),
-        ("gfx1201", 33, 5376, 5376, (64, 128, 64, 4)),
-        ("gfx1201", 64, 14336, 5376, (64, 128, 64, 4)),
-        ("gfx1201", 65, 5376, 5376, (128, 256, 64, 8)),
-        ("gfx1201", 128, 5376, 5376, (128, 256, 64, 8)),
-        ("gfx1201", 128, 8192, 8192, (128, 256, 64, 8)),
-        ("gfx1201", 128, 16384, 8192, (128, 128, 128, 8)),
-        ("gfx1201", 129, 5376, 5376, (128, 256, 64, 8)),
-        ("gfx1200", 32, 5376, 5376, (128, 256, 64, 8)),
-    ],
-)
-def test_gfx1201_short_batch_matmul_schedules(architecture, rows, outputs, width, expected):
-    plan = policy.select_execution_plan(
-        AcceleratorTarget("hip", architecture), in_features=width, rows=rows, out_features=outputs
-    )
+def test_gfx1201_short_batch_matmul_schedules():
+    gfx1201 = AcceleratorTarget("hip", "gfx1201")
+    gfx1200 = AcceleratorTarget("hip", "gfx1200")
+    short_plans = {
+        rows: policy.select_execution_plan(gfx1201, in_features=5376, rows=rows, out_features=14336)
+        for rows in (1, 16, 17, 32, 33, 64)
+    }
+    for rows, plan in short_plans.items():
+        # Every short batch up to 64 rows stays on one ungrouped M tile so weights stream once.
+        assert plan.matmul_block_m >= rows
+        assert policy.matmul_group_m(plan) == 0
+
+    wide_plan = policy.select_execution_plan(gfx1201, in_features=5376, rows=65, out_features=14336)
+    assert wide_plan.matmul_block_m == 128
+    assert policy.matmul_group_m(wide_plan) == 8
     assert (
-        plan.matmul_block_m,
-        plan.matmul_block_n,
-        plan.matmul_block_k,
-        plan.matmul_num_warps,
-    ) == expected
+        short_plans[16].matmul_block_m
+        < short_plans[17].matmul_block_m
+        == short_plans[32].matmul_block_m
+        < short_plans[33].matmul_block_m
+        == short_plans[64].matmul_block_m
+        < wide_plan.matmul_block_m
+    )
+
+    for rows, outputs in ((128, 5376), (128, 8192), (129, 5376)):
+        plan = policy.select_execution_plan(
+            gfx1201, in_features=8192, rows=rows, out_features=outputs
+        )
+        assert plan.matmul_block_m == 128
+        assert policy.matmul_group_m(plan) == 8
+
+    assert policy.select_execution_plan(
+        gfx1200, in_features=5376, rows=32, out_features=5376
+    ) == policy.select_execution_plan(gfx1200, in_features=5376)
 
 
 def test_optional_amd_compiler_option_compatibility(monkeypatch):

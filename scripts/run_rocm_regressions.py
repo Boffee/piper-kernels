@@ -22,6 +22,8 @@ _SUITE = (
     "tests/specializations/minimax_h3_vae/test_conv3d_compile.py",
     "tests/linear/convrot/int8/test_amd.py",
     "tests/linear/convrot/int8/test_amd_residual.py",
+    "tests/linear/convrot/int8/test_paired_projection.py",
+    "tests/linear/convrot/int8/test_splitk.py",
     "tests/linear/convrot/int8/test_static_input.py",
     "tests/linear/nvfp4/test_w4a16.py",
     "tests/fusions/ffn",

@@ -39,6 +39,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Accelerated small-batch (`1..16` rows) `ConvRotInt8Tensor` linear projections via
+  deterministic INT32 Split-K execution on supported NVIDIA SM8x/SM120 and AMD ROCm
+  targets, paired with single-M-tile RDNA4 (`gfx1201`) short-batch schedules that
+  preserve `17..32`-row performance (up to `6.5×` faster on tall-narrow `M=1`
+  prepared decode projections on RX 9070 XT; NVIDIA `sm80`/`sm86`/`sm89`/`sm120` and
+  AMD `gfx942`/`gfx1100`/`gfx1151`/`gfx1200` validated via offline compilation only).
 - `piper_kernels.trellis.TrellisStorage.from_hp` now pairs its RMS block-scale seed with
   peak-anchored (`amax`-derived) candidates and unclamped least-squares float scale
   refitting, improving SQNR on outlier-bearing and heterogeneous-variance rows. The

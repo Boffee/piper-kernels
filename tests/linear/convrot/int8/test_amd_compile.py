@@ -341,3 +341,195 @@ def test_rdna4_residual_matmul_compiles_with_bounded_spills(
         assert match is not None
         spills = int(match.group(1))
         assert spills == 0 if (block_n == 128 or not reusable) else spills <= 16
+
+
+def _compile_amd_splitk_kernels(
+    architecture: str,
+    warp_size: int,
+    *,
+    rows: int,
+    out_features: int,
+    in_features: int,
+    output_ty: str = "*bf16",
+    bias_ty: str | None = None,
+    paired: bool = False,
+    second_bias_ty: str | None = None,
+    num_sms: int = 64,
+) -> dict[str, triton.compiler.CompiledKernel]:
+    target = AcceleratorTarget("hip", architecture)
+    plan = policy.select_execution_plan(
+        target, in_features=in_features, rows=rows, out_features=out_features
+    )
+    group_m = policy.matmul_group_m(plan)
+    split_k = kernels.select_int8_split_k(
+        num_sms,
+        rows=rows,
+        out_features=out_features,
+        in_features=in_features,
+        block_m=plan.matmul_block_m,
+        block_n=plan.matmul_block_n,
+        block_k=plan.matmul_block_k,
+        paired=paired,
+        group_m=group_m,
+    )
+    if split_k <= 1:
+        return {}
+    accumulator_seed = kernels.splitk_accumulator_seed(
+        target,
+        rows=rows,
+        out_features=out_features,
+        in_features=in_features,
+        block_m=plan.matmul_block_m,
+        block_n=plan.matmul_block_n,
+        block_k=plan.matmul_block_k,
+        paired=paired,
+        split_k=split_k,
+    )
+    hip_target = GPUTarget("hip", architecture, warp_size)
+    matmul_compiled = triton.compile(
+        ASTSource(
+            kernels.int8_matmul_splitk_kernel,
+            {
+                "input_ptr": "*i8",
+                "weight_ptr": "*i8",
+                "second_weight_ptr": "*i8",
+                "partial_ptr": "*i32",
+                "m": "i32",
+                "n": "i32",
+                "k": "i32",
+                "split_k": "i32",
+            },
+            constexprs={
+                "block_m": plan.matmul_block_m,
+                "block_n": plan.matmul_block_n,
+                "block_k": plan.matmul_block_k,
+                "paired": paired,
+                "aligned_nk": (
+                    out_features % plan.matmul_block_n == 0
+                    and in_features % plan.matmul_block_k == 0
+                ),
+                "accumulator_seed": accumulator_seed,
+            },
+        ),
+        target=hip_target,
+        options={
+            "num_warps": plan.matmul_num_warps,
+            "num_stages": plan.matmul_num_stages,
+            **amd._amd_matmul_compiler_options(target),
+        },
+    )
+    second_has_bias = paired and second_bias_ty is not None
+    reduce_compiled = triton.compile(
+        ASTSource(
+            kernels.int8_splitk_reduce_kernel,
+            {
+                "partial_ptr": "*i32",
+                "input_scale_ptr": "*fp32",
+                "weight_scale_ptr": "*fp32",
+                "bias_ptr": output_ty if bias_ty is None else bias_ty,
+                "second_scale_ptr": "*fp32",
+                "second_bias_ptr": second_bias_ty if second_has_bias else output_ty,
+                "output_ptr": output_ty,
+                "m": "i32",
+                "n": "i32",
+                "split_k": "i32",
+                "output_row_stride": "i32",
+            },
+            constexprs={
+                "block_n": kernels.INT8_SPLITK_REDUCE_BLOCK_N,
+                "has_bias": bias_ty is not None,
+                "paired": paired,
+                "second_has_bias": second_has_bias,
+                "explicit_bias_fma": False,
+            },
+        ),
+        target=hip_target,
+        options={"num_warps": 4},
+    )
+    return {"splitk_matmul": matmul_compiled, "splitk_reduce": reduce_compiled}
+
+
+@pytest.mark.parametrize(
+    ("architecture", "warp_size"),
+    [("gfx942", 64), ("gfx1100", 32), ("gfx1151", 32), ("gfx1201", 32)],
+)
+@pytest.mark.parametrize("paired", [False, True])
+@pytest.mark.parametrize(
+    ("rows", "out_features", "in_features", "bias_ty", "second_bias_ty"),
+    [
+        (1, 512, 16384, None, None),
+        (1, 515, 16392, "*fp16", "*fp32"),
+    ],
+)
+def test_amd_splitk_kernels_compile_to_matrix_instructions(
+    architecture: str,
+    warp_size: int,
+    paired: bool,
+    rows: int,
+    out_features: int,
+    in_features: int,
+    bias_ty: str | None,
+    second_bias_ty: str | None,
+) -> None:
+    compiled = _compile_amd_splitk_kernels(
+        architecture,
+        warp_size,
+        rows=rows,
+        out_features=out_features,
+        in_features=in_features,
+        bias_ty=bias_ty,
+        paired=paired,
+        second_bias_ty=second_bias_ty if paired else None,
+        num_sms=64,
+    )
+    assert set(compiled) == {"splitk_matmul", "splitk_reduce"}
+    expected_isa = "v_mfma_i32" if architecture == "gfx942" else "v_wmma_i32"
+    amdgcn = compiled["splitk_matmul"].asm["amdgcn"]
+    assert expected_isa in amdgcn
+    if architecture == "gfx1201" and rocm_fences_only_lds():
+        assert "global_inv" not in amdgcn
+
+
+def test_gfx1201_seeded_splitk_kernel_compiles() -> None:
+    compiled = _compile_amd_splitk_kernels(
+        "gfx1201",
+        32,
+        rows=1,
+        out_features=2048,
+        in_features=16384,
+        num_sms=64,
+    )
+    assert set(compiled) == {"splitk_matmul", "splitk_reduce"}
+    assert "v_wmma_i32" in compiled["splitk_matmul"].asm["amdgcn"]
+
+
+@pytest.mark.parametrize(
+    ("architecture", "warp_size", "rows", "out_features", "in_features", "num_sms"),
+    [
+        ("gfx1200", 32, 1, 512, 16384, 64),
+        ("gfx1201", 32, 1, 17408, 5120, 32),
+        ("gfx1201", 32, 17, 2048, 4096, 32),
+        ("gfx1201", 32, 32, 512, 16384, 32),
+        ("gfx1201", 32, 64, 512, 16384, 32),
+        ("gfx1201", 32, 1, 512, 512, 32),
+    ],
+)
+def test_amd_non_splitk_workloads_skip_splitk_compilation(
+    architecture: str,
+    warp_size: int,
+    rows: int,
+    out_features: int,
+    in_features: int,
+    num_sms: int,
+) -> None:
+    assert (
+        _compile_amd_splitk_kernels(
+            architecture,
+            warp_size,
+            rows=rows,
+            out_features=out_features,
+            in_features=in_features,
+            num_sms=num_sms,
+        )
+        == {}
+    )
