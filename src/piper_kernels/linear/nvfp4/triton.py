@@ -1,7 +1,7 @@
 """Triton kernels for NVFP4 activation preparation and projection."""
 
-# Triton's JIT launcher accepts compile-time options outside its Python signature.
-# pyright: reportCallIssue=false, reportIndexIssue=false
+# Triton's JIT launcher and constexpr options are not fully represented in its typing surface.
+# pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
 
 from __future__ import annotations
 
@@ -812,6 +812,14 @@ def _expand_nvfp4_scales(
 
 
 @triton.jit
+def _split_global_scale(global_scale):
+    apply_early = tl.abs(global_scale) < 1.0
+    pre_scale = tl.where(apply_early, global_scale, 1.0)
+    post_scale = tl.where(apply_early, 1.0, global_scale)
+    return pre_scale, post_scale
+
+
+@triton.jit
 def _accumulate_scaled_row(
     x_vec,
     w_even,
@@ -825,13 +833,14 @@ def _accumulate_scaled_row(
     x_even, x_odd = tl.split(tl.reshape(x_vec.to(tl.float32), (block_packed_k, 2)))
     prod = w_even * x_even[None, :] + w_odd * x_odd[None, :]
     grouped = tl.reshape(prod, (block_n, block_scale_k, _NVFP4_QDATA_BLOCK_SIZE_TL))
-    return tl.sum(tl.sum(grouped, axis=2) * scales, axis=1)
+    block_sum = tl.sum(grouped, axis=2)
+    return tl.sum(tl.where(scales == 0.0, 0.0, block_sum * scales), axis=1)
 
 
 @triton.jit
 def _store_w4a16_result(
     acc,
-    weight_per_tensor_scale_ptr,
+    epilogue_scale,
     bias_ptr,
     output_ptr,
     pid_k,
@@ -855,7 +864,7 @@ def _store_w4a16_result(
             )
             return
         if has_weight_per_tensor_scale:
-            acc *= tl.load(weight_per_tensor_scale_ptr).to(tl.float32)
+            acc *= epilogue_scale
         if has_bias:
             acc += tl.load(bias_ptr + n_offs_i64, mask=n_valid, other=0.0).to(tl.float32)
         tl.store(output_ptr + n_offs_i64, acc, mask=n_valid)
@@ -867,7 +876,7 @@ def _store_w4a16_result(
         tl.store(output_ptr + partial_base + n_offs_i64[None, :], acc, mask=row_valid)
         return
     if has_weight_per_tensor_scale:
-        acc *= tl.load(weight_per_tensor_scale_ptr).to(tl.float32)
+        acc *= epilogue_scale
     if has_bias:
         bias_vec = tl.load(bias_ptr + n_offs_i64, mask=n_valid, other=0.0).to(tl.float32)
         acc += bias_vec[None, :]
@@ -912,6 +921,16 @@ def w4a16_gemv_splitk_kernel(
     packed_k = input_features // 2
     scale_k = input_features // _NVFP4_BLOCK_SIZE_TL
     block_packed_k: tl.constexpr = block_k // 2
+    # Keep FP16 tl.dot unscaled (cannot overflow FP32, would underflow FP16); BF16 pre-scales
+    # against FP32 overflow, trading away deep subnormal |x * pre_scale| < 2^-133 products.
+    pre_scale_in_gemv: tl.constexpr = tl.constexpr(
+        has_weight_per_tensor_scale and not (use_dot and input_ptr.dtype.element_ty == tl.float16)
+    )
+    global_scale = (
+        tl.load(weight_per_tensor_scale_ptr).to(tl.float32) if has_weight_per_tensor_scale else 1.0
+    )
+    pre_scale, post_scale = _split_global_scale(global_scale)
+    epilogue_scale = post_scale if pre_scale_in_gemv else global_scale
 
     total_k_tiles = tl.cdiv(input_features, block_k)
     base_tiles = total_k_tiles // split_k
@@ -942,7 +961,9 @@ def w4a16_gemv_splitk_kernel(
         k_elem_offs = k_base + tl.arange(0, block_k)
         k_elem_valid = k_elem_offs < input_features
         if block_m == 1:
-            x_vec = tl.load(input_ptr + k_elem_offs, mask=k_elem_valid, other=0.0)
+            x_vec = tl.load(input_ptr + k_elem_offs, mask=k_elem_valid, other=0.0).to(tl.float32)
+            if pre_scale_in_gemv:
+                x_vec = x_vec * pre_scale
             acc += _accumulate_scaled_row(x_vec, w_even, w_odd, scales, block_n, block_k)
         elif use_dot:
             scales_expanded = _expand_nvfp4_scales(scales, block_n, block_k)
@@ -951,6 +972,8 @@ def w4a16_gemv_splitk_kernel(
                 mask=(m_offs[:, None] < rows) & k_elem_valid[None, :],
                 other=0.0,
             )
+            if pre_scale_in_gemv:
+                x_tile = (x_tile.to(tl.float32) * pre_scale).to(x_tile.dtype)
             x_even, x_odd = tl.split(tl.reshape(x_tile, (block_m, block_packed_k, 2)))
             w_e = (w_even * scales_expanded).to(x_tile.dtype)
             w_o = (w_odd * scales_expanded).to(x_tile.dtype)
@@ -964,13 +987,15 @@ def w4a16_gemv_splitk_kernel(
                         input_ptr + tl.full((), row_idx, tl.int64) * input_features + k_elem_offs,
                         mask=k_elem_valid,
                         other=0.0,
-                    )
+                    ).to(tl.float32)
+                    if pre_scale_in_gemv:
+                        x_vec = x_vec * pre_scale
                     row_acc = _accumulate_scaled_row(x_vec, w_even, w_odd, scales, block_n, block_k)
                     acc += tl.where((m_offs == row_idx)[:, None], row_acc[None, :], 0.0)
 
     _store_w4a16_result(
         acc,
-        weight_per_tensor_scale_ptr,
+        epilogue_scale,
         bias_ptr,
         output_ptr,
         pid_k,
@@ -999,6 +1024,7 @@ def w4a16_splitk_reduce_kernel(
     block_n: tl.constexpr,
     has_weight_per_tensor_scale: tl.constexpr,
     has_bias: tl.constexpr,
+    post_scale_only: tl.constexpr = False,
 ):
     """Deterministically reduce Split-K partials in fixed order and apply affine epilogue."""
     pid_n = tl.program_id(0)
@@ -1015,7 +1041,12 @@ def w4a16_splitk_reduce_kernel(
         ptr += split_stride
 
     if has_weight_per_tensor_scale:
-        acc *= tl.load(weight_per_tensor_scale_ptr).to(tl.float32)
+        global_scale = tl.load(weight_per_tensor_scale_ptr).to(tl.float32)
+        if post_scale_only:
+            _, post_scale = _split_global_scale(global_scale)
+            acc *= post_scale
+        else:
+            acc *= global_scale
     if has_bias:
         acc += tl.load(bias_ptr + n_offs_i64, mask=n_valid, other=0.0).to(tl.float32)
     tl.store(output_ptr + row * out_features + n_offs_i64, acc, mask=n_valid)
@@ -1165,6 +1196,7 @@ def _compile_w4a16_reduce_kernel(
     out_ty: str,
     has_weight_per_tensor_scale: bool,
     has_bias: bool,
+    post_scale_only: bool = False,
 ) -> triton.compiler.CompiledKernel:
     return triton.compile(
         ASTSource(
@@ -1182,6 +1214,7 @@ def _compile_w4a16_reduce_kernel(
                 "block_n": _W4A16_REDUCE_BLOCK_N,
                 "has_weight_per_tensor_scale": has_weight_per_tensor_scale,
                 "has_bias": has_bias,
+                "post_scale_only": post_scale_only,
             },
         ),
         target=target,
@@ -1249,6 +1282,7 @@ def compile_w4a16_kernels(
                 out_ty=out_ty,
                 has_weight_per_tensor_scale=has_weight_per_tensor_scale,
                 has_bias=has_bias,
+                post_scale_only=active_dtype is not torch.float16,
             )
         return compiled_large
 
@@ -1295,6 +1329,7 @@ def compile_w4a16_kernels(
             out_ty=out_ty,
             has_weight_per_tensor_scale=has_weight_per_tensor_scale,
             has_bias=has_bias,
+            post_scale_only=not (use_dot and active_dtype is torch.float16),
         )
     return compiled
 
@@ -1378,6 +1413,15 @@ def _linear_w4a16(
         if weight_per_tensor_scale is None and bias is None and active_2d.dtype is input.dtype:
             return torch.mm(active_2d, dequant_weight.T).reshape(*input.shape[:-1], out_features)
         output = torch.empty((rows, out_features), device=input.device, dtype=input.dtype)
+        post_scale_only = (
+            weight_per_tensor_scale is not None and active_2d.dtype is not torch.float16
+        )
+        if post_scale_only:
+            assert weight_per_tensor_scale is not None
+            gs_f32 = weight_per_tensor_scale.to(device=active_2d.device, dtype=torch.float32)
+            pre_scale = torch.where(gs_f32.abs() < 1.0, gs_f32, torch.ones_like(gs_f32))
+        else:
+            pre_scale = None
         chunk_rows = min(
             rows,
             max(1, _W4A16_FP32_WORKSPACE_BYTES // (out_features * 4)),
@@ -1387,6 +1431,8 @@ def _linear_w4a16(
             for start in range(0, rows, chunk_rows):
                 end = min(start + chunk_rows, rows)
                 active_chunk = active_2d[start:end]
+                if pre_scale is not None:
+                    active_chunk = (active_chunk.float() * pre_scale).to(active_2d.dtype)
                 partial = (
                     torch.mm(active_chunk, dequant_weight.T)
                     if active_2d.dtype is torch.float32
@@ -1405,6 +1451,7 @@ def _linear_w4a16(
                     block_n=_W4A16_REDUCE_BLOCK_N,
                     has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
                     has_bias=bias is not None,
+                    post_scale_only=post_scale_only,
                     num_warps=4,
                 )
         return output.reshape(*input.shape[:-1], out_features)
@@ -1461,6 +1508,7 @@ def _linear_w4a16(
                 block_n=_W4A16_REDUCE_BLOCK_N,
                 has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
                 has_bias=bias is not None,
+                post_scale_only=not (use_dot and active_2d.dtype is torch.float16),
                 num_warps=4,
             )
     return output.reshape(*input.shape[:-1], out_features)

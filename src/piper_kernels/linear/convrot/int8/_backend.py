@@ -232,7 +232,11 @@ class LinearBackend:
         else:
             assert _convrot_triton is not None
             transformed_input = apply_input_activation(input_2d, activation_fn)
-            rotated = torch.empty_like(transformed_input)
+            rotated = torch.empty(
+                transformed_input.shape,
+                device=transformed_input.device,
+                dtype=torch.float32,
+            )
             _convrot_triton.rotate_input(
                 transformed_input,
                 rotated,

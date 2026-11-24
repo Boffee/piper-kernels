@@ -1014,3 +1014,54 @@ def test_gpu_w4a16_torch_compile_fullgraph(group_size: int, rows: int) -> None:
         eager = projection(x)
         compiled = torch.compile(projection, fullgraph=True, options=compile_options())(x)
     assert torch.equal(compiled, eager)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.parametrize("rows", [1, 8, 17])
+def test_gpu_w4a16_preserves_zero_and_tiny_global_scales(rows: int) -> None:
+    q = torch.full((16, 8), 0x77, dtype=torch.uint8, device="cuda")
+    s_ones = torch.ones((32, 16), dtype=torch.float8_e4m3fn, device="cuda")
+    x_huge = torch.full((rows, 16), 1e37, device="cuda", dtype=torch.float32)
+
+    w_zero = PiperNVFP4Tensor(
+        q, s_ones, 16, torch.float32, torch.tensor(0.0, device="cuda"), None, True, False, None
+    )
+    assert torch.equal(F.linear(x_huge, w_zero), torch.zeros(rows, 16, device="cuda"))
+
+    gs_tiny = torch.tensor(1e-30, device="cuda", dtype=torch.float32)
+    w_tiny = PiperNVFP4Tensor(q, s_ones, 16, torch.float32, gs_tiny, None, True, False, None)
+    actual_tiny = F.linear(x_huge, w_tiny)
+    expected_tiny = nvfp4_reference.linear_w4a16(
+        x_huge.cpu(), q.cpu(), s_ones.cpu(), gs_tiny.cpu(), None
+    ).cuda()
+    assert torch.isfinite(actual_tiny).all()
+    torch.testing.assert_close(actual_tiny, expected_tiny, rtol=1e-4, atol=1e-4)
+
+    # Scaling x rather than block scales preserves representable tiny weights (3 * 2^-149).
+    s_rep = torch.full((32, 16), 2.0**-9, device="cuda", dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
+    gs_rep = torch.tensor(2.0**-141, device="cuda", dtype=torch.float32)
+    w_rep = PiperNVFP4Tensor(q, s_rep, 16, torch.float32, gs_rep, None, True, False, None)
+    x_rep = torch.full((rows, 16), 3e38, device="cuda", dtype=torch.float32)
+    actual_rep = F.linear(x_rep, w_rep)
+    expected_rep = nvfp4_reference.linear_w4a16(
+        x_rep.cpu(), q.cpu(), s_rep.cpu(), gs_rep.cpu(), None
+    ).cuda()
+    assert float(actual_rep.abs().min()) > 0.0
+    torch.testing.assert_close(actual_rep, expected_rep, rtol=1e-4, atol=1e-6)
+
+    if rows >= 8:
+        gs_fp16 = torch.tensor(1e-8, device="cuda", dtype=torch.float32)
+        s_max = torch.full((32, 16), 448.0, device="cuda", dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        )
+        w_fp16 = PiperNVFP4Tensor(q, s_max, 16, torch.float16, gs_fp16, None, True, False, None)
+        x_fp16 = torch.ones((rows, 16), device="cuda", dtype=torch.float16)
+        actual_fp16 = F.linear(x_fp16, w_fp16)
+        expected_fp16 = nvfp4_reference.linear_w4a16(
+            x_fp16.cpu(), q.cpu(), s_max.cpu(), gs_fp16.cpu(), None
+        ).cuda()
+        assert float(actual_fp16.abs().min()) > 0.0
+        torch.testing.assert_close(actual_fp16, expected_fp16, rtol=1e-2, atol=1e-5)

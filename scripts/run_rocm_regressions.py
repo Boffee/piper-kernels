@@ -26,6 +26,7 @@ _SUITE = (
     "tests/linear/convrot/int8/test_splitk.py",
     "tests/linear/convrot/int8/test_static_input.py",
     "tests/linear/nvfp4/test_w4a16.py",
+    "tests/moe/test_moe.py",
     "tests/fusions/ffn",
     "tests/fusions/convrot_int8_sparse_piper/test_static.py",
     "tests/attention/test_gqa.py::test_sparse_gqa_matches_repeated_kv",

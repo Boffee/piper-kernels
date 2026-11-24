@@ -17,7 +17,7 @@ All package paths below are under [`src/piper_kernels`](../src/piper_kernels):
 |---|---|
 | `attention/` | Dense, sparse, and SageAttention2++ APIs, references, and backends |
 | `weights/` | Weight formats, quantization math, packed storage, tensor subclasses, updates, sharding |
-| `linear/`, `conv3d/` | Operators consuming weight formats, references, and backend dispatch |
+| `linear/`, `conv3d/`, `moe/` | Operators consuming weight formats, references, and backend dispatch |
 | `fusions/` | Composed operations and compiler rewrites sharing preparation or intermediates |
 | `_distributed/`, `_residual/`, `_input_activations/`, `_inductor_options.py` | Shared private contracts and compiler options |
 | `_triton/`, `attention/kernels/` | Triton target/runtime facts, compiler workarounds, shared GPU primitives |

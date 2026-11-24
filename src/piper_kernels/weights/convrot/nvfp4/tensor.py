@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
 import torch
+from torch._guards import detect_fake_mode
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
 from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
@@ -110,9 +111,18 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         """
         if group_size is None:
             raise TypeError("ConvRot NVFP4 quantization requires a group size")
+        rotated = rotate_groups(hp_tensor.detach().float(), group_size)
+        if (
+            not compute_per_tensor_scale
+            and rotated.device.type != "meta"
+            and not torch.compiler.is_compiling()
+            and detect_fake_mode() is None
+            and not bool(torch.isfinite(rotated).all())
+        ):
+            raise ValueError("ConvRot NVFP4 rotation produced non-finite weights")
         return cls._from_torchao_storage(
             _quantize_hp(
-                rotate_groups(hp_tensor.detach().float(), group_size),
+                rotated,
                 block_size=block_size,
                 per_tensor_scale=per_tensor_scale,
                 compute_per_tensor_scale=compute_per_tensor_scale,

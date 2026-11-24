@@ -159,9 +159,6 @@ def test_generic_preparation_zero_and_tiny_scales(device, magnitude, dtype):
     value[:, 0] = magnitude
     qdata, scale = _generic.prepare_input(value, 256)
     rotated = rotate_groups(value.float(), 256)
-    if device == "cuda":
-        # The generic GPU path materializes a compact rotation workspace.
-        rotated = rotated.to(dtype)
     expected_qdata, expected_scale = int8_quantization.dynamic_quantize_rows(rotated)
     expected_scale = expected_scale.squeeze(-1)
     assert torch.equal(qdata, expected_qdata)

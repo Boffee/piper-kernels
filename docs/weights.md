@@ -169,6 +169,75 @@ assert vectors.shape == (1, 3, 256)
 `padding_idx` affects only gradients, so it does not change a lookup. `max_norm`
 renormalization and transposed weights raise `NotImplementedError`.
 
+## Run a quantized MoE FFN
+
+`piper_kernels.moe` provides offload-first single-token (`M = 1`) decode execution across
+expert-major quantized slabs stored as `[num_slots, ...]`: NVFP4 W4A16 (`"nvfp4_w4a16"`),
+ConvRot NVFP4 W4A16 (`"convrot_nvfp4_w4a16"`), and ConvRot INT8 W8A8 (`"convrot_int8"`). Each
+contiguous slab holds `up_gate_qdata`, `up_gate_scale`, `down_qdata`, `down_scale`, and optional
+per-slot `float32` NVFP4 global scales (`[num_slots]`, `[num_slots, 1]`, or
+`[num_slots, 1, 1]`), so runtimes can wrap resident slabs or staging buffers zero-copy with
+`MoEWeights.from_quantized`.
+
+NVFP4 slabs use packed `uint8` nibbles and `SWIZZLE_32_4_4` `float8_e4m3fn` 16-value block scales
+on widths divisible by 16 (and `group_size` for ConvRot). ConvRot INT8 slabs use `int8` values,
+`float32` per-row scales (`[num_slots, out]` or `[num_slots, out, 1]`), `group_size` in
+`{16, 64, 256}`, and widths up to `131_071` so INT32 accumulators never wrap; GPU INT8 kernels
+target NVIDIA SM80+ and supported AMD ROCm GPUs, while earlier CUDA targets and CPU run the
+portable reference.
+
+```python
+import torch
+from piper_kernels.moe import MoEWeights, moe_ffn, prepare_moe_input
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+num_slots, hidden_size, intermediate_size = 4, 128, 128
+up_gate_hp = torch.randn(
+    num_slots, 2 * intermediate_size, hidden_size, device=device, dtype=torch.bfloat16
+)
+down_hp = torch.randn(
+    num_slots, hidden_size, intermediate_size, device=device, dtype=torch.bfloat16
+)
+hidden_states = torch.randn(1, hidden_size, device=device, dtype=torch.bfloat16)
+topk_ids = torch.tensor([[0, 2, 5]], device=device, dtype=torch.int64)
+topk_weights = torch.tensor([[0.5, 0.3, 0.2]], device=device, dtype=torch.bfloat16)
+expert_to_slot = torch.tensor([2, -1, 0, -1, 3, 1], device=device, dtype=torch.int64)
+residual_out = torch.zeros_like(hidden_states)
+
+weights = MoEWeights.from_hp(
+    up_gate_hp,  # [num_slots, 2 * I, H] ordered [gate | up] when gate_first=True
+    down_hp,  # [num_slots, H, I]
+    weight_format="nvfp4_w4a16",
+    activation_fn="swiglu",
+    gate_first=True,
+)
+with torch.inference_mode():
+    prepared = prepare_moe_input(hidden_states, weights)  # optional reuse across waves
+    output = moe_ffn(
+        hidden_states,
+        weights,
+        topk_ids,
+        topk_weights,
+        expert_to_slot=expert_to_slot,  # negative or out-of-range slots skip cleanly on-device
+        out=residual_out,
+        accumulate=True,  # add weighted slot hits into caller-owned out; all-miss leaves out intact
+        prepared_input=prepared,
+    )
+assert output is residual_out and output.shape == (1, hidden_size)
+assert torch.isfinite(output).all()
+```
+
+Set `gate_first=False` when checkpoints pack `[up | gate]` halves (matching Piper's linear SwiGLU
+convention), and pass `activation_fn="gelu_tanh"` for `tanh`-GELU experts without a paired gate
+projection. `prepare_moe_input` returns an independent snapshot safe to reuse across waves
+even when accumulating into `out=input` (storing FP32 rotated activations for
+`"convrot_nvfp4_w4a16"` across FP16, BF16, and FP32 inputs). Calling `moe_ffn`
+without `out` returns a freshly allocated contiguous tensor; multiple rows
+(`M > 1`) are supported by row-looping. Caller-supplied `out` must match input
+shape/dtype/device, have `stride(-1) == 1` with disjoint rows (`out.view(rows, H).stride(0) >= H`
+when `rows > 1`), must not use negated/conjugated views or alias weight storage, and must be
+writable in the active inference/autograd mode (`out is input` is supported zero-copy at `M = 1`).
+
 ## Run a Conv3D
 
 ConvRot INT8 represents logical `[out, in, 3, 3, 3]` weights usable with `F.conv3d`

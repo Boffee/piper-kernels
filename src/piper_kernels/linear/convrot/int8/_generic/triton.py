@@ -17,8 +17,8 @@ def _reciprocal_scale(value: torch.Tensor) -> bool:
 def prepare_input(input, group_size, input_scale=None, *, out):  # noqa: A002
     """Use separate rotation and row quantization to bound fused live storage."""
     width = input.shape[-1]
-    value = input.reshape(-1, width)
-    rotated = torch.empty_like(value)
+    value = input.reshape(-1, width).contiguous()
+    rotated = torch.empty(value.shape, device=value.device, dtype=torch.float32)
     rotate_input(value, rotated, group_size, num_warps=4)
     with device_context(input.device):
         quantize_rows_kernel[(value.shape[0],)](
