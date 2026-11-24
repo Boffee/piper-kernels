@@ -4,7 +4,7 @@ import itertools
 
 import pytest
 
-from piper_kernels.trellis._layout import TrellisLayout
+from piper_kernels.trellis import TrellisLayout, resolve_block_size, resolve_layout
 
 LAYOUTS = [
     TrellisLayout(256, 768),
@@ -66,3 +66,31 @@ def test_layout_rejects_unsupported_rates(arguments: tuple[int, int], message: s
 def test_layout_requires_integers() -> None:
     with pytest.raises(TypeError, match="block_size must be an integer"):
         TrellisLayout(True, 1024)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="bytes_per_block must be an integer"):
+        TrellisLayout.from_storage(256, True)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="bytes_per_block must be an integer"):
+        TrellisLayout.from_storage(256, 143.0)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad_width", [False, 256.0])
+def test_resolve_block_size_rejects_non_integers(bad_width: object) -> None:
+    with pytest.raises(TypeError, match="in_features must be an integer"):
+        resolve_block_size(bad_width)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad_width", [0, -256])
+def test_resolve_block_size_rejects_non_positive_widths(bad_width: int) -> None:
+    with pytest.raises(ValueError, match="positive multiple of 16 wide"):
+        resolve_block_size(bad_width)
+
+
+@pytest.mark.parametrize("bad_rate", [False, "4.5"])
+def test_resolve_layout_rejects_non_real_rates(bad_rate: object) -> None:
+    with pytest.raises(TypeError, match="bits_per_weight must be a real number"):
+        resolve_layout(256, bad_rate)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad_rate", [float("inf"), float("nan")])
+def test_resolve_layout_rejects_non_finite_rates(bad_rate: float) -> None:
+    with pytest.raises(ValueError, match="bits_per_weight must be finite"):
+        resolve_layout(256, bad_rate)

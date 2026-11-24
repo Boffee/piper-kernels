@@ -12,6 +12,7 @@ from piper_kernels.trellis.triton import decode_int8_kernel
 _HIP = pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only")
 
 
+@pytest.mark.parametrize("variable_rows", [False, True], ids=["uniform", "variable_rows"])
 @pytest.mark.parametrize(
     "target",
     [
@@ -21,23 +22,33 @@ _HIP = pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux
     ],
     ids=lambda target: f"{target.backend}-{target.arch}",
 )
-def test_decode_kernel_compiles(target: GPUTarget) -> None:
+def test_decode_kernel_compiles(target: GPUTarget, variable_rows: bool) -> None:
+    signature = {
+        "bitstreams": "*u8",
+        "block_scales": "*u8",
+        "qdata": "*i8",
+        "num_blocks": "i32",
+        "blocks_per_row": "i32",
+        "bitstreams_bytes": "i64",
+        "block_size": "i32",
+        "block_bits": "i32",
+        "step_bits": "i32",
+        "num_wide_steps": "i32",
+        "bytes_per_block": "i32",
+    }
+    constexprs: dict[str, object] = {
+        "tile_steps": 256,
+        "tile_blocks": 8,
+        "variable_rows": variable_rows,
+    }
+    if variable_rows:
+        signature["row_widths"] = "*u8"
+        signature["row_offsets"] = "*i64"
+    else:
+        constexprs["row_widths"] = None
+        constexprs["row_offsets"] = None
     compiled = triton.compile(
-        ASTSource(
-            decode_int8_kernel,
-            {
-                "bitstreams": "*u8",
-                "block_scales": "*u8",
-                "qdata": "*i8",
-                "num_blocks": "i32",
-                "block_size": "i32",
-                "block_bits": "i32",
-                "step_bits": "i32",
-                "num_wide_steps": "i32",
-                "bytes_per_block": "i32",
-            },
-            constexprs={"tile_steps": 256, "tile_blocks": 8},
-        ),
+        ASTSource(decode_int8_kernel, signature, constexprs=constexprs),
         target=target,
         options={"num_warps": 4},
     )

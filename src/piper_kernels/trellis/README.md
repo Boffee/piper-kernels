@@ -31,6 +31,17 @@ the tensors, a checkpoint needs only the block size `T`, the ConvRot group size
 and the logical dtype; the last two are stored for ConvRot INT8 already. Because
 each tensor's rate comes from its own shape, rates can differ between tensors.
 
+`ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` also accept a
+variable-row layout via `row_widths` (`uint8 [out]`): `bitstreams` becomes 1-D
+`uint8 [total_bytes]`, storing each row `r`'s `in / T` blocks of `row_widths[r]`
+bytes back-to-back with row byte offsets `(in / T) · prefix_sum(row_widths)`.
+Each row width must lie in `[⌈3·T / 8⌉, ⌊6·T / 8⌋]` and `(in / T) · sum(row_widths)`
+must fit within `bitstreams.numel()`; both are caller preconditions (no host readback
+or synchronization at decode time).
+
+`piper_kernels.trellis` exports `TrellisLayout`, `resolve_block_size`, and
+`resolve_layout` alongside `TrellisStorage`.
+
 ## Decoding a block
 
 A block's `B` bits are stored most significant bit first.
@@ -79,11 +90,13 @@ largest multiple of 16 up to 256 that divides it: 256 for most widths, 224 for 2
 
 ## Encoding
 
-`TrellisStorage.from_hp(weight, group_size=..., bits_per_weight=...)` rotates the
-weight in FP32 and encodes each block. The rate counts the block's FP8 scale: a
-block of `T` weights stores `⌊bits_per_weight · T⌋ - 8` bits, rounded down to whole
-bytes. At 4.5 bits per weight a 256-weight block takes 143 bytes, 4- and 5-bit
-steps; at 3.5 it takes 111 bytes, 3- and 4-bit steps.
+`TrellisStorage.from_hp(weight, group_size=..., bits_per_weight=...)` (or an exact
+whole-byte `bytes_per_block=...` in place of `bits_per_weight`) rotates the
+weight in FP32 and encodes each block. When using `bits_per_weight`, the rate
+counts the block's FP8 scale: a block of `T` weights stores
+`⌊bits_per_weight · T⌋ - 8` bits, rounded down to whole bytes. At 4.5 bits per
+weight a 256-weight block takes 143 bytes, 4- and 5-bit steps; at 3.5 it takes
+111 bytes, 3- and 4-bit steps.
 
 The [encoder](_encoder.py) minimizes each block's squared error in the rotated
 basis against the exact INT8 decode, without calibration data. A coarse search
@@ -107,8 +120,9 @@ though extreme post-rotation outliers remain bounded by 1MAD's ~3.2σ tail range
 [`triton.py`](triton.py) decodes a tile of 8 blocks per program. Each weight
 computes its offset in closed form and gathers the at most three bytes holding its
 window. The few windows within 16 bits of the stream's end join its last bits to
-its first. The kernel takes the rate as runtime arguments, so one compiled kernel
-serves every rate.
+its first. The kernel takes the rate as runtime arguments (and computes row offsets
+from a prefix sum of `row_widths` when `variable_rows=True`), so one compiled
+kernel serves every uniform rate and one serves every variable-row layout.
 
 On an RTX 5090 it decodes about 600 G weights/s at every rate. That consumes
 packed bytes about ten times faster than a pinned PCIe copy delivers them (33 GB/s

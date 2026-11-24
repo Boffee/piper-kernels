@@ -66,6 +66,7 @@ markers = [
     "gpu: requires a compatible accelerator (CUDA or ROCm, depending on the test)",
 ]
 pythonpath = ["benchmarks"]
+testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py314"

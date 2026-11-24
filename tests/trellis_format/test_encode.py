@@ -3,8 +3,7 @@
 import pytest
 import torch
 
-from piper_kernels.trellis import TrellisStorage
-from piper_kernels.trellis._layout import TrellisLayout, resolve_block_size, resolve_layout
+from piper_kernels.trellis import TrellisLayout, TrellisStorage, resolve_block_size, resolve_layout
 from piper_kernels.trellis._reference import compute_states
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from trellis_format._encoding_vectors import ENCODER_VECTORS, EncoderVector, build_rows
@@ -225,6 +224,32 @@ def test_from_hp_rejects_non_finite_weights() -> None:
 
 
 @pytest.mark.parametrize(
+    ("cols", "bytes_per_block", "bits_per_weight"),
+    [
+        (512, 143, 4.5),
+        (448, 84, 3.036),
+        (448, 125, 4.5),
+        (448, 168, 6.05),
+    ],
+)
+@pytest.mark.gpu
+@_nvidia
+def test_from_hp_bytes_per_block_matches_bits_per_weight(
+    cols: int, bytes_per_block: int, bits_per_weight: float
+) -> None:
+    weight = (torch.randn(4, cols, generator=torch.Generator().manual_seed(cols)) * 0.02).cuda()
+    weight = weight.to(torch.bfloat16)
+
+    exact = TrellisStorage.from_hp(weight, group_size=64, bytes_per_block=bytes_per_block)
+    by_rate = TrellisStorage.from_hp(weight, group_size=64, bits_per_weight=bits_per_weight)
+
+    assert exact.block_size == by_rate.block_size
+    assert torch.equal(exact.bitstreams, by_rate.bitstreams)
+    assert torch.equal(exact.block_scales, by_rate.block_scales)
+    assert torch.equal(exact.scale, by_rate.scale)
+
+
+@pytest.mark.parametrize(
     ("weight", "group_size", "bits_per_weight", "message"),
     [
         (torch.zeros(2, 256), 256, 4.5, "NVIDIA CUDA device"),
@@ -240,3 +265,29 @@ def test_from_hp_validates_its_arguments(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         TrellisStorage.from_hp(weight, group_size=group_size, bits_per_weight=bits_per_weight)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "exc", "message"),
+    [
+        ({"group_size": 256}, ValueError, "specify exactly one"),
+        (
+            {"group_size": 256, "bits_per_weight": 4.5, "bytes_per_block": 143},
+            ValueError,
+            "specify exactly one",
+        ),
+        (
+            {"group_size": 256, "bytes_per_block": True},
+            TypeError,
+            "bytes_per_block must be an integer",
+        ),
+        ({"group_size": 256, "bytes_per_block": 95}, ValueError, "take 96 to 192 whole bytes"),
+        ({"group_size": 256, "bytes_per_block": 193}, ValueError, "take 96 to 192 whole bytes"),
+    ],
+)
+def test_from_hp_validates_bytes_per_block_arguments(
+    kwargs: dict[str, object], exc: type[Exception], message: str
+) -> None:
+    weight = torch.zeros(2, 256)
+    with pytest.raises(exc, match=message):
+        TrellisStorage.from_hp(weight, **kwargs)  # type: ignore[arg-type]

@@ -7,6 +7,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Variable-row trellis decoding in `ConvRotInt8Tensor.from_trellis` and
+  `copy_from_trellis_` (`row_widths` `uint8 [out]` with 1-D concatenated `bitstreams`),
+  exact `bytes_per_block` encoding on `piper_kernels.trellis.TrellisStorage.from_hp`, and
+  public `TrellisLayout`, `resolve_block_size`, and `resolve_layout` exports in
+  `piper_kernels.trellis`.
 - Weight-only W4A16 `F.linear` and `torch.compile` support for `PiperNVFP4Tensor` and
   `ConvRotNVFP4Tensor` (`act_quant_kwargs=None`) on NVIDIA SM75+, Linux/Windows AMD
   `gfx942`, `gfx1100`, `gfx1151`, `gfx1200`, and `gfx1201`, and CPU (ConvRot fallback

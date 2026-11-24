@@ -15,6 +15,7 @@ from ._layout import (
     LCG_MULTIPLIER,
     STATE_BITS,
     TrellisLayout,
+    validate_block_size,
 )
 
 _INT8_LIMIT = 127
@@ -58,4 +59,42 @@ def decode_reference(
     return scaled.round().clamp(-_INT8_LIMIT, _INT8_LIMIT).to(torch.int8)
 
 
-__all__ = ["compute_code_numerators", "compute_states", "decode_reference"]
+def decode_variable_rows_reference(
+    bitstreams: torch.Tensor,
+    block_scales: torch.Tensor,
+    row_widths: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """INT8 values ``[rows, blocks * block_size]`` for variable-width rows.
+
+    ``bitstreams`` is 1-D uint8 containing concatenated rows of ``blocks``
+    blocks each, where row ``r`` stores ``row_widths[r]`` bytes per block, and
+    ``block_scales`` is ``[rows, blocks]`` float8_e4m3fn.
+    """
+    validate_block_size(block_size)
+    if (
+        bitstreams.ndim != 1
+        or block_scales.ndim != 2
+        or tuple(row_widths.shape) != (block_scales.shape[0],)
+    ):
+        raise ValueError("invalid variable-row trellis reference input shapes")
+    rows, blocks_per_row = block_scales.shape
+    output = torch.empty(
+        rows, blocks_per_row * block_size, dtype=torch.int8, device=bitstreams.device
+    )
+    offset = 0
+    for row, width in enumerate(row_widths.tolist()):
+        row_bytes = blocks_per_row * width
+        layout = TrellisLayout.from_storage(block_size, width)
+        row_streams = bitstreams[offset : offset + row_bytes].reshape(blocks_per_row, width)
+        output[row] = decode_reference(row_streams, block_scales[row], layout).reshape(-1)
+        offset += row_bytes
+    return output
+
+
+__all__ = [
+    "compute_code_numerators",
+    "compute_states",
+    "decode_reference",
+    "decode_variable_rows_reference",
+]
