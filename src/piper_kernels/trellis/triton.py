@@ -28,9 +28,9 @@ from ._layout import (
     TrellisLayout,
 )
 
-# Untuned launch shape: decode is off the critical path (see the README).
-_BLOCKS_PER_PROGRAM = 8
-_NUM_WARPS = 4
+# Tuned on RTX 5090 (SM120): 4 blocks/program x 2 warps minimizes wrap-load and barrier overhead.
+_BLOCKS_PER_PROGRAM = 4
+_NUM_WARPS = 2
 _STATE_BITS = tl.constexpr(STATE_BITS)
 _LCG_MULTIPLIER = tl.constexpr(LCG_MULTIPLIER)
 _LCG_INCREMENT = tl.constexpr(LCG_INCREMENT)
@@ -51,18 +51,28 @@ def _decode_e4m3(code):
 
 
 @triton.jit
-def _read_bits(block_bytes, bytes_per_block, valid, start_bit, num_bits):
-    """``num_bits`` (at most 16) stream bits from ``start_bit``, most significant first."""
-    byte = start_bit // 8
-    window = tl.zeros(start_bit.shape, tl.uint32)
-    # Triton's typing does not declare static_range iterable.
-    for index in tl.static_range(3):  # pyright: ignore[reportGeneralTypeIssues]
-        in_stream = valid & (byte + index < bytes_per_block)
-        value = tl.load(block_bytes + byte + index, mask=in_stream, other=0)
-        window = (window << 8) | value.to(tl.uint32)
-    shift = (24 - start_bit % 8 - num_bits).to(tl.uint32)
-    ones = (tl.full(start_bit.shape, 1, tl.uint32) << num_bits.to(tl.uint32)) - 1
-    return (window >> shift) & ones
+def _extract_states(block_ptr_1d, block_bytes, stream_bytes, stream_bytes_2d, block_mask, mask,
+                    start_bits, head_bits, tail_bits):  # fmt: skip
+    """Extract 16-bit cyclic stream windows using one block-level wrap-byte load."""
+    b0 = tl.load(block_ptr_1d, mask=block_mask & (stream_bytes > 0), other=0).to(tl.uint32)
+    b1 = tl.load(block_ptr_1d + 1, mask=block_mask & (stream_bytes > 1), other=0).to(tl.uint32)
+    wrap_u16 = (b0 << 8) | b1
+
+    byte = start_bits >> 3
+    bit_in_byte = start_bits & 7
+    w0 = tl.load(block_bytes + byte, mask=mask & (byte < stream_bytes_2d), other=0).to(tl.uint32)
+    w1 = tl.load(block_bytes + byte + 1, mask=mask & (byte + 1 < stream_bytes_2d), other=0).to(
+        tl.uint32
+    )
+    w2 = tl.load(block_bytes + byte + 2, mask=mask & (byte + 2 < stream_bytes_2d), other=0).to(
+        tl.uint32
+    )
+    window = (w0 << 16) | (w1 << 8) | w2
+    shift = (24 - bit_in_byte - head_bits).to(tl.uint32)
+    head_mask = (tl.full(start_bits.shape, 1, tl.uint32) << head_bits.to(tl.uint32)) - 1
+    head = (window >> shift) & head_mask
+    tail = tl.where(tail_bits > 0, wrap_u16[:, None] >> (16 - tail_bits).to(tl.uint32), 0)
+    return (head << tail_bits.to(tl.uint32)) | tail
 
 
 @triton.jit(
@@ -94,47 +104,61 @@ def decode_int8_kernel(
     tile_steps: tl.constexpr,
     tile_blocks: tl.constexpr,
     variable_rows: tl.constexpr,
+    exact_pow2: tl.constexpr,
 ):
     blocks = tl.program_id(0) * tile_blocks + tl.arange(0, tile_blocks)
     steps = tl.arange(0, tile_steps)
-    clamped_steps = tl.minimum(steps, block_size - 1)
+    clamped_steps = steps if exact_pow2 else tl.minimum(steps, block_size - 1)
     block_mask = blocks < num_blocks
-    step_mask = steps < block_size
-    mask = block_mask[:, None] & step_mask[None, :]
+    mask = (
+        block_mask[:, None] if exact_pow2 else (block_mask[:, None] & (steps < block_size)[None, :])
+    )
+    denom = tile_steps if exact_pow2 else block_size
 
     if variable_rows:
         row = blocks // blocks_per_row
-        block_in_row = blocks % blocks_per_row
+        block_in_row = blocks - row * blocks_per_row
         width = tl.load(row_widths + row, mask=block_mask, other=0).to(tl.int32)
         row_offset = tl.load(row_offsets + row, mask=block_mask, other=0).to(tl.int64)
         base = row_offset * blocks_per_row + block_in_row.to(tl.int64) * width.to(tl.int64)
         row_bits = width * 8
-        row_step_bits = row_bits // block_size
-        row_wide_steps = row_bits % block_size
+        row_step_bits = row_bits // denom
+        row_wide_steps = row_bits - row_step_bits * denom
         start_bits = (
             row_step_bits[:, None] * clamped_steps[None, :]
-            + row_wide_steps[:, None] * (clamped_steps[None, :] + 1) // block_size
+            + row_wide_steps[:, None] * (clamped_steps[None, :] + 1) // denom
         )
         head_bits = tl.minimum(row_bits[:, None] - start_bits, _STATE_BITS)
         tail_bits = _STATE_BITS - head_bits
-        block_bytes = bitstreams + base[:, None]
+        block_ptr_1d = bitstreams + base
+        block_bytes = block_ptr_1d[:, None]
         # Bound loads to bitstreams even if caller-owned row_widths are malformed.
         remaining_bytes = tl.maximum(bitstreams_bytes - base, 0)
-        stream_bytes = tl.minimum(width.to(tl.int64), remaining_bytes).to(tl.int32)[:, None]
+        stream_bytes = tl.minimum(width.to(tl.int64), remaining_bytes).to(tl.int32)
+        stream_bytes_2d = stream_bytes[:, None]
     else:
-        offsets = step_bits * clamped_steps + (clamped_steps + 1) * num_wide_steps // block_size
+        offsets = step_bits * clamped_steps + (clamped_steps + 1) * num_wide_steps // denom
         head_bits = tl.minimum(block_bits - offsets, _STATE_BITS)
         tail_bits = _STATE_BITS - head_bits
-        block_bytes = bitstreams + blocks.to(tl.int64)[:, None] * bytes_per_block
+        block_ptr_1d = bitstreams + blocks.to(tl.int64) * bytes_per_block
+        block_bytes = block_ptr_1d[:, None]
         start_bits = tl.broadcast_to(offsets[None, :], (tile_blocks, tile_steps))
         head_bits = tl.broadcast_to(head_bits[None, :], (tile_blocks, tile_steps))
         tail_bits = tl.broadcast_to(tail_bits[None, :], (tile_blocks, tile_steps))
-        stream_bytes = bytes_per_block
+        stream_bytes = tl.full((tile_blocks,), bytes_per_block, tl.int32)
+        stream_bytes_2d = bytes_per_block
 
-    stream_starts = tl.zeros_like(start_bits)
-    head = _read_bits(block_bytes, stream_bytes, mask, start_bits, head_bits)
-    tail = _read_bits(block_bytes, stream_bytes, mask, stream_starts, tail_bits)
-    states = (head << tail_bits.to(tl.uint32)) | tail
+    states = _extract_states(
+        block_ptr_1d,
+        block_bytes,
+        stream_bytes,
+        stream_bytes_2d,
+        block_mask,
+        mask,
+        start_bits,
+        head_bits,
+        tail_bits,
+    )
 
     x = states * _LCG_MULTIPLIER + _LCG_INCREMENT
     numerators = ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)).to(tl.int32)
@@ -144,7 +168,7 @@ def decode_int8_kernel(
     multipliers = _decode_e4m3(scale_codes.to(tl.uint32)) * _CODE_RECIPROCAL
     scaled = numerators.to(tl.float32) * multipliers[:, None]
     values = libdevice.rint(tl.clamp(scaled, -127.0, 127.0)).to(tl.int8)
-    destination = blocks.to(tl.int64)[:, None] * block_size + steps[None, :]
+    destination = blocks.to(tl.int64)[:, None] * denom + steps[None, :]
     tl.store(qdata + destination, values, mask=mask)
 
 
@@ -161,6 +185,7 @@ def decode_int8_out(
     num_blocks = bitstreams.shape[0]
     if num_blocks == 0:
         return
+    tile_steps = triton.next_power_of_2(layout.block_size)
     grid = (triton.cdiv(num_blocks, _BLOCKS_PER_PROGRAM),)
     with device_context(bitstreams.device):
         decode_int8_kernel[grid](
@@ -177,9 +202,10 @@ def decode_int8_out(
             layout.step_bits,
             layout.num_wide_steps,
             layout.bytes_per_block,
-            tile_steps=triton.next_power_of_2(layout.block_size),
+            tile_steps=tile_steps,
             tile_blocks=_BLOCKS_PER_PROGRAM,
             variable_rows=False,
+            exact_pow2=layout.block_size == tile_steps,
             num_warps=_NUM_WARPS,
         )
 
@@ -201,6 +227,7 @@ def decode_variable_rows_int8_out(
     num_blocks = rows * blocks_per_row
     if num_blocks == 0:
         return
+    tile_steps = triton.next_power_of_2(block_size)
     grid = (triton.cdiv(num_blocks, _BLOCKS_PER_PROGRAM),)
     with device_context(bitstreams.device):
         row_offsets = torch.empty(rows, dtype=torch.int64, device=bitstreams.device)
@@ -221,9 +248,10 @@ def decode_variable_rows_int8_out(
             0,
             0,
             0,
-            tile_steps=triton.next_power_of_2(block_size),
+            tile_steps=tile_steps,
             tile_blocks=_BLOCKS_PER_PROGRAM,
             variable_rows=True,
+            exact_pow2=block_size == tile_steps,
             num_warps=_NUM_WARPS,
         )
 

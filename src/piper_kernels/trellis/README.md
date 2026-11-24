@@ -99,59 +99,52 @@ weight a 256-weight block takes 143 bytes, 4- and 5-bit steps; at 3.5 it takes
 111 bytes, 3- and 4-bit steps.
 
 The [encoder](_encoder.py) minimizes each block's squared error in the rotated
-basis against the exact INT8 decode, without calibration data. A coarse search
-with 12-bit states evaluates each distinct RMS-based or peak-anchored candidate
-scale once per block. It refits the winning scale by least squares, picks each
-row's scale, and refines in INT8. One tail-biting Viterbi pass on the stored
-16-bit trellis then sets the walk. The module docstring describes the stages and
-where they come from.
+basis against the exact INT8 decode, without calibration data. Stage 1 analytically
+estimates per-block scales from a Bennett 1MAD + tail-clipping proxy and selects each
+row's scale across 29 multipliers. Stage 2 runs a cost-only 12-bit Viterbi check over
+the 3 nearest E4M3 block scales. Stage 3 then runs one tail-biting 16-bit Viterbi pass
+and refits each block's E4M3 scale in FP32. The module docstring describes each stage.
 
 On Gaussian rows, which ConvRot-rotated weights resemble, the weight SQNR is:
 
 | Bits per weight | 3.03 | 3.5 | 4.03 | 4.5 | 5.5 | 6.03 |
 |---|---|---|---|---|---|---|
-| SQNR (dB) | 17.5 | 20.3 | 23.5 | 26.3 | 32.2 | 35.3 |
+| SQNR (dB) | 17.5 | 20.3 | 23.4 | 26.2 | 32.1 | 35.2 |
 
-Peak-anchored seeding prevents outlier blocks from clipping at the RMS scale,
-though extreme post-rotation outliers remain bounded by 1MAD's ~3.2σ tail range.
+Peak-aware scale selection prevents outlier blocks from clipping, though extreme
+post-rotation outliers remain bounded by 1MAD's ~3.2σ tail range.
 
 ## Decode implementation
 
-[`triton.py`](triton.py) decodes a tile of 8 blocks per program. Each weight
-computes its offset in closed form and gathers the at most three bytes holding its
-window. The few windows within 16 bits of the stream's end join its last bits to
-its first. The kernel takes the rate as runtime arguments (and computes row offsets
-from a prefix sum of `row_widths` when `variable_rows=True`), so one compiled
+[`triton.py`](triton.py) decodes a tile of 4 blocks per program (2 warps). Each block
+loads its first two wrap bytes once, and each weight computes its offset in closed form
+and gathers the at most three contiguous bytes holding its window before merging any
+wrap bits from those cached head bytes. Power-of-2 block sizes specialize away runtime
+integer division. The kernel takes the rate as runtime arguments (and computes row
+offsets from a prefix sum of `row_widths` when `variable_rows=True`), so one compiled
 kernel serves every uniform rate and one serves every variable-row layout.
 
-On an RTX 5090 it decodes about 600 G weights/s at every rate. That consumes
-packed bytes about ten times faster than a pinned PCIe copy delivers them (33 GB/s
-measured), so blocks are stored packed rather than padded to words. For the same
-reason the launch shape (8 blocks per program, 4 warps) was not tuned: decode is
-not on the transfer's critical path. It has not been measured on AMD, including
-wave64 targets such as gfx942.
+On an RTX 5090 it decodes about 680–730 G weights/s for uniform 256-weight blocks
+(up from ~465–520 G weights/s) and about 490–590 G weights/s for variable-row streams
+(up from ~240–265 G weights/s), consuming packed bytes well above pinned PCIe copy
+bandwidth (33 GB/s measured), so blocks are stored packed rather than padded to words.
+It has not been measured on AMD, including wave64 targets such as gfx942.
 [`_reference.py`](_reference.py) is the PyTorch oracle; tests check both against
 blocks encoded by the research encoder.
 
 ## Encode implementation
 
-The [Viterbi search](_viterbi.py) finds the exact minimum over every walk of a
-block and a few candidate scales, with pinned FP32 arithmetic. Its forward runs
-in one of two ways, with identical results:
+The [persistent Gluon forward](_gluon_forward.py) runs all steps of a batch in one
+launch, packing two rows per 32-bit word (`FP16x2`) in registers and shared memory
+with normalized weights `(w / row_scale) · 0.03125`. Rows are sorted and bucket-padded
+by bitwise E4M3 block scale so every CTA decodes states once for all its rows and
+writes coalesced `uint16` backpointer pairs; a Triton traceback kernel reconstructs
+walks. It requires an NVIDIA SM80+ GPU with 99 KiB of opt-in shared memory per CTA and
+Triton 3.9+, and its inline PTX is NVIDIA-only.
 
-- **Persistent forward** ([`_gluon_forward.py`](_gluon_forward.py)): one Gluon
-  launch runs every step of a batch, keeping each row's prefix costs in shared
-  memory. It needs an NVIDIA GPU from sm_80 with 99 KiB of opt-in shared memory per
-  CTA, and Triton 3.9, whose Gluon it was written and measured for. Its inline PTX
-  is NVIDIA-only.
-- **Step loop:** one Triton launch per step. It runs on other NVIDIA GPUs and is
-  the persistent forward's bitwise reference.
-
-Encoding runs offline on NVIDIA GPUs. On an RTX 5090 with PyTorch 2.15 and Triton
+Encoding runs offline on NVIDIA SM80+ GPUs. On an RTX 5090 with PyTorch 2.15 and Triton
 3.9, `TrellisStorage.from_hp` encoded a 4096×5120 Gaussian BF16 weight with group
-size 256 at 36 to 45 M weights/s across 3 to 6 bits per weight. At 4.5 bits per
-weight the persistent forward reached 44 M weights/s (about 13 minutes for 34 G
-weights) and the step loop reached 6.6 M weights/s. Blocks with distinct peak
-seeds require more search work. Search batches target 4 GiB of backpointers.
-Peak allocations on the Gaussian matrix were 4.5 to 4.8 GiB beyond the input
-weight. Batches and row chunks give identical results.
+size 256 at 91 to 103 M weights/s across 3 to 6 bits per weight (102.9 M weights/s at
+4.5 bits per weight; 103.5 M weights/s at 4.03 bits per weight). Search batches target 4
+GiB of backpointers; peak allocations on the Gaussian matrix were 4.4 GiB beyond the
+input weight. Batches and row chunks give identical results.

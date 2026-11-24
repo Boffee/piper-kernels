@@ -67,26 +67,12 @@ def test_pack_states_inverts_the_decoder_windows(layout: TrellisLayout) -> None:
 @pytest.mark.gpu
 @_nvidia
 @pytest.mark.parametrize("vector", ENCODER_VECTORS, ids=lambda v: f"{v.cols}x{v.block_bits}")
-def test_encoder_matches_across_backends_and_meets_sqnr(
-    vector: EncoderVector, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from piper_kernels.trellis import _gluon_forward, _viterbi  # noqa: PLC0415 - needs Triton
+def test_encoder_meets_sqnr_across_vectors(vector: EncoderVector) -> None:
     from piper_kernels.trellis._encoder import encode_matrix  # noqa: PLC0415 - needs Triton
 
     rows = build_rows(vector.rows, vector.cols, vector.seed).cuda()
     layout = TrellisLayout(resolve_block_size(vector.cols), vector.block_bits)
-    persistent_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-    if _gluon_forward.supports_device(torch.device("cuda")):
-        persistent_out = encode_matrix(rows, layout)
-
-    monkeypatch.setattr(_viterbi, "_select_persistent_forward", lambda *_: False)
     bitstreams, block_scales, scale = encode_matrix(rows, layout)
-
-    if persistent_out is not None:
-        persistent_bitstreams, persistent_block_scales, persistent_scale = persistent_out
-        assert torch.equal(persistent_bitstreams, bitstreams)
-        assert torch.equal(persistent_block_scales, block_scales)
-        assert torch.equal(persistent_scale, scale)
 
     decoded = ConvRotInt8Tensor.from_trellis(
         bitstreams, block_scales, scale, block_size=layout.block_size, group_size=16
@@ -221,6 +207,26 @@ def test_from_hp_rejects_non_finite_weights() -> None:
 
     with pytest.raises(ValueError, match="finite"):
         TrellisStorage.from_hp(weight, group_size=256, bits_per_weight=4.5)
+
+
+@pytest.mark.gpu
+@_nvidia
+def test_from_hp_encodes_large_finite_weights_without_overflow() -> None:
+    weight = (torch.randn(8, 512, generator=torch.Generator().manual_seed(3)) * 1e20).cuda()
+
+    storage = TrellisStorage.from_hp(weight, group_size=256, bits_per_weight=4.5)
+    decoded = ConvRotInt8Tensor.from_trellis(
+        storage.bitstreams,
+        storage.block_scales,
+        storage.scale,
+        block_size=storage.block_size,
+        group_size=256,
+    ).dequantize(torch.float32)
+
+    assert bool(torch.isfinite(storage.scale).all())
+    assert bool(torch.isfinite(storage.block_scales.float()).all())
+    assert bool(torch.isfinite(decoded).all())
+    assert _sqnr_db(weight, decoded) > 25.0
 
 
 @pytest.mark.parametrize(

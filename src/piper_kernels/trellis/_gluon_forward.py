@@ -1,94 +1,23 @@
-"""Persistent Viterbi forward: every step of a search batch in one Gluon launch.
+"""FP16x2 persistent Viterbi search in Gluon: L=12 cost-only and L=16 walks.
 
-The step loop (``_viterbi._step_kernel``) runs each search as one Triton launch per
-position, so every step reads and writes all rows' ``2^(L-k)`` prefix costs through
-global memory. ``run_forward`` runs all ``T`` steps of a batch in one launch: a CTA
-keeps its rows' prefix costs in shared memory, computes the 1MAD hash in registers
-and decodes each state once for all of its rows when they share ``p1``. Final costs
-and backpointers are identical to the step loop's and in the layouts the loop and
-the traceback use. The kernel is written in Gluon, Triton's explicit-layout dialect,
-with inline PTX. It runs on NVIDIA GPUs from sm_80 with Triton 3.9 and the shared
-memory of its largest kernel (``supports_device``); other devices take the step loop.
+One Gluon launch executes all ``T`` steps for a batch in shared memory, packing two
+rows per 32-bit word (``half2``) in both registers and shared memory. Weights are
+pre-normalized once by the caller as ``(w / p2) * FP16_SCALE``, so decoded INT8 code
+values shift by an exact power of two (``0.03125``) and every step uses native
+``half2`` arithmetic (``sub.f16x2``, ``fma.rn.f16x2``, ``min.f16x2``) without
+float-mode duplication or host-managed step loops.
 
-Scope: the 1MAD code; L = 12 or 16 with any schedule of one step width of 3 to 6
-bits or of two adjacent ones, which covers every layout of the format, its L = 12
-search and the windows of either; float and INT8 decodes; free and overlap starts;
-one ``p1`` per row for all ``T`` steps. The backpointers take
-``T · rows · 2^(L - min k)`` bytes; a launch takes about
-``ceil(rows / compute_wave_rows(...))`` waves, so the caller sizes batches in whole
-waves.
-
-Design: one CTA runs ``compute_rows_per_cta`` rows (6, or 3 at L = 16 with 3-bit steps, whose
-32 KiB of prefix costs per row allow no more) through all ``T`` steps with 256
-threads at L = 16 and 64 at L = 12 (``_GEOMETRY``; with 3-bit steps 512 at L = 16,
-``_geometry``). Step ``t`` maps the prefix ``M[v]``, ``v`` the low ``L - k_t`` bits of
-the previous state, to ``M'[j']``, ``j'`` the low ``L - k_{t+1}`` bits of
-``s_t = (a, j')``: the minimum over the ``k_{t+1}`` dropped bits ``a`` of
-``M[s_t >> k_t] + (w_t - value(s_t))²``. With the group ``g = j' >> k_t``,
-``M[s_t >> k_t] = M[(a, g)]``: the outputs of one group share the same
-``2^k_{t+1}`` inputs.
-
-- Tensors are ``[threads]`` with one element per thread (``_thread_layout``), so a
-  Gluon tensor is a per-thread scalar: per step, thread ``(part, q, mid)`` loads its
-  group's 16 inputs ``(a, g)`` per row into registers, then loops over its
-  ``2^loop_bits`` outputs ``j'`` of that group (16 at L = 16, each output's numerators
-  computed during the previous one; 4 at L = 12 and 8 with 3-bit steps, without that
-  prefetch). The ``2^(k_{t+1} - 4)`` lanes of ``part`` split an output's values of
-  ``a``, 16 each; at ``k_{t+1} = 3`` an iteration takes the 8 of each of two outputs,
-  ``j'`` and ``j' + 2^LOW`` in two groups (``PAIR``: adjacent stored positions, so one
-  16-bit backpointer store), so every thread does the same 16 states per iteration at
-  every step width. A thread's outputs share their group, so with 3-bit steps the
-  loop bits drop to 3 and the threads double. Consecutive lanes take consecutive top
-  ``k_{t+2}`` bits of ``j'`` (the stored position's lowest bits), so a warp's
-  backpointer stores are contiguous runs. Per-row and per-``a`` arrays are tuples of
-  tensors, unrolled at trace time. Each step kind ``(k_t, k_{t+1}, k_{t+2})`` of the
-  schedule (relative to its smallest step, ``MIN_K``) is a constexpr specialization of
-  ``_step``, chosen per step at run time.
-- Decode, per CTA (``_order`` sorts rows by bitwise ``p1``; a CTA tests whether its
-  rows share one value and runs one of two specializations of its loop over the
-  steps, ``_run``): each state's 1MAD numerator comes from a ``dp4a`` of its hash;
-  with one ``p1`` the CTA decodes it once for all rows, else each row decodes its
-  own. Float mode computes the code value ``n / D`` by a 3-op Newton form exact for
-  all 1021 numerators, then multiplies by ``p1``. The arithmetic is pinned (launched
-  with ``enable_fp_fusion=False``): ``v = fl(c · p1)`` (INT8: then rint and clamp),
-  ``d = fma(v, -p2, w)``, ``cost = fma(d, d, prefix)``, the step loop's arithmetic.
-- Costs are non-negative and never NaN for finite inputs: prefixes start at +0 or
-  +inf, and ``fma(d, d, prefix)`` adds the exact, non-negative ``d · d`` to a
-  non-negative prefix (so never -0). The minimum's bits are therefore those of an
-  ascending scan however the comparisons are grouped, and costs order like their
-  bits as unsigned integers (``_argmin``, ``_owner``).
-- Shared memory: the rows' prefix costs (``2^(L - min k)`` each) in an identity
-  layout indexed by the swizzled position ``phys`` (``_IMAGES``), computed in
-  registers; loads are native ``gather``s.
-- Outputs: backpointers ``bp[t, row, pos]`` at
-  ``pos = _store_index(j', L - k_{t+1}, k_{t+2})`` and the final costs at
-  ``_store_index(v, L - k_0, k_1)``.
-
-Gluon 3.9 workarounds, each measured necessary: prefix stores are ``st.shared``
-inline PTX (Gluon's barrier analysis puts a ``bar.sync`` between any two native
-stores to one allocation it cannot prove disjoint, here between every output's
-stores; the two ``gl.barrier`` calls per step separate a step's loads from its
-stores and its stores from the next step's loads); compares and selects are inline
-PTX (``_argmin``: LLVM's SLP vectorizer packs them into bit vectors); a per-step
-``%tid.x`` read keeps LICM from hoisting every step kind's thread mapping
-(``_thread_index``); trip counts and ``k_0``, ``k_1`` and the start mode are run-time
-arguments (a constant 16-trip output loop unrolls into about 130 KB of code; the rest
-would multiply the specializations); shared allocations are powers of two (a CTA's
-prefixes take two buffers: 4 rows and 2, or 2 and 1).
-
-Kernels compile per (L, mode, smallest step, set of step kinds) on first use
-(``compute_wave_rows`` compiles the one it measures) and are cached by Triton.
+Rows are sorted by bitwise ``alpha`` and padded per bucket to ``rows_per_cta``, so
+every CTA decodes each 16-state tile once for all of its rows. Backpointers are
+stored coalesced as ``uint16`` pairs and traced back by ``_traceback_kernel``.
 """
 
-# Kernel constexprs are short upper-case names (KE = k_t, KA = k_{t+1}, ...). Gluon's
-# frontend has no starred unpacking, so per-row tuples grow by concatenation. Gluon
-# device types and layouts are not Python runtime values.
+# Kernel constexprs are short upper-case names (KE = k_t, KA = k_{t+1}). Gluon's
+# frontend has no starred unpacking, so per-pair tuples grow by concatenation.
 # ruff: noqa: N803, N806, RUF005, ANN001, ANN202, PLR0913, PLR0917
 # pyright: reportArgumentType=false, reportAssignmentType=false, reportCallIssue=false
 # pyright: reportGeneralTypeIssues=false, reportIndexIssue=false
 # pyright: reportAttributeAccessIssue=false, reportOperatorIssue=false
-# Static ranges unroll at trace time, so their first iteration binds what later ones read.
-# pyright: reportPossiblyUnboundVariable=false
 
 from __future__ import annotations
 
@@ -98,219 +27,180 @@ from collections.abc import Sequence
 
 import torch
 import triton
+import triton.language as tl
 from triton.compiler import CompiledKernel
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from piper_kernels._triton.runtime import device_context
+
 from ._layout import LCG_INCREMENT, LCG_MULTIPLIER
 
-STATE_BITS = (12, 16)
-STEP_BITS = (3, 4, 5, 6)
-"""Step widths ``k_t``; a schedule takes one of them or two adjacent ones (``supports_trellis``)."""
-MAX_LENGTH = 256
-"""Longest sequence: the format's largest block."""
-ROWS = 6
-"""Rows per CTA where their prefix costs fit (``compute_rows_per_cta``): at L = 16 with 4-bit
-steps they take 6 · 16 KiB of the 99 KiB a CTA may use on sm_86 to sm_120, so one CTA runs per
-SM."""
-SHARED_LIMIT = 99 * 1024
-"""Opt-in shared memory per CTA on sm_86 to sm_120, which a CTA's prefix costs must fit."""
+FP16_SCALE = 0.03125
+"""Exact 2^-5 multiplier for normalized weights and clamped INT8 codes in FP16."""
 _RESERVED_SHARED = 1024
-"""Shared memory the driver reserves per CTA from sm_80 on (``_resident_ctas``)."""
+SHARED_NEED = 96 * 1024 + 128
+"""Opt-in shared memory per CTA of the largest kernel (96 KiB prefixes + 128 B reduction)."""
 
-_GEOMETRY = {16: (256, 4), 12: (64, 2)}
-"""Threads per CTA and loop bits per state width for steps of 4 bits and more (``_geometry``): a
-thread's ``2^loop_bits`` outputs per step times 16 states each times the threads cover the
-``2^L`` states."""
-
-
-def _rows(L: int, min_k: int) -> int:
-    """Rows per CTA (``compute_rows_per_cta``)."""
-    return ROWS if 4 * ROWS << (L - min_k) <= SHARED_LIMIT else ROWS // 2
-
-
-SHARED_NEED = max(4 * _rows(L, k) << (L - k) for L in STATE_BITS for k in STEP_BITS)
-"""Shared memory per CTA of the largest kernel (L = 16: 96 KiB of prefix costs at 4 bits, and at 3
-bits with 3 rows): a GPU that cannot opt in to it takes the step loop (``supports_device``)."""
-
-
-@gluon.constexpr_function
-def _geometry(L: int, min_k: int) -> tuple[int, int]:
-    """Threads per CTA and loop bits of a kernel whose smallest step is ``min_k``: ``_GEOMETRY``'s,
-    except that a thread's outputs share their group ``g = j' >> k_t`` (``_step``), so with 3-bit
-    steps the loop bits drop to 3 and the threads double (L = 16). Keeping the threads and giving
-    each two sets of outputs instead (3 rows: the 4-bit kernels' 96 inputs per thread) ran 1.4-10%
-    slower: 16 warps per SM hide more latency than twice the work per thread and step."""
-    threads, bits = _GEOMETRY[L]
-    return (threads << (bits - min_k), min_k) if bits > min_k else (threads, bits)
-
-
-# A Gluon kernel reads only constexpr globals.
 _ONE_MAD_A = gl.constexpr(LCG_MULTIPLIER)
 _ONE_MAD_B = gl.constexpr(LCG_INCREMENT)
-_ROUND_MAGIC = gl.constexpr(12582912.0)  # 1.5 * 2^23
 _IDENTITY = gl.constexpr(gl.SwizzledSharedLayout(1, 1, 1, [0]))
 _U32 = 0xFFFFFFFF
-_IMAGES = {
-    4: {
-        6: (1,),
-        7: (1, 4),
-        8: (1, 2, 12),
-        10: (3, 1, 4, 8, 19),
-        11: (1, 2, 16, 4, 8, 19),
-        12: (2, 4, 9, 1, 2, 4, 25),
-    },
-    3: {
-        8: (1, 2, 24),
-        9: (20, 16, 1, 2),
-        12: (6, 12, 20, 17, 1, 4, 2),
-        13: (3, 8, 4, 24, 18, 3, 12, 6),
-    },
-}
-"""Swizzle images of a ``W``-bit prefix index's bits 5 and up (``_phys``), per swizzle family
-``min(MIN_K, 4)``. ``phys(v)`` is ``v`` XOR the images of its set bits 5 and up: linear over GF(2)
-and the identity on bits 5 and up, so a bijection. Every load and store instruction of a step is
-conflict free when its distinct lane addresses span bits whose bank images (the low 5 bits) are
-linearly independent; each family's thread mapping (``_step``, ``_geometry``) needs its own
-images for that, found by search over every step kind of the family at L = 12 and 16 and checked
-by the forward tests. Family 4 serves the 4/5 and 5/6 kernels, family 3 the 3/4 kernels."""
+
+_MIN_TRITON = (3, 9)
+_TRITON_VERSION = tuple(int(part) for part in re.findall(r"\d+", triton.__version__)[:2])
+_BACKPOINTER_BYTES = 1 << 32
+_TRACEBACK_SEQUENCES = 64
 
 
 @gluon.constexpr_function
-def _phys(v: int, width: int, family: int) -> int:
-    """``v`` XOR the images of its set bits 5 and up (``_IMAGES``)."""
-    low = 0
-    for bit in range(5, width):
-        if v >> bit & 1:
-            low ^= _IMAGES[family][width][bit - 5]
-    return v ^ low
+def _geometry(L: int, min_k: int) -> tuple[int, int, int]:
+    """``(threads, loop_bits, pairs_per_cta)`` for ``(L, min_k)``.
 
-
-_IN_OFFSETS = {
-    (family, width, group, select): tuple(
-        _phys((i & 7) << group | (i >> 3) << select if select >= 0 else i << group, width, family)
-        for i in range(16)
-    )
-    for family, images in _IMAGES.items()
-    for width in images
-    for group in range(width - 3 + 1)
-    for select in range(-1, group)
-    if select >= 0 or group <= width - 4
-}
+    Each pair holds two rows packed in ``half2``, giving 12 rows/CTA except at
+    ``L=16, min_k=3`` where 32 KiB/pair fits 3 pairs (6 rows) in 96 KiB.
+    """
+    if L == 12:
+        return (64, 2, 6)
+    if min_k == 3:
+        return (512, 3, 3)
+    return (256, 4, 6)
 
 
 @gluon.constexpr_function
-def _family(min_k):
-    """The swizzle family of a kernel whose smallest step is ``min_k`` (``_IMAGES``)."""
-    return min(min_k, 4)
-
-
-@gluon.constexpr_function
-def _images(width, family):
-    return _IMAGES[family][width]
-
-
-@gluon.constexpr_function
-def _in_offsets(width, group, select, family):
-    """Swizzled positions of a thread's 16 inputs of a ``width``-bit prefix with ``group`` bits of
-    ``g``, relative to its first group ``g0`` (``phys`` is linear: input ``(a, g)`` is
-    ``phys(g0) ^`` this): ``(a = i, g0)``, or with two groups (``select``: the bit of ``g`` they
-    differ in, else -1) ``(a = i mod 8, g0 + (i // 8 << select))``."""
-    return _IN_OFFSETS[family, width, group, select]
-
-
-@gluon.constexpr_function
-def _threads(L, min_k):
-    return _geometry(L, min_k)[0]
-
-
-@gluon.constexpr_function
-def _loop_bits(L, min_k):
-    return _geometry(L, min_k)[1]
-
-
-@gluon.constexpr_function
-def _parts(ka):
-    """Lanes per output at a ``ka``-bit step ``k_{t+1}``: 16 candidates each, or one of 8 at 3."""
-    return 1 << max(ka - 4, 0)
-
-
-@gluon.constexpr_function
-def _low_rows(rows):
-    """The rows in the first prefix buffer (``_row_buffer``): the largest power of two of them."""
-    return 1 << (rows.bit_length() - 1)
-
-
-@gluon.constexpr_function
-def _row_offset(r, rows, cap):
-    """The byte offset of row ``r``'s prefix costs in its buffer (``_row_buffer``)."""
-    low = _low_rows(rows)
-    return (r - low if r >= low else r) * cap * 4
-
-
-@gluon.constexpr_function
-def _thread_layout(threads):
-    """One element per thread: a ``[threads]`` tensor is a per-thread scalar."""
+def _thread_layout(threads: int):
     return gl.BlockedLayout([1], [32], [threads // 32], [0])
 
 
 @gluon.constexpr_function
-def _warp_lane_layout(threads):
-    """``_thread_layout`` viewed as ``[warp, lane]``: a gather along the lane axis is a shuffle."""
-    return gl.BlockedLayout([1, 1], [1, 32], [threads // 32, 1], [1, 0])
+def _low_pairs(pairs: int) -> int:
+    return 1 << (pairs.bit_length() - 1)
 
 
 @gluon.constexpr_function
-def _state_steps(out_bits, pair_bit):
-    """1MAD LCG increments of a thread's 16 states over ``(0, j')``, ``out_bits = L - k_{t+1}``:
-    ``(a = i, j')``, ``A · (i << out_bits)`` mod ``2^32``, or with two outputs per iteration
-    (``pair_bit``: the bit of ``j'`` they differ in, else -1) ``(a = i mod 8, j' + (i // 8 <<
-    pair_bit))``."""
-    return tuple(
-        _ONE_MAD_A.value
-        * ((i & 7) << out_bits | (i >> 3) << pair_bit if pair_bit >= 0 else i << out_bits)
-        & _U32
-        for i in range(16)
-    )
+def _pair_offset_bytes(p: int, pairs: int, cap: int) -> int:
+    low = _low_pairs(pairs)
+    return (p - low if p >= low else p) * cap * 4
 
 
 @gluon.constexpr_function
-def _store_asm(offset, predicated):
-    store = f"st.shared.f32 [$0+{offset}], $1;"
+def _phys_const(v: int) -> int:
+    """1-way bank-conflict-free XOR swizzle across all L in {12, 16} and k in {3..6}."""
+    return v ^ (((v >> 5) ^ (v >> 7)) & 31)
+
+
+@gluon.constexpr_function
+def _in_offsets(group: int, pair: bool) -> tuple[int, ...]:
+    if pair:
+        return tuple(_phys_const(((i & 7) << group) | ((i >> 3) << (group - 1))) for i in range(16))
+    return tuple(_phys_const(i << group) for i in range(16))
+
+
+@gluon.constexpr_function
+def _state_steps(out_bits: int, pair: bool) -> tuple[int, ...]:
+    if pair:
+        return tuple(
+            _ONE_MAD_A.value * (((i & 7) << out_bits) | ((i >> 3) << (out_bits - 1))) & _U32
+            for i in range(16)
+        )
+    return tuple(_ONE_MAD_A.value * (i << out_bits) & _U32 for i in range(16))
+
+
+@gluon.constexpr_function
+def _st_u32_asm(offset: int, predicated: bool) -> str:
+    store = f"st.shared.u32 [$0+{offset}], $1;"
     return "{ .reg .pred p; setp.ne.b32 p, $2, 0; @p " + store + " }" if predicated else store
 
 
 @gluon.constexpr_function
-def _scan_asm(i):
-    """PTX of one pair-then-scan step at pair ``(i, i + 1)`` (the candidates' indices): ``$0, $1``
-    the new minimum and argument from ``$2, $3`` (the running ones) and the pair's costs ``$4,
-    $5``."""
+def _decode_h2_asm() -> str:
+    """1MAD numerator -> clamped INT8 * 0.03125 packed identically in both FP16 halves."""
     return (
-        "{ .reg .pred p, q; .reg .f32 m; .reg .b32 a; "
-        "setp.lt.f32 p, $5, $4; selp.f32 m, $5, $4, p; "
-        f"selp.b32 a, {i + 1}, {i}, p; "
-        "setp.lt.f32 q, m, $2; selp.f32 $0, m, $2, q; selp.b32 $1, a, $3, q; }"
+        "{ .reg .b32 a; .reg .f32 n, s; "
+        "dp4a.u32.u32 a, $1, 16843009, 1262484994; "
+        "add.rn.f32 n, a, 0fCB400000; "
+        "mul.rn.f32 s, n, $2; "
+        "cvt.rni.f32.f32 s, s; "
+        "max.f32 s, s, 0fC2FE0000; min.f32 s, s, 0f42FE0000; "
+        "mul.rn.f32 s, s, 0f3D000000; "
+        "cvt.rn.f16x2.f32 $0, s, s; }"
+    )
+
+
+@gluon.constexpr_function
+def _h2_min_only_first_asm() -> str:
+    return (
+        "{ .reg .b32 d0, d1, t0, t1; "
+        "sub.f16x2 d0, $1, $2; sub.f16x2 d1, $1, $3; "
+        "fma.rn.f16x2 t0, d0, d0, $4; fma.rn.f16x2 t1, d1, d1, $5; "
+        "min.f16x2 $0, t0, t1; }"
+    )
+
+
+@gluon.constexpr_function
+def _h2_min_only_step_asm() -> str:
+    return (
+        "{ .reg .b32 d0, d1, t0, t1, m; "
+        "sub.f16x2 d0, $1, $2; sub.f16x2 d1, $1, $3; "
+        "fma.rn.f16x2 t0, d0, d0, $4; fma.rn.f16x2 t1, d1, d1, $5; "
+        "min.f16x2 m, t0, t1; min.f16x2 $0, $6, m; }"
+    )
+
+
+@gluon.constexpr_function
+def _h2_argmin_first_asm() -> str:
+    return (
+        "{ .reg .b32 d0, d1, t0, t1, msk; "
+        "sub.f16x2 d0, $2, $3; sub.f16x2 d1, $2, $4; "
+        "fma.rn.f16x2 t0, d0, d0, $5; fma.rn.f16x2 t1, d1, d1, $6; "
+        "set.lt.u32.f16x2 msk, t1, t0; "
+        "min.f16x2 $0, t0, t1; "
+        "and.b32 $1, msk, 0x00010001; }"
+    )
+
+
+@gluon.constexpr_function
+def _h2_argmin_single_asm(c: int) -> str:
+    cc = (c << 16) | c
+    return (
+        "{ .reg .b32 d, t, p; "
+        "sub.f16x2 d, $2, $3; "
+        "fma.rn.f16x2 t, d, d, $4; "
+        "set.lt.u32.f16x2 p, t, $5; "
+        "min.f16x2 $0, $5, t; "
+        f"lop3.b32 $1, p, {cc}, $6, 0xCA; }}"
+    )
+
+
+@gluon.constexpr_function
+def _merge_shfl_asm(mask_val: int) -> str:
+    return (
+        "{ .reg .b32 ob, oa, p; "
+        f"shfl.sync.bfly.b32 ob, $2, {mask_val}, 31, 0xffffffff; "
+        f"shfl.sync.bfly.b32 oa, $3, {mask_val}, 31, 0xffffffff; "
+        "set.lt.u32.f16x2 p, ob, $2; "
+        "min.f16x2 $0, $2, ob; "
+        "lop3.b32 $1, p, oa, $3, 0xCA; }"
+    )
+
+
+@gluon.constexpr_function
+def _merge_shfl_cost_asm(mask_val: int) -> str:
+    return (
+        "{ .reg .b32 ob; "
+        f"shfl.sync.bfly.b32 ob, $1, {mask_val}, 31, 0xffffffff; "
+        "min.f16x2 $0, $1, ob; }"
     )
 
 
 @gluon.jit
-def _phys_of(v, width: gl.constexpr, MIN_K: gl.constexpr):
-    """``_phys`` of a tensor of ``width``-bit prefix indices in a kernel whose smallest step is
-    ``MIN_K``."""
-    images: gl.constexpr = _images(width, _family(MIN_K))
-    low = gl.zeros_like(v)
-    for bit in gl.static_range(5, width):
-        low ^= ((v >> bit) & 1) * images[bit - 5]
-    return v ^ low
+def _phys(v):
+    return v ^ (((v >> 5) ^ (v >> 7)) & 31)
 
 
 @gluon.jit
 def _thread_index(THREADS: gl.constexpr):
-    """``%tid.x`` per element of a ``_thread_layout`` tensor (``gl.arange(0, THREADS)``), read so
-    that LLVM cannot hoist what depends on it out of ``_run``'s loop over the steps: hoisted,
-    every step kind's thread mapping stays live across the whole loop (VR: 255 registers; all 8
-    kinds: 72 spills, 87% of the one-kind speed). The mask restores the range ``arange`` implies,
-    which lets LLVM drop the gathers' bounds masks and fold each row's offset into the load."""
+    """Read ``%tid.x`` inside each step so LLVM does not hoist per-kind address maps."""
     tid = gl.inline_asm(
         "mov.u32 $0, %tid.x;",
         ("=r",),
@@ -323,493 +213,445 @@ def _thread_index(THREADS: gl.constexpr):
 
 @gluon.jit
 def _shared_address(buffer):
-    """The shared-memory byte address of ``buffer``'s first element (a uniform scalar)."""
     return gl.inline_asm("mov.u32 $0, $1;", ("=r", "r"), [buffer], gl.int32, is_pure=False)
 
 
 @gluon.jit
-def _store_shared(address, value, offset: gl.constexpr):
-    """``st.shared.f32 [address + offset], value`` per thread, outside the barrier analysis."""
-    gl.inline_asm(_store_asm(offset, False), ("r", "f"), [address, value], (), is_pure=False)
+def _st_shared_u32(addr, val, offset: gl.constexpr):
+    gl.inline_asm(_st_u32_asm(offset, False), ("r", "r"), [addr, val], (), is_pure=False)
 
 
 @gluon.jit
-def _store_shared_if(address, value, keep, offset: gl.constexpr):
-    """``_store_shared`` where ``keep`` (int32) is nonzero."""
-    gl.inline_asm(
-        _store_asm(offset, True), ("r", "f", "r"), [address, value, keep], (), is_pure=False
-    )
+def _st_shared_u32_if(addr, val, keep, offset: gl.constexpr):
+    gl.inline_asm(_st_u32_asm(offset, True), ("r", "r", "r"), [addr, val, keep], (), is_pure=False)
 
 
 @gluon.jit
-def _numerator(x):
-    """A state's 1MAD numerator ``n`` (byte sum of ``x`` - 510) as FP32: ``dp4a`` puts the byte
-    sum in the mantissa of 1.5 · 2^23, and subtracting it is exact."""
+def _decode_h2(x, alpha):
     return gl.inline_asm_elementwise(
-        "{ .reg .b32 a; dp4a.u32.u32 a, $1, 16843009, 1262484994; add.rn.f32 $0, a, 0fCB400000; }",
-        "=f,r",
-        [x],
-        dtype=gl.float32,
-        is_pure=True,
-        pack=1,
+        _decode_h2_asm(), "=r,r,f", [x, alpha], dtype=gl.uint32, is_pure=True, pack=1
     )
 
 
 @gluon.jit
-def _numerators(x_e, out_bits: gl.constexpr, PAIR_BIT: gl.constexpr):
-    """``_numerator`` of a thread's 16 states (``_state_steps``) from ``x_e``, the 1MAD input of
-    its first."""
-    steps: gl.constexpr = _state_steps(out_bits, PAIR_BIT)
-    out = ()
-    for i in gl.static_range(16):
-        out = out + (_numerator(x_e + steps[i]),)
-    return out
-
-
-@gluon.jit
-def _code_value(n):
-    """``fp32(n / 147.800537109375)``, correctly rounded for every numerator: the Newton correction
-    ``fma(fma(-q, D, n), R, q)`` of ``q = fl(n · R)``, ``R = fp32(1 / D)`` (``q · (-D)`` is
-    ``-q · D`` exactly)."""
-    return gl.inline_asm_elementwise(
-        "{ .reg .f32 q, r; mul.rn.f32 q, $1, 0f3BDDB447; fma.rn.f32 r, q, 0fC313CCF0, $1; "
-        "fma.rn.f32 $0, r, 0f3BDDB447, q; }",
-        "=f,f",
-        [n],
-        dtype=gl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
-def _decode_shared(alpha, n):
-    """``clamp(rint(alpha · n), ±127)`` (the format's INT8 decode) for a value every row shares:
-    ``rint`` issues on its own pipe."""
-    rounded = gl.inline_asm_elementwise(
-        "cvt.rni.f32.f32 $0, $1;", "=f,f", [alpha * n], dtype=gl.float32, is_pure=True, pack=1
-    )
-    return gl.minimum(gl.maximum(rounded, -127.0), 127.0)
-
-
-@gluon.jit
-def _decode_row(alpha, n):
-    """The same per row: ``rint(clamp(alpha · n))`` by the FP32 add and subtract of 1.5 · 2^23,
-    at full rate on the FMA pipe; it differs only in the sign of zero, which ``d · d`` discards."""
-    clamped = gl.minimum(gl.maximum(alpha * n, -127.0), 127.0)
-    return (clamped + _ROUND_MAGIC) - _ROUND_MAGIC
-
-
-@gluon.jit
-def _shared_values(n, p1, INT8: gl.constexpr, SHARED: gl.constexpr):
-    """What the CTA's rows share of the 16 states' decodes, from their numerators ``n``: their
-    values at the one ``p1`` (``SHARED``), else the numerators (INT8) or code values (float) that
-    each row decodes (``_row_values``)."""
-    c = n
-    if not INT8:
-        c = ()
-        for i in gl.static_range(16):
-            c = c + (_code_value(n[i]),)
-    if SHARED:
-        out = ()
-        for i in gl.static_range(16):
-            out = out + (_decode_shared(p1, c[i]) if INT8 else p1 * c[i],)
-    else:
-        out = c
-    return out
-
-
-@gluon.jit
-def _row_values(shared, p1, INT8: gl.constexpr, SHARED: gl.constexpr):
-    """One row's decoded values of the 16 states from ``_shared_values`` (``p1``: the row's)."""
-    if SHARED:
-        out = shared
-    else:
-        out = ()
-        for i in gl.static_range(16):
-            out = out + (_decode_row(p1, shared[i]) if INT8 else p1 * shared[i],)
-    return out
-
-
-@gluon.jit
-def _argmin(value, ins, r: gl.constexpr, minus_p2, w, FIRST: gl.constexpr, COUNT: gl.constexpr):
-    """Row ``r``'s minimum over the ``COUNT`` candidates ``c`` of ``ins[r, i] + (w - value[i] ·
-    p2)²``, ``i = FIRST + c``, and its lowest minimizing ``c``: pairs ``(c, c + 1)``, then a strict
-    less-than scan over the pair minima in ascending ``c``, which finds the same minimum and lowest
-    minimizer as one ascending scan (the pair holding the lowest minimizer has it as its minimum,
-    and every earlier pair is larger). The compares and selects are PTX: written as ``gl.where``,
-    LLVM's SLP vectorizer (on for every target but sm_80, with no per-kernel switch) packs the six
-    rows' compares into ``<32 x i1>`` vectors, which NVPTX keeps as bits of a register (693 instead
-    of 521 instructions per output, 74% of the speed)."""
-    for c in gl.static_range(0, COUNT, 2):
-        d0 = gl.fma(value[FIRST + c], minus_p2, w)
-        d1 = gl.fma(value[FIRST + c + 1], minus_p2, w)
-        t0 = gl.fma(d0, d0, ins[r * 16 + FIRST + c])
-        t1 = gl.fma(d1, d1, ins[r * 16 + FIRST + c + 1])
-        if c == 0:
-            best, arg = gl.inline_asm_elementwise(
-                "{ .reg .pred p; setp.lt.f32 p, $3, $2; selp.f32 $0, $3, $2, p; "
-                "selp.b32 $1, 1, 0, p; }",
-                "=f,=r,f,f",
-                [t0, t1],
-                dtype=(gl.float32, gl.int32),
+def _argmin_h2(
+    wp, q, ins, p: gl.constexpr, FIRST: gl.constexpr, COUNT: gl.constexpr, COST_ONLY: gl.constexpr
+):
+    if COST_ONLY:
+        best = gl.inline_asm_elementwise(
+            _h2_min_only_first_asm(),
+            "=r,r,r,r,r,r",
+            [wp, q[FIRST], q[FIRST + 1], ins[p * 16 + FIRST], ins[p * 16 + FIRST + 1]],
+            dtype=gl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+        for i in gl.static_range(2, COUNT, 2):
+            best = gl.inline_asm_elementwise(
+                _h2_min_only_step_asm(),
+                "=r,r,r,r,r,r,r",
+                [
+                    wp,
+                    q[FIRST + i],
+                    q[FIRST + i + 1],
+                    ins[p * 16 + FIRST + i],
+                    ins[p * 16 + FIRST + i + 1],
+                    best,
+                ],
+                dtype=gl.uint32,
                 is_pure=True,
                 pack=1,
             )
-        else:
-            best, arg = gl.inline_asm_elementwise(
-                _scan_asm(c),
-                "=f,=r,f,r,f,f",
-                [best, arg, t0, t1],
-                dtype=(gl.float32, gl.int32),
-                is_pure=True,
-                pack=1,
-            )
+        return best, best
+    best, arg = gl.inline_asm_elementwise(
+        _h2_argmin_first_asm(),
+        "=r,=r,r,r,r,r,r",
+        [wp, q[FIRST], q[FIRST + 1], ins[p * 16 + FIRST], ins[p * 16 + FIRST + 1]],
+        dtype=(gl.uint32, gl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+    for i in gl.static_range(2, COUNT):
+        best, arg = gl.inline_asm_elementwise(
+            _h2_argmin_single_asm(i),
+            "=r,=r,r,r,r,r,r",
+            [wp, q[FIRST + i], ins[p * 16 + FIRST + i], best, arg],
+            dtype=(gl.uint32, gl.uint32),
+            is_pure=True,
+            pack=1,
+        )
     return best, arg
 
 
 @gluon.jit
-def _partner(x, lane_partner, THREADS: gl.constexpr):
-    """``x`` of lane ``lane_partner`` (``[warps, 32]``) of each lane's warp (one warp shuffle)."""
-    pairs = gl.reshape(x, [THREADS // 32, 32])
-    pairs = gl.convert_layout(pairs, _warp_lane_layout(THREADS), assert_trivial=True)
-    swapped = gl.reshape(gl.gather(pairs, lane_partner, 1), [THREADS])
-    return gl.convert_layout(swapped, _thread_layout(THREADS), assert_trivial=True)
-
-
-@gluon.jit
-def _owner(best, part, partners, THREADS: gl.constexpr, PARTS: gl.constexpr):
-    """Whether this lane stores its lane group's minimum (int32): the ``PARTS`` lanes of an output
-    hold ascending sixteens of ``a``, and the lane holding the minimum with the lowest ``a`` on ties
-    stores it. Costs order like their bits, so per butterfly level ``bits(other) >= bits(mine) +
-    upper`` (``upper``: this lane is the level's upper half) says "this lane holds its half's
-    minimum" in both lanes of the level's pair, exactly one lane of the group passes every level,
-    and only costs are exchanged: one shuffle (``partners[0]``, lane ^ 1) for 2 parts, two (then
-    ``partners[1]``, lane ^ 2, on the pair minima) for 4."""
-    bits = best.to(gl.uint32, bitcast=True)
-    other = _partner(bits, partners[0], THREADS)
-    owner = other >= bits + (part % 2).to(gl.uint32)
+def _reduce_parts(best, arg, part, PARTS: gl.constexpr, COST_ONLY: gl.constexpr):
+    if COST_ONLY:
+        if PARTS >= 2:
+            best = gl.inline_asm_elementwise(
+                _merge_shfl_cost_asm(1), "=r,r", [best], dtype=gl.uint32, is_pure=True, pack=1
+            )
+        if PARTS == 4:
+            best = gl.inline_asm_elementwise(
+                _merge_shfl_cost_asm(2), "=r,r", [best], dtype=gl.uint32, is_pure=True, pack=1
+            )
+        return best, arg
+    add_a = ((16 * part) | ((16 * part) << 16)).to(gl.uint32)
+    arg = arg + add_a
+    if PARTS >= 2:
+        best, arg = gl.inline_asm_elementwise(
+            _merge_shfl_asm(1),
+            "=r,=r,r,r",
+            [best, arg],
+            dtype=(gl.uint32, gl.uint32),
+            is_pure=True,
+            pack=1,
+        )
     if PARTS == 4:
-        pair = gl.minimum(bits, other)
-        other_pair = _partner(pair, partners[1], THREADS)
-        owner = owner & (other_pair >= pair + (part // 2).to(gl.uint32))
-    return owner.to(gl.int32)
+        best, arg = gl.inline_asm_elementwise(
+            _merge_shfl_asm(2),
+            "=r,=r,r,r",
+            [best, arg],
+            dtype=(gl.uint32, gl.uint32),
+            is_pure=True,
+            pack=1,
+        )
+    return best, arg
 
 
 @gluon.jit
-def _row_buffer(low, high, r: gl.constexpr, CAP: gl.constexpr, ROWS: gl.constexpr):
-    """Row ``r``'s prefix buffer and its first element's index there: the first ``_low_rows``
-    rows share ``low``, the rest ``high`` (Gluon allocations are powers of two: 6 rows are 4 and
-    2, 3 rows 2 and 1)."""
-    LOW_ROWS: gl.constexpr = _low_rows(ROWS)
-    if r < LOW_ROWS:
-        return low, r * CAP
+def _store_step_output(
+    base_addr, out_off, bp_ptr, arg, best, part, is_owner, do_bp,
+    poff: gl.constexpr, PARTS: gl.constexpr, COST_ONLY: gl.constexpr,
+):  # fmt: skip
+    """Store one pair's winning shared-memory cost and optional packed uint16 backpointer."""
+    if PARTS == 1:
+        _st_shared_u32(base_addr + out_off, best, poff)
+        if not COST_ONLY and do_bp:
+            gl.store(bp_ptr, ((arg & 63) | ((arg >> 8) & 0x3F00)).to(gl.uint16))
     else:
-        return high, (r - LOW_ROWS) * CAP
+        best, arg = _reduce_parts(best, arg, part, PARTS, COST_ONLY)
+        _st_shared_u32_if(base_addr + out_off, best, is_owner, poff)
+        if not COST_ONLY and do_bp:
+            gl.store(bp_ptr, ((arg & 63) | ((arg >> 8) & 0x3F00)).to(gl.uint16), mask=part == 0)
 
 
 @gluon.jit
-def _output(stored, offsets, n, ins, w, bp, low_address, high_address, part, partners, p1,
-            minus_p2, THREADS: gl.constexpr, CAP: gl.constexpr, ROWS: gl.constexpr,
-            PARTS: gl.constexpr, PAIR: gl.constexpr, INT8: gl.constexpr,
-            SHARED: gl.constexpr):  # fmt: skip
-    """One iteration's outputs of every row from its 16 states' numerators ``n`` (one output, or
-    a ``PAIR`` of 8 states each at adjacent stored positions): the minimum over ``a`` and its
-    backpointer, stored. ``offsets``: per output, its byte offset in a row's prefix buffer;
-    ``stored``: the (first) output's stored position past the thread's first. A pair's
-    backpointers are one 16-bit store (the first output's position is even)."""
-    shared = _shared_values(n, p1[0], INT8, SHARED)
-    LOW_ROWS: gl.constexpr = _low_rows(ROWS)
-    for r in gl.static_range(ROWS):
-        value = _row_values(shared, p1[r], INT8, SHARED)
-        base = low_address if r < LOW_ROWS else high_address
-        if PAIR:
-            best0, arg0 = _argmin(value, ins, r, minus_p2[r], w[r], 0, 8)
-            best1, arg1 = _argmin(value, ins, r, minus_p2[r], w[r], 8, 8)
-            _store_shared(base + offsets[0], best0, _row_offset(r, ROWS, CAP))
-            _store_shared(base + offsets[1], best1, _row_offset(r, ROWS, CAP))
-            pair = bp[r] + stored
-            pair = pair.to(gl.pointer_type(gl.uint16), bitcast=True)
-            gl.store(pair, (arg0 | (arg1 << 8)).to(gl.uint16))
-        else:
-            best, arg = _argmin(value, ins, r, minus_p2[r], w[r], 0, 16)
-            if PARTS == 1:
-                _store_shared(base + offsets[0], best, _row_offset(r, ROWS, CAP))
-                gl.store(bp[r] + stored, arg.to(gl.uint8))
-            else:
-                owner = _owner(best, part, partners, THREADS, PARTS)
-                _store_shared_if(base + offsets[0], best, owner, _row_offset(r, ROWS, CAP))
-                arg = arg + 16 * part
-                gl.store(bp[r] + stored, arg.to(gl.uint8), mask=owner != 0)
-
-
-@gluon.jit
-def _stored(e, LOW: gl.constexpr, LB: gl.constexpr, KAP: gl.constexpr):
-    """The stored position of a thread's output ``j0 + e`` past that of ``j0``
-    (``_store_index``): ``e << KAP`` when ``e`` lies in the ``LOW`` bits below ``j'``'s top
-    ``KAP``, else its bits from ``LOW`` up are the low bits of the top ``KAP`` (``_step``)."""
-    return e << KAP if LOW >= LB else ((e & ((1 << LOW) - 1)) << KAP) | (e >> LOW)
-
-
-@gluon.jit
-def _step(t, low, high, low_address, high_address, row, p1, minus_p2, w_ptr, bp_ptr, rows, outputs,
-          L: gl.constexpr, CAP: gl.constexpr, ROWS: gl.constexpr, INT8: gl.constexpr,
-          SHARED: gl.constexpr, MIN_K: gl.constexpr, KE: gl.constexpr, KA: gl.constexpr,
-          KAP: gl.constexpr):  # fmt: skip
-    """Step ``t`` for the CTA's rows, ``KE = k_t``, ``KA = k_{t+1}``, ``KAP = k_{t+2}``. Thread
-    mapping, fastest first: ``part`` (which sixteen of the ``2^KA`` values of ``a``: ``PARTS``
-    lanes share an output), ``q`` (the bits of ``j'`` from ``QB`` up), ``mid`` (the bits of ``j'``
-    between ``QS`` and the thread's loop bits ``e``, its low ``LB``). ``QS`` is ``LOW``, so that
-    ``q`` is the top ``KAP`` bits of ``j'`` (the stored position's lowest bits: a warp's
-    backpointer stores are contiguous runs), unless ``LB`` is larger (L = 12 with 6-bit steps):
-    then ``e`` takes the low bits of the top ``KAP`` and ``q`` the rest of them. ``QB`` is ``QS``,
-    except with a ``PAIR`` of outputs per iteration (``KA = 3``), whose second output takes ``j'``
-    bit ``LOW = QS``, a bit of the group above ``KE`` and bit 0 of the stored position."""
-    THREADS: gl.constexpr = _threads(L, MIN_K)
-    LB: gl.constexpr = _loop_bits(L, MIN_K)
-    WARP_LANE: gl.constexpr = _warp_lane_layout(THREADS)
-    GROUP: gl.constexpr = L - KE - KA  # bits of g = j' >> KE
-    LOW: gl.constexpr = L - KA - KAP  # bits of j' below its top KAP
-    QS: gl.constexpr = LOW if LOW >= LB else LB
-    PAIR: gl.constexpr = KA == 3  # two outputs per iteration, j0 + e and j0 + e + 2^LOW
-    PAIR_BIT: gl.constexpr = LOW if PAIR else -1
-    QB: gl.constexpr = QS + 1 if PAIR else QS  # q's lowest j' bit
-    PARTS: gl.constexpr = _parts(KA)
-    IN_BITS: gl.constexpr = L - KE
+def _step_h2(
+    t, low, high, low_addr, high_addr, pair_idx, alpha, w_pair_ptr, bp_pair_ptr,
+    num_pairs, outputs, write_bp_from,
+    L: gl.constexpr, CAP: gl.constexpr, PAIRS: gl.constexpr, MIN_K: gl.constexpr,
+    KE: gl.constexpr, KA: gl.constexpr, COST_ONLY: gl.constexpr,
+):  # fmt: skip
+    THREADS: gl.constexpr = _geometry(L, MIN_K)[0]
+    LB: gl.constexpr = _geometry(L, MIN_K)[1]
+    PAIR: gl.constexpr = KA == 3
+    PARTS: gl.constexpr = 1 << (KA - 4) if KA > 4 else 1
+    PART_BITS: gl.constexpr = KA - 4 if KA > 4 else 0
     OUT_BITS: gl.constexpr = L - KA
-    offsets: gl.constexpr = _in_offsets(IN_BITS, GROUP, PAIR_BIT - KE if PAIR else -1,
-                                        _family(MIN_K))  # fmt: skip
+    GROUP: gl.constexpr = L - KE - KA
+    LOW_P: gl.constexpr = _low_pairs(PAIRS)
+    IDX_BITS: gl.constexpr = OUT_BITS - LB
+    OFFSETS: gl.constexpr = _in_offsets(GROUP, PAIR)
+    STEPS: gl.constexpr = _state_steps(OUT_BITS, PAIR)
+    SEC_OUT_OFF: gl.constexpr = 4 * _phys_const(1 << (OUT_BITS - 1)) if PAIR else 0
+    SEC_BP_OFF: gl.constexpr = (1 << (IDX_BITS - 1)) if PAIR else 0
+
     tid = _thread_index(THREADS)
-    part = tid % PARTS
-    q = (tid // PARTS) & ((1 << (OUT_BITS - QB)) - 1)
-    mid = (tid // PARTS) >> (OUT_BITS - QB)
-    j0 = (q << QB) | (mid << LB)  # the thread's outputs: j0 + e, e < 2^LB
-    pos = ((j0 & ((1 << LOW) - 1)) << KAP) | (q << (QB - LOW))  # stored position of j0
+    part = tid & (PARTS - 1)
+    idx = tid >> PART_BITS
+    j0 = idx << LB
 
-    w = ()
-    bp = ()
-    for r in gl.static_range(ROWS):
-        w = w + (gl.load(w_ptr + t * rows + row[r]),)
-        bp = bp + (bp_ptr + (t * rows + row[r]).to(gl.int64) * CAP + pos,)
-    in_base = _phys_of((part << (GROUP + 4)) | (j0 >> KE), IN_BITS, MIN_K)  # (16 part + i, g)
+    wp = ()
+    bp_base = ()
+    do_bp = (not COST_ONLY) and (t >= write_bp_from)
+    bp_t = t - write_bp_from
+    for p in gl.static_range(PAIRS):
+        wp = wp + (gl.load(w_pair_ptr + t * num_pairs + pair_idx[p]),)
+        if not COST_ONLY:
+            pair_off = (bp_t * num_pairs + pair_idx[p]).to(gl.int64) * CAP + idx
+            bp_base = bp_base + (bp_pair_ptr + pair_off,)
+
+    in_base = _phys(((part * 16) << GROUP) | (j0 >> KE))
     ins = ()
-    for r in gl.static_range(ROWS):
-        buffer, first = _row_buffer(low, high, r, CAP, ROWS)
+    for p in gl.static_range(PAIRS):
+        buf = low if p < LOW_P else high
+        first = (p if p < LOW_P else p - LOW_P) * CAP
         for i in gl.static_range(16):
-            ins = ins + (buffer.gather(first + (in_base ^ offsets[i]), 0),)
+            ins = ins + (buf.gather(first + (in_base ^ OFFSETS[i]), 0),)
     gl.barrier()
 
-    out_base = _phys_of(j0, OUT_BITS, MIN_K)  # j0 + e is out_base ^ e: e lies in the identity bits
+    out_base = _phys(j0)
     x_base = (j0 + ((16 * part) << OUT_BITS)).to(gl.uint32) * _ONE_MAD_A + _ONE_MAD_B
-    lanes = gl.arange(0, 32, gl.SliceLayout(0, WARP_LANE))[None, :]
-    lanes = lanes + gl.zeros([THREADS // 32, 1], gl.int32, WARP_LANE)
-    partners = (lanes ^ 1, lanes ^ 2)
-    # A pair's second output j0 + e + 2^LOW: j' bit LOW, clear in j0 + e, is a bit of the group
-    # (LOW >= KE) and bit 0 of the stored position.
-    second_offset: gl.constexpr = 4 * _phys(1 << LOW, OUT_BITS, _family(MIN_K))
-    if LB >= 4:
-        # Each output's numerators are computed during the previous output (one extra set per
-        # step); with 4 or 8 outputs per step (L = 12; 3-bit steps) the extra set costs more than
-        # the latency it hides.
-        nxt = _numerators(x_base, OUT_BITS, PAIR_BIT)
-        for e in range(outputs):
-            n = nxt
-            x_next = x_base + _ONE_MAD_A * (e + 1).to(gl.uint32)
-            nxt = _numerators(x_next, OUT_BITS, PAIR_BIT)
-            offset = 4 * (out_base ^ e)
-            _output(
-                _stored(e, LOW, LB, KAP), (offset, offset ^ second_offset), n, ins, w, bp,
-                low_address, high_address, part, partners, p1, minus_p2, THREADS, CAP, ROWS,
-                PARTS, PAIR, INT8, SHARED,
-            )  # fmt: skip
-    else:
-        for e in range(outputs):
-            n = _numerators(x_base + _ONE_MAD_A * e.to(gl.uint32), OUT_BITS, PAIR_BIT)
-            offset = 4 * (out_base ^ e)
-            _output(
-                _stored(e, LOW, LB, KAP), (offset, offset ^ second_offset), n, ins, w, bp,
-                low_address, high_address, part, partners, p1, minus_p2, THREADS, CAP, ROWS,
-                PARTS, PAIR, INT8, SHARED,
-            )  # fmt: skip
+    is_owner = (part == 0).to(gl.int32)
+
+    for e in range(outputs):
+        xe = x_base + _ONE_MAD_A * e.to(gl.uint32)
+        q = ()
+        for i in gl.static_range(16):
+            q = q + (_decode_h2(xe + STEPS[i], alpha),)
+        out_off = 4 * (out_base ^ e)
+        bp_off = e << IDX_BITS
+        for p in gl.static_range(PAIRS):
+            base_addr = low_addr if p < LOW_P else high_addr
+            if PAIR:
+                best0, arg0 = _argmin_h2(wp[p], q, ins, p, 0, 8, COST_ONLY)
+                best1, arg1 = _argmin_h2(wp[p], q, ins, p, 8, 8, COST_ONLY)
+                _store_step_output(
+                    base_addr, out_off, bp_base[p] + bp_off if not COST_ONLY else bp_pair_ptr,
+                    arg0, best0, part, is_owner, do_bp, _pair_offset_bytes(p, PAIRS, CAP),
+                    1, COST_ONLY,
+                )  # fmt: skip
+                _store_step_output(
+                    base_addr, out_off ^ SEC_OUT_OFF,
+                    bp_base[p] + bp_off + SEC_BP_OFF if not COST_ONLY else bp_pair_ptr,
+                    arg1, best1, part, is_owner, do_bp, _pair_offset_bytes(p, PAIRS, CAP),
+                    1, COST_ONLY,
+                )  # fmt: skip
+            else:
+                best, arg = _argmin_h2(wp[p], q, ins, p, 0, 16, COST_ONLY)
+                _store_step_output(
+                    base_addr, out_off, bp_base[p] + bp_off if not COST_ONLY else bp_pair_ptr,
+                    arg, best, part, is_owner, do_bp, _pair_offset_bytes(p, PAIRS, CAP),
+                    PARTS, COST_ONLY,
+                )  # fmt: skip
     gl.barrier()
 
 
 @gluon.jit
-def _run(low, high, low_address, high_address, row, p1, minus_p2, w_ptr, bp_ptr, kinds_ptr, rows,
-         length, outputs, L: gl.constexpr, CAP: gl.constexpr, ROWS: gl.constexpr,
-         INT8: gl.constexpr, MIN_K: gl.constexpr, KINDS: gl.constexpr,
-         SHARED: gl.constexpr):  # fmt: skip
-    """Every step for a CTA whose rows share one ``p1`` (``SHARED``) or not: step ``t``'s kind
-    ``kinds[t]`` selects its specialization."""
-    for t in range(length):
-        kind = gl.load(kinds_ptr + t)
-        for k in gl.static_range(8):
-            if (KINDS >> k) & 1:  # noqa: SIM102 (compile time: only the schedule's kinds)
-                if kind == k:
-                    _step(
-                        t, low, high, low_address, high_address, row, p1, minus_p2, w_ptr, bp_ptr,
-                        rows, outputs, L, CAP, ROWS, INT8, SHARED, MIN_K, MIN_K + (k >> 2),
-                        MIN_K + ((k >> 1) & 1), MIN_K + (k & 1),
-                    )  # fmt: skip
-
-
-@gluon.jit
-def _initial(low_address, high_address, row, start_ptr, mod, constrained, THREADS: gl.constexpr,
-             CAP: gl.constexpr, ROWS: gl.constexpr, MIN_K: gl.constexpr,
-             WIDTH0: gl.constexpr):  # fmt: skip
-    """Initial prefixes over ``v``, the low ``WIDTH0 = L - k_0`` bits of the last state: free (all
-    zero) or constrained to ``v = start`` (an out-of-range start leaves every cost infinite)."""
-    tid = gl.arange(0, THREADS, _thread_layout(THREADS))
-    LOW_ROWS: gl.constexpr = _low_rows(ROWS)
-    for r in gl.static_range(ROWS):
-        start = gl.load(start_ptr + row[r] % mod, mask=constrained != 0, other=-1)
+def _init_smem(
+    low_addr, high_addr, pair_idx, start_pair_ptr, constrained,
+    THREADS: gl.constexpr, CAP: gl.constexpr, PAIRS: gl.constexpr, WIDTH0: gl.constexpr,
+):  # fmt: skip
+    TL: gl.constexpr = _thread_layout(THREADS)
+    LOW_P: gl.constexpr = _low_pairs(PAIRS)
+    tid = gl.arange(0, THREADS, TL)
+    zero_u32 = gl.full([THREADS], 0, gl.uint32, TL)
+    h_inf_lo = gl.full([THREADS], 0x00007C00, gl.uint32, TL)
+    h_inf_hi = gl.full([THREADS], 0x7C000000, gl.uint32, TL)
+    for p in gl.static_range(PAIRS):
+        sp = gl.load(start_pair_ptr + pair_idx[p], mask=constrained != 0, other=-1)
+        s0 = sp & 0xFFFF
+        s1 = (sp >> 16) & 0xFFFF
+        base_addr = low_addr if p < LOW_P else high_addr
         for i in gl.static_range((1 << WIDTH0) // THREADS):
             v = i * THREADS + tid
-            cost = gl.where((v == start) | (constrained == 0), 0.0, float("inf"))
-            index = _phys_of(v, WIDTH0, MIN_K)
-            address = (low_address if r < LOW_ROWS else high_address) + 4 * index
-            _store_shared(address, cost, _row_offset(r, ROWS, CAP))
+            lo = gl.where((v == s0) | (constrained == 0), zero_u32, h_inf_lo)
+            hi = gl.where((v == s1) | (constrained == 0), zero_u32, h_inf_hi)
+            _st_shared_u32(base_addr + _phys(v) * 4, lo | hi, _pair_offset_bytes(p, PAIRS, CAP))
 
 
 @gluon.jit
-def _final(low, high, row, m_out_ptr, k1, THREADS: gl.constexpr, CAP: gl.constexpr,
-           ROWS: gl.constexpr, MIN_K: gl.constexpr, WIDTH0: gl.constexpr):  # fmt: skip
-    """Final costs at their stored positions ``pos = (low L - k_0 - k_1 bits of v, top k_1
-    bits)``."""
-    tid = gl.arange(0, THREADS, _thread_layout(THREADS))
-    for r in gl.static_range(ROWS):
-        buffer, first = _row_buffer(low, high, r, CAP, ROWS)
-        for i in gl.static_range((1 << WIDTH0) // THREADS):
-            stored = i * THREADS + tid
-            v = ((stored & ((1 << k1) - 1)) << (WIDTH0 - k1)) | (stored >> k1)
-            cost = buffer.gather(first + _phys_of(v, WIDTH0, MIN_K), 0)
-            gl.store(m_out_ptr + row[r].to(gl.int64) * (1 << WIDTH0) + stored, cost)
+def _merge_h2_candidates(b0, b1, a0, a1, COST_ONLY: gl.constexpr):
+    if COST_ONLY:
+        best = gl.inline_asm_elementwise(
+            "min.f16x2 $0, $1, $2;", "=r,r,r", [b0, b1], dtype=gl.uint32, is_pure=True, pack=1
+        )
+        return best, a0
+    return gl.inline_asm_elementwise(
+        "{ .reg .b32 m; set.lt.u32.f16x2 m, $3, $2; min.f16x2 $0, $2, $3; "
+        "lop3.b32 $1, m, $5, $4, 0xCA; }",
+        "=r,=r,r,r,r,r",
+        [b0, b1, a0, a1],
+        dtype=(gl.uint32, gl.uint32),
+        is_pure=True,
+        pack=1,
+    )
 
 
-@gluon.jit(do_not_specialize=["rows", "mod", "length", "outputs", "k0", "k1", "constrained"])
-def _forward_kernel(
-    w_ptr, p1_ptr, p2_ptr, start_ptr, order_ptr, kinds_ptr, m_out_ptr, bp_ptr, rows, mod, length,
-    outputs, k0, k1, constrained, L: gl.constexpr, ROWS: gl.constexpr, INT8: gl.constexpr,
-    MIN_K: gl.constexpr, KINDS: gl.constexpr,
+@gluon.jit
+def _reduce_final_min(
+    low, high, pair_idx, out_ptr,
+    THREADS: gl.constexpr, CAP: gl.constexpr, PAIRS: gl.constexpr, WIDTH0: gl.constexpr,
+    COST_ONLY: gl.constexpr,
 ):  # fmt: skip
-    """All ``length`` steps for one CTA's ``ROWS`` row slots (``order``, ``compute_rows_per_cta``).
-    ``MIN_K``: the schedule's smallest step ``k``; ``kinds[t]`` is step ``t``'s kind ``4 (k_t - k)
-    + 2 (k_{t+1} - k) + k_{t+2} - k`` and ``KINDS`` the set of kinds as bits; ``k0``, ``k1``:
-    ``k_0``, ``k_1``. ``outputs`` is ``2^loop_bits``, passed at run time so that the output loop
-    stays a loop (LLVM unrolls a constant 16-trip loop into about 130 KB of code)."""
-    THREADS: gl.constexpr = _threads(L, MIN_K)
-    MIXED: gl.constexpr = KINDS != 1  # both step widths: k_0 known at run time
+    TL: gl.constexpr = _thread_layout(THREADS)
+    LOW_P: gl.constexpr = _low_pairs(PAIRS)
+    tid = gl.arange(0, THREADS, TL)
+    red_buf = gl.allocate_shared_memory(gl.uint32, [32], _IDENTITY)
+    red_addr = _shared_address(red_buf)
+    lane = tid & 31
+    warp = tid >> 5
+    NUM_WARPS: gl.constexpr = THREADS // 32
+    is_lane0 = (lane == 0).to(gl.int32)
+    z_i32 = gl.zeros_like(tid)
+
+    for p in gl.static_range(PAIRS):
+        buf = low if p < LOW_P else high
+        first = (p if p < LOW_P else p - LOW_P) * CAP
+        best = buf.gather(first + _phys(tid), 0)
+        arg = (tid | (tid << 16)).to(gl.uint32)
+        for i in gl.static_range(1, (1 << WIDTH0) // THREADS):
+            v = i * THREADS + tid
+            val = buf.gather(first + _phys(v), 0)
+            best, arg = _merge_h2_candidates(
+                best, val, arg, (v | (v << 16)).to(gl.uint32), COST_ONLY
+            )
+        for sh in gl.static_range(5):
+            if COST_ONLY:
+                best = gl.inline_asm_elementwise(
+                    _merge_shfl_cost_asm(1 << sh),
+                    "=r,r",
+                    [best],
+                    dtype=gl.uint32,
+                    is_pure=True,
+                    pack=1,
+                )
+            else:
+                best, arg = gl.inline_asm_elementwise(
+                    _merge_shfl_asm(1 << sh),
+                    "=r,=r,r,r",
+                    [best, arg],
+                    dtype=(gl.uint32, gl.uint32),
+                    is_pure=True,
+                    pack=1,
+                )
+        _st_shared_u32_if(red_addr + warp * 4, best, is_lane0, 0)
+        if not COST_ONLY:
+            _st_shared_u32_if(red_addr + (16 + warp) * 4, arg, is_lane0, 0)
+        gl.barrier()
+        if NUM_WARPS > 1:
+            b = red_buf.gather(z_i32, 0)
+            a = red_buf.gather(gl.full([THREADS], 16, gl.int32, TL), 0) if not COST_ONLY else b
+            for w_i in gl.static_range(1, NUM_WARPS):
+                bw = red_buf.gather(gl.full([THREADS], w_i, gl.int32, TL), 0)
+                aw = (
+                    red_buf.gather(gl.full([THREADS], 16 + w_i, gl.int32, TL), 0)
+                    if not COST_ONLY
+                    else a
+                )
+                b, a = _merge_h2_candidates(b, bw, a, aw, COST_ONLY)
+            res = b if COST_ONLY else a
+        else:
+            res = best if COST_ONLY else arg
+        gl.store(out_ptr + pair_idx[p] + z_i32, res, mask=tid == 0)
+        gl.barrier()
+
+
+@gluon.jit(
+    do_not_specialize=["num_pairs", "length", "outputs", "k0", "constrained", "write_bp_from"]
+)
+def _forward_kernel(
+    w_pair_ptr, alpha_cta_ptr, start_pair_ptr, kinds_ptr, out_ptr, bp_pair_ptr,
+    num_pairs, length, outputs, k0, constrained, write_bp_from,
+    L: gl.constexpr, MIN_K: gl.constexpr, KINDS: gl.constexpr, COST_ONLY: gl.constexpr,
+):  # fmt: skip
+    """All ``length`` steps for one CTA's ``PAIRS`` pairs sharing ``alpha_cta[cta]``."""
+    THREADS: gl.constexpr = _geometry(L, MIN_K)[0]
+    PAIRS: gl.constexpr = _geometry(L, MIN_K)[2]
+    MIXED: gl.constexpr = KINDS != 1
     CAP: gl.constexpr = 1 << (L - MIN_K)
-    LOW_ROWS: gl.constexpr = _low_rows(ROWS)
+    LOW_P: gl.constexpr = _low_pairs(PAIRS)
+    HIGH_P: gl.constexpr = PAIRS - LOW_P
+
     cta = gl.program_id(0)
-    low = gl.allocate_shared_memory(gl.float32, [LOW_ROWS * CAP], _IDENTITY)
-    high = gl.allocate_shared_memory(gl.float32, [(ROWS - LOW_ROWS) * CAP], _IDENTITY)
-    low_address = _shared_address(low)
-    high_address = _shared_address(high)
+    low = gl.allocate_shared_memory(gl.uint32, [LOW_P * CAP], _IDENTITY)
+    high = gl.allocate_shared_memory(gl.uint32, [HIGH_P * CAP], _IDENTITY) if HIGH_P > 0 else low
+    low_addr = _shared_address(low)
+    high_addr = _shared_address(high)
 
-    row = ()
-    p1 = ()
-    minus_p2 = ()
-    for r in gl.static_range(ROWS):
-        slot_row = gl.load(order_ptr + cta * ROWS + r)
-        row = row + (slot_row,)
-        p1 = p1 + (gl.load(p1_ptr + slot_row),)
-        minus_p2 = minus_p2 + (-gl.load(p2_ptr + slot_row),)
-    first_bits = p1[0].to(gl.int32, bitcast=True)
-    one = p1[1].to(gl.int32, bitcast=True) == first_bits  # the slots share one bitwise p1
-    for r in gl.static_range(2, ROWS):
-        one = one & (p1[r].to(gl.int32, bitcast=True) == first_bits)
+    alpha = gl.load(alpha_cta_ptr + cta)
+    pair_idx = ()
+    for p in gl.static_range(PAIRS):
+        pair_idx = pair_idx + (cta * PAIRS + p,)
 
-    if not MIXED:  # noqa: SIM114 (a compile-time branch, then a run-time one)
-        _initial(
-            low_address, high_address, row, start_ptr, mod, constrained, THREADS, CAP, ROWS,
-            MIN_K, L - MIN_K,
+    if not MIXED:  # noqa: SIM114 (compile-time vs run-time width selection)
+        _init_smem(
+            low_addr, high_addr, pair_idx, start_pair_ptr, constrained, THREADS, CAP, PAIRS,
+            L - MIN_K,
         )  # fmt: skip
     elif k0 == MIN_K:
-        _initial(
-            low_address, high_address, row, start_ptr, mod, constrained, THREADS, CAP, ROWS,
-            MIN_K, L - MIN_K,
+        _init_smem(
+            low_addr, high_addr, pair_idx, start_pair_ptr, constrained, THREADS, CAP, PAIRS,
+            L - MIN_K,
         )  # fmt: skip
     else:
-        _initial(
-            low_address, high_address, row, start_ptr, mod, constrained, THREADS, CAP, ROWS,
-            MIN_K, L - MIN_K - 1,
+        _init_smem(
+            low_addr, high_addr, pair_idx, start_pair_ptr, constrained, THREADS, CAP, PAIRS,
+            L - MIN_K - 1,
         )  # fmt: skip
     gl.barrier()
 
-    if one:
-        _run(
-            low, high, low_address, high_address, row, p1, minus_p2, w_ptr, bp_ptr, kinds_ptr,
-            rows, length, outputs, L, CAP, ROWS, INT8, MIN_K, KINDS, True,
-        )  # fmt: skip
-    else:
-        _run(
-            low, high, low_address, high_address, row, p1, minus_p2, w_ptr, bp_ptr, kinds_ptr,
-            rows, length, outputs, L, CAP, ROWS, INT8, MIN_K, KINDS, False,
-        )  # fmt: skip
+    for t in range(length):
+        kind = gl.load(kinds_ptr + t)
+        for k in gl.static_range(4):
+            if (KINDS >> k) & 1:  # noqa: SIM102
+                if kind == k:
+                    _step_h2(
+                        t, low, high, low_addr, high_addr, pair_idx, alpha, w_pair_ptr, bp_pair_ptr,
+                        num_pairs, outputs, write_bp_from, L, CAP, PAIRS, MIN_K,
+                        MIN_K + (k >> 1), MIN_K + (k & 1), COST_ONLY,
+                    )  # fmt: skip
 
-    if not MIXED:  # noqa: SIM114 (a compile-time branch, then a run-time one)
-        _final(low, high, row, m_out_ptr, k1, THREADS, CAP, ROWS, MIN_K, L - MIN_K)
-    elif k0 == MIN_K:
-        _final(low, high, row, m_out_ptr, k1, THREADS, CAP, ROWS, MIN_K, L - MIN_K)
-    else:
-        _final(low, high, row, m_out_ptr, k1, THREADS, CAP, ROWS, MIN_K, L - MIN_K - 1)
+    if COST_ONLY or (constrained == 0):
+        if not MIXED:  # noqa: SIM114
+            _reduce_final_min(
+                low, high, pair_idx, out_ptr, THREADS, CAP, PAIRS, L - MIN_K, COST_ONLY
+            )
+        elif k0 == MIN_K:
+            _reduce_final_min(
+                low, high, pair_idx, out_ptr, THREADS, CAP, PAIRS, L - MIN_K, COST_ONLY
+            )
+        else:
+            _reduce_final_min(
+                low, high, pair_idx, out_ptr, THREADS, CAP, PAIRS, L - MIN_K - 1, COST_ONLY
+            )
 
 
-_MIN_TRITON = (3, 9)
-"""The Gluon release the kernel and its workarounds were written and measured for."""
-_TRITON_VERSION = tuple(int(part) for part in re.findall(r"\d+", triton.__version__)[:2])
+@triton.jit
+def _traceback_kernel(
+    bp_pair_ptr, slot_ptr, j_ptr, widths_ptr, states_ptr, batch, num_pairs,
+    length: tl.constexpr, trace_steps: tl.constexpr, state_bits: tl.constexpr,
+    width: tl.constexpr, lb: tl.constexpr, block: tl.constexpr,
+):  # fmt: skip
+    """Trace each sequence backward over the last ``trace_steps`` steps from coalesced pairs."""
+    seq = (tl.program_id(0) * block + tl.arange(0, block)).to(tl.int64)
+    valid = seq < batch
+    slot = tl.load(slot_ptr + seq, mask=valid, other=0).to(tl.int64)
+    pair = slot >> 1
+    shift_byte = ((slot & 1) << 3).to(tl.int32)
+    j = tl.load(j_ptr + seq, mask=valid, other=0)
+    last_bp = trace_steps - 1
+    offset_t = length - trace_steps
+    for i in range(trace_steps):
+        bp_t = last_bp - i
+        t = offset_t + bp_t
+        bits = state_bits - tl.load(widths_ptr + t + 1)
+        bp_pos = ((j & ((1 << lb) - 1)) << (bits - lb)) | (j >> lb)
+        packed = tl.load(
+            bp_pair_ptr + (bp_t * num_pairs + pair) * width + bp_pos, mask=valid, other=0
+        ).to(tl.int32)
+        a = ((packed >> shift_byte) & 0xFF).to(tl.int64)
+        state = (a << bits) | j
+        tl.store(states_ptr + bp_t * batch + seq, state, mask=valid)
+        j = state >> tl.load(widths_ptr + t)
 
 
 def _supports_properties(capability: tuple[int, int], shared_optin: int) -> bool:
-    """Whether an NVIDIA GPU with these properties runs ``run_forward``."""
+    """Whether an NVIDIA GPU with these properties runs ``_forward_kernel``."""
     return capability >= (8, 0) and shared_optin >= SHARED_NEED
 
 
 @functools.cache
 def _supports_index(index: int) -> bool:
     props = torch.cuda.get_device_properties(index)
-    capability = (props.major, props.minor)
-    return _supports_properties(capability, props.shared_memory_per_block_optin)
+    return _supports_properties((props.major, props.minor), props.shared_memory_per_block_optin)
+
+
+def _index(device: torch.device) -> int:
+    return torch.cuda.current_device() if device.index is None else device.index
 
 
 def supports_device(device: torch.device) -> bool:
-    """Whether ``run_forward`` runs on ``device``: an NVIDIA GPU from sm_80 with
-    ``SHARED_NEED`` bytes of opt-in shared memory per CTA, under Triton 3.9 or later.
-    Checked once per device."""
+    """Whether ``run_viterbi`` runs on ``device``: NVIDIA SM80+ with ``SHARED_NEED`` bytes
+    of opt-in shared memory per CTA under Triton 3.9+."""
     if device.type != "cuda" or torch.version.hip is not None or _TRITON_VERSION < _MIN_TRITON:
         return False
     return _supports_index(_index(device))
 
 
-def supports_trellis(state_bits: int, step_widths: Sequence[int]) -> bool:
-    """Whether ``run_forward`` runs this trellis: ``state_bits`` in ``STATE_BITS`` and
-    ``1 <= T <= MAX_LENGTH`` steps in any order of one or two adjacent widths of
-    ``STEP_BITS`` (3/4, 4/5 or 5/6 bits)."""
-    widths = set(step_widths)
-    return (
-        state_bits in STATE_BITS
-        and 0 < len(step_widths) <= MAX_LENGTH
-        and widths <= set(STEP_BITS)
-        and max(widths) - min(widths) <= 1
-    )
-
-
-def compute_rows_per_cta(state_bits: int, step_widths: Sequence[int]) -> int:
-    """Rows per CTA of a trellis's kernel (``_order`` groups rows into CTAs of this
-    many, and a wave holds a multiple): ``ROWS``, or half of them where ``ROWS`` rows'
-    prefix costs do not fit in ``SHARED_LIMIT`` (L = 16 with 3-bit steps)."""
-    return _rows(state_bits, min(step_widths))
-
-
 def _kinds(step_widths: Sequence[int]) -> list[int]:
-    """Each step's kind ``4 (k_t - k) + 2 (k_{t+1} - k) + k_{t+2} - k`` with ``k`` the
-    smallest step, cyclic."""
     n, k = len(step_widths), min(step_widths)
-    return [
-        4 * (step_widths[t] - k) + 2 * (step_widths[(t + 1) % n] - k) + step_widths[(t + 2) % n] - k
-        for t in range(n)
-    ]
+    return [2 * (step_widths[t] - k) + (step_widths[(t + 1) % n] - k) for t in range(n)]
 
 
 def _kind_set(step_widths: Sequence[int]) -> int:
@@ -818,160 +660,265 @@ def _kind_set(step_widths: Sequence[int]) -> int:
 
 @functools.cache
 def _kinds_tensor(step_widths: tuple[int, ...], device: torch.device) -> torch.Tensor:
-    """``_kinds`` on ``device``, made once per schedule."""
     return torch.tensor(_kinds(step_widths), dtype=torch.int32, device=device)
 
 
-type _Specialization = tuple[int, bool, int, int]
+@functools.cache
+def _widths_tensor(step_widths: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    n = len(step_widths)
+    extended = [step_widths[t % n] for t in range(n + 2)]
+    return torch.tensor(extended, dtype=torch.int64, device=device)
 
 
-def _specialization(state_bits: int, step_widths: Sequence[int], int8: bool) -> _Specialization:
-    """The compiled kernel a trellis runs: its constexprs ``(L, INT8, MIN_K, KINDS)``."""
-    return state_bits, int8, min(step_widths), _kind_set(step_widths)
+type _Specialization = tuple[int, int, int, bool]
 
 
-def _compile_args(L: int, int8: bool, min_k: int, kinds: int) -> dict[str, int | bool]:
-    """A specialization's constexprs and launch options."""
-    options = {"num_warps": _geometry(L, min_k)[0] // 32, "enable_fp_fusion": False}
-    constexprs = {"L": L, "ROWS": _rows(L, min_k), "INT8": int8, "MIN_K": min_k, "KINDS": kinds}
-    return constexprs | options
+def _specialization(
+    state_bits: int, step_widths: Sequence[int], cost_only: bool
+) -> _Specialization:
+    return state_bits, min(step_widths), _kind_set(step_widths), cost_only
 
 
-def _index(device: torch.device) -> int:
-    return torch.cuda.current_device() if device.index is None else device.index
+def _compile_args(L: int, min_k: int, kinds: int, cost_only: bool) -> dict[str, int | bool]:
+    threads = _geometry(L, min_k)[0]
+    return {
+        "L": L,
+        "MIN_K": min_k,
+        "KINDS": kinds,
+        "COST_ONLY": cost_only,
+        "num_warps": threads // 32,
+    }
 
 
 @functools.cache
 def _compiled(specialization: _Specialization, index: int) -> CompiledKernel:
-    """A specialization compiled for device ``index`` and loaded, with its register
-    count."""
-    f32, i32, i64, u8 = torch.float32, torch.int32, torch.int64, torch.uint8
+    L, min_k, kinds, cost_only = specialization
+    u32, f32, i32, u16 = torch.uint32, torch.float32, torch.int32, torch.uint16
+    outputs = 1 << _geometry(L, min_k)[1]
     with torch.cuda.device(index):
         kernel = _forward_kernel.warmup(
-            f32, f32, f32, i64, i32, i32, f32, u8, 0, 1, 1, 1, 4, 4, 0, grid=(1,),
-            **_compile_args(*specialization),
+            u32, f32, i32, i32, u32, u16, 1, 1, outputs, min_k, 0, 0, grid=(1,),
+            **_compile_args(L, min_k, kinds, cost_only),
         )  # fmt: skip
-        # Private: a compiled kernel's register count (n_regs) is known only once its
-        # module is loaded, which Triton does in this method on the first launch;
-        # compute_wave_rows needs it before.
+        # Private: n_regs is populated only once the CUDA module handle is initialized.
         kernel._init_handles()
     return kernel
 
 
 def _resident_ctas(specialization: _Specialization, index: int) -> int:
-    """Resident CTAs per SM of a specialization: the fewest that its threads,
-    registers (per warp in units of 256) and shared memory (with
-    ``_RESERVED_SHARED``) leave room for."""
     kernel = _compiled(specialization, index)
     props = torch.cuda.get_device_properties(index)
-    threads = _geometry(specialization[0], specialization[2])[0]
+    threads = _geometry(specialization[0], specialization[1])[0]
     warp_registers = -(-kernel.n_regs * 32 // 256) * 256
     by_threads = props.max_threads_per_multi_processor // threads
     by_registers = props.regs_per_multiprocessor // (warp_registers * threads // 32)
-    shared = kernel.metadata.shared + _RESERVED_SHARED
-    by_shared = props.shared_memory_per_multiprocessor // shared
+    by_shared = props.shared_memory_per_multiprocessor // (
+        kernel.metadata.shared + _RESERVED_SHARED
+    )
     return min(by_threads, by_registers, by_shared)
 
 
-def compute_wave_rows(
-    state_bits: int, step_widths: Sequence[int], int8: bool, device: torch.device
+def _wave_ctas(
+    state_bits: int, step_widths: Sequence[int], cost_only: bool, device: torch.device
 ) -> int:
-    """Rows that occupy every SM of ``device`` exactly once.
-
-    A launch takes about ``ceil(rows / wave_rows)`` times as long as one wave, so
-    batches should be whole multiples (RTX 5090, L = 16: 170 SMs x 1 CTA x 6 rows =
-    1020; with 3-bit steps x 3 rows = 510). Compiles the kernel on first use.
-    """
     index = _index(device)
-    ctas = _resident_ctas(_specialization(state_bits, step_widths, int8), index)
+    ctas = _resident_ctas(_specialization(state_bits, step_widths, cost_only), index)
     sms = torch.cuda.get_device_properties(index).multi_processor_count
-    return sms * ctas * compute_rows_per_cta(state_bits, step_widths)
+    return sms * ctas
 
 
-def _order(p1: torch.Tensor, rows_per_cta: int) -> torch.Tensor:
-    """The row of each CTA slot, int32 ``[ctas · rows_per_cta]``.
+def _bucket_pack_rows(
+    alpha: torch.Tensor, rows_per_cta: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Group rows by bitwise ``alpha``, padding each bucket to a multiple of ``rows_per_cta``."""
+    n = alpha.shape[0]
+    device = alpha.device
+    sorted_key, order = torch.sort(alpha.contiguous().view(torch.int32), stable=True)
+    uniq_keys, counts = torch.unique_consecutive(sorted_key, return_counts=True)
+    ctas_per_bucket = (counts + rows_per_cta - 1) // rows_per_cta
+    padded_sizes = ctas_per_bucket * rows_per_cta
+    total_slots = int(padded_sizes.sum().item())
 
-    Rows are sorted by bitwise ``p1`` so a CTA's rows share one value where they can,
-    the last CTA is padded with the last row (a repeated slot computes and stores the
-    same bytes), and the CTAs that hold more than one value come first. Those decode
-    per row, which takes about 1.7x the time of a shared decode in INT8; starting them
-    first keeps them out of the last wave, where one would extend the launch. Device
-    ops only (no host synchronization).
-    """
-    rows = p1.shape[0]
-    ctas = -(-rows // rows_per_cta)
-    key = p1.view(torch.int32)
-    order = torch.sort(key, stable=True).indices
-    order = torch.cat([order, order[-1:].expand(ctas * rows_per_cta - rows)])
-    slots = key[order].view(ctas, rows_per_cta)
-    mixed = (slots[:, 1:] != slots[:, :-1]).any(1).to(torch.int8)
-    slowest_first = torch.sort(mixed, descending=True, stable=True).indices
-    return order.view(ctas, rows_per_cta)[slowest_first].reshape(-1).to(torch.int32)
+    bucket_starts_src = torch.cumsum(counts, 0) - counts
+    bucket_starts_dst = torch.cumsum(padded_sizes, 0) - padded_sizes
+    bucket_ids = torch.arange(uniq_keys.numel(), device=device)
+
+    bucket_of_slot = torch.repeat_interleave(bucket_ids, padded_sizes)
+    offset_in_bucket = torch.arange(total_slots, device=device) - bucket_starts_dst[bucket_of_slot]
+    slot_to_row = order[
+        bucket_starts_src[bucket_of_slot]
+        + torch.minimum(offset_in_bucket, counts[bucket_of_slot] - 1)
+    ]
+
+    bucket_of_sorted = torch.repeat_interleave(bucket_ids, counts)
+    sorted_to_slot = bucket_starts_dst[bucket_of_sorted] + (
+        torch.arange(n, device=device) - bucket_starts_src[bucket_of_sorted]
+    )
+    row_to_slot = torch.empty(n, dtype=torch.int64, device=device)
+    row_to_slot[order] = sorted_to_slot
+
+    alpha_cta = torch.repeat_interleave(uniq_keys.view(torch.float32), ctas_per_bucket)
+    return slot_to_row, row_to_slot, alpha_cta
 
 
-def run_forward(
+def _pack_w_pairs(w_norm_h: torch.Tensor, length: int, num_pairs: int) -> torch.Tensor:
+    return (
+        w_norm_h.T.contiguous()
+        .view(length, num_pairs, 2)
+        .view(torch.uint32)
+        .squeeze(-1)
+        .contiguous()
+    )
+
+
+def _run_cost_only(
+    w_norm_h: torch.Tensor,
+    alpha: torch.Tensor,
+    widths: tuple[int, ...],
+    kinds_t: torch.Tensor,
+    state_bits: int,
+    min_k: int,
+    lb: int,
+    pairs_per_cta: int,
+    kind_set: int,
+    num_warps: int,
+) -> torch.Tensor:
+    device = w_norm_h.device
+    length = w_norm_h.shape[1]
+    rows_per_cta = 2 * pairs_per_cta
+    with device_context(device):
+        slot_to_row, row_to_slot, alpha_cta = _bucket_pack_rows(alpha, rows_per_cta)
+        num_ctas = alpha_cta.shape[0]
+        num_pairs = num_ctas * pairs_per_cta
+        w_packed = _pack_w_pairs(w_norm_h[slot_to_row], length, num_pairs)
+        start_pair = torch.empty(1, dtype=torch.int32, device=device)
+        out_pair = torch.empty(num_pairs, dtype=torch.uint32, device=device)
+        bp_pair = torch.empty(1, dtype=torch.uint16, device=device)
+        _forward_kernel[(num_ctas,)](
+            w_packed, alpha_cta, start_pair, kinds_t, out_pair, bp_pair,
+            num_pairs, length, 1 << lb, widths[0], 0, 0,
+            L=state_bits, MIN_K=min_k, KINDS=kind_set, COST_ONLY=True, num_warps=num_warps,
+        )  # fmt: skip
+        return out_pair.view(torch.float16).view(-1)[row_to_slot]
+
+
+def _run_walk(
+    w_norm_h: torch.Tensor,
+    alpha: torch.Tensor,
+    overlap: torch.Tensor | None,
+    widths: tuple[int, ...],
+    kinds_t: torch.Tensor,
+    widths_t: torch.Tensor,
+    state_bits: int,
+    min_k: int,
+    lb: int,
+    pairs_per_cta: int,
+    kind_set: int,
+    num_warps: int,
+    write_bp_from: int,
+) -> torch.Tensor:
+    device = w_norm_h.device
+    length = w_norm_h.shape[1]
+    trace_steps = length - write_bp_from
+    rows_per_cta = 2 * pairs_per_cta
+    cap = 1 << (state_bits - min_k)
+
+    with device_context(device):
+        slot_to_row, row_to_slot, alpha_cta = _bucket_pack_rows(alpha, rows_per_cta)
+        total_ctas = alpha_cta.shape[0]
+        total_slots = total_ctas * rows_per_cta
+
+        wave_ctas = max(1, _wave_ctas(state_bits, widths, False, device))
+        max_ctas = max(1, _BACKPOINTER_BYTES // (rows_per_cta * trace_steps * cap))
+        waves = max(1, max_ctas // wave_ctas)
+        batch_ctas = min(total_ctas, waves * wave_ctas)
+
+        slot_states = torch.empty(total_slots, trace_steps, dtype=torch.int64, device=device)
+        bp_storage = torch.empty(
+            trace_steps * batch_ctas * pairs_per_cta * cap, dtype=torch.uint16, device=device
+        )
+        slot_ids: torch.Tensor | None = None
+
+        for c0 in range(0, total_ctas, batch_ctas):
+            c1 = min(total_ctas, c0 + batch_ctas)
+            nb_ctas = c1 - c0
+            nb_pairs = nb_ctas * pairs_per_cta
+            nb_slots = nb_ctas * rows_per_cta
+            s_slice = slot_to_row[c0 * rows_per_cta : c1 * rows_per_cta]
+            w_packed = _pack_w_pairs(w_norm_h[s_slice], length, nb_pairs)
+            if overlap is None:
+                start_pair = torch.empty(1, dtype=torch.int32, device=device)
+                constrained = 0
+            else:
+                ov_b = overlap[s_slice].to(torch.int32).view(nb_pairs, 2)
+                start_pair = (ov_b[:, 0] | (ov_b[:, 1] << 16)).contiguous()
+                constrained = 1
+
+            out_pair = torch.empty(nb_pairs, dtype=torch.uint32, device=device)
+            bp_pair = bp_storage[: trace_steps * nb_pairs * cap].view(trace_steps, nb_pairs, cap)
+            _forward_kernel[(nb_ctas,)](
+                w_packed, alpha_cta[c0:c1], start_pair, kinds_t, out_pair, bp_pair,
+                nb_pairs, length, 1 << lb, widths[0], constrained, write_bp_from,
+                L=state_bits, MIN_K=min_k, KINDS=kind_set, COST_ONLY=False, num_warps=num_warps,
+            )  # fmt: skip
+            j_end = (
+                out_pair.view(torch.uint16).view(-1).to(torch.int64).contiguous()
+                if overlap is None
+                else overlap[s_slice].contiguous()
+            )
+            if slot_ids is None or slot_ids.numel() != nb_slots:
+                slot_ids = torch.arange(nb_slots, dtype=torch.int64, device=device)
+            states_t = torch.empty(trace_steps, nb_slots, dtype=torch.int64, device=device)
+            _traceback_kernel[(triton.cdiv(nb_slots, _TRACEBACK_SEQUENCES),)](
+                bp_pair, slot_ids, j_end, widths_t, states_t, nb_slots, nb_pairs,
+                length=length, trace_steps=trace_steps, state_bits=state_bits,
+                width=cap, lb=lb, block=_TRACEBACK_SEQUENCES, num_warps=2,
+            )  # fmt: skip
+            slot_states[c0 * rows_per_cta : c1 * rows_per_cta] = states_t.T
+        return slot_states[row_to_slot]
+
+
+def run_viterbi(
     state_bits: int,
     step_widths: Sequence[int],
+    w_norm_h: torch.Tensor,
+    alpha: torch.Tensor,
+    overlap: torch.Tensor | None = None,
     *,
-    int8: bool,
-    w: torch.Tensor,
-    p1: torch.Tensor,
-    p2: torch.Tensor,
-    overlap: torch.Tensor | None,
-    bp: torch.Tensor,
+    cost_only: bool = False,
+    write_bp_from: int = 0,
 ) -> torch.Tensor:
-    """All ``T`` steps of the Viterbi forward for ``rows`` independent rows.
+    """Run FP16x2 Viterbi over ``w_norm_h [N, T]`` (float16) and folded ``alpha [N]`` (float32).
 
-    Returns the final prefix costs and fills ``bp``, identical to the step loop from
-    the same initial prefix. Inputs are contiguous and on one CUDA device that
-    ``supports_device``, where the kernel launches:
-
-    - ``state_bits``, ``step_widths``: the trellis, with ``supports_trellis``;
-    - ``int8``: the format's INT8 decode (``p1`` is the folded ``alpha``) instead of the
-      float value ``(c(s)·p1)·p2``;
-    - ``w``: FP32 ``[T, rows]``, the weight of each row at each position. The kernel
-      indexes it by int32 ``t · rows + row``, which the caller's batches keep below
-      ``2^31``;
-    - ``p1``, ``p2``: FP32 ``[rows]``, the row's scale for every position and its
-      multiplier. ``w``, ``p1`` and ``p2`` must be finite: the kernel groups its
-      comparisons on the premise that costs are never NaN, so a row with a non-finite
-      input gets unspecified results;
-    - ``overlap``: int64 ``[mod]`` with ``rows % mod == 0``, or ``None``. ``None``:
-      free start, every initial prefix cost 0. Otherwise row ``r`` starts from
-      ``overlap[r % mod]``, below ``2^(L - k_0)``: cost 0 there and infinity elsewhere;
-    - ``bp``: uint8 ``[T, rows, 2^(L - min k)]`` to receive the backpointers:
-      ``bp[t, r, pos]`` is the minimizing dropped bits ``a`` at the stored position
-      ``pos`` of each prefix after step ``t`` (the first ``2^(L - k_(t+1))``
-      positions; the rest are not written).
-
-    Returns FP32 ``[rows, 2^(L - k_0)]``: the prefix costs after the last step in the
-    stored layout (``_store_index(j, L - k_0, k_1)``), as the loop's. Rows are grouped
-    by bitwise ``p1`` internally; outputs are in the caller's row order and each row's
-    result depends only on its own inputs.
+    With ``cost_only=True``, returns minimum final costs ``[N]`` (float16) without writing
+    backpointers. Otherwise traces back steps ``write_bp_from..T-1`` and returns states
+    ``[N, T - write_bp_from]`` (int64).
     """
-    length, rows = w.shape
-    out = torch.empty(rows, 1 << (state_bits - step_widths[0]), device=w.device)
-    if rows == 0:
-        return out
-    per_cta = compute_rows_per_cta(state_bits, step_widths)
-    with torch.cuda.device(w.device):
-        order = _order(p1, per_cta)
-        kinds = _kinds_tensor(tuple(step_widths), w.device)
-        free = overlap is None
-        outputs = 1 << _geometry(state_bits, min(step_widths))[1]
-        _forward_kernel[(order.shape[0] // per_cta,)](
-            w, p1, p2, torch.empty(1, dtype=torch.int64, device=w.device) if free else overlap,
-            order, kinds, out, bp, rows, 1 if free else overlap.shape[0], length, outputs,
-            step_widths[0], step_widths[1 % length], int(not free),
-            **_compile_args(*_specialization(state_bits, step_widths, int8)),
+    if cost_only and overlap is not None:
+        raise ValueError("overlap is not supported with cost_only=True")
+    n, length = w_norm_h.shape
+    device = w_norm_h.device
+    trace_steps = length - write_bp_from
+    if n == 0:
+        if cost_only:
+            return torch.empty(0, dtype=torch.float16, device=device)
+        return torch.empty(0, trace_steps, dtype=torch.int64, device=device)
+
+    widths = tuple(step_widths)
+    min_k = min(widths)
+    threads, lb, pairs_per_cta = _geometry(state_bits, min_k)
+    spec = _specialization(state_bits, widths, cost_only)
+    num_warps = threads // 32
+    kinds_t = _kinds_tensor(widths, device)
+    if cost_only:
+        return _run_cost_only(
+            w_norm_h, alpha, widths, kinds_t, state_bits, min_k, lb, pairs_per_cta,
+            spec[2], num_warps,
         )  # fmt: skip
-    return out
+    return _run_walk(
+        w_norm_h, alpha, overlap, widths, kinds_t, _widths_tensor(widths, device),
+        state_bits, min_k, lb, pairs_per_cta, spec[2], num_warps, write_bp_from,
+    )  # fmt: skip
 
 
-__all__ = [
-    "compute_rows_per_cta",
-    "compute_wave_rows",
-    "run_forward",
-    "supports_device",
-    "supports_trellis",
-]
+__all__ = ["FP16_SCALE", "SHARED_NEED", "run_viterbi", "supports_device"]
