@@ -7,9 +7,9 @@ and keeps a block's new walk or scale only where it lowers its FP64 error:
 
 1. **Coarse float stage**, on the layout's step widths with 12-bit states: QTIP
    Algorithm 4's overlap at ``center = max(rms(block) / 0.909, 1e-8)``, one Viterbi
-   over three candidate scales per block—``center``, ``peak = max(amax(block) /
-   3.0, center)``, and their geometric midpoint—then an unclamped continuous
-   least-squares scale refit for the winning walk. The row scale starts at
+   at that scale, also considering ``peak = amax(block) / 3.0`` and the geometric
+   midpoint when the peak exceeds the center. An unclamped continuous least-squares
+   refit sets the scale of the winning walk. The row scale starts at
    ``s_c0 = max |ŵ| / 127`` of that reconstruction.
 2. **Row scale:** ``m · s_c0`` for the ``m`` among 29 multipliers from 0.84 to 2.83
    at which the coarse walks decode to INT8 with the least error (no Viterbi).

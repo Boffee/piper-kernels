@@ -37,8 +37,9 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 - `piper_kernels.trellis.TrellisStorage.from_hp` now pairs its RMS block-scale seed with
   peak-anchored (`amax`-derived) candidates and unclamped least-squares float scale
-  refitting, improving SQNR on outlier-bearing and heterogeneous-variance rows without
-  changing the stored trellis format or size.
+  refitting, improving SQNR on outlier-bearing and heterogeneous-variance rows. The
+  offline encoder searches each distinct float scale once per block and preserves the
+  stored format and size.
 - Fused ConvRot INT8 sparse Piper attention validates prepared query metadata once
   across all query windows.
 - Updated ConvRot INT8 3D convolution dispatch on NVIDIA SM120 to select full-grid tiles
