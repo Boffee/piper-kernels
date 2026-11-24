@@ -609,14 +609,16 @@ def _assert_clean_offline_compile(
         "bias_dtype",
         "high_first",
         "two_level",
+        "group_size",
     ),
     [
-        (1, 1024, 5120, torch.bfloat16, torch.float32, False, True),
-        (1, 5120, 5120, torch.bfloat16, torch.float32, False, True),
-        (4, 5120, 5120, torch.float32, torch.float32, False, True),
-        (16, 5120, 5120, torch.bfloat16, torch.bfloat16, True, True),
-        (64, 5120, 5120, torch.float16, torch.float16, True, False),
-        (64, 5120, 5120, torch.float16, torch.float32, False, True),
+        (1, 1024, 5120, torch.bfloat16, torch.float32, False, True, 0),
+        (1, 5120, 5120, torch.bfloat16, torch.float32, False, True, 0),
+        (4, 5120, 5120, torch.float32, torch.float32, False, True, 0),
+        (8, 5120, 5120, torch.float16, torch.float16, False, True, 16),
+        (16, 5120, 5120, torch.bfloat16, torch.bfloat16, True, True, 0),
+        (64, 5120, 5120, torch.float16, torch.float16, True, False, 0),
+        (64, 5120, 5120, torch.float16, torch.float32, False, True, 0),
     ],
 )
 def test_w4a16_workloads_compile_without_vgpr_spills(
@@ -628,6 +630,7 @@ def test_w4a16_workloads_compile_without_vgpr_spills(
     bias_dtype: torch.dtype | None,
     high_first: bool,
     two_level: bool,
+    group_size: int,
 ) -> None:
     compiled = nvfp4_triton.compile_w4a16_kernels(
         target,
@@ -636,6 +639,7 @@ def test_w4a16_workloads_compile_without_vgpr_spills(
         input_features=input_features,
         input_dtype=input_dtype,
         bias_dtype=bias_dtype,
+        group_size=group_size,
         high_first=high_first,
         has_weight_per_tensor_scale=two_level,
     )
@@ -901,6 +905,39 @@ def test_gpu_w4a16_mixed_bias_avoids_pre_bias_fp16_overflow(rows: int) -> None:
         weight.scale.cpu(),
         weight.per_tensor_scale.cpu() if weight.per_tensor_scale is not None else None,
         bias.cpu(),
+    ).cuda()
+    assert actual.dtype is torch.float16
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.parametrize("rows", [1, 8, 17])
+def test_gpu_w4a16_convrot_fp16_preserves_rotation_range(rows: int) -> None:
+    pattern = (
+        torch.tensor(
+            [1, 1, 1, -1, 1, 1, 1, -1, 1, 1, 1, -1, -1, -1, -1, 1],
+            dtype=torch.float16,
+        )
+        * 20000.0
+    )
+    x = pattern.expand(rows, 16).contiguous().cuda()
+    qdata = torch.full((16, 8), 0x22, dtype=torch.uint8, device="cuda")
+    scale = torch.ones((32, 16), dtype=torch.float8_e4m3fn, device="cuda")
+    per_tensor_scale = torch.tensor(1.0 / 16.0, dtype=torch.float32, device="cuda")
+    weight = ConvRotNVFP4Tensor(
+        qdata, scale, 16, torch.float16, 16, per_tensor_scale, None, True, False, None
+    )
+
+    actual = F.linear(x, weight)
+    expected = nvfp4_reference.linear_w4a16(
+        x.cpu(),
+        qdata.cpu(),
+        scale.cpu(),
+        per_tensor_scale.cpu(),
+        None,
+        group_size=16,
     ).cuda()
     assert actual.dtype is torch.float16
     assert torch.isfinite(actual).all()

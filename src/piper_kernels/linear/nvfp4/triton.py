@@ -19,6 +19,7 @@ from piper_kernels._input_activations import triton as triton_input_activations
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.linear import _bias
 from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
+from piper_kernels.weights.convrot._rotation import validate_group_size
 from piper_kernels.weights.nvfp4 import _layout
 from piper_kernels.weights.nvfp4.triton import (
     _decode_fp4,
@@ -1174,6 +1175,7 @@ def compile_w4a16_kernels(
     input_features: int,
     input_dtype: torch.dtype,
     bias_dtype: torch.dtype | None = None,
+    group_size: int = 0,
     high_first: bool = False,
     has_weight_per_tensor_scale: bool = True,
     num_sms: int = 64,
@@ -1185,11 +1187,18 @@ def compile_w4a16_kernels(
         raise ValueError(f"Unsupported W4A16 input dtype: {input_dtype}")
     if bias_dtype is not None and bias_dtype not in _TRITON_FLOAT_POINTER_TYPES:
         raise ValueError(f"Unsupported W4A16 bias dtype: {bias_dtype}")
+    if group_size != 0:
+        validate_group_size(group_size)
 
-    in_ty = _TRITON_FLOAT_POINTER_TYPES[input_dtype]
-    mixed_bias = bias_dtype is not None and bias_dtype is not input_dtype
+    active_dtype = (
+        torch.float32 if (group_size > 0 and input_dtype is torch.float16) else input_dtype
+    )
+    active_ty = _TRITON_FLOAT_POINTER_TYPES[active_dtype]
+    out_ty = _TRITON_FLOAT_POINTER_TYPES[input_dtype]
+    use_fp32 = active_dtype is torch.float32 or (
+        bias_dtype is not None and bias_dtype is not input_dtype
+    )
     if rows > _W4A16_GEMV_MAX_ROWS:
-        dequant_ty = "*fp32" if mixed_bias else in_ty
         dequant = triton.compile(
             ASTSource(
                 dequantize_nvfp4_swizzled_kernel,
@@ -1197,7 +1206,7 @@ def compile_w4a16_kernels(
                     "weight_ptr": "*u8",
                     "weight_scale_ptr": "*u8",
                     "weight_per_tensor_scale_ptr": "*fp32",
-                    "output_ptr": dequant_ty,
+                    "output_ptr": "*fp32" if use_fp32 else out_ty,
                     "out_features": "i32",
                     "input_features": "i32",
                     "scale_column_blocks": "i32",
@@ -1215,9 +1224,9 @@ def compile_w4a16_kernels(
         return {"dequant": dequant}
 
     block_m, block_n, block_k, num_warps, use_dot, split_k = _select_w4a16_gemv_config_for_sms(
-        num_sms, rows, input_dtype, out_features, input_features
+        num_sms, rows, active_dtype, out_features, input_features
     )
-    bias_ty = in_ty if bias_dtype is None else _TRITON_FLOAT_POINTER_TYPES[bias_dtype]
+    bias_ty = out_ty if bias_dtype is None else _TRITON_FLOAT_POINTER_TYPES[bias_dtype]
     is_splitk = split_k > 1
     has_bias = bias_dtype is not None
     compiled: dict[str, triton.compiler.CompiledKernel] = {
@@ -1225,12 +1234,12 @@ def compile_w4a16_kernels(
             ASTSource(
                 w4a16_gemv_splitk_kernel,
                 {
-                    "input_ptr": in_ty,
+                    "input_ptr": active_ty,
                     "weight_ptr": "*u8",
                     "weight_scale_ptr": "*u8",
                     "weight_per_tensor_scale_ptr": "*fp32",
                     "bias_ptr": bias_ty,
-                    "output_ptr": "*fp32" if is_splitk else in_ty,
+                    "output_ptr": "*fp32" if is_splitk else out_ty,
                     "rows": "i32",
                     "out_features": "i32",
                     "input_features": "i32",
@@ -1260,7 +1269,7 @@ def compile_w4a16_kernels(
                     "partial_ptr": "*fp32",
                     "weight_per_tensor_scale_ptr": "*fp32",
                     "bias_ptr": bias_ty,
-                    "output_ptr": in_ty,
+                    "output_ptr": out_ty,
                     "rows": "i32",
                     "out_features": "i32",
                     "split_k": "i32",
@@ -1342,7 +1351,7 @@ def _linear_w4a16(
         rotated = torch.empty(
             (rows, input_features),
             device=input_2d.device,
-            dtype=input.dtype,
+            dtype=torch.float32 if input.dtype is torch.float16 else input.dtype,
         )
         rotate_input(input_2d, rotated, group_size, num_warps=4)
         active_2d = rotated
@@ -1350,17 +1359,19 @@ def _linear_w4a16(
         active_2d = input_2d
 
     if rows > _W4A16_GEMV_MAX_ROWS:
-        mixed_bias = bias is not None and bias.dtype is not input.dtype
+        use_fp32 = active_2d.dtype is torch.float32 or (
+            bias is not None and bias.dtype is not input.dtype
+        )
         dequant_weight = _dequantize_nvfp4_swizzled(
             weight_qdata,
             weight_scale,
             weight_per_tensor_scale,
             high_first=high_first,
-            output_dtype=torch.float32 if mixed_bias else input.dtype,
+            output_dtype=torch.float32 if use_fp32 else input.dtype,
         )
-        if mixed_bias:
-            assert bias is not None
-            result = F.linear(active_2d.float(), dequant_weight, bias.float()).to(input.dtype)
+        if use_fp32:
+            bias_fp32 = None if bias is None else bias.float()
+            result = F.linear(active_2d.float(), dequant_weight, bias_fp32).to(input.dtype)
         else:
             result = F.linear(active_2d, dequant_weight, bias)
         return result.reshape(*input.shape[:-1], out_features)
@@ -1369,7 +1380,7 @@ def _linear_w4a16(
     block_m, block_n, block_k, num_warps, use_dot, split_k = _select_w4a16_gemv_config(
         input.device,
         rows,
-        input.dtype,
+        active_2d.dtype,
         out_features,
         input_features,
     )
