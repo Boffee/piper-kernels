@@ -6,6 +6,7 @@ import pytest
 import torch
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -161,6 +162,34 @@ def test_from_hp_rejects_ambiguous_per_tensor_scale_configuration() -> None:
             per_tensor_scale=torch.ones(()),
             compute_per_tensor_scale=True,
         )
+
+
+def test_from_hp_handles_meta_fake_and_post_rotation_overflow() -> None:
+    meta_weight = ConvRotNVFP4Tensor.from_hp(
+        torch.empty(64, 64, dtype=torch.bfloat16, device="meta"),
+        group_size=64,
+    )
+    assert meta_weight.shape == (64, 64)
+    assert meta_weight.device.type == "meta"
+
+    with FakeTensorMode():
+        fake_weight = ConvRotNVFP4Tensor.from_hp(
+            torch.empty(64, 64, dtype=torch.bfloat16, device="cpu"),
+            group_size=64,
+        )
+    assert fake_weight.shape == (64, 64)
+
+    sign16 = torch.tensor(
+        [1, 1, 1, -1, 1, 1, 1, -1, 1, 1, 1, -1, -1, -1, -1, 1], dtype=torch.float32
+    )
+    overflow = sign16.repeat(16, 1) * 1e38
+    for compute_scale in (False, True):
+        with pytest.raises(ValueError, match="non-finite"):
+            ConvRotNVFP4Tensor.from_hp(
+                overflow,
+                group_size=16,
+                compute_per_tensor_scale=compute_scale,
+            )
 
 
 def test_device_and_dtype_copies_preserve_wrapper_and_group_size() -> None:

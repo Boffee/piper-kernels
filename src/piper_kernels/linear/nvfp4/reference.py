@@ -141,9 +141,14 @@ def linear_w4a16(
         torch.float32,
         is_swizzled_scales=True,
     ).dequantize(torch.float32)
-    result = flattened @ weight.T
     if weight_per_tensor_scale is not None:
-        result.mul_(weight_per_tensor_scale)
+        gs = weight_per_tensor_scale.to(device=weight.device, dtype=torch.float32)
+        apply_early = gs.abs() < 1.0
+        pre_scale = torch.where(apply_early, gs, torch.ones_like(gs))
+        post_scale = torch.where(apply_early, torch.ones_like(gs), gs)
+        result = ((flattened * pre_scale) @ weight.T) * post_scale
+    else:
+        result = flattened @ weight.T
     if bias is not None:
         result.add_(bias.float())
     return result.to(input.dtype).reshape(*input.shape[:-1], weight_qdata.shape[0])

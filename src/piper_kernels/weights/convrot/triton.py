@@ -4,8 +4,8 @@ The portable contract is in ``_rotation``. ConvRot INT8 and NVFP4 weight
 conversion and activation preparation share these primitives.
 """
 
-# Triton's JIT launcher accepts compile-time options outside its Python signature.
-# pyright: reportCallIssue=false
+# Triton's JIT launcher and constexpr options are not fully represented in its typing surface.
+# pyright: reportArgumentType=false, reportCallIssue=false
 
 from __future__ import annotations
 
@@ -19,8 +19,15 @@ from piper_kernels.gguf import triton as gguf_triton
 
 
 @triton.jit
-def rotate_hadamard_stage(values, block_size: tl.constexpr, stride: tl.constexpr):
+def rotate_hadamard_stage(
+    values,
+    block_size: tl.constexpr,
+    stride: tl.constexpr,
+    normalize: tl.constexpr = False,
+):
     """Apply one H4 factor with eight additions per independent quartet."""
+    if normalize:
+        values = values * 0.5
     outer: tl.constexpr = block_size // (4 * stride)
     grouped = tl.reshape(values, (outer, 4, stride))
     quartets = tl.permute(grouped, (0, 2, 1))
@@ -48,14 +55,15 @@ def rotate_hadamard_groups(
     values,
     block_size: tl.constexpr,
     group_size: tl.constexpr,
+    normalize: tl.constexpr = False,
 ):
     """Apply every H4 factor within independent ConvRot groups."""
-    values = rotate_hadamard_stage(values, block_size, tl.constexpr(1))
-    values = rotate_hadamard_stage(values, block_size, tl.constexpr(4))
+    values = rotate_hadamard_stage(values, block_size, tl.constexpr(1), normalize)
+    values = rotate_hadamard_stage(values, block_size, tl.constexpr(4), normalize)
     if group_size >= 64:
-        values = rotate_hadamard_stage(values, block_size, tl.constexpr(16))
+        values = rotate_hadamard_stage(values, block_size, tl.constexpr(16), normalize)
     if group_size >= 256:
-        values = rotate_hadamard_stage(values, block_size, tl.constexpr(64))
+        values = rotate_hadamard_stage(values, block_size, tl.constexpr(64), normalize)
     return values
 
 
@@ -181,7 +189,7 @@ def rotate_groups_kernel(
     row_width,
     groups_per_row,
     group_size: tl.constexpr,
-    inverse_sqrt_group: tl.constexpr,
+    inverse_sqrt_group: tl.constexpr = 1.0,  # noqa: ARG001 - retained for ABI compatibility
 ):
     group_id = tl.program_id(0)
     row = group_id // groups_per_row
@@ -190,8 +198,8 @@ def rotate_groups_kernel(
     row_offset = row.to(tl.int64) * row_width
     pointers = input_ptr + row_offset + group * group_size + offsets
     values = tl.load(pointers).to(tl.float32)
-    values = rotate_hadamard_groups(values, group_size, group_size)
-    tl.store(output_ptr + row_offset + group * group_size + offsets, values * inverse_sqrt_group)
+    values = rotate_hadamard_groups(values, group_size, group_size, normalize=True)
+    tl.store(output_ptr + row_offset + group * group_size + offsets, values)
 
 
 def rotate_input(

@@ -339,12 +339,8 @@ def test_amd_preparation_matches_rotation_and_populates_storage(dtype, width, ac
     implementation = _backend.require_linear_backend(value)
     assert implementation is amd
     actual = implementation.prepare_input(value, 256, activation, out=output)
-    plan = amd.default_execution_plan(output[0].reshape(6, width))
     activated = apply_input_activation(value, activation)
     rotated = rotate_groups(activated.float(), 256)
-    if not plan.fuse_rotation_quantization:
-        # The split path stores a compact materialized rotation.
-        rotated = rotated.to(activated.dtype)
     _, expected_scale = int8_quantization.dynamic_quantize_rows(rotated)
     assert actual is output
     # Nearest rounding has half a quantization step of error. Allow a small
@@ -397,8 +393,6 @@ def test_amd_preparation_zero_and_tiny_scales(dtype, width, magnitude):
     value[:, 0] = magnitude
     actual = amd.prepare_input(value, 256)
     rotated = rotate_groups(value.float(), 256)
-    if not amd.default_execution_plan(actual[0]).fuse_rotation_quantization:
-        rotated = rotated.to(dtype)
     expected_qdata, expected_scale = int8_quantization.dynamic_quantize_rows(rotated)
     expected = expected_qdata, expected_scale.squeeze(-1)
     assert torch.equal(actual[0], expected[0])
