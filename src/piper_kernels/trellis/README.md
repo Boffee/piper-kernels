@@ -87,9 +87,11 @@ steps; at 3.5 it takes 111 bytes, 3- and 4-bit steps.
 
 The [encoder](_encoder.py) minimizes each block's squared error in the rotated
 basis against the exact INT8 decode, without calibration data. A coarse search
-with 12-bit states picks each block's scale and each row's scale; one tail-biting
-Viterbi pass on the stored 16-bit trellis then sets the walk. The module docstring
-describes the stages and where they come from.
+with 12-bit states evaluates RMS-based and peak-anchored (`amax`-based)
+candidate block scales with continuous least-squares refitting, picks each row's
+scale, and refines in INT8; one tail-biting Viterbi pass on the stored 16-bit
+trellis then sets the walk. The module docstring describes the stages and where
+they come from.
 
 On Gaussian rows, which ConvRot-rotated weights resemble, the weight SQNR is:
 
@@ -97,8 +99,8 @@ On Gaussian rows, which ConvRot-rotated weights resemble, the weight SQNR is:
 |---|---|---|---|---|---|---|
 | SQNR (dB) | 17.5 | 20.3 | 23.5 | 26.3 | 32.2 | 35.3 |
 
-Rows with heavy outliers encode worse: the search starts each block at a scale
-from its RMS.
+Peak-anchored seeding prevents outlier blocks from clipping at the RMS scale,
+though extreme post-rotation outliers remain bounded by 1MAD's ~3.2σ tail range.
 
 ## Decode implementation
 
