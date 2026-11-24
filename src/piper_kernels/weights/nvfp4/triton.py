@@ -30,13 +30,16 @@ _AMAX_FINAL_REDUCTION_SIZE = 8_192
 
 @triton.jit
 def _decode_fp4_code(code):
-    magnitude = code & 0x7
-    value = tl.where(
-        magnitude <= 4,
-        magnitude.to(tl.float32) * 0.5,
-        tl.where(magnitude == 5, 3.0, tl.where(magnitude == 6, 4.0, 6.0)),
+    """Branchless IEEE FP32 decode of 4-bit E2M1 codes (0..15)."""
+    code_u32 = code.to(tl.uint32)
+    sign = (code_u32 & 8) << 28
+    magnitude = code_u32 & 7
+    bits = sign | tl.where(
+        magnitude != 0,
+        (magnitude + 252 - (magnitude == 1).to(tl.uint32)) << 22,
+        0,
     )
-    return tl.where(code & 0x8 == 0, value, -value)
+    return bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit

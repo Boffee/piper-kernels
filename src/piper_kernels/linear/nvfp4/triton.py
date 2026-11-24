@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
+from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import _input_activations as input_activations
 from piper_kernels._input_activations import triton as triton_input_activations
@@ -720,8 +723,575 @@ def _linear_mean_fake(
     return input_qdata.new_empty((batch, weight_qdata.shape[0]), dtype=torch.float32)
 
 
+_W4A16_GEMV_MAX_ROWS = 16
+_W4A16_GEMV_BLOCK_N = 32
+_W4A16_NARROW_BLOCK_N = 16
+_W4A16_GEMV_BLOCK_K = 256
+_W4A16_DOT_BLOCK_N = 64
+_W4A16_DOT_BLOCK_K = 128
+_W4A16_DEQUANT_BLOCK_N = 32
+_W4A16_DEQUANT_BLOCK_K = 128
+_W4A16_REDUCE_BLOCK_N = 64
+_W4A16_MAX_SPLIT_K = 32
+_W4A16_MIN_SPLITK_WEIGHT_BYTES = 2 * 1024 * 1024
+_W4A16_NARROW_NO_SPLITK_WEIGHT_BYTES = 4 * 1024 * 1024
+
+
+@triton.jit
+def _decode_e4m3_u8(code):
+    """Exact FP32 value of FP8 E4M3FN byte bits without backend FP8 lowering quirks."""
+    sign = code >> 7
+    exponent = (code >> 3) & 15
+    mantissa = code & 7
+    normal = (((exponent + 120) << 23) | (mantissa << 20)).to(tl.float32, bitcast=True)
+    subnormal = mantissa.to(tl.float32) * 0.001953125
+    magnitude = tl.where(exponent == 0, subnormal, normal)
+    return tl.where(sign != 0, -magnitude, magnitude)
+
+
+@triton.jit
+def _load_nvfp4_tile(
+    weight_ptr,
+    weight_scale_ptr,
+    n_offs_i64,
+    n_valid,
+    k_base,
+    packed_k,
+    scale_k,
+    scale_column_blocks,
+    block_k: tl.constexpr,
+    high_first: tl.constexpr,
+):
+    """Load one swizzled NVFP4 weight tile as decoded E2M1 pairs and FP32 block scales."""
+    block_packed_k: tl.constexpr = block_k // 2
+    block_scale_k: tl.constexpr = block_k // _NVFP4_BLOCK_SIZE_TL
+    k_byte_offs = (k_base // 2) + tl.arange(0, block_packed_k)
+    packed = tl.load(
+        weight_ptr + n_offs_i64[:, None] * packed_k + k_byte_offs[None, :],
+        mask=n_valid[:, None] & (k_byte_offs[None, :] < packed_k),
+        other=0,
+    )
+    w_lo = _decode_fp4_code(packed & 0xF)
+    w_hi = _decode_fp4_code(packed >> 4)
+    w_even = w_hi if high_first else w_lo
+    w_odd = w_lo if high_first else w_hi
+
+    scale_cols = (k_base // _NVFP4_BLOCK_SIZE_TL) + tl.arange(0, block_scale_k)
+    scale_offsets = swizzled_scale_offsets(
+        n_offs_i64[:, None],
+        scale_cols[None, :],
+        scale_column_blocks,
+    )
+    scale_u8 = tl.load(
+        weight_scale_ptr + scale_offsets,
+        mask=n_valid[:, None] & (scale_cols[None, :] < scale_k),
+        other=0,
+    )
+    scales = _decode_e4m3_u8(scale_u8.to(tl.uint32))
+    return w_even, w_odd, scales
+
+
+@triton.jit
+def _expand_nvfp4_scales(
+    scales,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    block_packed_k: tl.constexpr = block_k // 2
+    block_scale_k: tl.constexpr = block_k // _NVFP4_BLOCK_SIZE_TL
+    return tl.reshape(
+        tl.broadcast_to(
+            tl.reshape(scales, (block_n, block_scale_k, 1)),
+            (block_n, block_scale_k, _NVFP4_QDATA_BLOCK_SIZE_TL),
+        ),
+        (block_n, block_packed_k),
+    )
+
+
+@triton.jit
+def _accumulate_scaled_row(
+    x_vec,
+    w_even,
+    w_odd,
+    scales,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    block_packed_k: tl.constexpr = block_k // 2
+    block_scale_k: tl.constexpr = block_k // _NVFP4_BLOCK_SIZE_TL
+    x_even, x_odd = tl.split(tl.reshape(x_vec.to(tl.float32), (block_packed_k, 2)))
+    prod = w_even * x_even[None, :] + w_odd * x_odd[None, :]
+    grouped = tl.reshape(prod, (block_n, block_scale_k, _NVFP4_QDATA_BLOCK_SIZE_TL))
+    return tl.sum(tl.sum(grouped, axis=2) * scales, axis=1)
+
+
+@triton.jit
+def _store_w4a16_result(
+    acc,
+    weight_per_tensor_scale_ptr,
+    bias_ptr,
+    output_ptr,
+    pid_k,
+    m_offs,
+    m_offs_i64,
+    n_offs_i64,
+    n_valid,
+    rows,
+    out_features,
+    block_m: tl.constexpr,
+    has_weight_per_tensor_scale: tl.constexpr,
+    has_bias: tl.constexpr,
+    is_splitk: tl.constexpr,
+):
+    if block_m == 1:
+        if is_splitk:
+            tl.store(
+                output_ptr + pid_k.to(tl.int64) * out_features + n_offs_i64,
+                acc,
+                mask=n_valid,
+            )
+            return
+        if has_weight_per_tensor_scale:
+            acc *= tl.load(weight_per_tensor_scale_ptr).to(tl.float32)
+        if has_bias:
+            acc += tl.load(bias_ptr + n_offs_i64, mask=n_valid, other=0.0).to(tl.float32)
+        tl.store(output_ptr + n_offs_i64, acc, mask=n_valid)
+        return
+
+    row_valid = (m_offs[:, None] < rows) & n_valid[None, :]
+    if is_splitk:
+        partial_base = (pid_k.to(tl.int64) * rows + m_offs_i64[:, None]) * out_features
+        tl.store(output_ptr + partial_base + n_offs_i64[None, :], acc, mask=row_valid)
+        return
+    if has_weight_per_tensor_scale:
+        acc *= tl.load(weight_per_tensor_scale_ptr).to(tl.float32)
+    if has_bias:
+        bias_vec = tl.load(bias_ptr + n_offs_i64, mask=n_valid, other=0.0).to(tl.float32)
+        acc += bias_vec[None, :]
+    tl.store(
+        output_ptr + m_offs_i64[:, None] * out_features + n_offs_i64[None, :],
+        acc,
+        mask=row_valid,
+    )
+
+
+@triton.jit(do_not_specialize=["rows", "split_k"])
+def w4a16_gemv_splitk_kernel(
+    input_ptr,
+    weight_ptr,
+    weight_scale_ptr,
+    weight_per_tensor_scale_ptr,
+    bias_ptr,
+    output_ptr,
+    rows,
+    out_features,
+    input_features,
+    scale_column_blocks,
+    split_k,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    high_first: tl.constexpr,
+    has_weight_per_tensor_scale: tl.constexpr,
+    has_bias: tl.constexpr,
+    is_splitk: tl.constexpr,
+    use_dot: tl.constexpr,
+):
+    """Stream swizzled NVFP4 weights with Split-K and accumulate in FP32."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    n_offs = pid_n * block_n + tl.arange(0, block_n)
+    n_offs_i64 = n_offs.to(tl.int64)
+    n_valid = n_offs < out_features
+    m_offs = tl.arange(0, block_m)
+    m_offs_i64 = m_offs.to(tl.int64)
+
+    packed_k = input_features // 2
+    scale_k = input_features // _NVFP4_BLOCK_SIZE_TL
+    block_packed_k: tl.constexpr = block_k // 2
+
+    total_k_tiles = tl.cdiv(input_features, block_k)
+    tiles_per_split = tl.cdiv(total_k_tiles, split_k)
+    k_tile_start = pid_k * tiles_per_split
+    k_tile_end = tl.minimum(total_k_tiles, k_tile_start + tiles_per_split)
+
+    acc = (
+        tl.zeros((block_n,), dtype=tl.float32)
+        if block_m == 1
+        else tl.zeros((block_m, block_n), dtype=tl.float32)
+    )
+
+    for k_tile in range(k_tile_start, k_tile_end):
+        k_base = k_tile * block_k
+        w_even, w_odd, scales = _load_nvfp4_tile(
+            weight_ptr,
+            weight_scale_ptr,
+            n_offs_i64,
+            n_valid,
+            k_base,
+            packed_k,
+            scale_k,
+            scale_column_blocks,
+            block_k,
+            high_first,
+        )
+        k_elem_offs = k_base + tl.arange(0, block_k)
+        k_elem_valid = k_elem_offs < input_features
+        if block_m == 1:
+            x_vec = tl.load(input_ptr + k_elem_offs, mask=k_elem_valid, other=0.0)
+            acc += _accumulate_scaled_row(x_vec, w_even, w_odd, scales, block_n, block_k)
+        elif use_dot:
+            scales_expanded = _expand_nvfp4_scales(scales, block_n, block_k)
+            x_tile = tl.load(
+                input_ptr + m_offs_i64[:, None] * input_features + k_elem_offs[None, :],
+                mask=(m_offs[:, None] < rows) & k_elem_valid[None, :],
+                other=0.0,
+            )
+            x_even, x_odd = tl.split(tl.reshape(x_tile, (block_m, block_packed_k, 2)))
+            w_e = (w_even * scales_expanded).to(x_tile.dtype)
+            w_o = (w_odd * scales_expanded).to(x_tile.dtype)
+            acc += tl.dot(x_even, tl.trans(w_e))
+            acc += tl.dot(x_odd, tl.trans(w_o))
+        else:
+            # Triton's typing does not declare static_range iterable.
+            for row_idx in tl.static_range(block_m):  # pyright: ignore[reportGeneralTypeIssues]
+                if row_idx < rows:
+                    x_vec = tl.load(
+                        input_ptr + tl.full((), row_idx, tl.int64) * input_features + k_elem_offs,
+                        mask=k_elem_valid,
+                        other=0.0,
+                    )
+                    row_acc = _accumulate_scaled_row(x_vec, w_even, w_odd, scales, block_n, block_k)
+                    acc += tl.where((m_offs == row_idx)[:, None], row_acc[None, :], 0.0)
+
+    _store_w4a16_result(
+        acc,
+        weight_per_tensor_scale_ptr,
+        bias_ptr,
+        output_ptr,
+        pid_k,
+        m_offs,
+        m_offs_i64,
+        n_offs_i64,
+        n_valid,
+        rows,
+        out_features,
+        block_m,
+        has_weight_per_tensor_scale,
+        has_bias,
+        is_splitk,
+    )
+
+
+@triton.jit(do_not_specialize=["rows", "split_k"])
+def w4a16_splitk_reduce_kernel(
+    partial_ptr,
+    weight_per_tensor_scale_ptr,
+    bias_ptr,
+    output_ptr,
+    rows,
+    out_features,
+    split_k,
+    block_n: tl.constexpr,
+    has_weight_per_tensor_scale: tl.constexpr,
+    has_bias: tl.constexpr,
+):
+    """Deterministically reduce Split-K partials in fixed order and apply affine epilogue."""
+    pid_n = tl.program_id(0)
+    row = tl.program_id(1).to(tl.int64)
+    n_offs = pid_n * block_n + tl.arange(0, block_n)
+    n_offs_i64 = n_offs.to(tl.int64)
+    n_valid = n_offs < out_features
+
+    acc = tl.zeros((block_n,), dtype=tl.float32)
+    split_stride = tl.full((), rows, tl.int64) * out_features
+    ptr = partial_ptr + row * out_features + n_offs_i64
+    for _ in range(split_k):
+        acc += tl.load(ptr, mask=n_valid, other=0.0)
+        ptr += split_stride
+
+    if has_weight_per_tensor_scale:
+        acc *= tl.load(weight_per_tensor_scale_ptr).to(tl.float32)
+    if has_bias:
+        acc += tl.load(bias_ptr + n_offs_i64, mask=n_valid, other=0.0).to(tl.float32)
+    tl.store(output_ptr + row * out_features + n_offs_i64, acc, mask=n_valid)
+
+
+@triton.jit
+def dequantize_nvfp4_swizzled_kernel(
+    weight_ptr,
+    weight_scale_ptr,
+    weight_per_tensor_scale_ptr,
+    output_ptr,
+    out_features,
+    input_features,
+    scale_column_blocks,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    high_first: tl.constexpr,
+    has_weight_per_tensor_scale: tl.constexpr,
+):
+    """Dequantize packed swizzled NVFP4 weights into a contiguous floating matrix."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    n_offs = pid_n * block_n + tl.arange(0, block_n)
+    n_offs_i64 = n_offs.to(tl.int64)
+    n_valid = n_offs < out_features
+
+    packed_k = input_features // 2
+    scale_k = input_features // _NVFP4_BLOCK_SIZE_TL
+    k_base = pid_k * block_k
+
+    w_even, w_odd, scales = _load_nvfp4_tile(
+        weight_ptr,
+        weight_scale_ptr,
+        n_offs_i64,
+        n_valid,
+        k_base,
+        packed_k,
+        scale_k,
+        scale_column_blocks,
+        block_k,
+        high_first,
+    )
+    if has_weight_per_tensor_scale:
+        scales *= tl.load(weight_per_tensor_scale_ptr).to(tl.float32)
+
+    scales_expanded = _expand_nvfp4_scales(scales, block_n, block_k)
+    values = tl.reshape(
+        tl.join(w_even * scales_expanded, w_odd * scales_expanded),
+        (block_n, block_k),
+    )
+    k_elem_offs = k_base + tl.arange(0, block_k)
+    tl.store(
+        output_ptr + n_offs_i64[:, None] * input_features + k_elem_offs[None, :],
+        values,
+        mask=n_valid[:, None] & (k_elem_offs[None, :] < input_features),
+    )
+
+
+@lru_cache(maxsize=16)
+def _device_sm_count(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def _select_w4a16_split_k(
+    num_sms: int,
+    out_features: int,
+    input_features: int,
+    *,
+    block_n: int,
+    block_k: int,
+    cta_multiplier: int = 8,
+) -> int:
+    weight_bytes = out_features * (input_features // 2)
+    n_tiles = int(triton.cdiv(out_features, block_n))
+    k_tiles = int(triton.cdiv(input_features, block_k))
+    if n_tiles < 1 or k_tiles < 8 or weight_bytes < _W4A16_MIN_SPLITK_WEIGHT_BYTES:
+        return 1
+    target_ctas = max(1, cta_multiplier * num_sms)
+    if n_tiles >= target_ctas:
+        return 1
+    desired = triton.cdiv(target_ctas, n_tiles)
+    max_for_k = max(1, k_tiles // 4)
+    return int(min(desired, max_for_k, _W4A16_MAX_SPLIT_K))
+
+
+def _select_w4a16_gemv_config(
+    device: torch.device,
+    rows: int,
+    input_dtype: torch.dtype,
+    out_features: int,
+    input_features: int,
+) -> tuple[int, int, int, int, bool, int]:
+    """Select ``(block_m, block_n, block_k, num_warps, use_dot, split_k)``."""
+    device_index = torch.cuda.current_device() if device.index is None else int(device.index)
+    num_sms = _device_sm_count(device_index)
+    weight_bytes = out_features * (input_features // 2)
+    if rows == 1:
+        if (
+            triton.cdiv(out_features, _W4A16_GEMV_BLOCK_N) <= num_sms
+            and weight_bytes < _W4A16_NARROW_NO_SPLITK_WEIGHT_BYTES
+        ):
+            return (1, _W4A16_NARROW_BLOCK_N, _W4A16_GEMV_BLOCK_K, 8, False, 1)
+        split_k = _select_w4a16_split_k(
+            num_sms,
+            out_features,
+            input_features,
+            block_n=_W4A16_GEMV_BLOCK_N,
+            block_k=_W4A16_GEMV_BLOCK_K,
+        )
+        return (1, _W4A16_GEMV_BLOCK_N, _W4A16_GEMV_BLOCK_K, 4, False, split_k)
+    if rows <= 4 or input_dtype is torch.float32:
+        block_m = 4 if rows <= 4 else (8 if rows <= 8 else _W4A16_GEMV_MAX_ROWS)
+        split_k = _select_w4a16_split_k(
+            num_sms,
+            out_features,
+            input_features,
+            block_n=_W4A16_GEMV_BLOCK_N,
+            block_k=_W4A16_GEMV_BLOCK_K,
+        )
+        return (block_m, _W4A16_GEMV_BLOCK_N, _W4A16_GEMV_BLOCK_K, 4, False, split_k)
+    split_k = _select_w4a16_split_k(
+        num_sms,
+        out_features,
+        input_features,
+        block_n=_W4A16_DOT_BLOCK_N,
+        block_k=_W4A16_DOT_BLOCK_K,
+    )
+    return (_W4A16_GEMV_MAX_ROWS, _W4A16_DOT_BLOCK_N, _W4A16_DOT_BLOCK_K, 4, True, split_k)
+
+
+def _dequantize_nvfp4_swizzled(
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    *,
+    high_first: bool = False,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize a 2-D swizzled NVFP4 weight matrix in Triton."""
+    out_features, packed_k = weight_qdata.shape
+    input_features = 2 * packed_k
+    output = torch.empty(
+        (out_features, input_features),
+        device=weight_qdata.device,
+        dtype=output_dtype,
+    )
+    if out_features == 0 or input_features == 0:
+        return output
+    scale_column_blocks = int(triton.cdiv(input_features, _layout.SCALE_COLUMN_TILE))
+    grid = (
+        triton.cdiv(out_features, _W4A16_DEQUANT_BLOCK_N),
+        triton.cdiv(input_features, _W4A16_DEQUANT_BLOCK_K),
+    )
+    with device_context(weight_qdata.device):
+        dequantize_nvfp4_swizzled_kernel[grid](
+            weight_qdata,
+            weight_scale.view(torch.uint8),
+            weight_per_tensor_scale,
+            output,
+            out_features,
+            input_features,
+            scale_column_blocks,
+            block_n=_W4A16_DEQUANT_BLOCK_N,
+            block_k=_W4A16_DEQUANT_BLOCK_K,
+            high_first=high_first,
+            has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
+            num_warps=4,
+        )
+    return output
+
+
+def _linear_w4a16(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    high_first: bool = False,
+    *,
+    group_size: int = 0,
+) -> torch.Tensor:
+    """Apply a swizzled NVFP4 weight to a floating activation, optionally rotated."""
+    out_features, packed_k = weight_qdata.shape
+    input_features = 2 * packed_k
+    if input.numel() == 0 or out_features == 0:
+        return input.new_empty((*input.shape[:-1], out_features))
+
+    input_2d = input.reshape(-1, input_features).contiguous()
+    rows = int(input_2d.shape[0])
+    if group_size > 0:
+        from piper_kernels.weights.convrot.triton import rotate_input  # noqa: PLC0415
+
+        rotated = torch.empty(
+            (rows, input_features),
+            device=input_2d.device,
+            dtype=input.dtype,
+        )
+        rotate_input(input_2d, rotated, group_size, num_warps=4)
+        active_2d = rotated
+    else:
+        active_2d = input_2d
+
+    if rows > _W4A16_GEMV_MAX_ROWS:
+        dequant_weight = _dequantize_nvfp4_swizzled(
+            weight_qdata,
+            weight_scale,
+            weight_per_tensor_scale,
+            high_first=high_first,
+            output_dtype=input.dtype,
+        )
+        if bias is None or bias.dtype is input.dtype:
+            result = F.linear(
+                active_2d,
+                dequant_weight,
+                bias,
+            )
+        else:
+            result = (F.linear(active_2d, dequant_weight).float() + bias.float()).to(input.dtype)
+        return result.reshape(*input.shape[:-1], out_features)
+
+    output = torch.empty((rows, out_features), device=input.device, dtype=input.dtype)
+    block_m, block_n, block_k, num_warps, use_dot, split_k = _select_w4a16_gemv_config(
+        input.device,
+        rows,
+        input.dtype,
+        out_features,
+        input_features,
+    )
+    scale_column_blocks = int(triton.cdiv(input_features, _layout.SCALE_COLUMN_TILE))
+    is_splitk = split_k > 1
+    target = (
+        torch.empty((split_k, rows, out_features), device=input.device, dtype=torch.float32)
+        if is_splitk
+        else output
+    )
+    grid = (triton.cdiv(out_features, block_n), split_k)
+    with device_context(input.device):
+        w4a16_gemv_splitk_kernel[grid](
+            active_2d,
+            weight_qdata,
+            weight_scale.view(torch.uint8),
+            weight_per_tensor_scale,
+            bias,
+            target,
+            rows,
+            out_features,
+            input_features,
+            scale_column_blocks,
+            split_k,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            high_first=high_first,
+            has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
+            has_bias=bias is not None,
+            is_splitk=is_splitk,
+            use_dot=use_dot,
+            num_warps=num_warps,
+        )
+        if is_splitk:
+            reduce_grid = (triton.cdiv(out_features, _W4A16_REDUCE_BLOCK_N), rows)
+            w4a16_splitk_reduce_kernel[reduce_grid](
+                target,
+                weight_per_tensor_scale,
+                bias,
+                output,
+                rows,
+                out_features,
+                split_k,
+                block_n=_W4A16_REDUCE_BLOCK_N,
+                has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
+                has_bias=bias is not None,
+                num_warps=4,
+            )
+    return output.reshape(*input.shape[:-1], out_features)
+
+
 __all__ = [
     "add_bias_out",
+    "dequantize_nvfp4_swizzled_kernel",
     "dynamic_scale",
     "encode_nvfp4_blocks",
     "linear_mean",
@@ -730,4 +1300,6 @@ __all__ = [
     "prepare_static",
     "prepare_static_out",
     "swizzled_scale_offsets",
+    "w4a16_gemv_splitk_kernel",
+    "w4a16_splitk_reduce_kernel",
 ]

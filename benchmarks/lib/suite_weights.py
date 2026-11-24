@@ -21,7 +21,23 @@ from .quality import QualityCheck, QualityMetrics, measure_quality, validate_out
 # ruff: noqa: PLC0415
 
 type WeightFormat = Literal["torch", "convrot_int8", "nvfp4", "convrot_nvfp4"]
+type LinearFormat = Literal[
+    "torch",
+    "convrot_int8",
+    "nvfp4",
+    "convrot_nvfp4",
+    "nvfp4_w4a16",
+    "convrot_nvfp4_w4a16",
+]
 _FORMATS: tuple[WeightFormat, ...] = ("torch", "convrot_int8", "nvfp4", "convrot_nvfp4")
+_LINEAR_FORMATS: tuple[LinearFormat, ...] = (
+    "torch",
+    "convrot_int8",
+    "nvfp4",
+    "convrot_nvfp4",
+    "nvfp4_w4a16",
+    "convrot_nvfp4_w4a16",
+)
 _CPU = torch.device("cpu")
 
 
@@ -30,7 +46,7 @@ def _group_size(width: int) -> int:
 
 
 def _support(
-    format_name: WeightFormat, device: torch.device, *, convolution: bool = False
+    format_name: LinearFormat, device: torch.device, *, convolution: bool = False
 ) -> str | None:
     if format_name == "torch":
         return None
@@ -39,6 +55,7 @@ def _support(
     if importlib.util.find_spec("triton") is None:
         return "native implementation requires Triton"
     target = AcceleratorTarget.from_device(device)
+    reason: str | None = None
     if format_name == "convrot_int8":
         if convolution:
             from piper_kernels.conv3d.convrot.int8 import _policy
@@ -51,9 +68,14 @@ def _support(
                 linear_backend.select_linear_backend(torch.empty(0, device=device)) is not None
             )
         if not supported:
-            return "no native ConvRot INT8 backend for this accelerator"
+            reason = "no native ConvRot INT8 backend for this accelerator"
+    elif format_name in ("nvfp4_w4a16", "convrot_nvfp4_w4a16"):
+        if not target.supports_nvfp4_w4a16:
+            reason = "native W4A16 NVFP4 execution requires NVIDIA SM75+ or supported ROCm"
     elif not target.is_cuda_capability(12, 0):
-        return "native NVFP4 execution requires exact NVIDIA SM120"
+        reason = "native NVFP4 execution requires exact NVIDIA SM120"
+    if reason is not None:
+        return reason
     return (
         "quantized weight construction requires TorchAO"
         if importlib.util.find_spec("torchao") is None
@@ -66,7 +88,7 @@ def _dense_weight(rows: int, columns: int, dtype: torch.dtype, seed: int) -> tor
 
 
 def _pack_weight(
-    weight: torch.Tensor, format_name: WeightFormat, device: torch.device
+    weight: torch.Tensor, format_name: LinearFormat, device: torch.device
 ) -> torch.Tensor:
     if format_name == "torch":
         return weight.to(device)
@@ -74,19 +96,22 @@ def _pack_weight(
         from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
         return ConvRotInt8Tensor.from_hp(weight, group_size=_group_size(weight.shape[1])).to(device)
-    from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
-
     from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
     from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
-    activation = QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=True,
-    )
+    if format_name in ("nvfp4_w4a16", "convrot_nvfp4_w4a16"):
+        activation = None
+    else:
+        from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
-    if format_name == "convrot_nvfp4":
+        activation = QuantizeTensorToNVFP4Kwargs(
+            block_size=16,
+            is_swizzled_scales=True,
+            use_triton_kernel=False,
+            use_dynamic_per_tensor_scale=True,
+        )
+
+    if format_name in ("convrot_nvfp4", "convrot_nvfp4_w4a16"):
         return ConvRotNVFP4Tensor.from_hp(
             weight,
             group_size=_group_size(weight.shape[1]),
@@ -109,7 +134,7 @@ def _quantized_comparison(actual: torch.Tensor, expected: torch.Tensor) -> Quali
     return metrics
 
 
-def _linear(case: LinearCase, device: torch.device, format_name: WeightFormat) -> Operation:
+def _linear(case: LinearCase, device: torch.device, format_name: LinearFormat) -> Operation:
     dtype = getattr(torch, case.dtype)
     source = normal_tensor((case.rows, case.in_features), dtype=dtype, device=_CPU, seed=case.seed)
     dense = _dense_weight(case.out_features, case.in_features, dtype, case.seed + 1)
@@ -131,6 +156,22 @@ def _linear(case: LinearCase, device: torch.device, format_name: WeightFormat) -
         packed = cast(ConvRotInt8Tensor, weight)
         quantized_expected = reference.linear(
             source[selected], packed.qdata.cpu(), packed.scale.cpu(), packed.group_size, bias
+        )
+    elif format_name in ("nvfp4_w4a16", "convrot_nvfp4_w4a16"):
+        from piper_kernels.linear.nvfp4 import reference
+        from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+        from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
+
+        packed = cast(PiperNVFP4Tensor, weight)
+        group_size = packed.group_size if isinstance(packed, ConvRotNVFP4Tensor) else 0
+        quantized_expected = reference.linear_w4a16(
+            source[selected],
+            packed.qdata.cpu(),
+            packed.scale.cpu(),
+            None if packed.per_tensor_scale is None else packed.per_tensor_scale.cpu(),
+            bias,
+            high_first=packed.high_first,
+            group_size=group_size,
         )
     activation = source.to(device)
     device_bias = None if bias is None else bias.to(device)
@@ -157,7 +198,9 @@ def _linear(case: LinearCase, device: torch.device, format_name: WeightFormat) -
         check,
         {
             "format": format_name,
-            "activation_scaling": None if format_name == "torch" else "dynamic",
+            "activation_scaling": None
+            if format_name in ("torch", "nvfp4_w4a16", "convrot_nvfp4_w4a16")
+            else "dynamic",
             "group_size": _group_size(case.in_features)
             if format_name.startswith("convrot")
             else None,
@@ -474,5 +517,5 @@ def implementations(
         ]
     return [
         Implementation(name, partial(_linear, case, device, name), _support(name, device))
-        for name in _FORMATS
+        for name in _LINEAR_FORMATS
     ]

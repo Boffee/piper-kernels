@@ -6,7 +6,11 @@ from typing import Any
 import torch
 
 from piper_kernels.linear._dispatch import apply_linear_autocast, bind_linear_arguments
-from piper_kernels.linear.nvfp4._functional import supports_semantic_linear
+from piper_kernels.linear.nvfp4._functional import (
+    _supports_common_nvfp4_linear,
+    supports_semantic_linear,
+    supports_weight_only_linear,
+)
 from piper_kernels.weights._views import require_untransposed
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
@@ -15,8 +19,24 @@ def _supports_convrot_linear(input: object, weight: ConvRotNVFP4Tensor) -> bool:
     return (
         supports_semantic_linear(input, weight)
         and isinstance(input, torch.Tensor)
-        and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and input.ndim > 0
+        and input.shape[-1] % weight.group_size == 0
+    )
+
+
+def _supports_convrot_weight_only_linear(
+    input: object,  # noqa: A002
+    weight: ConvRotNVFP4Tensor,
+) -> bool:
+    cpu_weight_only = (
+        _supports_common_nvfp4_linear(input, weight)
+        and isinstance(input, torch.Tensor)
+        and input.device.type == "cpu"
+        and weight.act_quant_kwargs is None
+        and weight.act_per_tensor_scale is None
+    )
+    return (
+        (supports_weight_only_linear(input, weight) or cpu_weight_only)
+        and isinstance(input, torch.Tensor)
         and input.shape[-1] % weight.group_size == 0
     )
 
@@ -26,7 +46,7 @@ def convrot_nvfp4_linear(
     weight: ConvRotNVFP4Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Apply a canonical NVFP4 weight and activation in the same ConvRot basis."""
+    """Apply a canonical NVFP4 weight in the same ConvRot basis."""
     if not isinstance(input, torch.Tensor) or not isinstance(weight, ConvRotNVFP4Tensor):
         raise TypeError(
             "ConvRot NVFP4 linear requires a tensor input and ConvRotNVFP4Tensor weight"
@@ -39,22 +59,39 @@ def convrot_nvfp4_linear(
     converted_input, converted_weight, bias = apply_linear_autocast(input, weight, bias)
     assert isinstance(converted_weight, ConvRotNVFP4Tensor)
     weight = converted_weight
-    if not _supports_convrot_linear(converted_input, weight):
-        raise ValueError("ConvRot NVFP4 linear requires canonical SM120 NVFP4 operands")
-    quantization = weight.act_quant_kwargs
-    assert quantization is not None
-    from . import _ops  # noqa: PLC0415
+    if _supports_convrot_linear(converted_input, weight):
+        quantization = weight.act_quant_kwargs
+        assert quantization is not None
+        from . import _ops  # noqa: PLC0415
 
-    return _ops.linear(
-        converted_input,
-        weight.qdata,
-        weight.scale,
-        weight.per_tensor_scale,
-        weight.act_per_tensor_scale,
-        bias,
-        quantization.use_dynamic_per_tensor_scale,
-        weight.group_size,
-        weight.high_first,
+        return _ops.linear(
+            converted_input,
+            weight.qdata,
+            weight.scale,
+            weight.per_tensor_scale,
+            weight.act_per_tensor_scale,
+            bias,
+            quantization.use_dynamic_per_tensor_scale,
+            weight.group_size,
+            weight.high_first,
+        )
+    if _supports_convrot_weight_only_linear(converted_input, weight):
+        from . import _ops  # noqa: PLC0415
+
+        return _ops.linear(
+            converted_input,
+            weight.qdata,
+            weight.scale,
+            weight.per_tensor_scale,
+            None,
+            bias,
+            False,
+            weight.group_size,
+            weight.high_first,
+            True,
+        )
+    raise ValueError(
+        "ConvRot NVFP4 linear requires canonical SM120 W4A4 or weight-only NVFP4 operands"
     )
 
 

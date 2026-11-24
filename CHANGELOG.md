@@ -7,6 +7,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Weight-only W4A16 `F.linear` and `torch.compile` support for `PiperNVFP4Tensor` and
+  `ConvRotNVFP4Tensor` (`act_quant_kwargs=None`) on NVIDIA SM75+, Linux/Windows AMD
+  `gfx942`, `gfx1100`, `gfx1151`, `gfx1200`, and `gfx1201`, and CPU (ConvRot fallback
+  via `reference.linear_w4a16`).
 - Native PyTorch FSDP2 (`torch.distributed.fsdp.fully_shard`) support for contiguous
   untransposed 2-D `ConvRotInt8Tensor`, `PiperNVFP4Tensor`, and `ConvRotNVFP4Tensor`
   weights with even `dim=0` sharding, including `set_modules_to_forward_prefetch`,

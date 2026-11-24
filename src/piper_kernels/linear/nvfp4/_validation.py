@@ -53,10 +53,26 @@ def _validate_input_features(
         )
 
 
-def _validate_device(device: torch.device, name: str) -> None:
-    if device.type == "meta":
+def _validate_device(
+    device: torch.device,
+    name: str,
+    *,
+    weight_only: bool = False,
+    allow_cpu: bool = False,
+) -> None:
+    if device.type == "meta" or (allow_cpu and device.type == "cpu"):
         return
-    if device.type != "cuda" or not AcceleratorTarget.from_device(device).is_cuda_capability(12, 0):
+    if device.type != "cuda":
+        requirement = (
+            "a supported CUDA or ROCm accelerator" if weight_only else "exact NVIDIA SM120"
+        )
+        raise ValueError(f"{name} requires {requirement}")
+    target = AcceleratorTarget.from_device(device)
+    if weight_only:
+        if not target.supports_nvfp4_w4a16:
+            raise ValueError(f"{name} requires a supported CUDA or ROCm accelerator")
+        return
+    if not target.is_cuda_capability(12, 0):
         raise ValueError(f"{name} requires exact NVIDIA SM120")
 
 
@@ -128,7 +144,7 @@ def validate_weight(
     return output_features
 
 
-def validate_semantic_linear(
+def validate_semantic_linear(  # noqa: PLR0913
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     weight_qdata: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -139,6 +155,8 @@ def validate_semantic_linear(
     name: str,
     *,
     allow_empty: bool = False,
+    weight_only: bool = False,
+    allow_cpu: bool = False,
 ) -> LinearShape:
     """Validate an unprepared semantic NVFP4 linear."""
     if input.ndim == 0 or input.dtype not in _LOGICAL_DTYPES or input.layout is not torch.strided:
@@ -154,6 +172,8 @@ def validate_semantic_linear(
         input.device,
         name,
     )
+    if weight_only and (activation_per_tensor_scale is not None or dynamic_activation_scale):
+        raise ValueError(f"{name} weight-only execution does not accept activation scales")
     output_features = validate_weight(
         weight_qdata,
         weight_scale,
@@ -163,7 +183,7 @@ def validate_semantic_linear(
         device=input.device,
         name=name,
     )
-    _validate_device(input.device, name)
+    _validate_device(input.device, name, weight_only=weight_only, allow_cpu=allow_cpu)
     return LinearShape(rows, input_features, output_features)
 
 

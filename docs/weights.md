@@ -9,8 +9,8 @@ calibration, and model quality.
 | Format | Stored representation | Execution |
 |---|---|---|
 | `ConvRotInt8Tensor` | Grouped rotation, INT8 values, FP32 scale per output | Linear and Conv3D, with optimized NVIDIA/AMD kernels and portable fallback; embedding lookups. |
-| `PiperNVFP4Tensor` | Packed FP4 values, FP8 block scales, optional FP32 global scale | Piper's native linear path targets exact NVIDIA SM120. |
-| `ConvRotNVFP4Tensor` | NVFP4 in a grouped rotated basis | Same native NVFP4 target. |
+| `PiperNVFP4Tensor` | Packed FP4 values, FP8 block scales, optional FP32 global scale | Native W4A4 linear and fusions target exact NVIDIA SM120; weight-only W4A16 (`act_quant_kwargs=None`) targets NVIDIA SM75+ and supported AMD ROCm GPUs. |
+| `ConvRotNVFP4Tensor` | NVFP4 in a grouped rotated basis | Same W4A4 and W4A16 GPU targets, plus a CPU reference fallback for weight-only W4A16. |
 
 See [installation](../README.md#installation) for format extras and platform setup.
 Weight construction and storage are separate from execution support: being able
@@ -82,10 +82,12 @@ codes compared with separately materialized low-precision activations.
 
 ## Construct and run NVFP4
 
-This complete example needs an NVIDIA SM120 GPU and the NVFP4 dependencies.
-The native path requires 16-value blocks, swizzled scales, and the activation
-configuration shown here. It accepts FP16, BF16, or FP32 activations matching the
-logical weight dtype. ConvRot input widths must also divide into rotation groups.
+This complete example supports both full W4A4 execution (requires an NVIDIA SM120
+GPU and the NVFP4 dependencies) and weight-only W4A16 execution (`act_quant_kwargs=None`,
+supported on NVIDIA SM75+ and Linux/Windows AMD `gfx942`, `gfx1100`, `gfx1151`,
+`gfx1200`, and `gfx1201`). The native path requires 16-value blocks, swizzled
+scales, and FP16, BF16, or FP32 activations matching the logical weight dtype.
+ConvRot input widths must also divide into rotation groups.
 
 ```python
 import torch
@@ -115,6 +117,12 @@ with torch.inference_mode():
 assert output.shape == rotated_output.shape == (2, 128)
 ```
 
+For W4A16 weight-only execution across SM75+, supported ROCm GPUs, and CPU (where
+ConvRot weight-only runs on the portable reference while ordinary NVFP4 delegates to
+TorchAO or dequantized linear), construct the same tensors with `act_quant_kwargs=None`
+and `act_per_tensor_scale=None`. Set `act_quant_kwargs` as shown above on SM120 when
+you want W4A4 activations, including compiled FFN and sparse attention fusions.
+
 `compute_per_tensor_scale=True` computes the weight global scale (after rotation
 for ConvRot; mutually exclusive with `per_tensor_scale`). For static activation
 scaling, set `use_dynamic_per_tensor_scale=False` and pass a finite positive FP32
@@ -133,8 +141,9 @@ metadata to values already in that basis (see
 [ordinary NVFP4](../src/piper_kernels/weights/nvfp4/tensor.py) and
 [ConvRot NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) for packed
 constructors and fields, and [NVFP4 reference](../src/piper_kernels/linear/nvfp4/reference.py)
-for numerical checks). ConvRot NVFP4 linear requires the native SM120 path and
-raises when unsupported.
+for `linear` / `linear_w4a16` numerical checks). Native W4A4 ConvRot NVFP4 requires
+SM120; weight-only and unsupported paths either use portable fallbacks or raise when
+the backend constraints are unmet.
 
 ## Look up embedding rows
 

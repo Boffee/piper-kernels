@@ -78,6 +78,8 @@ def _parse_projection(node: object) -> _BoundProjection | None:
         return None
     if name == _CONVROT_INT8_LINEAR and bound.get("activation_fn") is not None:
         return None
+    if name in (_NVFP4_LINEAR, _CONVROT_NVFP4_LINEAR) and bound.get("weight_only") is True:
+        return None
     return _BoundProjection(node=node, schema_name=name, args=bound)
 
 

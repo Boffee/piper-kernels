@@ -95,10 +95,11 @@ def linear(
     bias: torch.Tensor | None,
     dynamic_activation_scale: bool,
     high_first: bool = False,
+    weight_only: bool = False,
 ) -> torch.Tensor:
-    """Apply a swizzled NVFP4 W4A4 weight; static None selects unit global input scale."""
-    if input.numel() == 0:
-        _validation.validate_semantic_linear(
+    """Apply a swizzled NVFP4 weight (W4A16 when ``weight_only`` is true, otherwise W4A4)."""
+    if input.ndim == 0 or input.numel() == 0 or weight_only:
+        shape = _validation.validate_semantic_linear(
             input,
             weight_qdata,
             weight_scale,
@@ -108,8 +109,18 @@ def linear(
             dynamic_activation_scale,
             "NVFP4 linear",
             allow_empty=True,
+            weight_only=weight_only,
         )
-        return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
+        if shape.rows == 0:
+            return input.new_empty((*input.shape[:-1], shape.output_features))
+        return nvfp4_triton._linear_w4a16(
+            input,
+            weight_qdata,
+            weight_scale,
+            weight_per_tensor_scale,
+            bias,
+            high_first=high_first,
+        )
     input_qdata, input_scale, input_per_tensor_scale = _prepare_compiled(
         input,
         activation_per_tensor_scale,
@@ -135,11 +146,14 @@ def _linear_fake(
     weight_qdata: torch.Tensor,
     _weight_scale: torch.Tensor,
     _weight_per_tensor_scale: torch.Tensor | None,
-    _activation_per_tensor_scale: torch.Tensor | None,
+    activation_per_tensor_scale: torch.Tensor | None,
     _bias: torch.Tensor | None,
-    _dynamic_activation_scale: bool,
+    dynamic_activation_scale: bool,
     _high_first: bool = False,
+    weight_only: bool = False,
 ) -> torch.Tensor:
+    if weight_only and (activation_per_tensor_scale is not None or dynamic_activation_scale):
+        raise ValueError("NVFP4 linear weight-only execution does not accept activation scales")
     return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
 
 

@@ -1,8 +1,11 @@
 """Backend-aware hardware facts required by Triton kernels."""
 
+import sys
 from dataclasses import dataclass
 
 import torch
+
+_AMD_W4A16_ARCHITECTURES = ("gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201")
 
 RDNA4_INT8_ACCUMULATOR_SEED = 0x155555
 RDNA4_INT8_ACCUMULATOR_SEED_MIN_REDUCTION = 4096
@@ -112,6 +115,15 @@ class AcceleratorTarget:
     def supports_fp8_fp16_mma(self) -> bool:
         """Return whether FP8 tensor-core inputs with FP16 accumulation are available."""
         return self.cuda_capability_at_least(8, 9)
+
+    @property
+    def supports_nvfp4_w4a16(self) -> bool:
+        """Return whether NVFP4 W4A16 execution is supported on this target."""
+        return (self.is_nvidia_cuda and self.cuda_capability_at_least(7, 5)) or (
+            sys.platform in ("linux", "win32")
+            and self.is_amd_hip
+            and self.is_architecture(*_AMD_W4A16_ARCHITECTURES)
+        )
 
 
 def rdna4_int8_accumulator_seed(
