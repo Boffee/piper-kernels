@@ -6,9 +6,11 @@ search (``_viterbi.compute_walks``) or a refit of the block scale for a fixed wa
 and keeps a block's new walk or scale only where it lowers its FP64 error:
 
 1. **Coarse float stage**, on the layout's step widths with 12-bit states: QTIP
-   Algorithm 4's overlap at the scale ``rms(block) / 0.909``, one Viterbi at that
-   scale, then the best point of a 97-point log grid around it for the walk. The
-   row scale starts at ``s_c0 = max |ŵ| / 127`` of that reconstruction.
+   Algorithm 4's overlap at ``center = max(rms(block) / 0.909, 1e-8)``, one Viterbi
+   over three candidate scales per block—``center``, ``peak = max(amax(block) /
+   3.0, center)``, and their geometric midpoint—then an unclamped continuous
+   least-squares scale refit for the winning walk. The row scale starts at
+   ``s_c0 = max |ŵ| / 127`` of that reconstruction.
 2. **Row scale:** ``m · s_c0`` for the ``m`` among 29 multipliers from 0.84 to 2.83
    at which the coarse walks decode to INT8 with the least error (no Viterbi).
 3. **Coarse INT8 stage** at that row scale: an FP8 refit of the block scale, then
@@ -18,12 +20,10 @@ and keeps a block's new walk or scale only where it lowers its FP64 error:
    scale and an FP8 refit. Its walk replaces the coarse one.
 
 A 12-bit pass costs about 0.06 of a 16-bit one on the persistent forward, so the
-final pass dominates. On ConvRot-rotated, Gaussian-like rows this ends 1.3-2.0%
-above the MSE of the research study's full multi-round encoder. Rows with heavy
-outliers encode much worse, because the one-candidate float stage starts at
-``rms / 0.909``. The constants are the study's (``piper-research``,
-``projects/e8-w4a8-vq``), where this encoder is ``trellis_vr_fast``; tests check
-that both produce the same bytes.
+final pass dominates. On ConvRot-rotated, Gaussian-like rows this tracks the
+research baseline (``piper-research``, ``projects/e8-w4a8-vq``
+``trellis_vr_fast``), while the peak-anchored Stage 1 candidates and unclamped
+float refit avoid clipping blocks with outliers or heterogeneous group variances.
 """
 
 # Triton's JIT launcher and constexpr arguments are not fully represented by its
@@ -55,8 +55,15 @@ from ._viterbi import (
 )
 
 _CENTER_RMS = 0.909
-"""The float stage's initial block scale is ``rms(block) / 0.909``, calibrated on
+"""The float stage's RMS-based candidate scale is ``rms(block) / 0.909``, calibrated on
 Gaussian rows (about 1.1 · rms, as for one global scale)."""
+
+_PEAK_DIVISOR = 3.0
+"""Divisor for the float stage's peak-anchored candidate ``amax(block) / 3.0``, near
+the 12-bit 1MAD tail ceiling (~3.07)."""
+
+_MIN_SCALE = 1e-8
+"""Lower clamp on positive derived float and row scales."""
 
 _COARSE_STATE_BITS = 12
 """State bits of the coarse search. 14 gained 0.010-0.012 dB over 12 for 1.2-1.4x
@@ -66,10 +73,6 @@ _OVERLAP_WINDOW = 64
 """The final pass's overlap comes from the ``2 · 64`` positions around the wrap
 point: 0.015 dB below the whole block for 0.82x the time. Shorter blocks use the
 whole block."""
-
-_FLOAT_SCALE_FACTORS = tuple(2.0 ** (k / 48) for k in range(-48, 49))
-"""The float stage's grid: 97 factors, 1.45% apart, one octave either side of the
-initial scale."""
 
 _FP8_SEARCH_RADIUS = 2
 """The coarse INT8 Viterbi's candidates: E4M3 values within 2 grid steps."""
@@ -196,12 +199,11 @@ class _Mode:
 
 @dataclass
 class _Search:
-    """The encoder's state for one trellis: the blocks ``w [N, T]``, the float
-    stage's grid center ``[N]`` and the tail-biting overlap of its searches."""
+    """The encoder's state for one trellis: the blocks ``w [N, T]`` and the
+    tail-biting overlap of its searches."""
 
     trellis: SearchTrellis
     w: torch.Tensor
-    center: torch.Tensor
     overlap: torch.Tensor | None = None
 
     def compute_values(self, states: torch.Tensor) -> torch.Tensor:
@@ -211,20 +213,6 @@ class _Search:
     def evaluate(self, states: torch.Tensor, scale: torch.Tensor, mode: _Mode) -> _Walks:
         error = mode.compute_error(self.w, mode.compute_entries(states), scale)
         return _Walks(states, scale, error)
-
-    def compute_grid_position(self, scale: torch.Tensor) -> torch.Tensor:
-        """Real-valued index of ``scale`` on the float grid (0 = ``center``)."""
-        half = (len(_FLOAT_SCALE_FACTORS) - 1) // 2
-        octaves = torch.log2(scale.double() / self.center.double())
-        return octaves * (half / math.log2(_FLOAT_SCALE_FACTORS[-1]))
-
-    def compute_grid_scale(self, index: torch.Tensor) -> torch.Tensor:
-        """``center · factor`` at signed grid ``index`` ``[N]`` or ``[N, S]``, clamped to
-        the grid."""
-        factors = torch.tensor(_FLOAT_SCALE_FACTORS, device=index.device)
-        half = (len(_FLOAT_SCALE_FACTORS) - 1) // 2
-        center = self.center if index.dim() == 1 else self.center[:, None]
-        return center * factors[index.clamp(-half, half) + half]
 
     def search(self, walks: _Walks, mode: _Mode, candidates: torch.Tensor) -> None:
         """Optimal walk and candidate scale per block ``[N, S]``, kept where better."""
@@ -236,21 +224,18 @@ class _Search:
         walks.take(found.err < walks.err, found.states, found.scale, found.err)
 
     def refit_float(self, walks: _Walks, mode: _Mode) -> None:
-        """Best float-grid scale for the fixed walk, kept where better. The error is a
-        convex quadratic in the scale, so the best grid point is one of the two that
-        bracket the least-squares scale; both are scored exactly."""
+        """Best continuous float scale for the fixed walk, kept where better."""
         values = self.compute_values(walks.states)
         v64 = values.double()
-        ls = (self.w.double() * v64).sum(-1) / v64.square().sum(-1).clamp(min=1e-300)
-        # Beyond the grid (or ls <= 0) both bracket points clamp to its end.
-        bounded = ls.clamp(min=self.center.double() / 4, max=self.center.double() * 4)
-        below = self.compute_grid_position(bounded).floor().long()
-        for index in (below, below + 1):
-            scale = self.compute_grid_scale(index)
-            err = mode.compute_error(self.w, values, scale)
-            better = err < walks.err
-            walks.scale = torch.where(better, scale, walks.scale)
-            walks.err = torch.where(better, err, walks.err)
+        denominator = v64.square().sum(-1)
+        ls = (self.w.double() * v64).sum(-1) / denominator.clamp(min=1e-300)
+        candidate = ls.float()
+        valid = (denominator > 0) & (ls > 0) & torch.isfinite(candidate)
+        scale = torch.where(valid, candidate.clamp(min=_MIN_SCALE), walks.scale)
+        err = mode.compute_error(self.w, values, scale)
+        better = err < walks.err
+        walks.scale = torch.where(better, scale, walks.scale)
+        walks.err = torch.where(better, err, walks.err)
 
     def refit_fp8(self, walks: _Walks, mode: _Mode) -> None:
         """Best FP8 block scale for the fixed walk among the incumbent and the E4M3
@@ -304,6 +289,19 @@ def _compute_row_multiplier_indices(
     return torch.stack(errors).argmin(0)
 
 
+def _float_scale_candidates(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-block RMS scale and 3-candidate float search grid ``(center, [N, 3])``.
+
+    Normal blocks stay at ``center = max(rms / 0.909, _MIN_SCALE)``; blocks with
+    ``amax / 3.0 > center`` also explore the peak-anchored scale and their geometric
+    midpoint so outlier blocks are not clipped in Stage 1.
+    """
+    center = (w.square().mean(-1).sqrt() / _CENTER_RMS).clamp(min=_MIN_SCALE)
+    peak = torch.maximum(w.abs().amax(-1) / _PEAK_DIVISOR, center)
+    midpoint = torch.where(peak > center, center * torch.sqrt(peak / center), center)
+    return center, torch.stack((center, midpoint, peak), dim=1)
+
+
 def _encode_rows(
     w_rows: torch.Tensor, layout: TrellisLayout
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -318,19 +316,18 @@ def _encode_rows(
     num_blocks = w.shape[0]
     stored = SearchTrellis(STATE_BITS, layout.compute_step_widths())
     coarse = stored.with_state_bits(_COARSE_STATE_BITS)
-    center = (w.square().mean(-1).sqrt() / _CENTER_RMS).clamp(min=1e-8)
-    search = _Search(coarse, w, center)
+    center, float_candidates = _float_scale_candidates(w)
+    search = _Search(coarse, w)
 
-    # 1. Coarse float stage at the grid center.
+    # 1. Coarse float stage across RMS and peak-anchored candidates.
     float_mode = _Mode(coarse, False, torch.ones(num_blocks, device=w.device))
     search.overlap = compute_overlap(coarse, w, center, float_mode.p2, int8=False)
     unset = torch.full_like(center, math.inf, dtype=torch.float64)
     walks = _Walks(torch.zeros_like(w, dtype=torch.int64), center, unset)
-    index = search.compute_grid_position(walks.scale).round().long()
-    search.search(walks, float_mode, search.compute_grid_scale(index[:, None]))
+    search.search(walks, float_mode, float_candidates)
     search.refit_float(walks, float_mode)
     recon = search.compute_values(walks.states) * walks.scale[:, None] * float_mode.p2[:, None]
-    s_c0 = (recon.reshape(rows, cols).abs().amax(-1) / _INT8_MAX).clamp(min=1e-8)
+    s_c0 = (recon.reshape(rows, cols).abs().amax(-1) / _INT8_MAX).clamp(min=_MIN_SCALE)
 
     # 2. Row scale.
     multiplier_index = _compute_row_multiplier_indices(search, walks, s_c0, rows)
@@ -345,7 +342,7 @@ def _encode_rows(
     search.refit_fp8(walks, int8_mode)
 
     # 4. Final pass on the stored trellis.
-    final = _Search(stored, w, center)
+    final = _Search(stored, w)
     final_mode = _Mode(stored, True, p2)
     window = min(_OVERLAP_WINDOW, block_size // 2)
     final.overlap = compute_overlap(stored, w, walks.scale, p2, int8=True, window=window)

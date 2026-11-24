@@ -7,7 +7,7 @@ from piper_kernels.trellis import TrellisStorage
 from piper_kernels.trellis._layout import TrellisLayout, resolve_block_size, resolve_layout
 from piper_kernels.trellis._reference import compute_states
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
-from trellis_format._encoding_vectors import ENCODER_VECTORS, EncoderVector, build_rows, digest
+from trellis_format._encoding_vectors import ENCODER_VECTORS, EncoderVector, build_rows
 
 _nvidia = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
@@ -65,36 +65,34 @@ def test_pack_states_inverts_the_decoder_windows(layout: TrellisLayout) -> None:
     assert torch.equal(pack_states(compute_states(bitstreams, layout), layout), bitstreams)
 
 
-def _encode_vector(vector: EncoderVector) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from piper_kernels.trellis._encoder import encode_matrix  # noqa: PLC0415 - needs Triton
-
-    layout = TrellisLayout(resolve_block_size(vector.cols), vector.block_bits)
-    return encode_matrix(build_rows(vector.rows, vector.cols, vector.seed).cuda(), layout)
-
-
-def _digests(storage: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> tuple[str, ...]:
-    return tuple(digest(tensor) for tensor in storage)
-
-
-def _expected_digests(vector: EncoderVector) -> tuple[str, ...]:
-    return (vector.bitstreams_sha256, vector.block_scales_sha256, vector.scale_sha256)
-
-
 @pytest.mark.gpu
 @_nvidia
 @pytest.mark.parametrize("vector", ENCODER_VECTORS, ids=lambda v: f"{v.cols}x{v.block_bits}")
-@pytest.mark.parametrize("persistent", [True, False], ids=["persistent", "step_loop"])
-def test_encoder_matches_research_encodings(
-    vector: EncoderVector, persistent: bool, monkeypatch: pytest.MonkeyPatch
+def test_encoder_matches_across_backends_and_meets_sqnr(
+    vector: EncoderVector, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from piper_kernels.trellis import _gluon_forward, _viterbi  # noqa: PLC0415 - needs Triton
+    from piper_kernels.trellis._encoder import encode_matrix  # noqa: PLC0415 - needs Triton
 
-    if persistent and not _gluon_forward.supports_device(torch.device("cuda")):
-        pytest.skip("this GPU or Triton release does not run the persistent forward")
-    if not persistent:
-        monkeypatch.setattr(_viterbi, "_select_persistent_forward", lambda *_: False)
+    rows = build_rows(vector.rows, vector.cols, vector.seed).cuda()
+    layout = TrellisLayout(resolve_block_size(vector.cols), vector.block_bits)
+    persistent_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    if _gluon_forward.supports_device(torch.device("cuda")):
+        persistent_out = encode_matrix(rows, layout)
 
-    assert _digests(_encode_vector(vector)) == _expected_digests(vector)
+    monkeypatch.setattr(_viterbi, "_select_persistent_forward", lambda *_: False)
+    bitstreams, block_scales, scale = encode_matrix(rows, layout)
+
+    if persistent_out is not None:
+        persistent_bitstreams, persistent_block_scales, persistent_scale = persistent_out
+        assert torch.equal(persistent_bitstreams, bitstreams)
+        assert torch.equal(persistent_block_scales, block_scales)
+        assert torch.equal(persistent_scale, scale)
+
+    decoded = ConvRotInt8Tensor.from_trellis(
+        bitstreams, block_scales, scale, block_size=layout.block_size, group_size=16
+    )
+    assert _sqnr_db(rows, decoded.qdata.float() * decoded.scale) > vector.min_sqnr_db
 
 
 def _sqnr_db(reference: torch.Tensor, approximation: torch.Tensor) -> float:
@@ -132,6 +130,46 @@ def test_from_hp_round_trips_through_int8_decode(
     assert storage.scale.dtype == torch.float32
     assert decoded.dtype == torch.bfloat16
     assert _sqnr_db(weight, decoded.dequantize(torch.float32)) > min_sqnr_db
+
+
+@pytest.mark.gpu
+@_nvidia
+def test_from_hp_encodes_outlier_rows() -> None:
+    generator = torch.Generator().manual_seed(2)
+    heterogeneous = torch.randn(8, 512, generator=generator) * 0.02
+    heterogeneous[:, 0:64] *= 4.0
+    heterogeneous[:, 256:320] *= 4.0
+    heterogeneous_cuda = heterogeneous.cuda()
+
+    heterogeneous_storage = TrellisStorage.from_hp(
+        heterogeneous_cuda, group_size=64, bits_per_weight=4.5
+    )
+    heterogeneous_decoded = ConvRotInt8Tensor.from_trellis(
+        heterogeneous_storage.bitstreams,
+        heterogeneous_storage.block_scales,
+        heterogeneous_storage.scale,
+        block_size=heterogeneous_storage.block_size,
+        group_size=64,
+    ).dequantize(torch.float32)
+    assert _sqnr_db(heterogeneous_cuda, heterogeneous_decoded) > 23.0
+
+    h4_row = torch.tensor((1.0, 1.0, 1.0, -1.0)) / 2.0
+    h256_row = h4_row
+    for _ in range(3):
+        h256_row = torch.kron(h256_row, h4_row)
+    spike_row = torch.randn(4, 512, generator=generator) * 0.02
+    spike_row[:, :256] += 10.0 * 0.02 * h256_row
+    spike_cuda = spike_row.cuda()
+
+    spike_storage = TrellisStorage.from_hp(spike_cuda, group_size=256, bits_per_weight=4.5)
+    spike_decoded = ConvRotInt8Tensor.from_trellis(
+        spike_storage.bitstreams,
+        spike_storage.block_scales,
+        spike_storage.scale,
+        block_size=spike_storage.block_size,
+        group_size=256,
+    ).dequantize(torch.float32)
+    assert _sqnr_db(spike_cuda, spike_decoded) > 21.0
 
 
 @pytest.mark.gpu
