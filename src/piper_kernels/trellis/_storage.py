@@ -14,11 +14,20 @@ from ._layout import TrellisLayout, resolve_block_size, resolve_layout
 
 
 def _require_encoder_device(device: torch.device) -> None:
-    """Raise unless ``device`` is an NVIDIA CUDA GPU that Triton can compile for."""
+    """Raise unless ``device`` is an NVIDIA SM80+ CUDA GPU with Triton 3.9+ Gluon support."""
     target = AcceleratorTarget.from_device(device)
-    if not target.is_nvidia_cuda or not runtime.supports_device(device):
+    supported = target.is_nvidia_cuda and runtime.supports_device(device)
+    if supported:
+        try:
+            from . import _gluon_forward  # noqa: PLC0415 - Triton/Gluon is optional
+
+            supported = _gluon_forward.supports_device(device)
+        except ImportError:
+            supported = False
+    if not supported:
         raise ValueError(
-            f"trellis encoding requires an NVIDIA CUDA device with Triton, got {device}"
+            "trellis encoding requires an NVIDIA CUDA device (SM80+) with Triton 3.9+, "
+            f"got {device}"
         )
 
 
@@ -50,13 +59,13 @@ class TrellisStorage:
         """Rotate and trellis-encode a high-precision linear weight.
 
         ``hp_tensor`` is a 2-D float16, bfloat16 or float32 ``[out, in]`` weight on an
-        NVIDIA CUDA device; it is rotated in FP32 for ConvRot ``group_size`` and
-        encoded there. Specify either ``bits_per_weight`` (the stored rate counting
-        each block's FP8 scale: each block takes the most whole bytes within it) or an
-        exact whole-byte ``bytes_per_block``, both yielding 3 to 6 code bits per
-        weight. The block size is the largest multiple of 16, up to 256, that divides
-        ``in``. For example, 4.5 bits per weight or ``bytes_per_block=143`` stores
-        each 256-weight block in 143 bytes plus its scale.
+        NVIDIA SM80+ CUDA device (99 KiB opt-in shared memory, Triton 3.9+); it is rotated
+        in FP32 for ConvRot ``group_size`` and encoded there. Specify either
+        ``bits_per_weight`` (the stored rate counting each block's FP8 scale: each block
+        takes the most whole bytes within it) or an exact whole-byte ``bytes_per_block``,
+        both yielding 3 to 6 code bits per weight. The block size is the largest multiple
+        of 16, up to 256, that divides ``in``. For example, 4.5 bits per weight or
+        ``bytes_per_block=143`` stores each 256-weight block in 143 bytes plus its scale.
 
         Encoding searches each block's walk and scale against the exact INT8
         decode. Unlike wrapping supplied storage, it reads the weight's values and

@@ -1,29 +1,20 @@
 """Coarse-to-fine trellis encoder: rotated FP32 rows to trellis-coded blocks.
 
-The encoder minimizes each block's plain squared weight error (data-free, no
-Hessian) against the format's exact INT8 decode. Each step below runs a Viterbi
-search (``_viterbi.compute_walks``) or a refit of the block scale for a fixed walk,
-and keeps a block's new walk or scale only where it lowers its FP64 error:
+The encoder minimizes each block's squared weight error (data-free, no Hessian)
+against the format's exact INT8 decode in three stages:
 
-1. **Coarse float stage**, on the layout's step widths with 12-bit states: QTIP
-   Algorithm 4's overlap at ``center = max(rms(block) / 0.909, 1e-8)``, one Viterbi
-   at that scale, also considering ``peak = amax(block) / 3.0`` and the geometric
-   midpoint when the peak exceeds the center. An unclamped continuous least-squares
-   refit sets the scale of the winning walk. The row scale starts at
-   ``s_c0 = max |ŵ| / 127`` of that reconstruction.
-2. **Row scale:** ``m · s_c0`` for the ``m`` among 29 multipliers from 0.84 to 2.83
-   at which the coarse walks decode to INT8 with the least error (no Viterbi).
-3. **Coarse INT8 stage** at that row scale: an FP8 refit of the block scale, then
-   one Viterbi over its five nearest E4M3 values and another refit.
-4. **Final pass** on the stored 16-bit trellis at those scales: the overlap again,
-   from the 128 positions around the wrap, one constrained Viterbi at the block
-   scale and an FP8 refit. Its walk replaces the coarse one.
-
-A 12-bit pass costs about 0.06 of a 16-bit one on the persistent forward, so the
-final pass dominates. On ConvRot-rotated, Gaussian-like rows this tracks the
-research baseline (``piper-research``, ``projects/e8-w4a8-vq``
-``trellis_vr_fast``), while the peak-anchored Stage 1 candidates and unclamped
-float refit avoid clipping blocks with outliers or heterogeneous group variances.
+1. **Analytical scale selection** (fused Triton): a 17-point log-grid search of a
+   Bennett-style 1MAD distortion + tail-clipping proxy picks each block's target
+   scale ``best_s`` and capped peak, then scores all 29 row-scale multipliers
+   ``m · s_c0`` (INT8 error plus trellis error at FP8-snapped block scales) to fix
+   the row scale ``p2`` and initial FP8 ``block_scale``.
+2. **Coarse L=12 cost check:** one cost-only ``FP16x2`` Viterbi pass (``COST_ONLY``,
+   no backpointers or traceback) over the 3 nearest E4M3 values (``radius=1``) picks
+   each block's winning FP8 scale against actual 1MAD trellis dynamics.
+3. **Final L=16 pass & FP8 refit:** QTIP Algorithm 4's wrap overlap over the ``2 · 32``
+   positions around the boundary (skipping backpointer writes on the first 32 steps),
+   one constrained 16-bit ``FP16x2`` Viterbi pass, and a fused FP32 refit over the 17
+   nearest E4M3 scales for the winning walk.
 """
 
 # Triton's JIT launcher and constexpr arguments are not fully represented by its
@@ -34,8 +25,6 @@ float refit avoid clipping blocks with outliers or heterogeneous group variances
 from __future__ import annotations
 
 import functools
-import math
-from dataclasses import dataclass
 
 import torch
 import triton
@@ -44,52 +33,31 @@ from triton.language.extra import libdevice
 
 from piper_kernels._triton.runtime import device_context
 
-from ._layout import STATE_BITS, TrellisLayout
-from ._viterbi import (
-    SearchTrellis,
-    build_numerator_table,
-    build_value_table,
-    compute_overlap,
-    compute_walks,
-    fold_block_scales,
+from ._gluon_forward import FP16_SCALE, run_viterbi
+from ._layout import (
+    CODE_OFFSET,
+    CODE_RECIPROCAL,
+    LCG_INCREMENT,
+    LCG_MULTIPLIER,
+    STATE_BITS,
+    TrellisLayout,
 )
 
-_CENTER_RMS = 0.909
-"""The float stage's RMS-based candidate scale is ``rms(block) / 0.909``, calibrated on
-Gaussian rows (about 1.1 · rms, as for one global scale)."""
-
-_PEAK_DIVISOR = 3.0
-"""Divisor for the float stage's peak-anchored candidate ``amax(block) / 3.0``, near
-the 12-bit 1MAD tail ceiling (~3.07)."""
-
 _MIN_SCALE = 1e-8
-"""Lower clamp on positive derived float and row scales."""
-
+_FP8_NORMAL_FLOOR = 2.0**-9
 _COARSE_STATE_BITS = 12
-"""State bits of the coarse search. 14 gained 0.010-0.012 dB over 12 for 1.2-1.4x
-the time."""
-
-_OVERLAP_WINDOW = 64
-"""The final pass's overlap comes from the ``2 · 64`` positions around the wrap
-point: 0.015 dB below the whole block for 0.82x the time. Shorter blocks use the
-whole block."""
-
-_FP8_SEARCH_RADIUS = 2
-"""The coarse INT8 Viterbi's candidates: E4M3 values within 2 grid steps."""
-
+_OVERLAP_WINDOW = 32
+_FP8_SEARCH_RADIUS = 1
 _FP8_REFIT_RADIUS = 8
-"""An FP8 refit's candidates: E4M3 values within 8 grid steps of the least-squares
-scale, about one octave either side."""
-
 _ROW_MULTIPLIERS = tuple(2.0 ** (i / 16) for i in range(-4, 25))
 """Row-scale candidates ``m · s_c0``: 29 values in 4.4% steps from 0.84 to 2.83."""
-
-_INT8_MAX = 127
-
 _MAX_CHUNK_WEIGHTS = 1 << 24
-"""Rows are encoded in chunks of at most this many weights, the research study's
-chunk, to bound the per-block working tensors. Rows and blocks encode
-independently, so chunking does not change the result."""
+
+_LCG_MULTIPLIER = tl.constexpr(LCG_MULTIPLIER)
+_LCG_INCREMENT = tl.constexpr(LCG_INCREMENT)
+_CODE_OFFSET = tl.constexpr(CODE_OFFSET)
+_CODE_RECIPROCAL = tl.constexpr(CODE_RECIPROCAL)
+_MIN_SCALE_TL = tl.constexpr(_MIN_SCALE)
 
 
 @functools.cache
@@ -106,9 +74,7 @@ def _round_fp8(x: torch.Tensor) -> torch.Tensor:
 
 
 def _compute_fp8_window(center: torch.Tensor, radius: int) -> torch.Tensor:
-    """The positive E4M3 values within ``radius`` grid steps of ``_round_fp8(center)``,
-    ascending, ``[*center.shape, 2 · radius + 1]`` (clamped, so they may repeat at
-    the grid ends)."""
+    """Positive E4M3 values within ``radius`` grid steps of ``_round_fp8(center)``."""
     grid = _build_fp8_values(center.device)
     nearest = _round_fp8(center).clamp(min=float(grid[0]))
     index = torch.searchsorted(grid, nearest.contiguous())
@@ -118,248 +84,249 @@ def _compute_fp8_window(center: torch.Tensor, radius: int) -> torch.Tensor:
 
 
 @triton.jit
-def _squared_error_kernel(
-    w_ptr, entries_ptr, factor_ptr, p2_ptr, out_ptr, total, length,
-    int8: tl.constexpr, double: tl.constexpr, block: tl.constexpr,
-):  # fmt: skip
-    """``(w - v · p2)²`` per position of contiguous ``[N, T]`` inputs, in FP64 when
-    ``double``. ``v`` is ``clamp(rint(n · alpha), ±127)`` (INT8, ``factor`` holding
-    ``alpha``) or ``c · scale``, each product rounded to FP32 (launched with
-    ``enable_fp_fusion=False``); ``factor`` and ``p2`` are per block."""
-    i = tl.program_id(0).to(tl.int64) * block + tl.arange(0, block)
-    valid = i < total
-    w = tl.load(w_ptr + i, mask=valid, other=0.0)
-    entry = tl.load(entries_ptr + i, mask=valid, other=0.0)
-    factor = tl.load(factor_ptr + i // length, mask=valid, other=0.0)
-    p2 = tl.load(p2_ptr + i // length, mask=valid, other=0.0)
-    value = entry * factor
-    if int8:
-        value = tl.minimum(tl.maximum(libdevice.nearbyint(value), -127.0), 127.0)
-    recon = value * p2
-    d = w.to(tl.float64) - recon.to(tl.float64) if double else w - recon
-    tl.store(out_ptr + i, d * d, mask=valid)
+def _estimate_block_scales_kernel(
+    w_ptr,
+    out_scale_ptr,
+    out_cap_amax_ptr,
+    num_blocks,
+    c_q,
+    block_size: tl.constexpr,
+    tile_t: tl.constexpr,
+):
+    """Per-block 17-point log-grid search of the 1MAD Bennett + tail-clipping proxy."""
+    bid = tl.program_id(0)
+    if bid >= num_blocks:
+        return
+    t = tl.arange(0, tile_t)
+    mask = t < block_size
+    w = tl.load(w_ptr + bid * block_size + t, mask=mask, other=0.0).to(tl.float32)
+    w_abs = tl.abs(w)
+    amax = tl.max(w_abs, axis=0)
+    # Normalize by block amax before squaring so large finite weights never overflow FP32.
+    u_scale = tl.maximum(amax, _MIN_SCALE_TL)
+    u_abs = w_abs / u_scale
+    u_amax = amax / u_scale  # pyright: ignore[reportOperatorIssue]
+    u_rms = tl.sqrt(tl.sum(u_abs * u_abs, axis=0) / block_size)
+    u_floor = _MIN_SCALE_TL / u_scale
+    u_lo = tl.maximum(u_rms * 0.85, u_floor)
+    u_hi = tl.maximum(tl.maximum(u_rms * 1.35, u_amax / 2.7), u_lo)
+    step_mult = tl.exp(tl.log(u_hi / u_lo) * (1.0 / 16.0))
+
+    best_u = tl.maximum(u_rms * 1.05, u_lo)
+    best_e = tl.full((), float("inf"), tl.float32)
+    u = u_lo
+    for _ in range(17):
+        z = tl.minimum(u_abs / u, 3.05)
+        q_term = tl.sum(tl.where(mask, tl.exp(0.37 * z * z), 0.0), axis=0)
+        clip = tl.maximum(u_abs - 3.05 * u, 0.0)
+        clip_term = tl.sum(tl.where(mask, clip * clip, 0.0), axis=0)
+        e = 0.62 * c_q * (u * u) * q_term + clip_term
+        better = e < best_e
+        best_e = tl.where(better, e, best_e)
+        best_u = tl.where(better, u, best_u)
+        u = u * step_mult
+
+    best_s = tl.maximum(best_u * u_scale, _MIN_SCALE_TL)
+    tl.store(out_scale_ptr + bid, best_s)
+    tl.store(out_cap_amax_ptr + bid, tl.minimum(amax, 3.05 * best_s))
 
 
-_ERROR_BLOCK = 1024
+@triton.jit
+def _score_row_multipliers_kernel(
+    w_ptr,
+    sc_ptr,
+    eff_s_ptr,
+    out_err_ptr,
+    num_blocks,
+    blocks_per_row,
+    c_q,
+    block_size: tl.constexpr,
+    tile_t: tl.constexpr,
+    num_mults: tl.constexpr,
+):
+    """Score all ``num_mults`` candidate row scales per block in registers."""
+    bid = tl.program_id(0)
+    if bid >= num_blocks:
+        return
+    row = bid // blocks_per_row
+    # Normalize by a constant positive scale for this row so argmin is invariant and
+    # large finite weights never overflow FP32 squaring.
+    s0 = tl.load(sc_ptr + row * num_mults).to(tl.float32)
+    t = tl.arange(0, tile_t)
+    mask = t < block_size
+    w = tl.load(w_ptr + bid * block_size + t, mask=mask, other=0.0).to(tl.float32)
+    wn = w / s0
+    wn_abs = tl.abs(wn)
+    for m in range(num_mults):
+        sc = tl.load(sc_ptr + row * num_mults + m)
+        eff_s = tl.load(eff_s_ptr + bid * num_mults + m)
+        q = tl.minimum(tl.maximum(libdevice.nearbyint(w / sc), -127.0), 127.0)
+        sc_n = sc / s0
+        eff_n = eff_s / s0
+        d_i8 = tl.where(mask, wn - q * sc_n, 0.0)
+        i8_e = tl.sum(d_i8 * d_i8, axis=0)
+        z = tl.minimum(wn_abs / eff_n, 3.05)
+        q_term = tl.sum(tl.where(mask, tl.exp(0.37 * z * z), 0.0), axis=0)
+        clip = tl.maximum(wn_abs - 3.05 * eff_n, 0.0)
+        clip_term = tl.sum(tl.where(mask, clip * clip, 0.0), axis=0)
+        t_e = 0.62 * c_q * (eff_n * eff_n) * q_term + clip_term
+        tl.store(out_err_ptr + bid * num_mults + m, i8_e + t_e)
 
 
-@dataclass
-class _Walks:
-    """A solution per block: walks, block scales (FP32 or FP8-valued) and FP64
-    errors."""
+@triton.jit
+def _refit_fp8_kernel(
+    w_ptr,
+    states_ptr,
+    p2_ptr,
+    window_ptr,
+    out_scale_ptr,
+    num_blocks,
+    block_size: tl.constexpr,
+    tile_t: tl.constexpr,
+    num_cands: tl.constexpr,
+):
+    """Best FP8 block scale in ``window`` for the fixed ``states`` walk (FP32)."""
+    bid = tl.program_id(0)
+    if bid >= num_blocks:
+        return
+    t = tl.arange(0, tile_t)
+    mask = t < block_size
+    w = tl.load(w_ptr + bid * block_size + t, mask=mask, other=0.0).to(tl.float32)
+    st = tl.load(states_ptr + bid * block_size + t, mask=mask, other=0).to(tl.uint32)
+    x = st * _LCG_MULTIPLIER + _LCG_INCREMENT
+    n = (
+        ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)).to(tl.int32) - _CODE_OFFSET
+    ).to(tl.float32)
+    p2 = tl.load(p2_ptr + bid).to(tl.float32)
+    w_scaled = w / p2
 
-    states: torch.Tensor  # [N, T] int64
-    scale: torch.Tensor  # [N] FP32
-    err: torch.Tensor  # [N] FP64
-
-    def take(
-        self, mask: torch.Tensor, states: torch.Tensor, scale: torch.Tensor, err: torch.Tensor
-    ) -> None:
-        """Replace the blocks where ``mask`` is set."""
-        self.states = torch.where(mask[:, None], states, self.states)
-        self.scale = torch.where(mask, scale, self.scale)
-        self.err = torch.where(mask, err, self.err)
-
-
-@dataclass(frozen=True)
-class _Mode:
-    """A reconstruction rule over per-position table entries: float
-    ``(c · scale) · p2``, or the format's INT8 decode ``q(n, scale) · p2``, where
-    ``scale`` is the block scale."""
-
-    trellis: SearchTrellis
-    int8: bool
-    p2: torch.Tensor  # [N]: 1 for the float stage, else the row scale
-
-    def compute_entries(self, states: torch.Tensor) -> torch.Tensor:
-        """The table entries of ``states``: ``c(s)``, or ``n(s)`` in INT8 mode."""
-        table = build_numerator_table if self.int8 else build_value_table
-        return table(self.trellis.state_bits, states.device)[states]
-
-    def compute_error(
-        self,
-        w: torch.Tensor,
-        entries: torch.Tensor,
-        scale: torch.Tensor,
-        dtype: torch.dtype = torch.float64,
-    ) -> torch.Tensor:
-        """Per-block squared error ``[N]`` of the reconstruction from ``entries``
-        against contiguous ``w [N, T]``, summed in ``dtype``."""
-        factor = (fold_block_scales(scale) if self.int8 else scale).contiguous()
-        out = torch.empty(w.shape, dtype=dtype, device=w.device)
-        total = w.numel()
-        with device_context(w.device):
-            _squared_error_kernel[(triton.cdiv(total, _ERROR_BLOCK),)](
-                w, entries, factor, self.p2, out, total, w.shape[1],
-                int8=self.int8, double=dtype == torch.float64, block=_ERROR_BLOCK,
-                enable_fp_fusion=False,
-            )  # fmt: skip
-        return out.sum(-1)
+    best_err = tl.full((), float("inf"), tl.float32)
+    best_scale = tl.load(window_ptr + bid * num_cands + (num_cands // 2))
+    for c in range(num_cands):
+        sc = tl.load(window_ptr + bid * num_cands + c)
+        q = tl.minimum(tl.maximum(libdevice.nearbyint(n * (sc * _CODE_RECIPROCAL)), -127.0), 127.0)
+        d = tl.where(mask, w_scaled - q, 0.0)
+        err = tl.sum(d * d, axis=0)
+        better = err < best_err
+        best_err = tl.where(better, err, best_err)
+        best_scale = tl.where(better, sc, best_scale)
+    tl.store(out_scale_ptr + bid, best_scale)
 
 
-@dataclass
-class _Search:
-    """The encoder's state for one trellis: the blocks ``w [N, T]`` and the
-    tail-biting overlap of its searches."""
+def _estimate_initial_scales(
+    w_rows: torch.Tensor, layout: TrellisLayout
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Analytical per-block and per-row scale estimation for ``w_rows [R, K]``."""
+    rows, cols = w_rows.shape
+    block_size = layout.block_size
+    blocks_per_row = cols // block_size
+    w = w_rows.reshape(-1, block_size)
+    num_blocks = w.shape[0]
+    device = w.device
+    tile_t = triton.next_power_of_2(block_size)
+    c_q = 2.0 ** (-2.0 * layout.block_bits / block_size)
 
-    trellis: SearchTrellis
-    w: torch.Tensor
-    overlap: torch.Tensor | None = None
-
-    def compute_values(self, states: torch.Tensor) -> torch.Tensor:
-        """``c(s)`` per position ``[N, T]``."""
-        return build_value_table(self.trellis.state_bits, states.device)[states]
-
-    def evaluate(self, states: torch.Tensor, scale: torch.Tensor, mode: _Mode) -> _Walks:
-        error = mode.compute_error(self.w, mode.compute_entries(states), scale)
-        return _Walks(states, scale, error)
-
-    def search(self, walks: _Walks, mode: _Mode, candidates: torch.Tensor) -> None:
-        """Optimal walk and candidate scale per block ``[N, S]``, kept where better."""
-        states, choice = compute_walks(
-            self.trellis, self.w, candidates, mode.p2, mode.int8, self.overlap
+    best_s = torch.empty(num_blocks, dtype=torch.float32, device=device)
+    cap_amax = torch.empty(num_blocks, dtype=torch.float32, device=device)
+    with device_context(device):
+        _estimate_block_scales_kernel[(num_blocks,)](
+            w, best_s, cap_amax, num_blocks, c_q, block_size=block_size, tile_t=tile_t, num_warps=4
         )
-        scale = candidates.gather(1, choice[:, None]).squeeze(1)
-        found = self.evaluate(states, scale, mode)
-        walks.take(found.err < walks.err, found.states, found.scale, found.err)
 
-    def refit_float(self, walks: _Walks, mode: _Mode) -> None:
-        """Best continuous float scale for the fixed walk, kept where better."""
-        values = self.compute_values(walks.states)
-        v64 = values.double()
-        denominator = v64.square().sum(-1)
-        ls = (self.w.double() * v64).sum(-1) / denominator.clamp(min=1e-300)
-        candidate = ls.float()
-        valid = (denominator > 0) & (ls > 0) & torch.isfinite(candidate)
-        scale = torch.where(valid, candidate.clamp(min=_MIN_SCALE), walks.scale)
-        err = mode.compute_error(self.w, values, scale)
-        better = err < walks.err
-        walks.scale = torch.where(better, scale, walks.scale)
-        walks.err = torch.where(better, err, walks.err)
+    s_c0 = (cap_amax.view(rows, blocks_per_row).amax(-1) / 127.0).clamp(min=_MIN_SCALE)
+    multipliers = torch.tensor(_ROW_MULTIPLIERS, dtype=torch.float32, device=device)
+    sc_all = (s_c0[:, None] * multipliers[None, :]).contiguous()
+    sc_blk = sc_all.repeat_interleave(blocks_per_row, dim=0)
+    ratio = (best_s[:, None] / sc_blk).clamp(min=_FP8_NORMAL_FLOOR)
+    eff_s = (_round_fp8(ratio) * sc_blk).contiguous()
 
-    def refit_fp8(self, walks: _Walks, mode: _Mode) -> None:
-        """Best FP8 block scale for the fixed walk among the incumbent and the E4M3
-        values within ``_FP8_REFIT_RADIUS`` of the least-squares scale, scored
-        exactly in ``mode``."""
-        v64 = self.compute_values(walks.states).double()
-        numerator = (self.w.double() * v64).sum(-1)
-        denominator = v64.square().sum(-1) * mode.p2.double()
-        ls = numerator / denominator.clamp(min=1e-300)
-        center = torch.where((denominator > 0) & (ls > 0), ls.float(), walks.scale)
-        smallest = float(_build_fp8_values(center.device)[0])
-        window = _compute_fp8_window(center.clamp(min=smallest), _FP8_REFIT_RADIUS)
-        entries = mode.compute_entries(walks.states)
-        for candidate_index in range(window.shape[-1]):
-            scale = window[..., candidate_index]
-            err = mode.compute_error(self.w, entries, scale)
-            better = err < walks.err
-            walks.scale = torch.where(better, scale, walks.scale)
-            walks.err = torch.where(better, err, walks.err)
-
-
-def _sum_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
-    """Per-row FP64 sum ``[R]`` of a per-block quantity ``[N]``."""
-    return x.double().reshape(rows, -1).sum(-1)
-
-
-def _compute_row_multiplier_indices(
-    search: _Search, walks: _Walks, s_c0: torch.Tensor, rows: int
-) -> torch.Tensor:
-    """Per row, the index in ``_ROW_MULTIPLIERS`` of the row scale ``m · s_c0`` at
-    which the coarse float walks decode to INT8 with the least error (FP32 sums).
-
-    Each block takes the best of ``_round_fp8(scale / s_c)`` and its two E4M3
-    neighbors. No Viterbi: it ranks the multipliers by the walk the INT8 search
-    starts from. Ties take the smaller ``m``.
-    """
-    device = search.w.device
-    per_row = search.w.shape[0] // rows
-    entries = build_numerator_table(search.trellis.state_bits, device)[walks.states]
-    multipliers = torch.tensor(_ROW_MULTIPLIERS, device=device)
-    p2 = (s_c0 * multipliers[:, None]).repeat_interleave(per_row, dim=1)  # [M, N]
-    window = _compute_fp8_window(walks.scale / p2, 1)  # [M, N, 3]
-    errors = []
-    for multiplier_index in range(len(_ROW_MULTIPLIERS)):
-        mode = _Mode(search.trellis, True, p2[multiplier_index])
-        err = [
-            mode.compute_error(search.w, entries, window[multiplier_index, :, j], torch.float32)
-            for j in range(3)
-        ]
-        errors.append(_sum_rows(torch.stack(err).amin(0), rows))
-    return torch.stack(errors).argmin(0)
-
-
-def _float_scale_candidates(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-block RMS scale and 3-candidate float search grid ``(center, [N, 3])``.
-
-    Normal blocks stay at ``center = max(rms / 0.909, _MIN_SCALE)``; blocks with
-    ``amax / 3.0 > center`` also explore the peak-anchored scale and their geometric
-    midpoint so outlier blocks are not clipped in Stage 1.
-    """
-    center = (w.square().mean(-1).sqrt() / _CENTER_RMS).clamp(min=_MIN_SCALE)
-    peak = torch.maximum(w.abs().amax(-1) / _PEAK_DIVISOR, center)
-    midpoint = torch.where(peak > center, center * torch.sqrt(peak / center), center)
-    return center, torch.stack((center, midpoint, peak), dim=1)
+    blk_errs = torch.empty(num_blocks, len(_ROW_MULTIPLIERS), dtype=torch.float32, device=device)
+    with device_context(device):
+        _score_row_multipliers_kernel[(num_blocks,)](
+            w,
+            sc_all,
+            eff_s,
+            blk_errs,
+            num_blocks,
+            blocks_per_row,
+            c_q,
+            block_size=block_size,
+            tile_t=tile_t,
+            num_mults=len(_ROW_MULTIPLIERS),
+            num_warps=4,
+        )
+    best_m = blk_errs.view(rows, blocks_per_row, len(_ROW_MULTIPLIERS)).double().sum(1).argmin(-1)
+    row_scale = sc_all.gather(1, best_m[:, None]).squeeze(1)
+    p2 = row_scale.repeat_interleave(blocks_per_row)
+    block_scale = _round_fp8((best_s / p2).clamp(min=_FP8_NORMAL_FLOOR))
+    return row_scale, p2, block_scale
 
 
 def _encode_rows(
     w_rows: torch.Tensor, layout: TrellisLayout
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Encode finite rotated FP32 rows ``[R, K]`` on a CUDA device.
-
-    Returns ``(states [R · K/T, T] int64, block_scales [R · K/T] FP8-valued FP32,
-    scale [R] FP32)``: each block's 16-bit walk, its scale and the row scale.
-    """
-    rows, cols = w_rows.shape
+    """Encode finite rotated FP32 rows ``[R, K]`` on an SM80+ CUDA device."""
     block_size = layout.block_size
     w = w_rows.reshape(-1, block_size)
     num_blocks = w.shape[0]
-    stored = SearchTrellis(STATE_BITS, layout.compute_step_widths())
-    coarse = stored.with_state_bits(_COARSE_STATE_BITS)
-    center, float_candidates = _float_scale_candidates(w)
-    search = _Search(coarse, w)
+    widths = layout.compute_step_widths()
 
-    # 1. Coarse float stage across RMS and peak-anchored candidates.
-    float_mode = _Mode(coarse, False, torch.ones(num_blocks, device=w.device))
-    search.overlap = compute_overlap(coarse, w, center, float_mode.p2, int8=False)
-    unset = torch.full_like(center, math.inf, dtype=torch.float64)
-    walks = _Walks(torch.zeros_like(w, dtype=torch.int64), center, unset)
-    search.search(walks, float_mode, float_candidates)
-    search.refit_float(walks, float_mode)
-    recon = search.compute_values(walks.states) * walks.scale[:, None] * float_mode.p2[:, None]
-    s_c0 = (recon.reshape(rows, cols).abs().amax(-1) / _INT8_MAX).clamp(min=_MIN_SCALE)
+    # 1. Analytical per-block & row scale selection.
+    row_scale, p2, block_scale = _estimate_initial_scales(w_rows, layout)
+    w_norm_h = ((w / p2[:, None]).clamp(-256.0, 256.0) * FP16_SCALE).to(torch.float16)
 
-    # 2. Row scale.
-    multiplier_index = _compute_row_multiplier_indices(search, walks, s_c0, rows)
-    scale = s_c0 * torch.tensor(_ROW_MULTIPLIERS, device=w.device)[multiplier_index]
+    # 2. Cost-only L=12 FP8 block-scale refinement (no backpointers).
+    cands = _compute_fp8_window(block_scale, _FP8_SEARCH_RADIUS)
+    num_cands = cands.shape[1]
+    costs_12 = run_viterbi(
+        _COARSE_STATE_BITS,
+        widths,
+        w_norm_h.repeat(num_cands, 1),
+        (cands.T.reshape(-1) * CODE_RECIPROCAL).contiguous(),
+        cost_only=True,
+    ).view(num_cands, num_blocks)
+    block_scale = cands.gather(1, costs_12.argmin(0)[:, None]).squeeze(1).contiguous()
+    alpha_16 = (block_scale * CODE_RECIPROCAL).contiguous()
 
-    # 3. Coarse INT8 stage.
-    p2 = scale.repeat_interleave(cols // block_size)
-    int8_mode = _Mode(coarse, True, p2)
-    walks = search.evaluate(walks.states, _round_fp8(walks.scale / p2), int8_mode)
-    search.refit_fp8(walks, int8_mode)
-    search.search(walks, int8_mode, _compute_fp8_window(walks.scale, _FP8_SEARCH_RADIUS))
-    search.refit_fp8(walks, int8_mode)
+    # 3. L=16 wrap overlap, constrained L=16 walk, and fused FP8 refit.
+    half = block_size // 2
+    span = min(_OVERLAP_WINDOW, half)
+    rolled_widths = widths[-half:] + widths[:-half]
+    ov_widths = rolled_widths[half - span : half + span]
+    ov_w_h = w_norm_h.roll(half, 1)[:, half - span : half + span].contiguous()
+    ov_states = run_viterbi(
+        STATE_BITS, ov_widths, ov_w_h, alpha_16, cost_only=False, write_bp_from=span
+    )
+    overlap = (ov_states[:, 0] >> widths[0]).contiguous()
 
-    # 4. Final pass on the stored trellis.
-    final = _Search(stored, w)
-    final_mode = _Mode(stored, True, p2)
-    window = min(_OVERLAP_WINDOW, block_size // 2)
-    final.overlap = compute_overlap(stored, w, walks.scale, p2, int8=True, window=window)
-    handed = _Walks(walks.states, walks.scale, torch.full_like(walks.err, math.inf))
-    final.search(handed, final_mode, _compute_fp8_window(handed.scale, 0))
-    final.refit_fp8(handed, final_mode)
-    return handed.states, handed.scale, scale
+    states = run_viterbi(
+        STATE_BITS, widths, w_norm_h, alpha_16, overlap, cost_only=False, write_bp_from=0
+    )
+
+    refit_win = _compute_fp8_window(block_scale, _FP8_REFIT_RADIUS).contiguous()
+    final_scale = torch.empty_like(block_scale)
+    with device_context(w.device):
+        _refit_fp8_kernel[(num_blocks,)](
+            w,
+            states,
+            p2,
+            refit_win,
+            final_scale,
+            num_blocks,
+            block_size=block_size,
+            tile_t=triton.next_power_of_2(block_size),
+            num_cands=refit_win.shape[1],
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return states, final_scale, row_scale
 
 
-def pack_states(states: torch.Tensor, layout: TrellisLayout) -> torch.Tensor:
-    """Tail-biting bitstreams ``[N, bytes]`` uint8 of walks ``[N, T]``.
-
-    Step ``t`` stores the ``k_t`` bits it shifts in, the low bits of ``s_t``, at
-    stream bits ``o_t + 16 - k_t`` to ``o_t + 15`` (mod ``B``), most significant
-    first, so state ``t`` is the cyclic window at ``o_t`` the decoder reads. Those
-    ranges tile the stream, so every bit is written once.
-    """
+@functools.cache
+def _build_pack_tables(
+    layout: TrellisLayout, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cached ``(source_index, shift_amount)`` bit-packing gather tables on ``device``."""
     total = layout.block_bits
     sources = [0] * total
     shifts = [0] * total
@@ -369,11 +336,19 @@ def pack_states(states: torch.Tensor, layout: TrellisLayout) -> torch.Tensor:
             position = (offset + STATE_BITS - width + i) % total
             sources[position] = t
             shifts[position] = width - 1 - i
-    device = states.device
-    source_index = torch.tensor(sources, device=device).view(-1, 8)
-    shift_amount = torch.tensor(shifts, dtype=torch.int32, device=device).view(-1, 8)
+    return (
+        torch.tensor(sources, device=device).view(-1, 8),
+        torch.tensor(shifts, dtype=torch.int32, device=device).view(-1, 8),
+    )
+
+
+def pack_states(states: torch.Tensor, layout: TrellisLayout) -> torch.Tensor:
+    """Tail-biting bitstreams ``[N, bytes]`` uint8 of walks ``[N, T]``."""
+    source_index, shift_amount = _build_pack_tables(layout, states.device)
     narrow = states.to(torch.int32)
-    packed = torch.zeros(states.shape[0], layout.bytes_per_block, dtype=torch.int32, device=device)
+    packed = torch.zeros(
+        states.shape[0], layout.bytes_per_block, dtype=torch.int32, device=states.device
+    )
     for bit in range(8):
         value = (narrow[:, source_index[:, bit]] >> shift_amount[:, bit]) & 1
         packed |= value << (7 - bit)
@@ -383,7 +358,7 @@ def pack_states(states: torch.Tensor, layout: TrellisLayout) -> torch.Tensor:
 def encode_matrix(
     rotated: torch.Tensor, layout: TrellisLayout
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Trellis-coded storage of a rotated FP32 matrix ``[R, K]`` on a CUDA device.
+    """Trellis-coded storage of a rotated FP32 matrix ``[R, K]`` on an SM80+ CUDA device.
 
     Returns ``(bitstreams [R, K/T, bytes] uint8, block_scales [R, K/T] float8_e4m3fn,
     scale [R, 1] float32)``. The values must be finite.

@@ -5,6 +5,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking: `piper_kernels.trellis.TrellisStorage.from_hp` now requires an NVIDIA
+  SM80+ GPU with Triton 3.9+ (dropping SM70/SM75 offline encoding) and encodes
+  ~2.3–2.5× faster across 3–6 bits per weight on RTX 5090; trellis decoding in
+  `ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` is ~1.3–2.2× faster while
+  keeping stored checkpoints unchanged.
+
 ## [0.8.0rc7] - 2026-11-24
 
 ### Added

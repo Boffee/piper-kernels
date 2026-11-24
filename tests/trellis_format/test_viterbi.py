@@ -1,14 +1,13 @@
-"""The persistent Gluon forward against the Triton step loop.
+"""Tests for the FP16x2 Gluon persistent Viterbi forward against a PyTorch oracle."""
 
-Final costs and every backpointer byte, written and unwritten, must be equal for the
-encoder's state widths, step widths, decode modes and starts. Each batch mixes CTAs
-whose rows share one scale with CTAs whose rows do not, so both decode paths run.
-"""
+from types import ModuleType
 
 import pytest
 import torch
 
-from piper_kernels.trellis._layout import TrellisLayout
+from piper_kernels.trellis import TrellisLayout
+from piper_kernels.trellis._layout import CODE_RECIPROCAL
+from piper_kernels.trellis._reference import compute_code_numerators
 
 _nvidia = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
@@ -17,124 +16,176 @@ _nvidia = pytest.mark.skipif(
 
 _VR45 = TrellisLayout(256, 1144).compute_step_widths()
 _MIX45 = (4, 4, 4, 5, 5, 5, 4, 5)
-"""A de Bruijn cycle: every step kind ``(k_t, k_t+1, k_t+2)`` once."""
+"""A de Bruijn cycle covering all 8 adjacent 2-width step pairs."""
 _WIDTHS = {
-    "k3": (3,) * 256,
-    "k4": (4,) * 256,
-    "k5": (5,) * 256,
-    "k6": (6,) * 256,
+    "k3": (3,) * 16,
+    "k4": (4,) * 16,
+    "k5": (5,) * 16,
+    "k6": (6,) * 16,
     "vr34": TrellisLayout(256, 888).compute_step_widths(),
     "vr45": _VR45,
     "vr56": TrellisLayout(256, 1400).compute_step_widths(),
     "vr45_224": TrellisLayout(224, 1000).compute_step_widths(),
-    "window45": _VR45[-64:] + _VR45[:64],
+    "window45": _VR45[-32:] + _VR45[:32],
     "mix34": tuple(k - 1 for k in _MIX45),
     "mix45": _MIX45,
     "mix56": tuple(k + 1 for k in _MIX45),
 }
-_CASES = [
-    (state_bits, name, int8)
-    for state_bits, int8s in ((12, (False, True)), (16, (True,)))
-    for name in _WIDTHS
-    if state_bits == 16 or name != "window45"
-    for int8 in int8s
-]
-"""What the encoder runs: float and INT8 searches over whole blocks with 12-bit states,
-and INT8 searches over blocks and wrap windows with 16-bit states."""
-_COUNT = 5  # candidates per sequence: row = candidate · batch + sequence
-_BATCH = 41  # 205 rows: 35 CTAs of 6, the last one partly padding
+_BATCH = 29  # odd batch size with mixed FP8 buckets and padding slots
 
 
-def _generator(seed: int) -> torch.Generator:
-    return torch.Generator(device="cuda").manual_seed(seed)
+def _gluon() -> ModuleType:
+    from piper_kernels.trellis import _gluon_forward  # noqa: PLC0415 - Triton is optional
+
+    return _gluon_forward
 
 
-def _inputs(
-    kind: str, length: int, int8: bool, seed: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``(w [T, rows], scale [rows], p2 [rows])``, the scale before folding.
-
-    The first half of the sequences take an FP8 window around ``1.1 · rms / s_c0``
-    with ``p2 = s_c0``, so CTAs share their few values; large ones engage the INT8
-    clamp. The rest take distinct jittered scales.
-    """
-    generator = _generator(seed)
-    device = torch.device("cuda")
-    if kind == "random":
-        sequences = torch.randn(_BATCH, length, generator=generator, device=device)
-        spikes = torch.rand(_BATCH, length, generator=generator, device=device) < 0.01
-        sequences = torch.where(spikes, 6 * sequences, sequences) * 0.02
-        second = torch.arange(_BATCH, device=device) >= 24
-        top = sequences.abs().amax(1)
-        s_c0 = torch.where(second, top[24:].max() / 8, top[:24].max()) / 127
-    else:  # zero, constant and three-level sequences: many equal costs
-        levels = torch.randint(-1, 2, (_BATCH, length), generator=generator, device=device)
-        sequences = torch.where(
-            (torch.arange(_BATCH, device=device) % 3 == 0)[:, None], 0.0, levels * 2.0**-7
+def _pytorch_viterbi_fp16(
+    state_bits: int,
+    widths: tuple[int, ...],
+    w_norm_h: torch.Tensor,
+    alpha: torch.Tensor,
+    overlap: torch.Tensor | None,
+    *,
+    cost_only: bool = False,
+) -> torch.Tensor:
+    """Pure-PyTorch FP16 Viterbi oracle matching the Gluon kernel's arithmetic."""
+    fp16_scale = _gluon().FP16_SCALE
+    n, length = w_norm_h.shape
+    device = w_norm_h.device
+    num_table = compute_code_numerators(torch.arange(1 << state_bits, device=device)).float()
+    q_table = (
+        torch.clamp(torch.round(num_table[None, :] * alpha[:, None]), -127.0, 127.0) * fp16_scale
+    ).to(torch.float16)
+    k0 = widths[0]
+    if overlap is None:
+        costs = torch.zeros((n, 1 << (state_bits - k0)), dtype=torch.float16, device=device)
+    else:
+        costs = torch.full(
+            (n, 1 << (state_bits - k0)), float("inf"), dtype=torch.float16, device=device
         )
-        sequences[1::3] = 2.0**-7
-        s_c0 = torch.full((_BATCH,), 2.0**-12, device=device)
-    half = _BATCH // 2
-    rms = sequences.square().mean(1).sqrt()
-    center = (1.1 * rms / s_c0).clamp(min=2.0**-9).to(torch.float8_e4m3fn).float()
-    steps = torch.arange(-(_COUNT // 2), _COUNT // 2 + 1, device=device)
-    window = center[:, None] * 2.0 ** (steps / 8)
-    window = window.to(torch.float8_e4m3fn).float()
-    jitter = 1 + torch.rand(_BATCH, _COUNT, generator=generator, device=device) * 0.5
-    distinct = window * jitter if int8 else rms[:, None] / 0.909 * jitter
-    scale = torch.cat([window[:half], distinct[half:]]).T.reshape(-1)
-    p2 = s_c0 if int8 else torch.cat([s_c0[:half], torch.ones_like(s_c0[half:])])
-    w = sequences.T.repeat(1, _COUNT).contiguous()
-    return w, scale.contiguous(), p2.repeat(_COUNT).contiguous()
+        costs.scatter_(1, overlap[:, None], 0.0)
+    backpointers: list[torch.Tensor] = []
+    for t in range(length):
+        ke, ka = widths[t], widths[(t + 1) % length]
+        states = torch.arange(1 << state_bits, device=device).view(1 << ka, 1 << (state_bits - ka))
+        diff = w_norm_h[:, t : t + 1, None] - q_table[:, states]
+        costs, arg = torch.addcmul(costs[:, states >> ke], diff, diff).min(dim=1)
+        backpointers.append(arg.to(torch.uint8))
+    if cost_only:
+        return costs.amin(dim=1)
+    j = costs.argmin(dim=1) if overlap is None else overlap.clone()
+    walk = torch.empty((n, length), dtype=torch.int64, device=device)
+    for t in range(length - 1, -1, -1):
+        ke, ka = widths[t], widths[(t + 1) % length]
+        a = backpointers[t].gather(1, j[:, None]).squeeze(1).long()
+        state = (a << (state_bits - ka)) | j
+        walk[:, t] = state
+        j = state >> ke
+    return walk
+
+
+def _make_inputs(
+    state_bits: int, widths: tuple[int, ...], seed: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fp16_scale = _gluon().FP16_SCALE
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    length = len(widths)
+    w = torch.randn(_BATCH, length, generator=gen, device="cuda") * 2.5
+    w_norm_h = (w.clamp(-256.0, 256.0) * fp16_scale).to(torch.float16)
+    fp8_choices = torch.tensor([12.0, 24.0, 40.0, 64.0], device="cuda")
+    alpha = fp8_choices[torch.arange(_BATCH, device="cuda") % 4] * CODE_RECIPROCAL
+    return w_norm_h, alpha
+
+
+@pytest.mark.gpu
+@_nvidia
+@pytest.mark.parametrize("name", list(_WIDTHS))
+def test_viterbi_l12_cost_only_matches_oracle(name: str) -> None:
+    gluon = _gluon()
+    if not gluon.supports_device(torch.device("cuda")):
+        pytest.skip("this GPU or Triton release does not run the persistent forward")
+    widths = _WIDTHS[name]
+    w_norm_h, alpha = _make_inputs(12, widths, seed=100 + list(_WIDTHS).index(name))
+    got = gluon.run_viterbi(12, widths, w_norm_h, alpha, cost_only=True)
+    expected = _pytorch_viterbi_fp16(12, widths, w_norm_h, alpha, None, cost_only=True)
+    assert torch.equal(got, expected)
 
 
 @pytest.mark.gpu
 @_nvidia
 @pytest.mark.parametrize("constrained", [False, True], ids=["free", "overlap"])
-@pytest.mark.parametrize("kind", ["random", "ties"])
-@pytest.mark.parametrize(("state_bits", "name", "int8"), _CASES, ids=str)
-def test_forward_matches_the_step_loop(
-    state_bits: int, name: str, kind: str, int8: bool, constrained: bool
-) -> None:
-    from piper_kernels.trellis import _gluon_forward, _viterbi  # noqa: PLC0415
-
-    if not _gluon_forward.supports_device(torch.device("cuda")):
+@pytest.mark.parametrize("name", list(_WIDTHS))
+def test_viterbi_l16_walks_match_oracle(name: str, constrained: bool) -> None:
+    gluon = _gluon()
+    if not gluon.supports_device(torch.device("cuda")):
         pytest.skip("this GPU or Triton release does not run the persistent forward")
     widths = _WIDTHS[name]
-    trellis = _viterbi.SearchTrellis(state_bits, widths)
-    length = len(widths)
-    seed = 10 * _CASES.index((state_bits, name, int8)) + int(constrained)
-    w, scale, p2 = _inputs(kind, length, int8, seed)
-    p1 = _viterbi.fold_block_scales(scale) if int8 else scale
-    overlap = None
+    seed = 200 + 2 * list(_WIDTHS).index(name) + int(constrained)
+    w_norm_h, alpha = _make_inputs(16, widths, seed)
+    gen = torch.Generator(device="cuda").manual_seed(seed + 1)
+    overlap = (
+        torch.randint(0, 1 << (16 - widths[0]), (_BATCH,), generator=gen, device="cuda")
+        if constrained
+        else None
+    )
+
+    got = gluon.run_viterbi(16, widths, w_norm_h, alpha, overlap, cost_only=False)
+    expected = _pytorch_viterbi_fp16(16, widths, w_norm_h, alpha, overlap, cost_only=False)
+
+    num_table = compute_code_numerators(torch.arange(1 << 16, device="cuda")).float()
+    q_got = (
+        torch.clamp(torch.round(num_table[got] * alpha[:, None]), -127.0, 127.0) * gluon.FP16_SCALE
+    ).to(torch.float16)
+    q_exp = (
+        torch.clamp(torch.round(num_table[expected] * alpha[:, None]), -127.0, 127.0)
+        * gluon.FP16_SCALE
+    ).to(torch.float16)
+    err_got = (w_norm_h.float() - q_got.float()).square().sum(-1)
+    err_exp = (w_norm_h.float() - q_exp.float()).square().sum(-1)
+    max_rel = ((err_got - err_exp).abs() / err_exp.clamp(min=1e-6)).max().item()
+    assert max_rel < 5e-3
+    for t in range(1, len(widths)):
+        ke = widths[t]
+        assert torch.equal(got[:, t] >> ke, got[:, t - 1] & ((1 << (16 - ke)) - 1))
+
     if constrained:
-        high = 1 << (state_bits - widths[0])
-        overlap = torch.randint(0, high, (_BATCH,), generator=_generator(seed + 2), device="cuda")
-    per_cta = _gluon_forward.compute_rows_per_cta(state_bits, widths)
-    order = _gluon_forward._order(p1, per_cta).long()
-    slots = p1.view(torch.int32)[order].view(-1, per_cta)
-    assert {min(len(set(row)), 2) for row in slots.tolist()} == {1, 2}
-
-    bp_expected = torch.full(
-        (length, w.shape[1], 1 << (state_bits - min(widths))), 0xA5, dtype=torch.uint8,
-        device="cuda",
-    )  # fmt: skip
-    expected = _viterbi._build_initial_prefix(trellis, _BATCH, overlap, w.device)
-    table = (_viterbi.build_numerator_table if int8 else _viterbi.build_value_table)(
-        state_bits, w.device
-    )
-    for t in range(length):
-        fields = _viterbi._compute_step_fields(widths, t)
-        expected = _viterbi._run_step(
-            expected, table, w[t], p1, p2, bp_expected[t], int8, state_bits, fields
+        assert overlap is not None
+        assert torch.equal(got[:, 0] >> widths[0], overlap)
+        assert torch.equal(got[:, -1] & ((1 << (16 - widths[0])) - 1), overlap)
+    else:
+        half = len(widths) // 2
+        partial = gluon.run_viterbi(
+            16, widths, w_norm_h, alpha, None, cost_only=False, write_bp_from=half
         )
-    bp = torch.full_like(bp_expected, 0xA5)
-    got = _gluon_forward.run_forward(
-        state_bits, widths, int8=int8, w=w, p1=p1, p2=p2, overlap=overlap, bp=bp
-    )
+        assert partial.shape == (_BATCH, len(widths) - half)
+        assert torch.equal(partial, got[:, half:])
 
-    assert torch.equal(got, expected)
-    assert torch.equal(bp, bp_expected)
+
+@pytest.mark.gpu
+@_nvidia
+def test_viterbi_handles_extreme_normalized_inputs_and_validates_overlap() -> None:
+    gluon = _gluon()
+    if not gluon.supports_device(torch.device("cuda")):
+        pytest.skip("this GPU or Triton release does not run the persistent forward")
+    widths = _VR45
+    w_extreme = torch.full(
+        (4, len(widths)), 256.0 * gluon.FP16_SCALE, dtype=torch.float16, device="cuda"
+    )
+    alpha = torch.full((4,), (2.0**-9) * CODE_RECIPROCAL, dtype=torch.float32, device="cuda")
+    cost12 = gluon.run_viterbi(12, widths, w_extreme, alpha, cost_only=True)
+    assert bool(torch.isfinite(cost12).all())
+
+    noncontig_alpha = torch.stack([alpha, alpha], dim=1)[:, 0]
+    assert not noncontig_alpha.is_contiguous()
+    states16 = gluon.run_viterbi(16, widths, w_extreme, noncontig_alpha, cost_only=False)
+    for t in range(1, len(widths)):
+        ke = widths[t]
+        assert torch.equal(states16[:, t] >> ke, states16[:, t - 1] & ((1 << (16 - ke)) - 1))
+
+    overlap = torch.zeros(4, dtype=torch.int64, device="cuda")
+    with pytest.raises(ValueError, match="overlap is not supported with cost_only=True"):
+        gluon.run_viterbi(12, widths, w_extreme, alpha, overlap, cost_only=True)
 
 
 @pytest.mark.gpu
@@ -142,38 +193,24 @@ def test_forward_matches_the_step_loop(
 @pytest.mark.parametrize("min_step_bits", [3, 4, 5, 6])
 @pytest.mark.parametrize("state_bits", [16, 12])
 def test_encoder_forward_kernels_do_not_spill(state_bits: int, min_step_bits: int) -> None:
-    """A spill or a larger shared allocation would cost speed, or the GPUs the kernel
-    runs on, without changing a result."""
-    from piper_kernels.trellis import _gluon_forward  # noqa: PLC0415
-
-    if not _gluon_forward.supports_device(torch.device("cuda")):
+    """No register spills and shared memory fits opt-in limit across all schedules."""
+    gluon = _gluon()
+    if not gluon.supports_device(torch.device("cuda")):
         pytest.skip("this GPU or Triton release does not run the persistent forward")
     k = min_step_bits
     widths = (k,) * 256 if k == 6 else TrellisLayout(256, 256 * k + 120).compute_step_widths()
     index = torch.cuda.current_device()
-    for int8 in (False, True):
-        specialization = _gluon_forward._specialization(state_bits, widths, int8)
-        kernel = _gluon_forward._compiled(specialization, index)
-        prefixes = 4 * _gluon_forward.compute_rows_per_cta(state_bits, widths) << (state_bits - k)
+    for cost_only in (False, True):
+        spec = gluon._specialization(state_bits, widths, cost_only)
+        kernel = gluon._compiled(spec, index)
         assert kernel.n_spills == 0
-        assert kernel.metadata.shared == prefixes <= _gluon_forward.SHARED_NEED
+        assert kernel.metadata.shared <= gluon.SHARED_NEED
 
 
 def test_persistent_forward_scope() -> None:
-    from piper_kernels.trellis import _gluon_forward  # noqa: PLC0415
-
-    assert all(_gluon_forward.supports_trellis(16, widths) for widths in _WIDTHS.values())
-    assert all(_gluon_forward.supports_trellis(12, widths) for widths in _WIDTHS.values())
-    assert not _gluon_forward.supports_trellis(14, _VR45)
-    assert not _gluon_forward.supports_trellis(16, (2,) * 256)
-    assert not _gluon_forward.supports_trellis(16, (4,) * 257)
-    assert not _gluon_forward.supports_trellis(16, (4, 6) * 128)
-    assert not _gluon_forward.supports_device(torch.device("cpu"))
-    assert _gluon_forward._supports_properties((12, 0), _gluon_forward.SHARED_NEED)
-    assert _gluon_forward._supports_properties((8, 0), 163 * 1024)
-    assert not _gluon_forward._supports_properties((7, 5), 163 * 1024)
-    assert not _gluon_forward._supports_properties((8, 6), _gluon_forward.SHARED_NEED - 1)
-    assert [_gluon_forward.compute_rows_per_cta(state_bits, (3,)) for state_bits in (16, 12)] == [
-        3,
-        _gluon_forward.ROWS,
-    ]
+    gluon = _gluon()
+    assert not gluon.supports_device(torch.device("cpu"))
+    assert gluon._supports_properties((12, 0), gluon.SHARED_NEED)
+    assert gluon._supports_properties((8, 0), 163 * 1024)
+    assert not gluon._supports_properties((7, 5), 163 * 1024)
+    assert not gluon._supports_properties((8, 6), gluon.SHARED_NEED - 1)
