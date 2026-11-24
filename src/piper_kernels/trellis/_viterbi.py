@@ -224,29 +224,16 @@ def _run_step(
 
 @triton.jit
 def _traceback_kernel(
-    bp_ptr, pick_ptr, j_ptr, widths_ptr, states_ptr, chosen_ptr, batch, rows,
-    length: tl.constexpr, picked: tl.constexpr, state_bits: tl.constexpr,
+    bp_ptr, row_ptr, j_ptr, widths_ptr, states_ptr, batch, rows,
+    length: tl.constexpr, selected: tl.constexpr, state_bits: tl.constexpr,
     width: tl.constexpr, block: tl.constexpr,
 ):  # fmt: skip
-    """The whole traceback of ``block`` sequences in one program.
-
-    ``picked``: the sequences chose among several candidates, recorded in ``pick``
-    at the last state; ``widths``: ``k_t`` for ``t < length + 2``, cyclic;
-    ``width``: the row stride of ``bp`` and ``pick``.
-    """
+    """Trace each sequence backward from its final prefix in its winning forward row."""
     seq = (tl.program_id(0) * block + tl.arange(0, block)).to(tl.int64)
     valid = seq < batch
     j = tl.load(j_ptr + seq, mask=valid, other=0)
+    row = tl.load(row_ptr + seq, mask=valid, other=0) if selected else seq
     last = length - 1
-    chosen = tl.zeros_like(j)
-    if picked:
-        low = state_bits - tl.load(widths_ptr + last + 1) - tl.load(widths_ptr + last + 2)
-        top = tl.load(widths_ptr + last + 2)
-        position = ((j - ((j >> low) << low)) << top) | (j >> low)
-        pick = tl.load(pick_ptr + seq * width + position, mask=valid, other=0)
-        chosen = pick.to(tl.int64)
-    tl.store(chosen_ptr + seq, chosen, mask=valid)
-    row = chosen * batch + seq
     for i in range(length):
         t = last - i
         bits = state_bits - tl.load(widths_ptr + t + 1)
@@ -272,29 +259,22 @@ def _build_widths_tensor(widths: tuple[int, ...], device: torch.device) -> torch
 def _trace_back(
     trellis: SearchTrellis,
     bp: torch.Tensor,
-    pick: torch.Tensor,
     j: torch.Tensor,
-    num_candidates: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(states [T, batch], chosen [batch])`` walked back from the final ``j``.
-
-    ``j`` holds the low ``L - k_0`` bits of each sequence's last state. The chosen
-    candidate is read from ``pick [batch, width]`` there, then that candidate's
-    backpointers ``bp [T, num_candidates · batch, width]``.
-    """
+    selected_rows: torch.Tensor | None,
+) -> torch.Tensor:
+    """States [T, batch] from the final prefixes j and their selected backpointer rows."""
     length, rows, width = bp.shape
-    batch = rows // num_candidates
+    batch = j.numel()
     device = bp.device
     states = torch.empty(length, batch, dtype=torch.int64, device=device)
-    chosen = torch.empty(batch, dtype=torch.int64, device=device)
     widths = _build_widths_tensor(trellis.step_widths, device)
     with device_context(device):
         _traceback_kernel[(triton.cdiv(batch, _TRACEBACK_SEQUENCES),)](
-            bp, pick, j, widths, states, chosen, batch, rows,
-            length=length, picked=num_candidates > 1, state_bits=trellis.state_bits, width=width,
-            block=_TRACEBACK_SEQUENCES, num_warps=2,
+            bp, j if selected_rows is None else selected_rows, j, widths, states, batch, rows,
+            length=length, selected=selected_rows is not None, state_bits=trellis.state_bits,
+            width=width, block=_TRACEBACK_SEQUENCES, num_warps=2,
         )  # fmt: skip
-    return states, chosen
+    return states
 
 
 def _select_persistent_forward(trellis: SearchTrellis, device: torch.device) -> bool:
@@ -357,48 +337,48 @@ def _build_initial_prefix(
     return costs.scatter_(1, _store_index(overlap, bits, ap).unsqueeze(1), 0.0)
 
 
-def _minimize_candidates(
-    costs: torch.Tensor, num_candidates: int, pick: torch.Tensor
-) -> torch.Tensor:
-    """Final costs ``[num_candidates · batch, width]`` minimized over each sequence's
-    candidates, the lowest minimizing candidate stored in ``pick [batch, width]``."""
-    if num_candidates == 1:
-        return costs
-    rows, width = costs.shape
-    costs, index = costs.view(num_candidates, rows // num_candidates, width).min(0)
-    pick[:, :width].copy_(index)
-    return costs
-
-
 def _search_batch(
     trellis: SearchTrellis,
     int8: bool,
-    w: torch.Tensor,
-    p1: torch.Tensor,
+    weights: torch.Tensor,
+    candidates: torch.Tensor,
     p2: torch.Tensor,
     overlap: torch.Tensor | None,
-    num_candidates: int,
     persistent: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One batch of ``rows = num_candidates · batch`` rows, row ``candidate · batch + sequence``.
-
-    ``w`` is ``[T, rows]``; ``p1`` and ``p2`` are ``[rows]``; ``overlap`` is
-    ``[batch]`` or ``None``. Returns ``(states [T, batch], chosen [batch])``.
-    """
-    length, rows = w.shape
-    batch = rows // num_candidates
+    """Search one bounded batch of blocks, returning states [T, batch] and scale choices."""
+    batch, length = weights.shape
+    num_candidates = candidates.shape[1]
+    candidate_rows = None
+    if not int8 and overlap is not None and num_candidates > 1:
+        # Float seeds are sorted per block and often coincide. Run each distinct
+        # (block, scale) once per search, even for a mixed batch.
+        distinct = torch.ones_like(candidates, dtype=torch.bool)
+        distinct[:, 1:] = candidates[:, 1:] != candidates[:, :-1]
+        blocks, slots = distinct.nonzero(as_tuple=True)
+        candidate_rows = (distinct.flatten().cumsum(0) - 1).view_as(candidates)
+        w = weights[blocks].T.contiguous()
+        p1 = candidates[blocks, slots]
+        p2 = p2[blocks]
+        start_overlap = overlap[blocks]
+    else:
+        w = weights.T.repeat(1, num_candidates)
+        p1 = candidates.T.reshape(-1)
+        p2 = p2.repeat(num_candidates)
+        start_overlap = overlap
+    rows = w.shape[1]
     widths = trellis.step_widths
     width = 1 << (trellis.state_bits - trellis.min_step_bits)
     bp = torch.empty(length, rows, width, dtype=torch.uint8, device=w.device)
-    pick = torch.zeros(batch, width, dtype=torch.uint8, device=w.device)
     if persistent:
         from ._gluon_forward import run_forward  # noqa: PLC0415 - Gluon is optional
 
         costs = run_forward(
-            trellis.state_bits, widths, int8=int8, w=w, p1=p1, p2=p2, overlap=overlap, bp=bp
+            trellis.state_bits, widths, int8=int8, w=w, p1=p1, p2=p2, overlap=start_overlap, bp=bp
         )
     else:
-        costs = _build_initial_prefix(trellis, batch, overlap, w.device)
+        prefix_rows = batch if start_overlap is None else start_overlap.numel()
+        costs = _build_initial_prefix(trellis, prefix_rows, start_overlap, w.device)
         table = (build_numerator_table if int8 else build_value_table)(trellis.state_bits, w.device)
         for t in range(length):
             costs = _run_step(
@@ -412,10 +392,24 @@ def _search_batch(
                 trellis.state_bits,
                 _compute_step_fields(widths, t),
             )
-    costs = _minimize_candidates(costs, num_candidates, pick)
     _, a, ap = _compute_step_fields(widths, length - 1)
-    j = overlap if overlap is not None else _load_index(costs.argmin(1), trellis.state_bits - a, ap)
-    return _trace_back(trellis, bp, pick, j, num_candidates)
+    prefix_bits = trellis.state_bits - a
+    if overlap is None:
+        # Free end: choose the first minimum prefix across candidates before
+        # breaking ties between candidates at that prefix.
+        best = costs.view(num_candidates, batch, -1).amin(0) if num_candidates > 1 else costs
+        j = _load_index(best.argmin(1), prefix_bits, ap)
+    else:
+        j = overlap
+    if num_candidates == 1:
+        return _trace_back(trellis, bp, j, None), torch.zeros_like(j)
+
+    if candidate_rows is None:
+        candidate_rows = torch.arange(rows, device=w.device).view(num_candidates, batch).T
+    position = _store_index(j, prefix_bits, ap)
+    chosen = costs[candidate_rows, position[:, None]].argmin(1)
+    selected_rows = candidate_rows.gather(1, chosen[:, None]).flatten()
+    return _trace_back(trellis, bp, j, selected_rows), chosen
 
 
 def compute_walks(
@@ -456,12 +450,15 @@ def compute_walks(
     for start_sequence in range(0, num_sequences, batch):
         end_sequence = min(num_sequences, start_sequence + batch)
         span = slice(start_sequence, end_sequence)
-        w_batch = w[span].float().T.repeat(1, num_candidates)
-        p1 = candidates[span].float().T.reshape(-1)
-        p2_batch = p2[span].float().repeat(num_candidates)
         batch_overlap = None if overlap is None else overlap[span].contiguous()
         states, chosen = _search_batch(
-            trellis, int8, w_batch, p1, p2_batch, batch_overlap, num_candidates, persistent
+            trellis,
+            int8,
+            w[span].float(),
+            candidates[span].float(),
+            p2[span].float(),
+            batch_overlap,
+            persistent,
         )
         states_out[span] = states.T
         choice_out[span] = chosen
