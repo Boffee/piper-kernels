@@ -10,7 +10,7 @@ from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.weights.convrot._rotation import rotate_groups
 
-from ._layout import resolve_layout
+from ._layout import TrellisLayout, resolve_block_size, resolve_layout
 
 
 def _require_encoder_device(device: torch.device) -> None:
@@ -44,17 +44,19 @@ class TrellisStorage:
         hp_tensor: torch.Tensor,
         *,
         group_size: int,
-        bits_per_weight: float,
+        bits_per_weight: float | None = None,
+        bytes_per_block: int | None = None,
     ) -> TrellisStorage:
         """Rotate and trellis-encode a high-precision linear weight.
 
         ``hp_tensor`` is a 2-D float16, bfloat16 or float32 ``[out, in]`` weight on an
         NVIDIA CUDA device; it is rotated in FP32 for ConvRot ``group_size`` and
-        encoded there. ``bits_per_weight`` is the stored rate, counting each block's
-        FP8 scale: each block takes the most whole bytes within it, from 3 to 6 code
-        bits per weight. The block size is the largest multiple of 16, up to 256,
-        that divides ``in``. For example, 4.5 bits per weight stores each 256-weight
-        block in 143 bytes plus its scale.
+        encoded there. Specify either ``bits_per_weight`` (the stored rate counting
+        each block's FP8 scale: each block takes the most whole bytes within it) or an
+        exact whole-byte ``bytes_per_block``, both yielding 3 to 6 code bits per
+        weight. The block size is the largest multiple of 16, up to 256, that divides
+        ``in``. For example, 4.5 bits per weight or ``bytes_per_block=143`` stores
+        each 256-weight block in 143 bytes plus its scale.
 
         Encoding searches each block's walk and scale against the exact INT8
         decode. Unlike wrapping supplied storage, it reads the weight's values and
@@ -69,7 +71,15 @@ class TrellisStorage:
 
         source = hp_tensor.detach()
         validate_hp_weight(source, group_size, ndims=(2,))
-        layout = resolve_layout(source.shape[1], bits_per_weight)
+        if (bits_per_weight is None) == (bytes_per_block is None):
+            raise ValueError("specify exactly one of bits_per_weight or bytes_per_block")
+        if bits_per_weight is not None:
+            layout = resolve_layout(source.shape[1], bits_per_weight)
+        else:
+            assert bytes_per_block is not None
+            layout = TrellisLayout.from_storage(
+                resolve_block_size(source.shape[1]), bytes_per_block
+            )
         _require_encoder_device(source.device)
         rotated = rotate_groups(source.float(), group_size)
         # Offline conversion reads values: a non-finite weight would encode to

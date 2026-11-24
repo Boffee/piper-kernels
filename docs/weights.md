@@ -319,6 +319,12 @@ int8_weight.copy_from_trellis_(storage.bitstreams, storage.block_scales, storage
 ```
 
 A checkpoint stores `(bitstreams, block_scales, scale, block_size, group_size)`.
+`TrellisStorage.from_hp` also accepts an exact `bytes_per_block` instead of
+`bits_per_weight`, and `piper_kernels.trellis` exports `TrellisLayout`,
+`resolve_block_size`, and `resolve_layout`. Both `from_trellis` and
+`copy_from_trellis_` accept optional `row_widths` (`uint8 [out]`) with 1-D
+row-concatenated `bitstreams` (`uint8 [total_bytes]`), where valid row widths
+(`3–6` code bits per weight) and bitstream capacity are caller preconditions.
 `TrellisStorage.from_hp` requires an NVIDIA GPU and validates finite input
 weights. Decoding requires a supported Triton GPU (validated on NVIDIA, compile
 coverage only on AMD), reuses contiguous `scale` storage, and supports in-place

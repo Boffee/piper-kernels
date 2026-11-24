@@ -54,19 +54,13 @@ class TrellisLayout:
     block_bits: int
 
     def __post_init__(self) -> None:
-        for name in ("block_size", "block_bits"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise TypeError(f"trellis {name} must be an integer, got {value!r}")
-        size = self.block_size
-        if not MIN_BLOCK_SIZE <= size <= MAX_BLOCK_SIZE:
-            raise ValueError(
-                f"trellis blocks hold {MIN_BLOCK_SIZE} to {MAX_BLOCK_SIZE} weights, got {size}"
-            )
+        size = validate_block_size(self.block_size)
+        if isinstance(self.block_bits, bool) or not isinstance(self.block_bits, int):
+            raise TypeError(f"trellis block_bits must be an integer, got {self.block_bits!r}")
         lowest, highest = MIN_BITS_PER_WEIGHT * size, MAX_BITS_PER_WEIGHT * size
         if self.block_bits % 8 or not lowest <= self.block_bits <= highest:
             raise ValueError(
-                f"trellis blocks of {size} weights take {lowest // 8} to "
+                f"trellis blocks of {size} weights take {(lowest + 7) // 8} to "
                 f"{highest // 8} whole bytes (3 to 6 bits per weight), got "
                 f"{self.block_bits} bits"
             )
@@ -74,6 +68,8 @@ class TrellisLayout:
     @classmethod
     def from_storage(cls, block_size: int, bytes_per_block: int) -> TrellisLayout:
         """The layout of streams holding ``bytes_per_block`` bytes per block."""
+        if isinstance(bytes_per_block, bool) or not isinstance(bytes_per_block, int):
+            raise TypeError(f"trellis bytes_per_block must be an integer, got {bytes_per_block!r}")
         return cls(block_size, 8 * bytes_per_block)
 
     @property
@@ -110,13 +106,28 @@ class TrellisLayout:
         return tuple(narrow * t + (t + 1) * wide // size for t in range(size))
 
 
+def validate_block_size(block_size: int) -> int:
+    """Validate that ``block_size`` is an integer in ``[16, 256]`` and return it."""
+    if isinstance(block_size, bool) or not isinstance(block_size, int):
+        raise TypeError(f"trellis block_size must be an integer, got {block_size!r}")
+    if not MIN_BLOCK_SIZE <= block_size <= MAX_BLOCK_SIZE:
+        raise ValueError(
+            f"trellis blocks hold {MIN_BLOCK_SIZE} to {MAX_BLOCK_SIZE} weights, got {block_size}"
+        )
+    return block_size
+
+
 def resolve_block_size(in_features: int) -> int:
     """The encoder's block size for ``in_features``-wide rows: the largest multiple
-    of 16, up to 256, that divides it. Raises ``ValueError`` when none does."""
+    of 16, up to 256, that divides it. Raises ``TypeError`` or ``ValueError`` when invalid."""
+    if isinstance(in_features, bool) or not isinstance(in_features, int):
+        raise TypeError(f"trellis in_features must be an integer, got {in_features!r}")
+    if in_features <= 0:
+        raise ValueError(f"trellis rows must be a positive multiple of 16 wide, got {in_features}")
     for block_size in range(MAX_BLOCK_SIZE, 0, -16):
         if in_features % block_size == 0:
             return block_size
-    raise ValueError(f"trellis rows must be a multiple of 16 wide, got {in_features}")
+    raise ValueError(f"trellis rows must be a positive multiple of 16 wide, got {in_features}")
 
 
 def resolve_layout(in_features: int, bits_per_weight: float) -> TrellisLayout:
@@ -128,7 +139,14 @@ def resolve_layout(in_features: int, bits_per_weight: float) -> TrellisLayout:
     weight.
     """
     block_size = resolve_block_size(in_features)
-    budget = math.floor(Fraction(bits_per_weight) * block_size) - BLOCK_SCALE_BITS
+    if isinstance(bits_per_weight, bool) or not isinstance(bits_per_weight, (int, float)):
+        raise TypeError(f"trellis bits_per_weight must be a real number, got {bits_per_weight!r}")
+    try:
+        budget = math.floor(Fraction(bits_per_weight) * block_size) - BLOCK_SCALE_BITS
+    except (OverflowError, ValueError) as error:
+        raise ValueError(
+            f"trellis bits_per_weight must be finite, got {bits_per_weight!r}"
+        ) from error
     block_bits = budget - budget % 8
     lowest, highest = MIN_BITS_PER_WEIGHT * block_size, MAX_BITS_PER_WEIGHT * block_size
     if not lowest <= block_bits <= highest:
@@ -157,4 +175,5 @@ __all__ = [
     "TrellisLayout",
     "resolve_block_size",
     "resolve_layout",
+    "validate_block_size",
 ]
