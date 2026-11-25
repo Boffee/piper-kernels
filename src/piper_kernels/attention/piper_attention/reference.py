@@ -271,7 +271,7 @@ def freeze_kv_chunks_reference(
     grouped_qk = key_scale.shape[2] == _PV_TILES_PER_CHUNK
     autocast_ctx = (
         torch.amp.autocast(device_type=key.device.type, enabled=False)
-        if key.device.type in ("cpu", "cuda")
+        if torch.amp.is_autocast_available(key.device.type)
         else contextlib.nullcontext()
     )
     with autocast_ctx:
@@ -333,4 +333,282 @@ def freeze_kv_chunks_reference(
                 src_value_scale,
                 src_value_mean,
             ),
+        )
+
+
+def _online_softmax_update(
+    running_max: torch.Tensor,
+    running_bias: torch.Tensor,
+    running_sum: torch.Tensor,
+    acc: torch.Tensor,
+    scores: torch.Tensor,
+    block_bias: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    chunk_mean: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    block_max = scores.amax(dim=-1)
+    has_nan = torch.isnan(scores).any(dim=-1) | torch.isnan(block_max + block_bias)
+    block_max = torch.where(has_nan, float("nan"), block_max)
+    has_block = ((block_max != -float("inf")) & (block_bias != -float("inf"))) | has_nan
+    has_running = running_max != -float("inf")
+    bias_diff = torch.where(block_bias == running_bias, 0.0, block_bias - running_bias)
+    raw_delta = (block_max - running_max) + bias_diff
+    delta = torch.where(
+        has_block,
+        torch.where(has_running, raw_delta, float("inf")),
+        -float("inf"),
+    )
+    tile_wins = (delta > 0.0) | has_nan
+    next_max = torch.where(tile_wins, block_max, running_max)
+    next_bias = torch.where(tile_wins, block_bias, running_bias)
+    decay = torch.exp(-torch.abs(delta))
+    old_weight = torch.where(has_running, torch.where(tile_wins, decay, 1.0), 0.0)
+    current_weight = torch.where(has_block, torch.where(tile_wins, 1.0, decay), 0.0)
+    safe_block_max = torch.where(has_block, block_max, 0.0)
+    probs = torch.where(
+        has_block[..., None],
+        torch.exp(scores - safe_block_max[..., None]) * current_weight[..., None],
+        0.0,
+    )
+    block_sum = probs.sum(dim=-1)
+    next_sum = running_sum * old_weight + block_sum
+    next_acc = acc * old_weight[..., None] + torch.where(
+        has_block[..., None],
+        torch.matmul(probs, values),
+        0.0,
+    )
+    if chunk_mean is not None:
+        next_acc = next_acc + torch.where(
+            has_block[..., None],
+            block_sum[..., None] * chunk_mean,
+            0.0,
+        )
+    return next_max, next_bias, next_sum, next_acc
+
+
+def _decode_frozen_chunks_reference(  # noqa: PLR0913
+    q_rot: torch.Tensor,
+    running_max: torch.Tensor,
+    running_bias: torch.Tensor,
+    running_sum: torch.Tensor,
+    acc: torch.Tensor,
+    *,
+    key_int8: torch.Tensor,
+    key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    value_int8: torch.Tensor,
+    value_scale: torch.Tensor,
+    value_mean: torch.Tensor,
+    chunk_to_slot: torch.Tensor | None,
+    num_chunks: torch.Tensor,
+    scale: float,
+    pack_wmma: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_slots, _, _, head_dim = key_int8.shape
+    batch = q_rot.shape[0]
+    max_chunks = num_slots if chunk_to_slot is None else chunk_to_slot.shape[1]
+    if max_chunks == 0 or num_slots == 0:
+        return running_max, running_bias, running_sum, acc
+
+    grouped_qk = key_scale.shape[2] == _PV_TILES_PER_CHUNK
+    active_chunks = num_chunks.clamp(0, max_chunks)
+    wmma_perm: torch.Tensor | None = None
+    if pack_wmma:
+        tokens = torch.arange(_PV_BLOCK, device=q_rot.device, dtype=torch.int64)
+        wmma_perm = (tokens & ~24) | ((tokens & 8) << 1) | ((tokens & 16) >> 1)
+
+    key_i8_signed = key_int8.view(torch.int8)
+    val_i8_signed = value_int8.view(torch.int8)
+
+    for chunk_idx in range(max_chunks):
+        slots = (
+            torch.full((batch,), chunk_idx, device=q_rot.device, dtype=torch.int32)
+            if chunk_to_slot is None
+            else chunk_to_slot[:, chunk_idx]
+        )
+        slot_valid = (chunk_idx < active_chunks) & (slots >= 0) & (slots < num_slots)
+        safe_idx = torch.where(slot_valid, slots, 0).to(torch.int64)
+
+        k_q = key_i8_signed.index_select(0, safe_idx).float()
+        k_s = torch.where(slot_valid[:, None, None], key_scale.index_select(0, safe_idx), 0.0)
+        k_c = torch.where(slot_valid[:, None, None], key_center.index_select(0, safe_idx), 0.0)
+        v_q_tile = val_i8_signed.index_select(0, safe_idx)
+        v_s = torch.where(slot_valid[:, None, None], value_scale.index_select(0, safe_idx), 0.0)
+        v_m = torch.where(slot_valid[:, None, None], value_mean.index_select(0, safe_idx), 0.0)
+
+        if wmma_perm is not None:
+            v_q_tile = v_q_tile.index_select(-1, wmma_perm)
+        v_q_tok = v_q_tile.transpose(-2, -1).reshape(batch, k_q.shape[1], _CENTER_CHUNK, head_dim)
+
+        k_tok_scale = k_s.repeat_interleave(_PV_BLOCK, dim=-1) if grouped_qk else k_s
+        k_centered = k_q * k_tok_scale.unsqueeze(-1)
+        scores_centered = torch.matmul(q_rot, k_centered.transpose(-1, -2))
+        scores = (scores_centered * scale).masked_fill(
+            ~slot_valid[:, None, None, None], -float("inf")
+        )
+        k_bias = (q_rot * k_c.unsqueeze(2)).sum(dim=-1)
+        chunk_bias = torch.where(slot_valid[:, None, None], k_bias * scale, 0.0)
+
+        v_centered = torch.where(
+            slot_valid[:, None, None, None],
+            v_q_tok.float() * v_s.unsqueeze(-1),
+            0.0,
+        )
+        running_max, running_bias, running_sum, acc = _online_softmax_update(
+            running_max,
+            running_bias,
+            running_sum,
+            acc,
+            scores,
+            chunk_bias,
+            v_centered,
+            chunk_mean=v_m.unsqueeze(2),
+        )
+
+    return running_max, running_bias, running_sum, acc
+
+
+def _decode_tail_reference(  # noqa: PLR0913
+    q_grouped: torch.Tensor,
+    running_max: torch.Tensor,
+    running_bias: torch.Tensor,
+    running_sum: torch.Tensor,
+    acc: torch.Tensor,
+    *,
+    tail_key: torch.Tensor,
+    tail_value: torch.Tensor,
+    tail_len: torch.Tensor,
+    seq_q: int,
+    scale: float,
+    is_causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    tail_cap = tail_key.shape[2]
+    if tail_cap == 0:
+        return running_max, running_bias, running_sum, acc
+    batch, kv_heads, _, _ = tail_key.shape
+    q_flat = q_grouped.reshape(batch, kv_heads, -1, q_grouped.shape[-1])
+    active_tail = tail_len.clamp(0, tail_cap)
+    k_pos = torch.arange(tail_cap, device=q_grouped.device, dtype=torch.int64)
+    tail_valid = k_pos[None, :] < active_tail[:, None]
+    tail_k_f = torch.where(tail_valid[:, None, :, None], tail_key.float(), 0.0)
+    tail_v_f = torch.where(tail_valid[:, None, :, None], tail_value.float(), 0.0)
+    scores = torch.matmul(q_flat, tail_k_f.transpose(-1, -2)) * scale
+    scores = scores.masked_fill(~tail_valid[:, None, None, :], -float("inf"))
+    if is_causal:
+        q_pos = torch.arange(seq_q, device=q_grouped.device, dtype=torch.int64)
+        # Reshape into [B, kv_heads, gqa_group, seq_q, tail_cap] for row-level causal mask.
+        scores_q = scores.reshape(batch, kv_heads, -1, seq_q, tail_cap)
+        cutoff = active_tail[:, None] - seq_q + q_pos[None, :]
+        causal_mask = k_pos[None, None, :] > cutoff[:, :, None]
+        scores = scores_q.masked_fill(causal_mask[:, None, None, :, :], -float("inf")).reshape(
+            batch, kv_heads, -1, tail_cap
+        )
+    return _online_softmax_update(
+        running_max,
+        running_bias,
+        running_sum,
+        acc,
+        scores,
+        torch.zeros_like(running_bias),
+        tail_v_f,
+    )
+
+
+def piper_attention_decode_reference(  # noqa: PLR0913
+    query: torch.Tensor,
+    key_int8: torch.Tensor,
+    key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    value_int8: torch.Tensor,
+    value_scale: torch.Tensor,
+    value_mean: torch.Tensor,
+    chunk_to_slot: torch.Tensor | None,
+    num_chunks: torch.Tensor,
+    *,
+    tail_key: torch.Tensor | None = None,
+    tail_value: torch.Tensor | None = None,
+    tail_len: torch.Tensor | None = None,
+    scale: float,
+    is_causal: bool = True,
+    pack_wmma: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable FP32-accumulation reference for GQA chunked INT8 + BF16/FP16 tail decode."""
+    batch, q_heads, seq_q, head_dim = query.shape
+    if batch == 0:
+        return (
+            torch.empty((0, q_heads, seq_q, head_dim), device=query.device, dtype=query.dtype),
+            torch.empty((0, q_heads, seq_q), device=query.device, dtype=torch.float32),
+        )
+    kv_heads = key_int8.shape[1]
+    gqa_group = q_heads // kv_heads
+    gq = gqa_group * seq_q
+
+    autocast_ctx = (
+        torch.amp.autocast(device_type=query.device.type, enabled=False)
+        if torch.amp.is_autocast_available(query.device.type)
+        else contextlib.nullcontext()
+    )
+    with autocast_ctx:
+        q_grouped = query.float().reshape(batch, kv_heads, gqa_group, seq_q, head_dim)
+        q_flat = q_grouped.reshape(batch, kv_heads, gq, head_dim)
+        running_max = torch.full(
+            (batch, kv_heads, gq),
+            -float("inf"),
+            device=query.device,
+            dtype=torch.float32,
+        )
+        running_bias = torch.zeros_like(running_max)
+        running_sum = torch.zeros_like(running_max)
+        acc = torch.zeros(
+            (batch, kv_heads, gq, head_dim),
+            device=query.device,
+            dtype=torch.float32,
+        )
+
+        max_chunks = key_int8.shape[0] if chunk_to_slot is None else chunk_to_slot.shape[1]
+        if max_chunks > 0 and key_int8.shape[0] > 0:
+            q_rot = rotate_signed_hadamard_heads(q_flat)
+            running_max, running_bias, running_sum, acc = _decode_frozen_chunks_reference(
+                q_rot,
+                running_max,
+                running_bias,
+                running_sum,
+                acc,
+                key_int8=key_int8,
+                key_scale=key_scale,
+                key_center=key_center,
+                value_int8=value_int8,
+                value_scale=value_scale,
+                value_mean=value_mean,
+                chunk_to_slot=chunk_to_slot,
+                num_chunks=num_chunks,
+                scale=scale,
+                pack_wmma=pack_wmma,
+            )
+
+        if tail_key is not None and tail_value is not None and tail_len is not None:
+            running_max, running_bias, running_sum, acc = _decode_tail_reference(
+                q_grouped,
+                running_max,
+                running_bias,
+                running_sum,
+                acc,
+                tail_key=tail_key,
+                tail_value=tail_value,
+                tail_len=tail_len,
+                seq_q=seq_q,
+                scale=scale,
+                is_causal=is_causal,
+            )
+
+        has_any = running_max != -float("inf")
+        safe_denom = torch.where(has_any, running_sum, 1.0)
+        output = torch.where(has_any[..., None], acc / safe_denom[..., None], 0.0)
+        lse = torch.where(
+            has_any, (running_max + running_bias) + torch.log(safe_denom), -float("inf")
+        )
+        return (
+            output.reshape(batch, q_heads, seq_q, head_dim).to(query.dtype),
+            lse.reshape(batch, q_heads, seq_q),
         )

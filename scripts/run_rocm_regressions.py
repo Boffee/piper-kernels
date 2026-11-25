@@ -17,6 +17,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 _SUITE = (
     "tests/attention/piper_attention/test_amd.py",
     "tests/attention/piper_attention/test_kv_cache.py",
+    "tests/attention/piper_attention/test_kv_decode.py",
     "tests/attention/test_gqa.py::test_dense_gqa_matches_repeated_kv",
     "tests/attention/sparse_piper_attention/test_amd_fragments.py",
     "tests/conv3d/convrot/int8",

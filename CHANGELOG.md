@@ -7,6 +7,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- GQA-grouped Split-KV chunked KV decode and natural-log LSE wave merging
+  (`piper_kernels`: `piper_attention_decode` and `merge_attention_lse`), combining
+  indirect `chunk_to_slot` lookups against finalized `PiperKVChunkPool` chunks with an
+  optional unfrozen BF16/FP16 tail, multi-token MTP causal verification
+  (`seq_q > 1`), zero-host-readback miss skipping, `torch.compile(fullgraph=True,
+  dynamic=True)`, and CUDA Graph capture across NVIDIA and AMD GPUs. Validated on CPU
+  and AMD RX 9070 XT (`gfx1201`), with NVIDIA `sm75`/`sm80`/`sm89`/`sm120` and AMD
+  `gfx942`/`gfx1100`/`gfx1151` targets validated via zero-spill offline compilation.
 - Global chunk-major persistent KV cache pool and chunk freeze operator
   (`piper_kernels`: `PiperKVChunkPool`, `kv_chunk_storage_specs`, and
   `freeze_kv_chunks_`) storing K1024/V1024 centered
@@ -61,6 +69,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- Shared scalar validation (`validate_finite_float` and `validate_positive_finite_float`)
+  now enforces a strict real-scalar allowlist, rejecting all `torch.Tensor` inputs
+  without `.item()` / `.cpu()` host readbacks along with `str`, `bytes`, `bytearray`,
+  `memoryview`, and non-real NumPy scalars/arrays (`np.complex*`, `np.bool_`,
+  `np.ndarray`), and maps overflowing integers to `ValueError` (or `None` in
+  `static_positive_finite_float`).
 - Avoided wide-FP16 overflow during unfused ConvRot INT8 input preparation using FP32
   rotated scratch, reduced intermediate overflow in `rotate_groups_kernel` via
   per-stage `0.5` butterfly scaling, and preserved zero and tiny global scales across
