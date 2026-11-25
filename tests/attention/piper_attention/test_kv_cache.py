@@ -6,10 +6,8 @@ import math
 from collections.abc import Callable
 from typing import Any
 
-import numpy as np
 import pytest
 import torch
-import triton
 from _accelerators import (
     forbid_device_probes,
     forbid_triton_driver,
@@ -56,6 +54,8 @@ class _FreezeFakeOpOnly(TorchDispatchMode):
 
 
 def _record_triton_launches[T](fn_call: Callable[[], T]) -> tuple[T, list[str]]:
+    import triton  # noqa: PLC0415 - GPU-only launch hook keeps CPU collection Triton-free
+
     launched: list[str] = []
 
     def _record_launch(metadata: Any) -> None:
@@ -657,10 +657,11 @@ def test_pool_validation_rejects_malformed_layouts_and_overlaps() -> None:
             base.value_mean,
         )
 
-    # Distinct UntypedStorage handles aliasing overlapping memory via frombuffer / from_numpy.
-    raw_np = np.zeros(2 * 2 * 1024 * 64 + 64, dtype=np.uint8)
-    align_off = (-raw_np.ctypes.data) % 16
-    aligned_buf = memoryview(raw_np)[align_off:]
+    # Distinct UntypedStorage handles aliasing overlapping memory via frombuffer.
+    raw_mv = memoryview(bytearray(2 * 2 * 1024 * 64 + 64))
+    base_ptr = torch.frombuffer(raw_mv, dtype=torch.uint8, count=1).data_ptr()
+    align_off = (-base_ptr) % 16
+    aligned_buf = raw_mv[align_off:]
     k_alias = torch.frombuffer(aligned_buf, dtype=torch.uint8, count=2 * 2 * 1024 * 64).view(
         2, 2, 1024, 64
     )
