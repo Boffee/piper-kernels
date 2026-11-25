@@ -1326,9 +1326,14 @@ def merge_attention_lse(
         safe_out = torch.where(valid.unsqueeze(-1), out_stack, 0.0)
         denom = weights.sum(dim=0)
         safe_denom = torch.where(has_any, denom, 1.0)
+        norm_weights = torch.where(
+            has_any.unsqueeze(0),
+            weights / safe_denom.unsqueeze(0),
+            0.0,
+        )
         merged_out = torch.where(
             has_any.unsqueeze(-1),
-            (weights.unsqueeze(-1) * safe_out).sum(dim=0) / safe_denom.unsqueeze(-1),
+            (norm_weights.unsqueeze(-1) * safe_out).sum(dim=0),
             0.0,
         )
         merged_lse = torch.where(

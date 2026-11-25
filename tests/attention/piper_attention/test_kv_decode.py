@@ -761,6 +761,26 @@ def test_merge_attention_lse_nan_inf_fp64_and_negated_views() -> None:
     assert torch.isnan(pos_inf_o).all()
     assert torch.isnan(pos_inf_l).all()
 
+    # Large finite wave outputs normalize weights before summing so they never overflow to inf.
+    for big_dtype, big_val in (
+        (torch.float64, 1.0e308),
+        (torch.float32, 2.0e38),
+        (torch.bfloat16, 2.0e38),
+    ):
+        big_wave = torch.full((2, 4), big_val, dtype=big_dtype)
+        big_lse = torch.zeros(
+            (2,), dtype=torch.float64 if big_dtype is torch.float64 else torch.float32
+        )
+        big_mo, big_ml = merge_attention_lse([big_wave, big_wave], [big_lse, big_lse])
+        assert torch.isfinite(big_mo).all()
+        torch.testing.assert_close(big_mo, big_wave, atol=0.0, rtol=2e-2)
+        torch.testing.assert_close(
+            big_ml,
+            torch.full_like(big_ml, math.log(2.0)),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
     # float64 inputs preserve float64 precision instead of rounding through float32.
     f64_o0 = torch.tensor([[1.0, 2.0]], dtype=torch.float64)
     f64_o1 = torch.tensor([[1.0 + 1e-10, 2.0 - 1e-10]], dtype=torch.float64)
@@ -780,14 +800,21 @@ def test_merge_attention_lse_nan_inf_fp64_and_negated_views() -> None:
     torch.testing.assert_close(mixed_o, ref_mixed_o, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(mixed_l, ref_mixed_l, atol=1e-2, rtol=1e-2)
 
+
+def test_merge_attention_lse_negated_views() -> None:
+    torch.manual_seed(602)
+    o0 = torch.randn((2, 4, 3, 64), dtype=torch.float32)
+    o1 = torch.randn_like(o0)
+    l0 = torch.randn((2, 4, 3), dtype=torch.float32)
+    l1 = torch.randn_like(l0)
+
     # Negated views preserve negation across eager, in-graph Inductor _neg_view, and aot_eager.
-    o_f32 = o0.float()
-    o_neg = torch._neg_view(o_f32)
+    o_neg = torch._neg_view(o0)
     l_neg = torch._neg_view(l0)
     assert o_neg.is_neg()
     assert l_neg.is_neg()
-    ref_neg_o, ref_neg_l = merge_attention_lse([-o_f32, o1.float()], [-l0, l1])
-    eager_neg_o, eager_neg_l = merge_attention_lse([o_neg, o1.float()], [l_neg, l1])
+    ref_neg_o, ref_neg_l = merge_attention_lse([-o0, o1], [-l0, l1])
+    eager_neg_o, eager_neg_l = merge_attention_lse([o_neg, o1], [l_neg, l1])
     torch.testing.assert_close(eager_neg_o, ref_neg_o, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(eager_neg_l, ref_neg_l, atol=1e-6, rtol=1e-6)
 
@@ -799,7 +826,7 @@ def test_merge_attention_lse_nan_inf_fp64_and_negated_views() -> None:
             ),
             fullgraph=True,
         )
-        inner_o, inner_l = compiled_inner(o_f32, o1.float(), l0, l1)
+        inner_o, inner_l = compiled_inner(o0, o1, l0, l1)
         torch.testing.assert_close(inner_o, ref_neg_o, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(inner_l, ref_neg_l, atol=1e-6, rtol=1e-6)
 
@@ -809,7 +836,7 @@ def test_merge_attention_lse_nan_inf_fp64_and_negated_views() -> None:
         backend="aot_eager",
         fullgraph=True,
     )
-    aot_o, aot_l = compiled_aot(o_neg, o1.float(), l_neg, l1)
+    aot_o, aot_l = compiled_aot(o_neg, o1, l_neg, l1)
     torch.testing.assert_close(aot_o, ref_neg_o, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(aot_l, ref_neg_l, atol=1e-6, rtol=1e-6)
 
@@ -1765,6 +1792,38 @@ def test_gpu_chunk_map_none_strided_and_tail_splits(
     )
     torch.testing.assert_close(out_t2, sdpa_t2, atol=tol, rtol=tol)
     torch.testing.assert_close(lse_t2, sdpa_t2_lse, atol=5e-4, rtol=5e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+def test_gpu_splitkv_reduce_normalized_weights() -> None:
+    device = torch.device("cuda")
+    pool = PiperKVChunkPool.empty(0, 1, 64, device=device)
+    q = torch.zeros((1, 1, 1, 64), device=device, dtype=torch.bfloat16)
+    q[..., 0] = 1.0
+    tk = torch.zeros((1, 1, 128, 64), device=device, dtype=torch.bfloat16)
+    tk[:, :, 0, 0] = 120.0
+    tk[:, :, 64, 0] = 120.0
+    tv = torch.zeros_like(tk)
+    tv[:, :, 0] = 2.0e38
+    tv[:, :, 64] = 2.0e38
+    out, lse = piper_attention_decode(
+        q,
+        pool,
+        None,
+        torch.zeros((1,), device=device, dtype=torch.int32),
+        tail_key=tk,
+        tail_value=tv,
+        tail_len=torch.tensor([128], device=device, dtype=torch.int32),
+        scale=1.0,
+        is_causal=False,
+        return_lse=True,
+    )
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, torch.full_like(out, 2.0e38), atol=0.0, rtol=2e-2)
+    torch.testing.assert_close(
+        lse, torch.full_like(lse, 120.0 + math.log(2.0)), atol=1e-4, rtol=1e-4
+    )
 
 
 @pytest.mark.gpu

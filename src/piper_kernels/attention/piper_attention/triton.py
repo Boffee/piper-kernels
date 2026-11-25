@@ -580,12 +580,17 @@ def _piper_decode_splitkv_reduce_kernel(
 
         out_s = tl.load(po_base + s64 * stride_pop + offsets_d)
         safe_out_s = tl.where(has_nan_s, float("nan"), tl.where(has_s, out_s, 0.0))
-        acc = acc * old_w + cur_w * safe_out_s
-        denom = denom * old_w + cur_w
+        old_num = denom * old_w
+        denom = old_num + cur_w
+        has_denom = denom != 0.0
+        safe_dn = tl.where(has_denom, denom, 1.0)
+        old_alpha = tl.where(has_denom, old_num / safe_dn, 0.0)
+        cur_alpha = tl.where(has_denom, cur_w / safe_dn, 0.0)
+        acc = acc * old_alpha + cur_alpha * safe_out_s
 
     has_any = m_win != -float("inf")
     safe_denom = tl.where(has_any, denom, 1.0)
-    final_out = tl.where(has_any, acc / safe_denom, 0.0)
+    final_out = tl.where(has_any, acc, 0.0)
     final_lse = tl.where(
         has_any, (m_win * _LN2 + bias_win * _LN2) + tl.math.log2(safe_denom) * _LN2, -float("inf")
     )
