@@ -66,6 +66,7 @@ def _bind_unactivated_linear(
         or not isinstance(group_size, int)
         or isinstance(group_size, bool)
         or activation_fn is not None
+        or bound["block_scales"] is not None
         or (input_scale is not None and not isinstance(input_scale, torch.fx.Node))
     ):
         return None

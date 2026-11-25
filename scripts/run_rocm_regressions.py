@@ -25,7 +25,7 @@ _SUITE = (
     "tests/linear/convrot/int8/test_paired_projection.py",
     "tests/linear/convrot/int8/test_splitk.py",
     "tests/linear/convrot/int8/test_static_input.py",
-    "tests/linear/convrot/trellis/test_trellis_linear.py",
+    "tests/linear/convrot/int8/test_trellis_linear.py",
     "tests/linear/nvfp4/test_w4a16.py",
     "tests/moe/test_moe.py",
     "tests/trellis_format/test_decode.py",

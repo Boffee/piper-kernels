@@ -30,7 +30,7 @@ class BoundLinearNodes:
     def from_call(cls, node: torch.fx.Node) -> BoundLinearNodes | None:
         """Bind an unactivated ConvRot INT8 linear call, verifying node and scalar types."""
         bound = linear_fx.bind_call(node, torch.ops.piper_kernels.convrot_int8_linear.default)
-        if bound is None or bound["activation_fn"] is not None:
+        if bound is None or bound["activation_fn"] is not None or bound["block_scales"] is not None:
             return None
         input_node = bound["input"]
         weight_qdata = bound["weight_qdata"]

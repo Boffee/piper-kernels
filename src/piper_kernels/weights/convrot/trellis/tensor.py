@@ -417,6 +417,7 @@ class ConvRotTrellisTensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright:
         return repr(
             (
                 type(self).__qualname__,
+                "piper_kernels::convrot_int8_linear",
                 tuple(self.shape),
                 self.stride(),
                 str(self.device),
@@ -493,7 +494,7 @@ def _linear_dispatch(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    from piper_kernels.linear.convrot.trellis._functional import linear_dispatch  # noqa: PLC0415
+    from piper_kernels.linear.convrot.int8._functional import linear_dispatch  # noqa: PLC0415
 
     return linear_dispatch(func, types, args, kwargs)
 

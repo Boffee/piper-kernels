@@ -145,8 +145,9 @@ def test_mmap_checkpoint_and_parameter_assignment_preserve_storage(tmp_path, wei
     ("module", "name"),
     [
         ("piper_kernels.linear.convrot", "ConvRotInt8Tensor"),
+        ("piper_kernels.linear.convrot", "ConvRotTrellisTensor"),
         ("piper_kernels.linear.convrot.int8", "ConvRotInt8Tensor"),
-        ("piper_kernels.linear.convrot.trellis", "ConvRotTrellisTensor"),
+        ("piper_kernels.linear.convrot.int8", "ConvRotTrellisTensor"),
         ("piper_kernels.linear.convrot.nvfp4", "ConvRotNVFP4Tensor"),
         ("piper_kernels.linear.nvfp4", "PiperNVFP4Tensor"),
     ],

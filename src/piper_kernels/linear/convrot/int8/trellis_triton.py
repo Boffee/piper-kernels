@@ -22,7 +22,6 @@ from triton.compiler import ASTSource
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.linear._splitk import device_sm_count, select_split_k
-from piper_kernels.linear.convrot.int8 import _backend as convrot_int8_backend
 from piper_kernels.trellis._layout import TrellisLayout, validate_block_size
 from piper_kernels.trellis.triton import (
     _bit_window_params,
@@ -33,6 +32,8 @@ from piper_kernels.trellis.triton import (
     decode_variable_rows_int8_out,
 )
 from piper_kernels.weights.convrot.triton import rotate_input
+
+from . import _backend as convrot_int8_backend
 
 _GEMV_MAX_ROWS = 8
 _SCRATCH_DECODE_MAX_BYTES = 32 * 1024 * 1024

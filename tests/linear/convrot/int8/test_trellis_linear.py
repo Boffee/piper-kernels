@@ -8,15 +8,17 @@ import sys
 
 import pytest
 import torch
+from _compile_capture import TargetCapturePass
 from torch._dynamo.testing import CompileCounterWithBackend
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
 from triton.backends.compiler import GPUTarget
 
-from piper_kernels.linear.convrot.trellis import convrot_trellis_linear
-from piper_kernels.linear.convrot.trellis import reference as trellis_reference
-from piper_kernels.linear.convrot.trellis.triton import compile_trellis_kernels, linear_a16
-from piper_kernels.linear.convrot.trellis.triton import linear as triton_trellis_linear
+from piper_kernels import compile_options
+from piper_kernels.linear.convrot import convrot_int8_linear
+from piper_kernels.linear.convrot.int8 import reference as convrot_reference
+from piper_kernels.linear.convrot.int8.trellis_triton import compile_trellis_kernels, linear_a16
+from piper_kernels.linear.convrot.int8.trellis_triton import linear as triton_trellis_linear
 from piper_kernels.trellis import TrellisLayout, TrellisStorage, resolve_layout
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
@@ -268,6 +270,9 @@ def test_unsupported_block1_operations_raise_not_implemented() -> None:
         lambda: weight[:2],
         lambda: F.linear(torch.randn(2, 4, dtype=torch.bfloat16), weight.t()),
         lambda: torch.addmm(torch.zeros(4), x, weight.t(), alpha=0.5, beta=1),
+        lambda: convrot_int8_linear(
+            torch.randn(2, 512, dtype=torch.bfloat16), weight, activation_fn="swiglu"
+        ),
     ):
         with pytest.raises(NotImplementedError):
             call()
@@ -403,7 +408,7 @@ def test_cpu_linear_matches_dequantized_reference(
 
     for input_shape in ((in_features,), (2, 3, in_features)):
         x = torch.randn(input_shape, dtype=dtype)
-        actual = convrot_trellis_linear(x, weight, bias)
+        actual = convrot_int8_linear(x, weight, bias)
         expected = F.linear(x.float(), weight.dequantize(torch.float32), bias).to(dtype)
         rtol, atol = _tolerance(dtype)
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
@@ -443,6 +448,46 @@ def test_cpu_autocast_and_aot_eager_compile() -> None:
     for rows in (3, 12):
         inp = torch.randn(rows, 256, dtype=torch.bfloat16)
         torch.testing.assert_close(compiled(inp), F.linear(inp, bf16_weight), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=[pytest.mark.gpu, _gpu])],
+)
+def test_trellis_swiglu_ffn_compile_skips_int8_fx_passes(device: str) -> None:
+    w_up = _make_weight(
+        64, 128, block_size=128, group_size=64, dtype=torch.bfloat16, device=device, seed=141
+    )
+    w_gate = _make_weight(
+        64, 128, block_size=128, group_size=64, dtype=torch.bfloat16, device=device, seed=142
+    )
+    w_down = _make_weight(
+        128, 64, block_size=64, group_size=64, dtype=torch.bfloat16, device=device, seed=143
+    )
+
+    def trellis_ffn(inp: torch.Tensor) -> torch.Tensor:
+        return F.linear(F.silu(F.linear(inp, w_gate)) * F.linear(inp, w_up), w_down)
+
+    torch.manual_seed(144)
+    x = torch.randn(4, 128, dtype=torch.bfloat16, device=device) * 0.1
+    eager = trellis_ffn(x)
+
+    torch.compiler.reset()
+    capture = TargetCapturePass()
+    compiled = torch.compile(
+        trellis_ffn,
+        fullgraph=True,
+        options=capture.wrap_options(compile_options(ffn=True, attention=True)),
+    )
+    actual = compiled(x)
+    assert isinstance(actual, torch.Tensor)
+    torch.testing.assert_close(actual, eager, rtol=1e-2, atol=1e-2)
+    piper_targets = [
+        target
+        for target in capture.targets
+        if getattr(target, "namespace", None) == "piper_kernels"
+    ]
+    assert piper_targets == [torch.ops.piper_kernels.convrot_int8_linear.default] * 3
 
 
 def test_copy_pin_and_sharding_contracts() -> None:
@@ -677,7 +722,7 @@ def test_gpu_small_batch_a16_gemv_matches_reference(
     bias = torch.randn(out_features, dtype=torch.float32, device="cuda") if use_bias else None
 
     actual = F.linear(x, weight, bias)
-    expected = trellis_reference.linear_a16(
+    expected = convrot_reference.linear_trellis_a16(
         x.cpu(),
         weight.bitstreams.cpu(),
         weight.block_scales.cpu(),
@@ -732,7 +777,7 @@ def test_gpu_gemv_variants_rates_nonpow2_and_splitk(
     for active_bias in biases:
         for x in (x_full[0], x_full.view(2, 2, in_features)):
             actual = F.linear(x, weight, active_bias)
-            expected = trellis_reference.linear_a16(
+            expected = convrot_reference.linear_trellis_a16(
                 x.cpu(),
                 weight.bitstreams.cpu(),
                 weight.block_scales.cpu(),
@@ -793,7 +838,7 @@ def test_gpu_large_batch_w8a8_prefill_matches_int8(
         expected_int8 = F.linear(x, w_int8, active_bias)
         assert torch.equal(actual, expected_int8)
 
-        expected_ref = trellis_reference.linear_w8a8(
+        expected_ref = convrot_reference.linear_trellis_w8a8(
             x.cpu(),
             bitstreams,
             block_scales,
@@ -876,7 +921,7 @@ def test_gpu_direct_a16_large_batch_fallback_and_truncated_variable_bounds() -> 
         weight.block_size,
         weight.group_size,
     )
-    expected = trellis_reference.linear_a16(
+    expected = convrot_reference.linear_trellis_a16(
         x.cpu(),
         weight.bitstreams.cpu(),
         weight.block_scales.cpu(),
@@ -1072,7 +1117,7 @@ def test_gpu_executes_cleanly_on_non_current_device() -> None:
         assert out.device == torch.device("cuda:1")
         assert torch.cuda.current_device() == 0
         expected = (
-            trellis_reference.linear_w8a8(
+            convrot_reference.linear_trellis_w8a8(
                 x.cpu(),
                 weight.bitstreams.cpu(),
                 weight.block_scales.cpu(),
@@ -1083,7 +1128,7 @@ def test_gpu_executes_cleanly_on_non_current_device() -> None:
                 weight.group_size,
             )
             if rows > 8
-            else trellis_reference.linear_a16(
+            else convrot_reference.linear_trellis_a16(
                 x.cpu(),
                 weight.bitstreams.cpu(),
                 weight.block_scales.cpu(),
