@@ -6,6 +6,8 @@ uses one signed-INT8 scale per V row and a nonnegative UINT8 probability
 operand. The reference is intentionally readable rather than fast.
 """
 
+import contextlib
+
 import torch
 
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
@@ -18,6 +20,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 
 _CENTER_CHUNK = 1024
 _PV_BLOCK = 64
+_PV_TILES_PER_CHUNK = _CENTER_CHUNK // _PV_BLOCK
 _P_UINT8_RANGE = 255.0
 _V_INT8_RANGE = 127.0
 _SCALE_EPSILON = 1e-7
@@ -217,3 +220,117 @@ def reference_piper_attention(
 
     output = numerator / (denominator.clamp_min(1e-30)[..., None] * _P_UINT8_RANGE)
     return output.reshape(query.shape).to(output_dtype)
+
+
+def _round_to_int8(values: torch.Tensor) -> torch.Tensor:
+    rounded = values + torch.where(values >= 0, 0.5, -0.5)
+    return rounded.clamp(-_V_INT8_RANGE, _V_INT8_RANGE).to(torch.int8)
+
+
+def _scatter_slots_reference(
+    slot_ids: torch.Tensor,
+    dst_tensors: tuple[torch.Tensor, ...],
+    src_tensors: tuple[torch.Tensor, ...],
+) -> None:
+    num_slots = dst_tensors[0].shape[0]
+    num_new = slot_ids.shape[0]
+    if num_new == 0 or num_slots == 0:
+        return
+    valid = (slot_ids >= 0) & (slot_ids < num_slots)
+    is_slot0 = valid & (slot_ids == 0)
+    slot0_updated = is_slot0.any()
+    slot0_src_idx = is_slot0.to(torch.int64).argmax().reshape(1)
+    safe_idx = torch.where(valid, slot_ids.to(torch.int64), 0)
+    for dst, src in zip(dst_tensors, src_tensors, strict=True):
+        slot0_candidate = src.index_select(0, slot0_src_idx).squeeze(0)
+        slot0_val = torch.where(slot0_updated, slot0_candidate, dst[0])
+        valid_mask = valid.reshape(num_new, *([1] * (dst.ndim - 1)))
+        write_vals = torch.where(valid_mask, src, slot0_val.unsqueeze(0))
+        dst.index_copy_(0, safe_idx, write_vals)
+
+
+def freeze_kv_chunks_reference(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_int8: torch.Tensor,
+    key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    value_int8: torch.Tensor,
+    value_scale: torch.Tensor,
+    value_mean: torch.Tensor,
+    slot_ids: torch.Tensor,
+    *,
+    pack_wmma: bool = False,
+) -> None:
+    """Portable PyTorch reference for chunk-major KV centering and quantization."""
+    num_new, kv_heads, _, head_dim = key.shape
+    num_slots = key_int8.shape[0]
+    if num_new == 0 or num_slots == 0:
+        return
+
+    grouped_qk = key_scale.shape[2] == _PV_TILES_PER_CHUNK
+    autocast_ctx = (
+        torch.amp.autocast(device_type=key.device.type, enabled=False)
+        if key.device.type in ("cpu", "cuda")
+        else contextlib.nullcontext()
+    )
+    with autocast_ctx:
+        key_f = key.float()
+        key_mean = key_f.mean(dim=2)
+        src_key_center = rotate_signed_hadamard_heads(key_mean)
+        rotated_k = rotate_signed_hadamard_heads(key_f - key_mean.unsqueeze(2))
+        if grouped_qk:
+            rotated_tiles = rotated_k.reshape(
+                num_new, kv_heads, _PV_TILES_PER_CHUNK, _PV_BLOCK, head_dim
+            )
+            src_key_scale = rotated_tiles.abs().amax(dim=(3, 4)) / _V_INT8_RANGE + _SCALE_EPSILON
+            src_key_q = _round_to_int8(
+                rotated_tiles / src_key_scale.unsqueeze(-1).unsqueeze(-1)
+            ).reshape(num_new, kv_heads, _CENTER_CHUNK, head_dim)
+        else:
+            grouped_k = rotated_k.reshape(num_new, kv_heads, _PV_TILES_PER_CHUNK, 8, 4, 2, head_dim)
+            thread_scale = (
+                grouped_k.abs().amax(dim=(3, 5, 6), keepdim=True) / _V_INT8_RANGE + _SCALE_EPSILON
+            )
+            src_key_scale = (
+                thread_scale.squeeze(-1)
+                .expand(num_new, kv_heads, _PV_TILES_PER_CHUNK, 8, 4, 2)
+                .reshape(num_new, kv_heads, _CENTER_CHUNK)
+            )
+            src_key_q = _round_to_int8(rotated_k / src_key_scale.unsqueeze(-1))
+
+        value_f = value.float()
+        src_value_mean = value_f.mean(dim=2)
+        centered_v = value_f - src_value_mean.unsqueeze(2)
+        scale_floor = src_value_mean.abs().amax(dim=-1, keepdim=True) * _VALUE_MEAN_SCALE_FLOOR
+        src_value_scale = torch.maximum(
+            centered_v.abs().amax(dim=-1) / _V_INT8_RANGE + _SCALE_EPSILON,
+            scale_floor,
+        )
+        value_q_tok = _round_to_int8(centered_v / src_value_scale.unsqueeze(-1))
+        src_value_q = (
+            value_q_tok.reshape(num_new, kv_heads, _PV_TILES_PER_CHUNK, _PV_BLOCK, head_dim)
+            .transpose(-2, -1)
+            .contiguous()
+        )
+        if pack_wmma:
+            tokens = torch.arange(_PV_BLOCK, device=value.device, dtype=torch.int64)
+            perm = (tokens & ~24) | ((tokens & 8) << 1) | ((tokens & 16) >> 1)
+            src_value_q = src_value_q.index_select(-1, perm)
+
+        if key_int8.dtype is torch.uint8:
+            src_key_q = src_key_q.view(torch.uint8)
+            src_value_q = src_value_q.view(torch.uint8)
+
+        _scatter_slots_reference(
+            slot_ids,
+            (key_int8, key_scale, key_center, value_int8, value_scale, value_mean),
+            (
+                src_key_q,
+                src_key_scale,
+                src_key_center,
+                src_value_q,
+                src_value_scale,
+                src_value_mean,
+            ),
+        )

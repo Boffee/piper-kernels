@@ -1,11 +1,17 @@
 """Offline smoke coverage after separating NVIDIA dense Piper execution."""
 
+import re
 import sys
 from dataclasses import replace
 
 import pytest
+import torch
 import triton
-from _nvidia_resources import ATTENTION_STACK_BUDGET_BYTES, stack_frame_bytes
+from _nvidia_resources import (
+    ATTENTION_STACK_BUDGET_BYTES,
+    compile_with_spill_stores,
+    stack_frame_bytes,
+)
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 from triton.experimental.gluon._runtime import GluonASTSource
@@ -168,7 +174,10 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(
 def test_nvidia_value_preparation_accepts_runtime_head_count(architecture, head_dim):
     constants = {
         "store_log_scale": True,
+        "scale_by_p_range": True,
         "pack_wmma": False,
+        "tile_layout": False,
+        "scatter_slots": False,
         "head_dim": head_dim,
     }
     kernel = _quantization._quantize_value_k1024_kernel
@@ -179,6 +188,7 @@ def test_nvidia_value_preparation_accepts_runtime_head_count(architecture, head_
         scale_multiplier_ptr="*fp32",
         log_scale_ptr="*fp16",
         value_mean_ptr="*fp32",
+        slot_ids_ptr="*i8",
     )
     compiled = triton.compile(
         ASTSource(kernel, signature, constexprs=constants),
@@ -186,3 +196,69 @@ def test_nvidia_value_preparation_accepts_runtime_head_count(architecture, head_
         options={"num_warps": 4},
     )
     assert compiled.asm["cubin"]
+
+
+_KV_FREEZE_COMPILE_TARGETS = (
+    GPUTarget("cuda", 75, 32),
+    GPUTarget("cuda", 80, 32),
+    GPUTarget("cuda", 89, 32),
+    GPUTarget("cuda", 120, 32),
+    pytest.param(
+        GPUTarget("hip", "gfx942", 64),
+        marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
+    ),
+    pytest.param(
+        GPUTarget("hip", "gfx1100", 32),
+        marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
+    ),
+    pytest.param(
+        GPUTarget("hip", "gfx1151", 32),
+        marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
+    ),
+    pytest.param(
+        GPUTarget("hip", "gfx1201", 32),
+        marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "target", _KV_FREEZE_COMPILE_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}"
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_freeze_8_target_compile_zero_spills(
+    target: GPUTarget,
+    dtype: torch.dtype,
+    head_dim: int,
+) -> None:
+    if target.backend == "cuda":
+        spill_counts: list[int] = []
+
+        def _compile_cuda(source: object, tgt: object, options: dict[str, object]) -> object:
+            compiled, spills = compile_with_spill_stores(source, tgt, options)  # type: ignore[arg-type]
+            assert compiled.asm.get("cubin")
+            spill_counts.append(spills)
+            return compiled
+
+        _quantization.compile_kv_freeze_kernels(
+            target, dtype=dtype, head_dim=head_dim, compile_fn=_compile_cuda
+        )
+        assert spill_counts == [0, 0]
+        return
+
+    compiled_k, compiled_v = _quantization.compile_kv_freeze_kernels(
+        target, dtype=dtype, head_dim=head_dim
+    )
+    for compiled in (compiled_k, compiled_v):
+        assert compiled.asm.get("hsaco")  # type: ignore[attr-defined]
+        assert compiled.metadata.global_scratch_size == 0  # type: ignore[attr-defined]
+        amdgcn = compiled.asm.get("amdgcn", "")  # type: ignore[attr-defined]
+        assert amdgcn
+        vgpr_spills = re.search(r"vgpr_spill[^:]*:\s*(\d+)", amdgcn)
+        priv_size = re.search(r"\.private_segment_fixed_size:\s*(\d+)", amdgcn)
+        assert vgpr_spills is not None or priv_size is not None
+        if vgpr_spills is not None:
+            assert int(vgpr_spills.group(1)) == 0
+        if priv_size is not None:
+            assert int(priv_size.group(1)) == 0

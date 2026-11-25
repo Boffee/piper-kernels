@@ -37,6 +37,16 @@ def supports_amd_target(target: AcceleratorTarget) -> bool:
     )
 
 
+def kv_chunk_layout(target: AcceleratorTarget) -> tuple[int, bool, bool]:
+    """Return ``(key_scales, grouped_qk, pack_wmma)`` from target ISA capabilities."""
+    if target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201"):
+        return 16, True, True
+    if nvidia_policy.supports_target(target):
+        grouped_qk = nvidia_policy.groups_qk_scales(target)
+        return (16 if grouped_qk else 1024), grouped_qk, False
+    return 16, True, False
+
+
 def select_backend(target: AcceleratorTarget) -> AttentionImplementation | None:
     """Return a native implementation or preserve the portable fallback."""
     if nvidia_policy.supports_target(target):

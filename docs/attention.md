@@ -144,6 +144,71 @@ gate. Pass `routing="mean"` or `"minmax"` and a finite positive `coarse_scale`;
 Compatible compiler fusions accumulate fine and coarse outputs in FP32 before
 casting, so outputs can differ slightly from standalone addition.
 
+## Persistent chunk-major KV pool
+
+Dense KV chunks of 1024 finalized tokens can be quantized and
+stored persistently in a global layer-shared `PiperKVChunkPool` via
+`freeze_kv_chunks_` and sized from `kv_chunk_storage_specs`:
+
+```python
+import torch
+from piper_kernels import PiperKVChunkPool, freeze_kv_chunks_, kv_chunk_storage_specs
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+specs = kv_chunk_storage_specs(
+    num_slots=8, kv_heads=4, head_dim=128, device=device, kv_dtype=torch.uint8
+)
+pool = PiperKVChunkPool.from_tensors(
+    **{
+        name: torch.empty(shape, device=device, dtype=dtype)
+        for name, (shape, dtype) in specs.items()
+    }
+)
+
+new_k = torch.randn(2, 4, 1024, 128, device=device, dtype=torch.bfloat16)
+new_v = torch.randn(2, 4, 1024, 128, device=device, dtype=torch.bfloat16)
+slot_ids = torch.tensor([0, 3], device=device, dtype=torch.int32)
+
+with torch.inference_mode():
+    freeze_kv_chunks_(new_k, new_v, pool, slot_ids)
+```
+
+Pool and operator contract:
+
+- **Buffer geometry:** Parameterized by `num_slots >= 0`, `kv_heads >= 1`, and
+  `head_dim` in `{64, 128}`, with all 6 buffers on the same device: `key_int8`
+  (`[num_slots, kv_heads, 1024, head_dim]`), `value_int8`
+  (`[num_slots, kv_heads, 16, head_dim, 64]`), `key_scale` (`float32`,
+  `[num_slots, kv_heads, 16]` on SM12x / RDNA4 / portable targets or
+  `[num_slots, kv_heads, 1024]` on SM8x), `key_center` and `value_mean` (`float32`,
+  `[num_slots, kv_heads, head_dim]`), and `value_scale` (`float32`,
+  `[num_slots, kv_heads, 1024]`). `key_int8` and `value_int8` must match in dtype
+  (`torch.int8` or `torch.uint8`).
+- **Opaque target-family storage & host staging:** `value_int8`'s trailing 64-token axis
+  uses target-specific ordering (WMMA-packed on RDNA4 `gfx1200`/`gfx1201`, unpermuted
+  elsewhere), and `freeze_kv_chunks_` enforces the active GPU's `key_scale` width
+  (`1024` on SM8x, `16` elsewhere). When allocating CPU staging buffers for GPU host-DMA
+  swapping, pass the target GPU `device` (or `"sm80"` / `"sm120"` / `"gfx1201"`) to
+  `kv_chunk_storage_specs` instead of `None`/`"cpu"`; frozen slab bytes are portable across
+  devices in the same target family, not across differing target families.
+- **Shared byte arenas and strided `stride(0)`:** `key_int8` and `value_int8` accept
+  either `torch.int8` (default) or `torch.uint8` so callers managing dynamic shared byte
+  arenas (such as interleaved `[num_slots, 2, kv_heads, 1024, head_dim]` views and
+  `uint8` MoE buffers) can share one `uint8` backing allocation while keeping FP32
+  metadata in separate `float32` buffers. Every pool tensor must be dense row-major
+  within each slot, with 16-byte-aligned base pointers, storage offsets, and multi-slot
+  `stride(0)` byte steps (`stride(0) >= slot_elements`), and pairwise disjoint per-slot
+  byte spans.
+- **Slot freezing:** `freeze_kv_chunks_` quantizes non-overlapping `key` / `value` inputs
+  of shape `[num_new, kv_heads, 1024, head_dim]` sharing dtype (`float16` or `bfloat16`)
+  and `pool.device` (`stride(-1) == 1`; outer dims may be strided) directly into
+  contiguous `int32` `slot_ids` (`[num_new]`, non-overlapping with `pool`) using zero
+  host readbacks. Entries `< 0` or `>= pool.num_slots`, `num_new == 0`, and
+  `pool.num_slots == 0` are safe no-ops leaving untouched slots unchanged; valid
+  `slot_ids` within a single call must be distinct. `freeze_kv_chunks_` is inference-only
+  (enforcing `InferenceMode` if any pool buffer is an inference tensor) and supports CUDA
+  Graph capture and `torch.compile(fullgraph=True, dynamic=True)`.
+
 ## Compile and fuse projections
 
 Standalone attention works with `torch.compile(piper_attention, fullgraph=True)`.
