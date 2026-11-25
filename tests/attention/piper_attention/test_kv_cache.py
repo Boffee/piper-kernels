@@ -723,6 +723,7 @@ def test_finite_slot_different_stride_arena_disjointness_and_collision(
         pool = PiperKVChunkPool.from_tensors(
             base.key_int8, base.key_scale, kc, base.value_int8, base.value_scale, vm
         )
+        _fill_pool_sentinels(pool)
         ref = _clone_pool(pool)
         sentinel = _clone_pool(pool)
         # Mask out written elements so untouched arena padding stays unchanged at -999.0.
@@ -911,6 +912,137 @@ def test_freeze_rejects_overlapping_inputs_and_accepts_disjoint_arena() -> None:
         freeze_kv_chunks_(k_disjoint, torch.zeros_like(k_disjoint), pool_arena, overlap_slots)
     assert _pool_versions(pool_arena) == versions_before
     _assert_pools_exact(pool_arena, snap)
+
+
+def test_freeze_interleaved_strided_inputs_in_shared_arena() -> None:
+    torch.manual_seed(913)
+    num_slots = 2
+    kv_heads = 1
+    head_dim = 64
+    chunk_u8_bytes = kv_heads * KV_CHUNK_TOKENS * head_dim
+    chunk_bf16_bytes = chunk_u8_bytes * 2
+    stride_bytes = chunk_bf16_bytes + chunk_u8_bytes
+
+    base = PiperKVChunkPool.empty(num_slots, kv_heads, head_dim, device="cpu", kv_dtype=torch.uint8)
+    arena_k = torch.empty(num_slots * stride_bytes, dtype=torch.uint8)
+    arena_v = torch.empty(num_slots * stride_bytes, dtype=torch.uint8)
+    # Place 2-chunk BF16 inputs at [0, 131072), [196608, 327680) interleaved with
+    # uint8 pool slots at [131072, 196608), [327680, 393216) in the same arena.
+    k_in = arena_k.view(torch.bfloat16).as_strided(
+        (num_slots, kv_heads, KV_CHUNK_TOKENS, head_dim),
+        (stride_bytes // 2, chunk_u8_bytes, head_dim, 1),
+        storage_offset=0,
+    )
+    v_in = arena_v.view(torch.bfloat16).as_strided(
+        (num_slots, kv_heads, KV_CHUNK_TOKENS, head_dim),
+        (stride_bytes // 2, chunk_u8_bytes, head_dim, 1),
+        storage_offset=0,
+    )
+    k_in.copy_(torch.randn_like(k_in))
+    v_in.copy_(torch.randn_like(v_in))
+    k_snap = k_in.clone()
+    v_snap = v_in.clone()
+
+    key_pool_view = arena_k.as_strided(
+        (num_slots, kv_heads, KV_CHUNK_TOKENS, head_dim),
+        (stride_bytes, chunk_u8_bytes, head_dim, 1),
+        storage_offset=chunk_bf16_bytes,
+    )
+    val_pool_view = arena_v.as_strided(
+        (num_slots, kv_heads, 16, head_dim, 64),
+        (stride_bytes, chunk_u8_bytes, head_dim * 64, 64, 1),
+        storage_offset=chunk_bf16_bytes,
+    )
+    pool = PiperKVChunkPool.from_tensors(
+        key_pool_view,
+        base.key_scale,
+        base.key_center,
+        val_pool_view,
+        base.value_scale,
+        base.value_mean,
+    )
+    _fill_pool_sentinels(pool)
+    ref = _clone_pool(pool)
+    slots = torch.tensor([0, 1], dtype=torch.int32)
+    with torch.no_grad():
+        freeze_kv_chunks_(k_in, v_in, pool, slots)
+        freeze_kv_chunks_reference(
+            k_in,
+            v_in,
+            ref.key_int8,
+            ref.key_scale,
+            ref.key_center,
+            ref.value_int8,
+            ref.value_scale,
+            ref.value_mean,
+            slots,
+        )
+    _assert_pools_exact(pool, ref)
+    torch.testing.assert_close(k_in, k_snap, atol=0, rtol=0)
+    torch.testing.assert_close(v_in, v_snap, atol=0, rtol=0)
+
+    # Shifting key input so chunk 1 overlaps pool.key_int8[0] must still be rejected.
+    bad_k = arena_k.view(torch.bfloat16).as_strided(
+        (2, 1, KV_CHUNK_TOKENS, head_dim),
+        ((chunk_bf16_bytes + 4096) // 2, chunk_u8_bytes, head_dim, 1),
+        storage_offset=0,
+    )
+    snap = _clone_pool(pool)
+    versions_before = _pool_versions(pool)
+    with pytest.raises(ValueError, match="must not overlap key_int8"):
+        freeze_kv_chunks_(bad_k, v_in, pool, slots)
+    assert _pool_versions(pool) == versions_before
+    _assert_pools_exact(pool, snap)
+
+
+def test_freeze_multi_dim_strided_input_in_shared_arena() -> None:
+    torch.manual_seed(914)
+    head_dim = 64
+    head_bytes_bf16 = KV_CHUNK_TOKENS * head_dim * 2
+    slot_pool_bytes = 2 * KV_CHUNK_TOKENS * head_dim
+    head_stride_bytes = head_bytes_bf16 + slot_pool_bytes
+    slot_stride_2 = head_stride_bytes + head_bytes_bf16
+
+    # Pool slot [131072, 262144) sits inside k_multi's stride(1) gap between head 0 and head 1.
+    base2 = PiperKVChunkPool.empty(2, 2, head_dim, device="cpu", kv_dtype=torch.uint8)
+    arena2 = torch.empty(2 * slot_stride_2, dtype=torch.uint8)
+    k_multi = arena2.view(torch.bfloat16).as_strided(
+        (2, 2, KV_CHUNK_TOKENS, head_dim),
+        (slot_stride_2 // 2, head_stride_bytes // 2, head_dim, 1),
+        storage_offset=0,
+    )
+    k_multi.copy_(torch.randn_like(k_multi))
+    key_pool_2 = arena2.as_strided(
+        (2, 2, KV_CHUNK_TOKENS, head_dim),
+        (slot_stride_2, KV_CHUNK_TOKENS * head_dim, head_dim, 1),
+        storage_offset=head_bytes_bf16,
+    )
+    pool2 = PiperKVChunkPool.from_tensors(
+        key_pool_2,
+        base2.key_scale,
+        base2.key_center,
+        base2.value_int8,
+        base2.value_scale,
+        base2.value_mean,
+    )
+    _fill_pool_sentinels(pool2)
+    v_multi = torch.randn((2, 2, KV_CHUNK_TOKENS, head_dim), dtype=torch.bfloat16)
+    slots = torch.tensor([0, 1], dtype=torch.int32)
+    ref2 = _clone_pool(pool2)
+    with torch.no_grad():
+        freeze_kv_chunks_(k_multi, v_multi, pool2, slots)
+        freeze_kv_chunks_reference(
+            k_multi,
+            v_multi,
+            ref2.key_int8,
+            ref2.key_scale,
+            ref2.key_center,
+            ref2.value_int8,
+            ref2.value_scale,
+            ref2.value_mean,
+            slots,
+        )
+    _assert_pools_exact(pool2, ref2)
 
 
 def test_freeze_rejects_inference_pool_outside_inference_mode() -> None:

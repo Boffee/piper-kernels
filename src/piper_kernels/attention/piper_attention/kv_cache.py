@@ -243,6 +243,37 @@ def _general_byte_span(tensor: torch.Tensor, base_ptr: int) -> tuple[_SymInt, _S
     return start, end
 
 
+_MAX_STRIDED_OVERLAP_CHECKS = 1024
+
+
+def _span_extent_bytes(block_bytes: int, outer_dims: tuple[tuple[int, int], ...]) -> int:
+    return block_bytes + sum((count - 1) * step for count, step in outer_dims)
+
+
+def _decompose_byte_spans(
+    tensor: torch.Tensor, base_ptr: int
+) -> tuple[int, int, tuple[tuple[int, int], ...]] | None:
+    shape = tensor.shape
+    strides = tensor.stride()
+    storage_offset = tensor.storage_offset()
+    if any(isinstance(v, torch.SymInt) or v < 0 for v in (*shape, *strides, storage_offset)):
+        return None
+    concrete_dims = sorted(
+        (int(st), int(s)) for s, st in zip(shape, strides, strict=True) if s > 1 and st > 0
+    )
+    block_elems = 1
+    split_idx = 0
+    for stride, size in concrete_dims:
+        if stride != block_elems:
+            break
+        block_elems *= size
+        split_idx += 1
+    elem_size = tensor.element_size()
+    start_byte = base_ptr + int(storage_offset) * elem_size
+    outer_dims = tuple((size, stride * elem_size) for stride, size in concrete_dims[split_idx:])
+    return start_byte, block_elems * elem_size, outer_dims
+
+
 def _interval_avoids_periodic_slots(
     start: _SymInt,
     end: _SymInt,
@@ -394,6 +425,69 @@ def _slot_spans_overlap(first: torch.Tensor, second: torch.Tensor) -> bool:
     )
 
 
+def _strided_subtensor_avoids_periodic_slots(
+    start_byte: int,
+    block_bytes: int,
+    outer_dims: tuple[tuple[int, int], ...],
+    pool_span: _SlotBufferSpan,
+    budget: int,
+) -> bool:
+    extent = _span_extent_bytes(block_bytes, outer_dims)
+    if _interval_avoids_periodic_slots(
+        start_byte,
+        start_byte + extent,
+        pool_span.start_byte,
+        pool_span.step_byte,
+        pool_span.slot_bytes,
+        pool_span.num_slots,
+    ):
+        return True
+    if not outer_dims:
+        return False
+    if len(outer_dims) == 1:
+        count, step = outer_dims[0]
+        return _periodic_spans_disjoint(
+            start_byte,
+            step,
+            block_bytes,
+            count,
+            pool_span.start_byte,
+            pool_span.step_byte,
+            pool_span.slot_bytes,
+            pool_span.num_slots,
+        )
+    outer_count, outer_step = outer_dims[-1]
+    rest = outer_dims[:-1]
+    rest_extent = _span_extent_bytes(block_bytes, rest)
+    if outer_step > rest_extent and _periodic_spans_disjoint(
+        start_byte,
+        outer_step,
+        rest_extent,
+        outer_count,
+        pool_span.start_byte,
+        pool_span.step_byte,
+        pool_span.slot_bytes,
+        pool_span.num_slots,
+    ):
+        return True
+    split_idx = min(range(len(outer_dims)), key=lambda idx: outer_dims[idx][0])
+    split_count, split_step = outer_dims[split_idx]
+    if split_count > budget:
+        return False
+    sub_dims = outer_dims[:split_idx] + outer_dims[split_idx + 1 :]
+    sub_budget = budget // split_count
+    return all(
+        _strided_subtensor_avoids_periodic_slots(
+            start_byte + step_idx * split_step,
+            block_bytes,
+            sub_dims,
+            pool_span,
+            sub_budget,
+        )
+        for step_idx in range(split_count)
+    )
+
+
 def _input_overlaps_pool_tensor(read_tensor: torch.Tensor, pool_tensor: torch.Tensor) -> bool:
     if read_tensor.device != pool_tensor.device:
         return False
@@ -401,15 +495,25 @@ def _input_overlaps_pool_tensor(read_tensor: torch.Tensor, pool_tensor: torch.Te
     pool_key, pool_base = _storage_identity(pool_tensor)
     if read_key != pool_key or read_tensor.numel() == 0 or pool_tensor.numel() == 0:
         return False
-    read_start, read_end = _general_byte_span(read_tensor, read_base)
     pool_span = _slot_buffer_span(pool_tensor, pool_base)
-    return not _interval_avoids_periodic_slots(
-        read_start,
-        read_end,
-        pool_span.start_byte,
-        pool_span.step_byte,
-        pool_span.slot_bytes,
-        pool_span.num_slots,
+    decomposed = _decompose_byte_spans(read_tensor, read_base)
+    if decomposed is None:
+        read_start, read_end = _general_byte_span(read_tensor, read_base)
+        return not _interval_avoids_periodic_slots(
+            read_start,
+            read_end,
+            pool_span.start_byte,
+            pool_span.step_byte,
+            pool_span.slot_bytes,
+            pool_span.num_slots,
+        )
+    start_byte, block_bytes, outer_dims = decomposed
+    return not _strided_subtensor_avoids_periodic_slots(
+        start_byte,
+        block_bytes,
+        outer_dims,
+        pool_span,
+        _MAX_STRIDED_OVERLAP_CHECKS,
     )
 
 
