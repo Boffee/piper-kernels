@@ -24,11 +24,14 @@ import piper_kernels.linear.convrot.int8
 import piper_kernels.linear.convrot.nvfp4
 import piper_kernels.linear.nvfp4
 from piper_kernels import (
+    PiperKVChunkPool,
     SparsePiperAttention,
     apply_coarse_attention_residual,
     coarse_attention,
     coarse_attention_residual,
     compile_options,
+    freeze_kv_chunks_,
+    kv_chunk_storage_specs,
     mean_pool_block_values,
     piper_attention,
     sage_attention_2pp,
@@ -207,6 +210,44 @@ for forbidden_prefix in (
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_kv_cache_cpu_fallback_remains_usable_without_triton() -> None:
+    script = """
+import builtins
+import importlib.util
+import sys
+import torch
+
+original_import = builtins.__import__
+original_find_spec = importlib.util.find_spec
+
+def guarded_import(name, *args, **kwargs):
+    if name == "triton" or name.startswith("triton."):
+        raise ModuleNotFoundError(f"{name} intentionally unavailable", name=name)
+    return original_import(name, *args, **kwargs)
+
+def guarded_find_spec(name, *args, **kwargs):
+    if name == "triton" or name.startswith("triton."):
+        return None
+    return original_find_spec(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+importlib.util.find_spec = guarded_find_spec
+
+from piper_kernels import PiperKVChunkPool, freeze_kv_chunks_, kv_chunk_storage_specs
+
+specs = kv_chunk_storage_specs(2, 2, 64, device="cpu", kv_dtype=torch.uint8)
+assert specs["key_scale"] == ((2, 2, 16), torch.float32)
+pool = PiperKVChunkPool.empty(2, 2, 64, device="cpu", kv_dtype=torch.uint8)
+key = torch.randn(1, 2, 1024, 64, dtype=torch.bfloat16)
+value = torch.randn_like(key)
+slots = torch.tensor([1], dtype=torch.int32)
+freeze_kv_chunks_(key, value, pool, slots)
+assert "triton" not in sys.modules
+assert not any(mod == "triton" or mod.startswith("triton.") for mod in sys.modules)
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 @pytest.mark.parametrize("family", ["sparse_piper", "projection"])
 def test_convrot_int8_fusion_packages_have_explicit_names(family: str) -> None:
     current = f"piper_kernels.fusions.convrot_int8_{family}"
@@ -278,7 +319,10 @@ assert "piper_kernels.attention.sparse_piper_attention._quantized_dispatch" not 
 
 def test_public_packages_import() -> None:
     assert piper_kernels.__name__ == "piper_kernels"
+    assert piper_kernels.PiperKVChunkPool is PiperKVChunkPool
     assert piper_kernels.compile_options is compile_options
+    assert piper_kernels.freeze_kv_chunks_ is freeze_kv_chunks_
+    assert piper_kernels.kv_chunk_storage_specs is kv_chunk_storage_specs
     assert piper_kernels.piper_attention is piper_attention
     assert piper_kernels.sage_attention_2pp is sage_attention_2pp
     assert piper_kernels.SparsePiperAttention is SparsePiperAttention
@@ -288,11 +332,14 @@ def test_public_packages_import() -> None:
     assert piper_kernels.mean_pool_block_values is mean_pool_block_values
     assert piper_kernels.sparse_piper_coarse_residual is sparse_piper_coarse_residual
     assert piper_kernels.__all__ == [
+        "PiperKVChunkPool",
         "SparsePiperAttention",
         "apply_coarse_attention_residual",
         "coarse_attention",
         "coarse_attention_residual",
         "compile_options",
+        "freeze_kv_chunks_",
+        "kv_chunk_storage_specs",
         "mean_pool_block_values",
         "piper_attention",
         "sage_attention_2pp",

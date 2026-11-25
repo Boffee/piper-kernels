@@ -22,8 +22,11 @@ def rotate_signed_hadamard_heads(value: torch.Tensor) -> torch.Tensor:
         )
 
     offsets = torch.arange(head_dim, device=value.device)
-    words = torch.tensor(SIGNED_HADAMARD_MASK, device=value.device, dtype=torch.int64)
-    signs = 2 * ((words[offsets // 32] >> (offsets % 32)) & 1) - 1
+    word_index = offsets // 32
+    selected = torch.full_like(word_index, SIGNED_HADAMARD_MASK[3], dtype=torch.int64)
+    for index in (2, 1, 0):
+        selected = torch.where(word_index == index, SIGNED_HADAMARD_MASK[index], selected)
+    signs = 2 * ((selected >> (offsets % 32)) & 1) - 1
     rotated = value.float() * signs
     butterfly_distance = 1
     while butterfly_distance < head_dim:

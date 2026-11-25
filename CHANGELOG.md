@@ -7,6 +7,15 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Global chunk-major persistent KV cache pool and chunk freeze operator
+  (`piper_kernels`: `PiperKVChunkPool`, `kv_chunk_storage_specs`, and
+  `freeze_kv_chunks_`) storing K1024/V1024 centered
+  INT8 chunks across layer-shared `[num_slots, kv_heads, ...]` slabs with strided
+  `stride(0)` and `uint8 | int8` storage support for shared dynamic `uint8` byte arenas,
+  zero-host-readback `int32` slot-scatter / miss-skipping, `torch.compile(fullgraph=True,
+  dynamic=True)`, and CUDA Graph capture. Validated on CPU and AMD RX 9070 XT (`gfx1201`),
+  with NVIDIA `sm75`/`sm80`/`sm89`/`sm120` and AMD `gfx942`/`gfx1100`/`gfx1151` targets
+  validated via offline compilation.
 - Optional Block-LDLQ Hessian-aware trellis encoding via
   `piper_kernels.trellis.TrellisHessian` and optional `hessian` / `hessian_damping`
   arguments on `TrellisStorage.from_hp` and `ConvRotTrellisTensor.from_hp` (preserving
