@@ -76,7 +76,9 @@ def _parse_projection(node: object) -> _BoundProjection | None:
     bound = linear_fx.bind_arguments(node)
     if bound is None or not isinstance(bound.get("input"), torch.fx.Node):
         return None
-    if name == _CONVROT_INT8_LINEAR and bound.get("activation_fn") is not None:
+    if name == _CONVROT_INT8_LINEAR and (
+        bound.get("activation_fn") is not None or bound.get("block_scales") is not None
+    ):
         return None
     if name in (_NVFP4_LINEAR, _CONVROT_NVFP4_LINEAR) and bound.get("weight_only") is True:
         return None

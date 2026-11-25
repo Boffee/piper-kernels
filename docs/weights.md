@@ -9,6 +9,7 @@ calibration, and model quality.
 | Format | Stored representation | Execution |
 |---|---|---|
 | `ConvRotInt8Tensor` | Grouped rotation, INT8 values, FP32 scale per output | Linear and Conv3D, with optimized NVIDIA/AMD kernels and portable fallback; embedding lookups. |
+| `ConvRotTrellisTensor` | Packed 3–6 bpw trellis bitstreams, FP8 block scales, FP32 row scale | Linear (`F.linear`) via Triton kernels on supported NVIDIA/AMD GPUs and CPU fallback. |
 | `PiperNVFP4Tensor` | Packed FP4 values, FP8 block scales, optional FP32 global scale | Native W4A4 linear and fusions target exact NVIDIA SM120; weight-only W4A16 (`act_quant_kwargs=None`) targets NVIDIA SM75+ and supported AMD ROCm GPUs. |
 | `ConvRotNVFP4Tensor` | NVFP4 in a grouped rotated basis | Same W4A4 and W4A16 GPU targets, plus a CPU reference fallback for weight-only W4A16. |
 
@@ -369,17 +370,26 @@ same scale and activation options as `from_hp`, including
 [INT8](../src/piper_kernels/weights/convrot/int8/tensor.py) and
 [NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) constructors.
 
-## Encode and decode trellis-coded storage
+## Encode, execute, and decode trellis-coded weights
 
 Trellis coding packs a rotated ConvRot INT8 weight to 3–6 bits per weight for
-offline export and decodes it back into ordinary ConvRot INT8 storage at load
-time (`block_size <= 256` independent of ConvRot `group_size`):
+offline export (`block_size <= 256`, independent of ConvRot `group_size`):
 
 ```python
 from piper_kernels.trellis import TrellisStorage
+from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
 
 storage = TrellisStorage.from_hp(weight, group_size=256, bits_per_weight=4.5)
 
+# Keep packed trellis storage in memory for direct F.linear execution:
+trellis_weight = ConvRotTrellisTensor.from_storage(
+    storage,
+    group_size=256,
+    logical_dtype=weight.dtype,
+)
+output = torch.nn.functional.linear(input, trellis_weight)
+
+# Or decode at load time into ordinary ConvRot INT8 storage:
 int8_weight = ConvRotInt8Tensor.from_trellis(
     storage.bitstreams,  # uint8 [out, in / 256, 143]
     storage.block_scales,  # float8_e4m3fn [out, in / 256]
@@ -390,17 +400,28 @@ int8_weight = ConvRotInt8Tensor.from_trellis(
 int8_weight.copy_from_trellis_(storage.bitstreams, storage.block_scales, storage.scale)
 ```
 
+`ConvRotTrellisTensor` also wraps checkpoint storage zero-copy via
+`ConvRotTrellisTensor.from_quantized(...)`, accepts `TrellisStorage.from_hp`
+arguments directly via `ConvRotTrellisTensor.from_hp(...)`, and supports
+`dequantize()`, transposed `mm`/`addmm`/`matmul`, and CPU execution; small
+batches keep high-precision activations while larger batches use dynamic INT8
+activation quantization on supported W8A8 backends (`F.embedding`, sharding,
+FSDP2, and in-place weight updates are unsupported on `ConvRotTrellisTensor`).
+
 A checkpoint stores `(bitstreams, block_scales, scale, block_size, group_size)`.
 `TrellisStorage.from_hp` also accepts an exact `bytes_per_block` instead of
 `bits_per_weight`, and `piper_kernels.trellis` exports `TrellisLayout`,
-`resolve_block_size`, and `resolve_layout`. Both `from_trellis` and
-`copy_from_trellis_` accept optional `row_widths` (`uint8 [out]`) with 1-D
-row-concatenated `bitstreams` (`uint8 [total_bytes]`), where valid row widths
-(`3–6` code bits per weight) and bitstream capacity are caller preconditions.
-`TrellisStorage.from_hp` requires an NVIDIA SM80+ GPU and validates finite input
-weights. Decoding requires a supported Triton GPU (validated on NVIDIA, compile
-coverage only on AMD), reuses contiguous `scale` storage, and supports in-place
-refills via `copy_from_trellis_`; see [trellis format details](../src/piper_kernels/trellis/README.md).
+`resolve_block_size`, and `resolve_layout`. `ConvRotTrellisTensor.from_quantized`,
+`ConvRotInt8Tensor.from_trellis`, and `copy_from_trellis_` accept optional
+`row_widths` (`uint8 [out]`) with 1-D row-concatenated `bitstreams`
+(`uint8 [total_bytes]`), where valid row widths (`3–6` code bits per weight)
+and bitstream capacity are caller preconditions. `TrellisStorage.from_hp`
+requires an NVIDIA SM80+ GPU and validates finite input weights. GPU decoding and
+execution require a supported Triton GPU (validated on NVIDIA decode and AMD
+RDNA4 decode/execution hardware, with offline compile coverage for NVIDIA direct
+execution and additional AMD targets), reuse contiguous `scale` storage, and
+support in-place `ConvRotInt8Tensor` refills via `copy_from_trellis_`; see
+[trellis format details](../src/piper_kernels/trellis/README.md).
 
 ## Shard a quantized weight
 

@@ -51,28 +51,58 @@ def _decode_e4m3(code):
 
 
 @triton.jit
-def _extract_states(block_ptr_1d, block_bytes, stream_bytes, stream_bytes_2d, block_mask, mask,
-                    start_bits, head_bits, tail_bits):  # fmt: skip
-    """Extract 16-bit cyclic stream windows using one block-level wrap-byte load."""
-    b0 = tl.load(block_ptr_1d, mask=block_mask & (stream_bytes > 0), other=0).to(tl.uint32)
-    b1 = tl.load(block_ptr_1d + 1, mask=block_mask & (stream_bytes > 1), other=0).to(tl.uint32)
-    wrap_u16 = (b0 << 8) | b1
+def _decode_states_to_q_fp32(states, scale_codes):
+    """Decode 16-bit trellis states and raw E4M3 scale codes to quantized INT8 values in FP32."""
+    x = states * _LCG_MULTIPLIER + _LCG_INCREMENT
+    numerators = ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)).to(tl.int32)
+    numerators -= _CODE_OFFSET
+    multipliers = _decode_e4m3(scale_codes.to(tl.uint32)) * _CODE_RECIPROCAL
+    scaled = numerators.to(tl.float32) * multipliers[:, None]
+    return libdevice.rint(tl.clamp(scaled, -127.0, 127.0))
 
+
+@triton.jit
+def _bit_window_params(start_bits, stream_bits):
+    """Compute closed-form byte indices and cyclic 16-bit head/tail masks."""
+    head_bits = tl.minimum(stream_bits - start_bits, _STATE_BITS)
+    tail_bits = _STATE_BITS - head_bits
     byte = start_bits >> 3
     bit_in_byte = start_bits & 7
-    w0 = tl.load(block_bytes + byte, mask=mask & (byte < stream_bytes_2d), other=0).to(tl.uint32)
-    w1 = tl.load(block_bytes + byte + 1, mask=mask & (byte + 1 < stream_bytes_2d), other=0).to(
-        tl.uint32
-    )
-    w2 = tl.load(block_bytes + byte + 2, mask=mask & (byte + 2 < stream_bytes_2d), other=0).to(
-        tl.uint32
-    )
-    window = (w0 << 16) | (w1 << 8) | w2
     shift = (24 - bit_in_byte - head_bits).to(tl.uint32)
     head_mask = (tl.full(start_bits.shape, 1, tl.uint32) << head_bits.to(tl.uint32)) - 1
+    tail_shift = (16 - tail_bits).to(tl.uint32)
+    has_tail = tail_bits > 0
+    tail_bits_u32 = tail_bits.to(tl.uint32)
+    return byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift
+
+
+@triton.jit
+def _load_cyclic_states(
+    block_ptr_1d,
+    block_bytes,
+    byte,
+    shift,
+    head_mask,
+    has_tail,
+    tail_bits_u32,
+    tail_shift,
+    b0_mask,
+    b1_mask,
+    m0,
+    m1,
+    m2,
+):
+    """Load three stream bytes + two wrap bytes and assemble 16-bit cyclic trellis states."""
+    b0 = tl.load(block_ptr_1d, mask=b0_mask, other=0).to(tl.uint32)
+    b1 = tl.load(block_ptr_1d + 1, mask=b1_mask, other=0).to(tl.uint32)
+    wrap_u16 = (b0 << 8) | b1
+    w0 = tl.load(block_bytes + byte, mask=m0, other=0).to(tl.uint32)
+    w1 = tl.load(block_bytes + byte + 1, mask=m1, other=0).to(tl.uint32)
+    w2 = tl.load(block_bytes + byte + 2, mask=m2, other=0).to(tl.uint32)
+    window = (w0 << 16) | (w1 << 8) | w2
     head = (window >> shift) & head_mask
-    tail = tl.where(tail_bits > 0, wrap_u16[:, None] >> (16 - tail_bits).to(tl.uint32), 0)
-    return (head << tail_bits.to(tl.uint32)) | tail
+    tail = tl.where(has_tail, wrap_u16[:, None] >> tail_shift, 0)
+    return (head << tail_bits_u32) | tail
 
 
 @triton.jit(
@@ -128,46 +158,41 @@ def decode_int8_kernel(
             row_step_bits[:, None] * clamped_steps[None, :]
             + row_wide_steps[:, None] * (clamped_steps[None, :] + 1) // denom
         )
-        head_bits = tl.minimum(row_bits[:, None] - start_bits, _STATE_BITS)
-        tail_bits = _STATE_BITS - head_bits
+        stream_bits = row_bits[:, None]
         block_ptr_1d = bitstreams + base
-        block_bytes = block_ptr_1d[:, None]
         # Bound loads to bitstreams even if caller-owned row_widths are malformed.
         remaining_bytes = tl.maximum(bitstreams_bytes - base, 0)
         stream_bytes = tl.minimum(width.to(tl.int64), remaining_bytes).to(tl.int32)
         stream_bytes_2d = stream_bytes[:, None]
     else:
         offsets = step_bits * clamped_steps + (clamped_steps + 1) * num_wide_steps // denom
-        head_bits = tl.minimum(block_bits - offsets, _STATE_BITS)
-        tail_bits = _STATE_BITS - head_bits
         block_ptr_1d = bitstreams + blocks.to(tl.int64) * bytes_per_block
-        block_bytes = block_ptr_1d[:, None]
         start_bits = tl.broadcast_to(offsets[None, :], (tile_blocks, tile_steps))
-        head_bits = tl.broadcast_to(head_bits[None, :], (tile_blocks, tile_steps))
-        tail_bits = tl.broadcast_to(tail_bits[None, :], (tile_blocks, tile_steps))
+        stream_bits = block_bits
         stream_bytes = tl.full((tile_blocks,), bytes_per_block, tl.int32)
         stream_bytes_2d = bytes_per_block
 
-    states = _extract_states(
+    byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift = _bit_window_params(
+        start_bits, stream_bits
+    )
+    states = _load_cyclic_states(
         block_ptr_1d,
-        block_bytes,
-        stream_bytes,
-        stream_bytes_2d,
-        block_mask,
-        mask,
-        start_bits,
-        head_bits,
-        tail_bits,
+        block_ptr_1d[:, None],
+        byte,
+        shift,
+        head_mask,
+        has_tail,
+        tail_bits_u32,
+        tail_shift,
+        block_mask & (stream_bytes > 0),
+        block_mask & (stream_bytes > 1),
+        mask & (byte < stream_bytes_2d),
+        mask & ((byte + 1) < stream_bytes_2d),
+        mask & ((byte + 2) < stream_bytes_2d),
     )
 
-    x = states * _LCG_MULTIPLIER + _LCG_INCREMENT
-    numerators = ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)).to(tl.int32)
-    numerators -= _CODE_OFFSET
-
     scale_codes = tl.load(block_scales + blocks.to(tl.int64), mask=block_mask, other=0)
-    multipliers = _decode_e4m3(scale_codes.to(tl.uint32)) * _CODE_RECIPROCAL
-    scaled = numerators.to(tl.float32) * multipliers[:, None]
-    values = libdevice.rint(tl.clamp(scaled, -127.0, 127.0)).to(tl.int8)
+    values = _decode_states_to_q_fp32(states, scale_codes).to(tl.int8)
     destination = blocks.to(tl.int64)[:, None] * denom + steps[None, :]
     tl.store(qdata + destination, values, mask=mask)
 
@@ -210,12 +235,25 @@ def decode_int8_out(
         )
 
 
+def compute_row_offsets(row_widths: torch.Tensor) -> torch.Tensor:
+    """Compute per-row byte-offset prefixes (in blocks) for variable-row trellis streams."""
+    rows = row_widths.shape[0]
+    row_offsets = torch.empty(rows, dtype=torch.int64, device=row_widths.device)
+    if rows > 0:
+        row_offsets[:1].zero_()
+    if rows > 1:
+        torch.cumsum(row_widths[:-1], dim=0, dtype=torch.int64, out=row_offsets[1:])
+    return row_offsets
+
+
 def decode_variable_rows_int8_out(
     bitstreams: torch.Tensor,
     block_scales: torch.Tensor,
     row_widths: torch.Tensor,
     block_size: int,
     qdata: torch.Tensor,
+    *,
+    row_offsets: torch.Tensor | None = None,
 ) -> None:
     """Decode variable-width row streams ``[total_bytes]`` and uint8 E4M3 scales ``[R, B]``.
 
@@ -230,16 +268,15 @@ def decode_variable_rows_int8_out(
     tile_steps = triton.next_power_of_2(block_size)
     grid = (triton.cdiv(num_blocks, _BLOCKS_PER_PROGRAM),)
     with device_context(bitstreams.device):
-        row_offsets = torch.empty(rows, dtype=torch.int64, device=bitstreams.device)
-        row_offsets[:1].zero_()
-        if rows > 1:
-            torch.cumsum(row_widths[:-1], dim=0, dtype=torch.int64, out=row_offsets[1:])
+        resolved_row_offsets = (
+            compute_row_offsets(row_widths) if row_offsets is None else row_offsets
+        )
         decode_int8_kernel[grid](
             bitstreams,
             block_scales.view(-1),
             qdata,
             row_widths,
-            row_offsets,
+            resolved_row_offsets,
             num_blocks,
             blocks_per_row,
             bitstreams.numel(),
@@ -256,4 +293,9 @@ def decode_variable_rows_int8_out(
         )
 
 
-__all__ = ["decode_int8_kernel", "decode_int8_out", "decode_variable_rows_int8_out"]
+__all__ = [
+    "compute_row_offsets",
+    "decode_int8_kernel",
+    "decode_int8_out",
+    "decode_variable_rows_int8_out",
+]

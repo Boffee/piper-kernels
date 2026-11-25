@@ -15,29 +15,34 @@ from piper_kernels.weights.convrot.int8._quantization import (
     validate_activation_scale,
     validate_storage,
 )
+from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
+from piper_kernels.weights.convrot.trellis.tensor import (
+    validate_storage as validate_trellis_storage,
+)
 
 from . import _backend, _ops, reference
 
 
-def _validate_linear(
+def _validate_linear_operands(
     input: torch.Tensor,  # noqa: A002
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    dtype: torch.dtype,
-    group_size: int,
-    bias: torch.Tensor | None,
+    *,
+    out_features: int,
     expected_features: int,
+    weight_device: torch.device,
+    dtype: torch.dtype,
+    scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    extra_grad_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """Validate one linear and canonicalize its optional bias."""
-    validate_storage(qdata, scale, group_size, dtype)
+    """Validate input, bias, and autograd contracts shared by ConvRot linears."""
     if input.ndim == 0 or input.shape[-1] != expected_features:
         actual = 0 if input.ndim == 0 else input.shape[-1]
         raise ValueError(
             f"ConvRot linear input has {actual} features, expected {expected_features}"
         )
-    if input.device != qdata.device:
+    if input.device != weight_device:
         raise ValueError(
-            f"ConvRot input and weight must share a device, got {input.device}/{qdata.device}"
+            f"ConvRot input and weight must share a device, got {input.device}/{weight_device}"
         )
     if input.dtype is not dtype:
         raise ValueError(
@@ -51,7 +56,7 @@ def _validate_linear(
             raise TypeError(
                 f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}"
             )
-        expected_bias_shape = (qdata.shape[0],)
+        expected_bias_shape = (out_features,)
         if tuple(bias.shape) != expected_bias_shape:
             raise ValueError(
                 f"ConvRot linear bias must have shape {expected_bias_shape}, "
@@ -60,19 +65,44 @@ def _validate_linear(
         if bias.device != input.device:
             raise ValueError(
                 "ConvRot input, weight, and bias must share a device, "
-                f"got {input.device}/{qdata.device}/{bias.device}"
+                f"got {input.device}/{weight_device}/{bias.device}"
             )
         _bias.validate_dtype(bias, "ConvRot linear")
         if bias.layout is not torch.strided:
             raise ValueError("ConvRot linear bias must use strided layout")
 
     if torch.is_grad_enabled() and (
-        input.requires_grad or scale.requires_grad or (bias is not None and bias.requires_grad)
+        input.requires_grad
+        or scale.requires_grad
+        or (extra_grad_tensor is not None and extra_grad_tensor.requires_grad)
+        or (bias is not None and bias.requires_grad)
     ):
         raise RuntimeError(
-            "ConvRot INT8 linear does not support autograd; detach its inputs or use no_grad"
+            "ConvRot linear does not support autograd; detach its inputs or use no_grad"
         )
     return None if bias is None else bias.contiguous()
+
+
+def _validate_linear(
+    input: torch.Tensor,  # noqa: A002
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    dtype: torch.dtype,
+    group_size: int,
+    bias: torch.Tensor | None,
+    expected_features: int,
+) -> torch.Tensor | None:
+    """Validate one INT8 linear and canonicalize its optional bias."""
+    validate_storage(qdata, scale, group_size, dtype)
+    return _validate_linear_operands(
+        input,
+        out_features=qdata.shape[0],
+        expected_features=expected_features,
+        weight_device=qdata.device,
+        dtype=dtype,
+        scale=scale,
+        bias=bias,
+    )
 
 
 def linear(
@@ -142,12 +172,64 @@ def linear(
 
 def convrot_int8_linear(
     input: torch.Tensor,  # noqa: A002
-    weight: ConvRotInt8Tensor,
+    weight: ConvRotInt8Tensor | ConvRotTrellisTensor,
     bias: torch.Tensor | None = None,
     *,
     activation_fn: InputActivation | None = None,
 ) -> torch.Tensor:
-    """Apply an optional input activation followed by a ConvRot INT8 linear."""
+    """Apply an optional input activation followed by a ConvRot INT8 or Trellis linear."""
+    if isinstance(weight, ConvRotTrellisTensor):
+        if not isinstance(input, torch.Tensor):
+            raise TypeError(
+                "ConvRot Trellis linear requires a tensor input and ConvRotTrellisTensor weight"
+            )
+        if activation_fn is not None:
+            raise NotImplementedError(
+                "ConvRot Trellis linear does not support fused input activations"
+            )
+        require_untransposed(weight, "linear")
+        if bias is not None and not isinstance(bias, torch.Tensor):
+            raise TypeError(
+                f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}"
+            )
+        converted_input, converted_weight, bias = apply_linear_autocast(input, weight, bias)
+        assert isinstance(converted_weight, ConvRotTrellisTensor)
+        out_features, in_features, _ = validate_trellis_storage(
+            converted_weight.bitstreams,
+            converted_weight.block_scales,
+            converted_weight.scale,
+            converted_weight.block_size,
+            converted_weight.group_size,
+            converted_weight.dtype,
+            row_widths=converted_weight.row_widths,
+            require_contiguous=True,
+        )
+        canonical_bias = _validate_linear_operands(
+            converted_input,
+            out_features=out_features,
+            expected_features=in_features,
+            weight_device=converted_weight.bitstreams.device,
+            dtype=converted_weight.dtype,
+            scale=converted_weight.scale,
+            bias=bias,
+            extra_grad_tensor=converted_weight.block_scales,
+        )
+        return _ops.linear(
+            converted_input,
+            converted_weight.bitstreams,
+            converted_weight.scale,
+            canonical_bias,
+            converted_weight.group_size,
+            None,
+            None,
+            converted_weight.block_scales,
+            converted_weight.row_widths,
+            converted_weight.block_size,
+        )
+    if not isinstance(weight, ConvRotInt8Tensor):
+        raise TypeError(
+            "ConvRot linear requires a ConvRotInt8Tensor or ConvRotTrellisTensor weight"
+        )
     weight._require_matrix("linear")
     require_untransposed(weight, "linear")
     converted_input, converted_weight, bias = apply_linear_autocast(input, weight, bias)
@@ -171,9 +253,12 @@ def linear_dispatch(
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
     linear_input, weight, bias = bind_linear_arguments(args, kwargs)
-    if not isinstance(linear_input, torch.Tensor) or not isinstance(weight, ConvRotInt8Tensor):
+    if not isinstance(linear_input, torch.Tensor) or not isinstance(
+        weight, (ConvRotInt8Tensor, ConvRotTrellisTensor)
+    ):
         raise TypeError(
-            "ConvRot linear dispatch requires a tensor input and ConvRotInt8Tensor weight"
+            "ConvRot linear dispatch requires a tensor input and "
+            "ConvRotInt8Tensor or ConvRotTrellisTensor weight"
         )
     if bias is not None and not isinstance(bias, torch.Tensor):
         raise TypeError(f"ConvRot linear bias must be a tensor or None, got {type(bias).__name__}")

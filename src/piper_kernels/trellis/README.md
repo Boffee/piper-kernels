@@ -1,11 +1,10 @@
 # Trellis-coded weights
 
-Trellis coding stores a ConvRot INT8 weight in 3 to 6 bits per weight. It is a
-storage and transfer format: `TrellisStorage.from_hp` encodes a weight once, and
-`ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` decode it into ordinary
-ConvRot INT8 storage, so execution uses the INT8 kernels unchanged. This README
-owns the format and its encoder; the
-[weights guide](../../../docs/weights.md#encode-and-decode-trellis-coded-storage)
+Trellis coding stores a ConvRot INT8 weight in 3 to 6 bits per weight. It can be
+executed directly in memory via `ConvRotTrellisTensor` (`F.linear`) or decoded
+at load time via `ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` into
+ordinary ConvRot INT8 storage. This README owns the format and its encoder; the
+[weights guide](../../../docs/weights.md#encode-execute-and-decode-trellis-coded-weights)
 shows the API.
 
 The code is QTIP's bitshift trellis with its 1MAD code ([Tseng et al., 2024,
@@ -31,13 +30,13 @@ the tensors, a checkpoint needs only the block size `T`, the ConvRot group size
 and the logical dtype; the last two are stored for ConvRot INT8 already. Because
 each tensor's rate comes from its own shape, rates can differ between tensors.
 
-`ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` also accept a
-variable-row layout via `row_widths` (`uint8 [out]`): `bitstreams` becomes 1-D
-`uint8 [total_bytes]`, storing each row `r`'s `in / T` blocks of `row_widths[r]`
-bytes back-to-back with row byte offsets `(in / T) · prefix_sum(row_widths)`.
-Each row width must lie in `[⌈3·T / 8⌉, ⌊6·T / 8⌋]` and `(in / T) · sum(row_widths)`
-must fit within `bitstreams.numel()`; both are caller preconditions (no host readback
-or synchronization at decode time).
+`ConvRotTrellisTensor.from_quantized`, `ConvRotInt8Tensor.from_trellis`, and
+`copy_from_trellis_` also accept a variable-row layout via `row_widths`
+(`uint8 [out]`): `bitstreams` becomes 1-D `uint8 [total_bytes]`, storing each row
+`r`'s `in / T` blocks of `row_widths[r]` bytes back-to-back with row byte offsets
+`(in / T) · prefix_sum(row_widths)`. Each row width must lie in `[⌈3·T / 8⌉,
+⌊6·T / 8⌋]` and `(in / T) · sum(row_widths)` must fit within `bitstreams.numel()`;
+both are caller preconditions (no host readback or synchronization at decode time).
 
 `piper_kernels.trellis` exports `TrellisLayout`, `resolve_block_size`, and
 `resolve_layout` alongside `TrellisStorage`.
@@ -70,10 +69,12 @@ A block's `B` bits are stored most significant bit first.
 
 Both products are single IEEE FP32 multiplies of exactly representable values, so
 CUDA, HIP and the PyTorch reference decode identical INT8 values by construction.
-Tests confirm this on NVIDIA hardware; on AMD the kernel has so far only been
-compiled (gfx942, gfx1201), not run. Scales must not
-be NaN encodings (`0x7F`, `0xFF`); this is a caller precondition, not a runtime
-check.
+Tests confirm decoding on NVIDIA hardware and both decoding and direct
+`ConvRotTrellisTensor` linear execution on AMD RX 9070 XT (`gfx1201`); NVIDIA
+direct `ConvRotTrellisTensor` execution (`sm75`, `sm80`, `sm89`, `sm120`) and
+AMD `gfx942`, `gfx1100`, and `gfx1151` have offline compile coverage only. Scales
+must not be NaN encodings (`0x7F`, `0xFF`); this is a caller precondition, not a
+runtime check.
 
 ## Layout limits
 
@@ -128,7 +129,7 @@ On an RTX 5090 it decodes about 680–730 G weights/s for uniform 256-weight blo
 (up from ~465–520 G weights/s) and about 490–590 G weights/s for variable-row streams
 (up from ~240–265 G weights/s), consuming packed bytes well above pinned PCIe copy
 bandwidth (33 GB/s measured), so blocks are stored packed rather than padded to words.
-It has not been measured on AMD, including wave64 targets such as gfx942.
+Wave64 targets such as `gfx942` have compile coverage only.
 [`_reference.py`](_reference.py) is the PyTorch oracle; tests check both against
 blocks encoded by the research encoder.
 

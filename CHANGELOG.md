@@ -7,6 +7,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Direct `F.linear` execution for packed ConvRot trellis weights via
+  `piper_kernels.weights.convrot.trellis.ConvRotTrellisTensor` (supporting both
+  uniform and variable-row bitstreams, `dequantize()`, and `torch.compile`), using
+  fused in-register high-precision decode at small batches and bounded-scratch W8A8
+  execution at larger batches. Validated on CPU and AMD RX 9070 XT (`gfx1201`);
+  NVIDIA `sm75`/`sm80`/`sm89`/`sm120` and AMD `gfx942`/`gfx1100`/`gfx1151` targets
+  validated via offline compilation.
 - Offload-first single-token (`M = 1`), small-batch, and prefill (`M > 1`) quantized MoE
   FFN execution (`piper_kernels.moe`: `MoEWeights`, `PreparedMoEInput`, `prepare_moe_input`,
   and `moe_ffn`) across expert-major `[num_slots, ...]` slabs for NVFP4 W4A16, ConvRot NVFP4

@@ -4,9 +4,12 @@ Fake implementations describe shared tensor contracts without selecting hardware
 Runtime bodies resolve implementations again, including after compiler rewrites.
 """
 
+import math
+
 import torch
 
 from piper_kernels._input_activations import input_activation_width
+from piper_kernels._triton import runtime
 
 from . import _backend
 
@@ -20,8 +23,46 @@ def linear(
     group_size: int,
     activation_fn: str | None = None,
     input_scale: torch.Tensor | None = None,
+    block_scales: torch.Tensor | None = None,
+    row_widths: torch.Tensor | None = None,
+    block_size: int = 0,
 ) -> torch.Tensor:
     """Dispatch the stable linear operation to a supported implementation."""
+    if block_scales is not None:
+        out_features, blocks_per_row = block_scales.shape
+        leading_shape = input.shape[:-1]
+        rows = math.prod(leading_shape)
+        if input.device.type == "meta" or rows == 0 or out_features == 0:
+            return input.new_empty((*leading_shape, out_features))
+        if blocks_per_row == 0:
+            if bias is None:
+                return input.new_zeros((*leading_shape, out_features))
+            return bias.to(input.dtype).expand(*leading_shape, out_features).clone()
+        if runtime.supports_device(input.device):
+            from . import trellis_triton  # noqa: PLC0415
+
+            return trellis_triton.linear(
+                input,
+                weight_qdata,
+                block_scales,
+                weight_scale,
+                row_widths,
+                bias,
+                block_size,
+                group_size,
+            )
+        from . import reference  # noqa: PLC0415
+
+        return reference.linear_trellis_a16(
+            input,
+            weight_qdata,
+            block_scales,
+            weight_scale,
+            row_widths,
+            bias,
+            block_size,
+            group_size,
+        )
     return _backend.require_linear_backend(input).linear(
         input, weight_qdata, weight_scale, bias, group_size, activation_fn, input_scale
     )
@@ -30,14 +71,17 @@ def linear(
 @linear.register_fake
 def _linear_fake(
     input: torch.Tensor,  # noqa: A002
-    weight_qdata: torch.Tensor,
-    _weight_scale: torch.Tensor,
+    _weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
     _bias: torch.Tensor | None,
     _group_size: int,
     _activation_fn: str | None = None,
     _input_scale: torch.Tensor | None = None,
+    _block_scales: torch.Tensor | None = None,
+    _row_widths: torch.Tensor | None = None,
+    _block_size: int = 0,
 ) -> torch.Tensor:
-    return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
+    return input.new_empty((*input.shape[:-1], weight_scale.shape[0]))
 
 
 @torch.library.custom_op("piper_kernels::convrot_int8_prepare_input", mutates_args=())
