@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from piper_kernels.weights.nvfp4.tensor import PiperNVFP4Tensor
 
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-_IGNORED_COPY_METADATA = frozenset({"dtype", "orig_dtype", "transposed", "use_triton_kernel"})
 
 
 class _FlatQuantizedWeightView(torch.Tensor):
@@ -648,78 +647,11 @@ def _new_zeros_dispatch(
     return cast(torch.Tensor, type(weight).__tensor_unflatten__(tensors, updated, None, None))
 
 
-def _copy_dispatch(
-    _func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> torch.Tensor:
-    dst = cast("QuantizedWeight", args[0])
-    src = args[1]
-    non_blocking = bool(args[2] if len(args) > 2 else kwargs.get("non_blocking", False))
-    if type(dst) is not type(src):
-        raise NotImplementedError(f"cannot copy {type(src).__name__} into {type(dst).__name__}")
-    src_weight = cast("QuantizedWeight", src)
-    dst_scale = _require_fsdp_weight(dst, "copy_")
-    src_scale = _require_fsdp_weight(src_weight, "copy_")
-    if tuple(dst.shape) != tuple(src_weight.shape):
-        raise RuntimeError(
-            f"shape mismatch in quantized weight copy_: {tuple(dst.shape)} vs "
-            f"{tuple(src_weight.shape)}"
-        )
-
-    dst_names, dst_attrs = dst.__tensor_flatten__()
-    src_names, src_attrs = src_weight.__tensor_flatten__()
-    dst_meta = {k: v for k, v in dst_attrs.items() if k not in _IGNORED_COPY_METADATA}
-    src_meta = {k: v for k, v in src_attrs.items() if k not in _IGNORED_COPY_METADATA}
-    if dst_meta != src_meta:
-        raise NotImplementedError(
-            f"quantized metadata mismatch in {type(dst).__name__} copy_: {dst_meta} vs {src_meta}"
-        )
-    src_optional = _optional_tensors(src_weight, src_names)
-    _validate_optional_tensor_keys(dst, src_optional, target_names=dst_names)
-
-    dst.qdata.copy_(src_weight.qdata, non_blocking=non_blocking)
-    if _is_int8_weight(dst):
-        dst_scale.copy_(src_scale, non_blocking=non_blocking)
-    else:
-        dst_scale.view(torch.uint8).copy_(src_scale.view(torch.uint8), non_blocking=non_blocking)
-    _copy_optional_tensors(dst, src_optional, non_blocking=non_blocking)
-    return dst
-
-
-def _is_pinned_dispatch(
-    func: Callable[..., object],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> bool:
-    weight = cast("QuantizedWeight", args[0])
-    names, _ = weight.__tensor_flatten__()
-    return all(bool(func(getattr(weight, name), *args[1:], **kwargs)) for name in names)
-
-
-def _pin_memory_dispatch(
-    func: Callable[..., torch.Tensor],
-    _types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> torch.Tensor:
-    weight = cast("QuantizedWeight", args[0])
-    return cast(
-        torch.Tensor,
-        weight._apply_fn_to_data(lambda value: func(value, *args[1:], **kwargs)),
-    )
-
-
 def register_fsdp_ops(cls: type[TorchAOBaseTensor]) -> None:
-    """Register FSDP2 parameter-sharding and CPU-offload ATen handlers."""
+    """Register FSDP2 parameter-sharding and unshard ATen handlers."""
     aten = torch.ops.aten
     cls.implements(aten.split.Tensor)(_split_dispatch)
     cls.implements(aten.new_zeros.default)(_new_zeros_dispatch)
-    cls.implements(aten.copy_.default)(_copy_dispatch)
-    cls.implements(aten.is_pinned.default)(_is_pinned_dispatch)
-    cls.implements(aten._pin_memory.default)(_pin_memory_dispatch)
 
 
 __all__ = [

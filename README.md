@@ -23,7 +23,7 @@ and accelerator dependencies:
 
 | Extra | Use |
 |---|---|
-| `convrot` | ConvRot INT8 weights |
+| `convrot` | ConvRot INT8 and Trellis weights |
 | `nvfp4` | Ordinary and ConvRot NVFP4 weights |
 | `triton` | Optimized GPU backends |
 

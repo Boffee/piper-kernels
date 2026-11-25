@@ -10,10 +10,13 @@ from torchao.prototype.mx_formats.utils import from_blocked, to_blocked
 from piper_kernels.weights._dispatch import QuantizedWeight
 from piper_kernels.weights._views import require_untransposed
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
+from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor, _layout
 
 
 def _validate_partition(weight: QuantizedWeight, dim: int, start: int, length: int) -> int:
+    if isinstance(weight, ConvRotTrellisTensor):
+        raise NotImplementedError("ConvRotTrellisTensor does not support shard_quantized_weight")
     if not isinstance(weight, (ConvRotInt8Tensor, PiperNVFP4Tensor)):
         raise TypeError("shard_quantized_weight requires a Piper quantized weight")
     if weight.ndim != 2:

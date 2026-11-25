@@ -14,12 +14,15 @@ if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
     from .convrot.int8.tensor import ConvRotInt8Tensor
+    from .convrot.trellis.tensor import ConvRotTrellisTensor
     from .nvfp4.tensor import PiperNVFP4Tensor
 type QuantizedWeight = ConvRotInt8Tensor | PiperNVFP4Tensor
-_WeightT = TypeVar("_WeightT", bound="QuantizedWeight")
+type QuantizedWeightWrapper = QuantizedWeight | ConvRotTrellisTensor
+_WrapperT = TypeVar("_WrapperT", bound="QuantizedWeightWrapper")
+_IGNORED_COPY_METADATA = frozenset({"dtype", "orig_dtype", "transposed", "use_triton_kernel"})
 
 
-def require_untransposed(weight: QuantizedWeight, operation: str) -> None:
+def require_untransposed(weight: QuantizedWeightWrapper, operation: str) -> None:
     """Reject operations that would interpret a transpose as canonical storage."""
     if weight.transposed:
         raise NotImplementedError(
@@ -105,18 +108,18 @@ def _explicit_to_copy_args(
 
 
 def to_quantized_weight(
-    tensor: _WeightT,
+    tensor: _WrapperT,
     super_to: Callable[..., object],
     args: tuple[object, ...],
     kwargs: dict[str, object],
     *,
     format_name: str,
-) -> _WeightT:
+) -> _WrapperT:
     """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
     tensor._validate_memory_format(kwargs.get("memory_format"))
     explicit_copy_args = _explicit_to_copy_args(args, kwargs)
     if explicit_copy_args is None:
-        return cast(_WeightT, super_to(*args, **kwargs))
+        return cast(_WrapperT, super_to(*args, **kwargs))
     to_args, to_kwargs = explicit_copy_args
     options = tensor._get_to_kwargs(*to_args, **to_kwargs)
     dtype = options["dtype"]
@@ -125,7 +128,7 @@ def to_quantized_weight(
     device = options["device"]
     non_blocking = options["non_blocking"]
     copied = cast(
-        _WeightT,
+        _WrapperT,
         tensor._apply_fn_to_data(
             lambda value: value.to(
                 device=device,
@@ -135,7 +138,7 @@ def to_quantized_weight(
         ),
     )
     if dtype is not copied.dtype:
-        copied = cast(_WeightT, copied._rebuild_with_logical_dtype(dtype))
+        copied = cast(_WrapperT, copied._rebuild_with_logical_dtype(dtype))
     return copied
 
 
@@ -148,7 +151,7 @@ def register_conversion_ops(cls: type[TorchAOBaseTensor], *, format_name: str) -
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> torch.Tensor:
-        tensor = cast("QuantizedWeight", args[0])
+        tensor = cast("QuantizedWeightWrapper", args[0])
         assert isinstance(tensor, cls)
         arguments = dict(kwargs)
         dtype = arguments.pop("dtype", tensor.dtype)
@@ -177,7 +180,7 @@ def register_conversion_ops(cls: type[TorchAOBaseTensor], *, format_name: str) -
             tensor
             if metadata_only
             else cast(
-                "QuantizedWeight",
+                "QuantizedWeightWrapper",
                 tensor._apply_fn_to_data(
                     lambda value: func(value, device=device, non_blocking=non_blocking)
                 ),
@@ -191,6 +194,89 @@ def register_conversion_ops(cls: type[TorchAOBaseTensor], *, format_name: str) -
         )
 
     cls.implements(torch.ops.aten._to_copy.default)(_to_copy)
+    cls.implements(torch.ops.aten.copy_.default)(_copy_dispatch)
+    cls.implements(torch.ops.aten.is_pinned.default)(_is_pinned_dispatch)
+    cls.implements(torch.ops.aten._pin_memory.default)(_pin_memory_dispatch)
+
+
+def _copy_dispatch(
+    _func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> torch.Tensor:
+    dst = args[0]
+    src = args[1]
+    non_blocking = bool(args[2] if len(args) > 2 else kwargs.get("non_blocking", False))
+    if type(dst) is not type(src):
+        raise NotImplementedError(f"cannot copy {type(src).__name__} into {type(dst).__name__}")
+    dst_weight = cast("QuantizedWeightWrapper", dst)
+    src_weight = cast("QuantizedWeightWrapper", src)
+    dst_tensors = dst_weight._copy_storage_tensors("copy_")
+    src_tensors = src_weight._copy_storage_tensors("copy_")
+    if tuple(dst_weight.shape) != tuple(src_weight.shape):
+        raise RuntimeError(
+            f"shape mismatch in quantized weight copy_: {tuple(dst_weight.shape)} vs "
+            f"{tuple(src_weight.shape)}"
+        )
+
+    _, dst_attrs = dst_weight.__tensor_flatten__()
+    _, src_attrs = src_weight.__tensor_flatten__()
+    dst_meta = {k: v for k, v in dst_attrs.items() if k not in _IGNORED_COPY_METADATA}
+    src_meta = {k: v for k, v in src_attrs.items() if k not in _IGNORED_COPY_METADATA}
+    if dst_meta != src_meta:
+        raise NotImplementedError(
+            f"quantized metadata mismatch in {type(dst_weight).__name__} copy_: "
+            f"{dst_meta} vs {src_meta}"
+        )
+    if set(dst_tensors) != set(src_tensors):
+        raise ValueError(
+            f"quantized weight storage tensors do not match: {sorted(dst_tensors)} "
+            f"vs {sorted(src_tensors)}"
+        )
+    for name, dst_val in dst_tensors.items():
+        src_val = src_tensors[name]
+        if tuple(dst_val.shape) != tuple(src_val.shape) or dst_val.dtype is not src_val.dtype:
+            raise ValueError(
+                f"quantized weight storage tensor {name!r} mismatch in "
+                f"{type(dst_weight).__name__} copy_: "
+                f"{dst_val.dtype} {tuple(dst_val.shape)} vs {src_val.dtype} {tuple(src_val.shape)}"
+            )
+
+    for name, dst_val in dst_tensors.items():
+        src_val = src_tensors[name]
+        if dst_val is not src_val:
+            if dst_val.dtype is torch.float8_e4m3fn:
+                dst_val.view(torch.uint8).copy_(
+                    src_val.view(torch.uint8), non_blocking=non_blocking
+                )
+            else:
+                dst_val.copy_(src_val, non_blocking=non_blocking)
+    return cast(torch.Tensor, dst_weight)
+
+
+def _is_pinned_dispatch(
+    func: Callable[..., object],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> bool:
+    weight = cast("QuantizedWeightWrapper", args[0])
+    names, _ = weight.__tensor_flatten__()
+    return all(bool(func(getattr(weight, name), *args[1:], **kwargs)) for name in names)
+
+
+def _pin_memory_dispatch(
+    func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> torch.Tensor:
+    weight = cast("QuantizedWeightWrapper", args[0])
+    return cast(
+        torch.Tensor,
+        weight._apply_fn_to_data(lambda value: func(value, *args[1:], **kwargs)),
+    )
 
 
 class QuantizedWeightMixin:
@@ -202,7 +288,10 @@ class QuantizedWeightMixin:
 
     def _validate_memory_format(self, memory_format: object) -> None:
         if memory_format not in (None, torch.preserve_format):
-            require_untransposed(cast("QuantizedWeight", self), "to with a different memory format")
+            require_untransposed(
+                cast("QuantizedWeightWrapper", self),
+                "to with a different memory format",
+            )
             if self._contiguous_memory_format_only and memory_format is not torch.contiguous_format:
                 raise NotImplementedError(
                     f"{self._format_name} only supports contiguous memory format"
@@ -236,6 +325,16 @@ class QuantizedWeightMixin:
                 *extra,
             )
         )
+
+    def _copy_storage_tensors(self, operation: str) -> dict[str, torch.Tensor]:
+        from piper_kernels.weights._fsdp import _require_fsdp_weight  # noqa: PLC0415
+
+        weight = cast("QuantizedWeight", self)
+        canonical_scale = _require_fsdp_weight(weight, operation)
+        names, _ = weight.__tensor_flatten__()
+        tensors = {name: getattr(weight, name) for name in names}
+        tensors["scale"] = canonical_scale
+        return tensors
 
     def _update_target(self, _operation: str) -> tuple[Any, tuple[object, ...]]:
         raise NotImplementedError
@@ -304,7 +403,7 @@ class QuantizedWeightMixin:
         return cast(
             Self,
             to_quantized_weight(
-                cast("QuantizedWeight", self),
+                cast("QuantizedWeightWrapper", self),
                 cast(Any, super()).to,
                 args,
                 kwargs,

@@ -10,6 +10,7 @@ import torch
 
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 _GRAD_MODES = [
@@ -18,11 +19,22 @@ _GRAD_MODES = [
 ]
 
 
-@pytest.fixture(params=[ConvRotInt8Tensor, PiperNVFP4Tensor, ConvRotNVFP4Tensor])
+@pytest.fixture(
+    params=[ConvRotInt8Tensor, ConvRotTrellisTensor, PiperNVFP4Tensor, ConvRotNVFP4Tensor]
+)
 def weight(request):
     torch.manual_seed(163)
-    source = torch.randn(32, 64, dtype=torch.bfloat16)
     cls = request.param
+    if cls is ConvRotTrellisTensor:
+        return cls.from_quantized(
+            torch.randint(0, 256, (32, 1, 36), dtype=torch.uint8),
+            (torch.rand(32, 1) + 0.5).to(torch.float8_e4m3fn),
+            torch.rand(32, 1, dtype=torch.float32) * 0.05 + 1e-3,
+            block_size=64,
+            group_size=64,
+            logical_dtype=torch.bfloat16,
+        )
+    source = torch.randn(32, 64, dtype=torch.bfloat16)
     return cls.from_hp(source, **({} if cls is PiperNVFP4Tensor else {"group_size": 64}))
 
 
