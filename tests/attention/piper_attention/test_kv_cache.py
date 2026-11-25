@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import math
+import os
+import shutil
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -956,8 +959,6 @@ def test_cpu_opcheck_and_standalone_dynamic_compile() -> None:
     )
     assert set(res.values()) == {"SUCCESS"}
 
-    counter = CompileCounterWithBackend("inductor")
-
     def _fn(
         k_in: torch.Tensor,
         v_in: torch.Tensor,
@@ -973,39 +974,47 @@ def test_cpu_opcheck_and_standalone_dynamic_compile() -> None:
         freeze_kv_chunks_(k_in, v_in, dyn_pool, s_in)
         return ks.sum()
 
-    compiled = torch.compile(_fn, backend=counter, fullgraph=True, dynamic=True)
-    with torch.no_grad():
-        for num_slots, slot_list in ((5, [0, 3, 1]), (8, [5, -1, 2, 0])):
-            p = PiperKVChunkPool.empty(num_slots, 2, 64, device="cpu", kv_dtype=torch.uint8)
-            _fill_pool_sentinels(p)
-            p_ref = _clone_pool(p)
-            kk = torch.randn((len(slot_list), 2, KV_CHUNK_TOKENS, 64), dtype=torch.bfloat16)
-            vv = torch.randn_like(kk)
-            ss = torch.tensor(slot_list, dtype=torch.int32)
-            compiled(
-                kk,
-                vv,
-                p.key_int8,
-                p.key_scale,
-                p.key_center,
-                p.value_int8,
-                p.value_scale,
-                p.value_mean,
-                ss,
-            )
-            freeze_kv_chunks_reference(
-                kk,
-                vv,
-                p_ref.key_int8,
-                p_ref.key_scale,
-                p_ref.key_center,
-                p_ref.value_int8,
-                p_ref.value_scale,
-                p_ref.value_mean,
-                ss,
-            )
-            _assert_pools_exact(p, p_ref)
-    assert counter.frame_count == 1
+    has_cpu_inductor = (
+        sys.platform != "win32" or shutil.which(os.environ.get("CXX", "cl")) is not None
+    )
+    backends = ("aot_eager", "inductor") if has_cpu_inductor else ("aot_eager",)
+
+    for backend in backends:
+        torch._dynamo.reset()
+        counter = CompileCounterWithBackend(backend)
+        compiled = torch.compile(_fn, backend=counter, fullgraph=True, dynamic=True)
+        with torch.no_grad():
+            for num_slots, slot_list in ((5, [0, 3, 1]), (8, [5, -1, 2, 0])):
+                p = PiperKVChunkPool.empty(num_slots, 2, 64, device="cpu", kv_dtype=torch.uint8)
+                _fill_pool_sentinels(p)
+                p_ref = _clone_pool(p)
+                kk = torch.randn((len(slot_list), 2, KV_CHUNK_TOKENS, 64), dtype=torch.bfloat16)
+                vv = torch.randn_like(kk)
+                ss = torch.tensor(slot_list, dtype=torch.int32)
+                compiled(
+                    kk,
+                    vv,
+                    p.key_int8,
+                    p.key_scale,
+                    p.key_center,
+                    p.value_int8,
+                    p.value_scale,
+                    p.value_mean,
+                    ss,
+                )
+                freeze_kv_chunks_reference(
+                    kk,
+                    vv,
+                    p_ref.key_int8,
+                    p_ref.key_scale,
+                    p_ref.key_center,
+                    p_ref.value_int8,
+                    p_ref.value_scale,
+                    p_ref.value_mean,
+                    ss,
+                )
+                _assert_pools_exact(p, p_ref)
+        assert counter.frame_count == 1
 
 
 @pytest.mark.gpu
