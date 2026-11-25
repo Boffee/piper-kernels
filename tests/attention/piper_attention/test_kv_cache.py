@@ -682,6 +682,129 @@ def test_pool_validation_rejects_malformed_layouts_and_overlaps() -> None:
         )
 
 
+def _finite_intervals_overlap(
+    a_start: int,
+    a_step: int,
+    a_len: int,
+    a_slots: int,
+    b_start: int,
+    b_step: int,
+    b_len: int,
+    b_slots: int,
+) -> bool:
+    for i in range(a_slots):
+        a0 = a_start + i * a_step
+        a1 = a0 + a_len
+        for j in range(b_slots):
+            b0 = b_start + j * b_step
+            if a0 < b0 + b_len and b0 < a1:
+                return True
+    return False
+
+
+@pytest.mark.parametrize("swap_offsets", [False, True])
+def test_finite_slot_different_stride_arena_disjointness_and_collision(
+    swap_offsets: bool,
+) -> None:
+    # With strides (256, 320) and offsets (0, 128), slots stay disjoint for num_slots <= 3
+    # and collide at num_slots == 4; with swapped offsets (128, 0), num_slots == 2 is disjoint
+    # and num_slots == 3 collides at key_center[2] == value_mean[2] == [640, 704).
+    disjoint_counts = (2,) if swap_offsets else (2, 3)
+    collide_count = 3 if swap_offsets else 4
+    off_k, off_v = (128, 0) if swap_offsets else (0, 128)
+
+    for num_slots in disjoint_counts:
+        base = PiperKVChunkPool.empty(num_slots, 1, 64, device="cpu", kv_dtype=torch.uint8)
+        arena = torch.full((1280,), -999.0, dtype=torch.float32)
+        kc = arena.as_strided((num_slots, 1, 64), (256, 64, 1), storage_offset=off_k)
+        vm = arena.as_strided((num_slots, 1, 64), (320, 64, 1), storage_offset=off_v)
+        kc.fill_(101.0)
+        vm.fill_(105.0)
+        pool = PiperKVChunkPool.from_tensors(
+            base.key_int8, base.key_scale, kc, base.value_int8, base.value_scale, vm
+        )
+        ref = _clone_pool(pool)
+        sentinel = _clone_pool(pool)
+        # Mask out written elements so untouched arena padding stays unchanged at -999.0.
+        pad_mask = torch.ones_like(arena, dtype=torch.bool)
+        for s in range(num_slots):
+            pad_mask[off_k + s * 256 : off_k + s * 256 + 64] = False
+            pad_mask[off_v + s * 320 : off_v + s * 320 + 64] = False
+        pad_snap = arena[pad_mask].clone()
+
+        k_in = torch.randn((num_slots - 1, 1, KV_CHUNK_TOKENS, 64), dtype=torch.bfloat16)
+        v_in = torch.randn_like(k_in)
+        slot_ids = torch.arange(num_slots - 1, dtype=torch.int32)
+        with torch.no_grad():
+            freeze_kv_chunks_(k_in, v_in, pool, slot_ids)
+            freeze_kv_chunks_reference(
+                k_in,
+                v_in,
+                ref.key_int8,
+                ref.key_scale,
+                ref.key_center,
+                ref.value_int8,
+                ref.value_scale,
+                ref.value_mean,
+                slot_ids,
+            )
+        _assert_pools_exact(pool, ref)
+        _assert_slot_equal(pool, sentinel, num_slots - 1)
+        torch.testing.assert_close(arena[pad_mask], pad_snap, atol=0, rtol=0)
+
+    base_col = PiperKVChunkPool.empty(collide_count, 1, 64, device="cpu", kv_dtype=torch.uint8)
+    arena_col = torch.empty(1400, dtype=torch.float32)
+    kc_col = arena_col.as_strided((collide_count, 1, 64), (256, 64, 1), storage_offset=off_k)
+    vm_col = arena_col.as_strided((collide_count, 1, 64), (320, 64, 1), storage_offset=off_v)
+    with pytest.raises(ValueError, match="must not overlap in storage"):
+        PiperKVChunkPool.from_tensors(
+            base_col.key_int8,
+            base_col.key_scale,
+            kc_col,
+            base_col.value_int8,
+            base_col.value_scale,
+            vm_col,
+        )
+
+
+def test_finite_slot_arena_overlap_matches_brute_force_oracle() -> None:
+    arena = torch.empty(4096, dtype=torch.float32)
+    for num_slots in (2, 3, 4):
+        base = PiperKVChunkPool.empty(num_slots, 1, 64, device="cpu", kv_dtype=torch.uint8)
+        for a_step in (64, 96, 128, 160, 192):
+            for b_step in (64, 96, 128, 160, 192):
+                for a_off in (0, 64, 96, 128):
+                    for b_off in (0, 64, 96, 128):
+                        kc = arena.as_strided(
+                            (num_slots, 1, 64), (a_step, 64, 1), storage_offset=a_off
+                        )
+                        vm = arena.as_strided(
+                            (num_slots, 1, 64), (b_step, 64, 1), storage_offset=b_off
+                        )
+                        should_overlap = _finite_intervals_overlap(
+                            a_off, a_step, 64, num_slots, b_off, b_step, 64, num_slots
+                        )
+                        if should_overlap:
+                            with pytest.raises(ValueError, match="must not overlap in storage"):
+                                PiperKVChunkPool.from_tensors(
+                                    base.key_int8,
+                                    base.key_scale,
+                                    kc,
+                                    base.value_int8,
+                                    base.value_scale,
+                                    vm,
+                                )
+                        else:
+                            PiperKVChunkPool.from_tensors(
+                                base.key_int8,
+                                base.key_scale,
+                                kc,
+                                base.value_int8,
+                                base.value_scale,
+                                vm,
+                            )
+
+
 def test_meta_and_zero_slot_pools() -> None:
     meta_pool = PiperKVChunkPool.empty(2, 2, 64, device="meta", kv_dtype=torch.uint8)
     meta_k = torch.empty((1, 2, KV_CHUNK_TOKENS, 64), device="meta", dtype=torch.bfloat16)

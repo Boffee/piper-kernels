@@ -261,6 +261,53 @@ def _interval_avoids_periodic_slots(
     return bool(offset >= slot_len and offset + (end - start) <= slot_step)
 
 
+def _min_step_in_mod_range(step: int, mod: int, lo: int, hi: int) -> int | None:
+    """Return smallest integer t >= 0 with ``lo <= (t * step) % mod <= hi``, or ``None``."""
+    if lo == 0:
+        return 0
+    step %= mod
+    if step == 0:
+        return None
+    direct = (lo + step - 1) // step
+    if direct * step <= hi:
+        return direct
+    wraps = _min_step_in_mod_range(mod % step, step, step - (hi % step), step - (lo % step))
+    if wraps is None:
+        return None
+    return (wraps * mod + lo + step - 1) // step
+
+
+def _finite_periodic_spans_disjoint(
+    a_start: int,
+    a_step: int,
+    a_len: int,
+    a_slots: int,
+    b_start: int,
+    b_step: int,
+    b_len: int,
+    b_slots: int,
+) -> bool:
+    if a_step <= 0 or b_step <= 0:
+        return False
+    # Overlap requires lo <= i * a_step - j * b_step <= hi
+    # for some 0 <= i < a_slots and 0 <= j < b_slots.
+    lo = b_start - a_start - a_len + 1
+    hi = b_start - a_start + b_len - 1
+    j_min = max(0, (-hi + b_step - 1) // b_step)
+    j_max = min(b_slots - 1, ((a_slots - 1) * a_step - lo) // b_step)
+    if j_min > j_max:
+        return True
+    width = hi - lo
+    if width >= a_step - 1:
+        return False
+    count = j_max - j_min + 1
+    r0 = (-lo - j_min * b_step) % a_step
+    if r0 <= width:
+        return False
+    first_t = _min_step_in_mod_range((-b_step) % a_step, a_step, a_step - r0, a_step - r0 + width)
+    return first_t is None or first_t >= count
+
+
 def _periodic_spans_disjoint(
     a_start: _SymInt,
     a_step: _SymInt,
@@ -288,13 +335,15 @@ def _periodic_spans_disjoint(
     if a_slots <= 1 or b_slots <= 1:
         return False
     if b_start < a_start:
-        a_start, a_step, a_len, b_start, b_step, b_len = (
+        a_start, a_step, a_len, a_slots, b_start, b_step, b_len, b_slots = (
             b_start,
             b_step,
             b_len,
+            b_slots,
             a_start,
             a_step,
             a_len,
+            a_slots,
         )
     gcd_step: _SymInt
     if a_step == b_step and a_step > 0:
@@ -307,7 +356,19 @@ def _periodic_spans_disjoint(
         return False
     diff = b_start - a_start
     rem = diff if diff < gcd_step else diff % gcd_step
-    return bool(rem >= a_len and (gcd_step - rem) >= b_len)
+    return bool(rem >= a_len and (gcd_step - rem) >= b_len) or (
+        isinstance(a_start, int)
+        and isinstance(b_start, int)
+        and isinstance(a_step, int)
+        and isinstance(a_len, int)
+        and isinstance(a_slots, int)
+        and isinstance(b_step, int)
+        and isinstance(b_len, int)
+        and isinstance(b_slots, int)
+        and _finite_periodic_spans_disjoint(
+            a_start, a_step, a_len, a_slots, b_start, b_step, b_len, b_slots
+        )
+    )
 
 
 def _slot_spans_overlap(first: torch.Tensor, second: torch.Tensor) -> bool:
