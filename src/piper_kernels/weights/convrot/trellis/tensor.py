@@ -31,7 +31,7 @@ from piper_kernels.weights.convrot.int8._quantization import dequantize_weight
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
-    from piper_kernels.trellis import TrellisStorage
+    from piper_kernels.trellis import TrellisHessian, TrellisStorage
 
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -322,6 +322,8 @@ class ConvRotTrellisTensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright:
         group_size: int,
         bits_per_weight: float | None = None,
         bytes_per_block: int | None = None,
+        hessian: torch.Tensor | TrellisHessian | None = None,
+        hessian_damping: float | None = None,
     ) -> ConvRotTrellisTensor:
         """Rotate and trellis-encode a high-precision 2-D weight into a ``ConvRotTrellisTensor``.
 
@@ -335,6 +337,8 @@ class ConvRotTrellisTensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright:
             group_size=group_size,
             bits_per_weight=bits_per_weight,
             bytes_per_block=bytes_per_block,
+            hessian=hessian,
+            hessian_damping=hessian_damping,
         )
         return cls.from_storage(
             storage,

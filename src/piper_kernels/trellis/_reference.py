@@ -44,8 +44,13 @@ def compute_code_numerators(states: torch.Tensor) -> torch.Tensor:
     return (x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24) - CODE_OFFSET
 
 
-def _decode_states_to_int8(states: torch.Tensor, block_scales: torch.Tensor) -> torch.Tensor:
-    numerators = compute_code_numerators(states)
+def decode_states(states: torch.Tensor, block_scales: torch.Tensor) -> torch.Tensor:
+    """INT8 values ``[..., T]`` of 16-bit states ``[..., T]`` and E4M3 scales ``[...]``.
+
+    ``q = clamp(round_half_even(fp32(n) · fp32(scale · R)), ±127)`` with both
+    products single FP32 multiplies, as every backend computes them.
+    """
+    numerators = compute_code_numerators(states.to(torch.int64))
     multipliers = block_scales.to(torch.float32) * CODE_RECIPROCAL
     scaled = numerators.to(torch.float32) * multipliers.unsqueeze(-1)
     return scaled.round().clamp(-_INT8_LIMIT, _INT8_LIMIT).to(torch.int8)
@@ -61,7 +66,7 @@ def decode_reference(
     ``q = clamp(round_half_even(fp32(n) · fp32(scale · R)), ±127)`` with both
     products single FP32 multiplies, as every backend computes them.
     """
-    return _decode_states_to_int8(compute_states(bitstreams, layout), block_scales)
+    return decode_states(compute_states(bitstreams, layout), block_scales)
 
 
 def decode_variable_rows_reference(
@@ -95,7 +100,7 @@ def decode_variable_rows_reference(
     total_bytes = bitstreams.numel()
     if total_bytes == 0:
         states = torch.zeros((rows, blocks_per_row, block_size), dtype=torch.int64, device=device)
-        return _decode_states_to_int8(states, block_scales).reshape(rows, -1)
+        return decode_states(states, block_scales).reshape(rows, -1)
 
     widths = row_widths.to(torch.int64)
     safe_widths = widths.clamp(min=1)
@@ -136,12 +141,13 @@ def decode_variable_rows_reference(
 
     pack24 = (loaded_bytes[0] << 16) | (loaded_bytes[1] << 8) | loaded_bytes[2]
     states = (pack24 >> (8 - bit_in_byte[:, None, :])) & 0xFFFF
-    return _decode_states_to_int8(states, block_scales).reshape(rows, blocks_per_row * block_size)
+    return decode_states(states, block_scales).reshape(rows, blocks_per_row * block_size)
 
 
 __all__ = [
     "compute_code_numerators",
     "compute_states",
     "decode_reference",
+    "decode_states",
     "decode_variable_rows_reference",
 ]

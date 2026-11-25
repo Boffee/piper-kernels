@@ -6,6 +6,12 @@ The package README specifies the format. Encode a weight with
 """
 
 from ._layout import TrellisLayout, resolve_block_size, resolve_layout
-from ._storage import TrellisStorage
+from ._storage import TrellisHessian, TrellisStorage
 
-__all__ = ["TrellisLayout", "TrellisStorage", "resolve_block_size", "resolve_layout"]
+__all__ = [
+    "TrellisHessian",
+    "TrellisLayout",
+    "TrellisStorage",
+    "resolve_block_size",
+    "resolve_layout",
+]

@@ -7,6 +7,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Optional Block-LDLQ Hessian-aware trellis encoding via
+  `piper_kernels.trellis.TrellisHessian` and optional `hessian` / `hessian_damping`
+  arguments on `TrellisStorage.from_hp` and `ConvRotTrellisTensor.from_hp` (preserving
+  per-row `scale` across correlated blocks while reusing pre-factored feedback matrices
+  across weights sharing an input covariance). Validated on CPU and NVIDIA RTX 5090
+  (`sm120`).
 - 2-bit trellis-coded weight storage (`2` to `6` code bits per weight across
   `TrellisLayout`, `TrellisStorage.from_hp`, `ConvRotInt8Tensor.from_trellis`/
   `copy_from_trellis_`, and `ConvRotTrellisTensor` direct `F.linear` execution,

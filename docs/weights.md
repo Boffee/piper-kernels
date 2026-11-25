@@ -433,13 +433,16 @@ FSDP2, and in-place weight updates are unsupported on `ConvRotTrellisTensor`).
 
 A checkpoint stores `(bitstreams, block_scales, scale, block_size, group_size)`.
 `TrellisStorage.from_hp` also accepts an exact `bytes_per_block` instead of
-`bits_per_weight`, and `piper_kernels.trellis` exports `TrellisLayout`,
+`bits_per_weight`, plus optional `hessian` (`[in, in]` unrotated second-moment
+matrix or a reusable `TrellisHessian.from_hessian(hessian, group_size=...)`) and
+`hessian_damping` (default `0.01` for raw tensors) for Hessian-aware Block-LDLQ
+encoding, and `piper_kernels.trellis` exports `TrellisHessian`, `TrellisLayout`,
 `resolve_block_size`, and `resolve_layout`. `ConvRotTrellisTensor.from_quantized`,
 `ConvRotInt8Tensor.from_trellis`, and `copy_from_trellis_` accept optional
 `row_widths` (`uint8 [out]`) with 1-D row-concatenated `bitstreams`
 (`uint8 [total_bytes]`), where valid row widths (`2–6` code bits per weight)
 and bitstream capacity are caller preconditions. `TrellisStorage.from_hp`
-requires an NVIDIA SM80+ GPU and validates finite input weights. GPU decoding and
+requires an NVIDIA SM80+ GPU and validates finite input weights and raw Hessians. GPU decoding and
 execution require a supported Triton GPU (validated on NVIDIA decode and AMD
 RDNA4 decode/execution hardware, with offline compile coverage for NVIDIA direct
 execution and additional AMD targets), reuse contiguous `scale` storage, and

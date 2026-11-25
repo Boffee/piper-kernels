@@ -43,8 +43,8 @@ both are caller preconditions (no host readback or synchronization at decode tim
 `row_widths` bounds and require non-negative `slot_offsets` whose per-slot ranges fit
 within `bitstreams.numel()`.
 
-`piper_kernels.trellis` exports `TrellisLayout`, `resolve_block_size`, and
-`resolve_layout` alongside `TrellisStorage`.
+`piper_kernels.trellis` exports `TrellisHessian`, `TrellisLayout`, `resolve_block_size`,
+and `resolve_layout` alongside `TrellisStorage`.
 
 ## Decoding a block
 
@@ -105,11 +105,20 @@ weight a 256-weight block takes 143 bytes, 4- and 5-bit steps; at 3.5 it takes
 111 bytes, 3- and 4-bit steps; at 2.5 it takes 79 bytes, 2- and 3-bit steps.
 
 The [encoder](_encoder.py) minimizes each block's squared error in the rotated
-basis against the exact INT8 decode, without calibration data. Stage 1 analytically
+basis against the exact INT8 decode. Without calibration data, Stage 1 analytically
 estimates per-block scales from a Bennett 1MAD + tail-clipping proxy and selects each
 row's scale across 29 multipliers. Stage 2 runs a cost-only 12-bit Viterbi check over
 the 3 nearest E4M3 block scales. Stage 3 then runs one tail-biting 16-bit Viterbi pass
 and refits each block's E4M3 scale in FP32. The module docstring describes each stage.
+
+When `hessian` is passed (raw unrotated `H [in, in]` or a pre-factored
+`TrellisHessian`), `TrellisHessian.from_hessian` symmetrizes `H`, rotates it in FP64
+into the ConvRot basis (`M^T H M`), adds `damping * mean(diag_pos) * I` (retried up to
+`25x` if ill-conditioned) for Cholesky factor `L`, and forms the block unit-lower
+triangular FP32 feedback matrix (`feedback[e:, s:e] = L[e:, s:e] @ L[s:e, s:e]^{-1}`).
+The encoder fixes `scale` once across each rotated row and sweeps blocks from right
+to left, propagating `(W_orig - W_hat_b) @ feedback[s:e, :s]` into earlier blocks
+before selecting each block's FP8 scale and Viterbi walk.
 
 On Gaussian rows, which ConvRot-rotated weights resemble, the weight SQNR is:
 
