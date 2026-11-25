@@ -2573,9 +2573,11 @@ def test_gpu_launch_canary_nvfp4_and_int8() -> None:
         up_gate_global_scale=torch.full((1,), 100.0, device="cuda", dtype=torch.float32),
         down_global_scale=torch.ones((1,), device="cuda", dtype=torch.float32),
     )
+    # Use an exact power of two so odd Split-K partitions cancel to 0 without FP32 ULP drift
+    # (which SwiGLU would otherwise square to inf) while pre-reduce post_scale still overflows.
     x_cancel = torch.empty((1, 16384), device="cuda", dtype=torch.float32)
-    x_cancel[:, :8192] = 1e33
-    x_cancel[:, 8192:] = -1e33
+    x_cancel[:, :8192] = 2.0**110
+    x_cancel[:, 8192:] = -(2.0**110)
     ids8 = torch.tensor([[0] + [99] * 7], device="cuda", dtype=torch.int64)
     wts8 = torch.ones((1, 8), device="cuda", dtype=torch.float32)
     res_hint1 = moe_ffn(x_cancel, w_sk_cancel, ids8, wts8, active_slots_hint=1)
