@@ -26,8 +26,11 @@ All package paths below are under [`src/piper_kernels`](../src/piper_kernels):
 
 `_triton/` has zero internal dependencies. Shared private root packages import
 `__init__.py` without Triton (Triton code lives in `triton.py`), and `weights/`
-separates Triton-free math from `triton.py`. Existing `specializations/` and offline
-`trellis/` encoding are legacy and must not expand. `tests/` mirrors this tree.
+separates Triton-free math from `triton.py`. Existing `specializations/` is legacy
+and must not expand; `trellis/` keeps generic format-level GPU encoding (`from_hp`
+and caller-supplied second-moment inputs) alongside its decode kernels, while
+calibration capture and model-level bit allocation live in external tooling. `tests/`
+mirrors this tree.
 
 ## Code conventions
 

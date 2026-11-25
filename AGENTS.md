@@ -6,9 +6,11 @@ for architecture, validation, and tests.
 
 ## Rules
 
-1. **Strict core scope:** Core `piper_kernels` owns reusable runtime operators and
-   kernels only—no new single-model shape tables, hardcoded calibration constants, or
-   offline encoders; external tools and specializations use public APIs only.
+1. **Strict core scope:** Core `piper_kernels` owns reusable runtime operators,
+   kernels, and generic format-level weight encoders (`from_hp`)—no new single-model
+   shape tables, hardcoded calibration constants, calibration/dataset capture, or
+   model-level quantization planners; external tools and specializations use public
+   APIs only.
 2. **Parameterize orthogonal axes:** Never add a Cartesian `<format>_<variant>_<op>`
    package, compiler pass, or test suite; parameterize format, basis, activation, and
    mutation, splitting a `custom_op` only when PyTorch's schema forces it (distinct
