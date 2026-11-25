@@ -121,9 +121,15 @@ def forbid_device_probes(
 @contextmanager
 def forbid_triton_driver(message: str = "unexpected Triton driver access") -> Iterator[Mock]:
     """Fail if code accesses Triton's active driver, including cached JIT references."""
-    import triton  # noqa: PLC0415 - keep tests._accelerators importable without Triton
-
     guard = Mock(side_effect=AssertionError(message))
+    try:
+        import triton  # noqa: PLC0415 - keep tests._accelerators importable without Triton
+    except ModuleNotFoundError as exc:
+        if exc.name != "triton":
+            raise
+        yield guard
+        return
+
     driver = triton.runtime.driver
     previous = getattr(driver, "_active", None)
     driver.set_active(

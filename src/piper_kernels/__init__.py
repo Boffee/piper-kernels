@@ -8,7 +8,9 @@ from .attention.piper_attention import (
     PiperKVChunkPool,
     freeze_kv_chunks_,
     kv_chunk_storage_specs,
+    merge_attention_lse,
     piper_attention,
+    piper_attention_decode,
 )
 from .attention.sage_attention_2pp import sage_attention_2pp
 from .attention.sparse_piper_attention import (
@@ -89,7 +91,9 @@ __all__ = [
     "freeze_kv_chunks_",
     "kv_chunk_storage_specs",
     "mean_pool_block_values",
+    "merge_attention_lse",
     "piper_attention",
+    "piper_attention_decode",
     "sage_attention_2pp",
     "sparse_piper_coarse_residual",
 ]

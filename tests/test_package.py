@@ -33,7 +33,9 @@ from piper_kernels import (
     freeze_kv_chunks_,
     kv_chunk_storage_specs,
     mean_pool_block_values,
+    merge_attention_lse,
     piper_attention,
+    piper_attention_decode,
     sage_attention_2pp,
     sparse_piper_coarse_residual,
 )
@@ -233,7 +235,13 @@ def guarded_find_spec(name, *args, **kwargs):
 builtins.__import__ = guarded_import
 importlib.util.find_spec = guarded_find_spec
 
-from piper_kernels import PiperKVChunkPool, freeze_kv_chunks_, kv_chunk_storage_specs
+from piper_kernels import (
+    PiperKVChunkPool,
+    freeze_kv_chunks_,
+    kv_chunk_storage_specs,
+    merge_attention_lse,
+    piper_attention_decode,
+)
 
 specs = kv_chunk_storage_specs(2, 2, 64, device="cpu", kv_dtype=torch.uint8)
 assert specs["key_scale"] == ((2, 2, 16), torch.float32)
@@ -242,6 +250,23 @@ key = torch.randn(1, 2, 1024, 64, dtype=torch.bfloat16)
 value = torch.randn_like(key)
 slots = torch.tensor([1], dtype=torch.int32)
 freeze_kv_chunks_(key, value, pool, slots)
+q = torch.randn(1, 4, 2, 64, dtype=torch.bfloat16)
+c2s = torch.tensor([[1]], dtype=torch.int32)
+nc = torch.tensor([1], dtype=torch.int32)
+tk = torch.randn(1, 2, 4, 64, dtype=torch.bfloat16)
+tv = torch.randn_like(tk)
+tl = torch.tensor([4], dtype=torch.int32)
+out, lse = piper_attention_decode(
+    q, pool, c2s, nc, tail_key=tk, tail_value=tv, tail_len=tl, return_lse=True
+)
+merged_out, merged_lse = merge_attention_lse(
+    [out, torch.full_like(out, float("nan"))],
+    [lse, torch.full_like(lse, -float("inf"))],
+)
+assert merged_out.shape == q.shape
+assert merged_lse.shape == lse.shape
+assert torch.isfinite(merged_out).all()
+assert torch.isfinite(merged_lse).all()
 assert "triton" not in sys.modules
 assert not any(mod == "triton" or mod.startswith("triton.") for mod in sys.modules)
 """
@@ -323,7 +348,9 @@ def test_public_packages_import() -> None:
     assert piper_kernels.compile_options is compile_options
     assert piper_kernels.freeze_kv_chunks_ is freeze_kv_chunks_
     assert piper_kernels.kv_chunk_storage_specs is kv_chunk_storage_specs
+    assert piper_kernels.merge_attention_lse is merge_attention_lse
     assert piper_kernels.piper_attention is piper_attention
+    assert piper_kernels.piper_attention_decode is piper_attention_decode
     assert piper_kernels.sage_attention_2pp is sage_attention_2pp
     assert piper_kernels.SparsePiperAttention is SparsePiperAttention
     assert piper_kernels.apply_coarse_attention_residual is apply_coarse_attention_residual
@@ -341,7 +368,9 @@ def test_public_packages_import() -> None:
         "freeze_kv_chunks_",
         "kv_chunk_storage_specs",
         "mean_pool_block_values",
+        "merge_attention_lse",
         "piper_attention",
+        "piper_attention_decode",
         "sage_attention_2pp",
         "sparse_piper_coarse_residual",
     ]

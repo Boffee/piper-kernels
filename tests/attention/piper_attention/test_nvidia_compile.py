@@ -2,6 +2,7 @@
 
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
@@ -24,6 +25,7 @@ from piper_kernels.attention.piper_attention._nvidia.gluon_async_copy import (
 )
 from piper_kernels.attention.piper_attention._nvidia.policy import select_execution_plan
 from piper_kernels.attention.piper_attention._nvidia.triton import _piper_attention_kernel
+from piper_kernels.attention.piper_attention.triton import compile_kv_decode_kernels
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="offline compiler coverage on Linux"
@@ -198,39 +200,26 @@ def test_nvidia_value_preparation_accepts_runtime_head_count(architecture, head_
     assert compiled.asm["cubin"]
 
 
-_KV_FREEZE_COMPILE_TARGETS = (
+_KV_COMPILE_TARGETS = (
     GPUTarget("cuda", 75, 32),
     GPUTarget("cuda", 80, 32),
     GPUTarget("cuda", 89, 32),
     GPUTarget("cuda", 120, 32),
-    pytest.param(
-        GPUTarget("hip", "gfx942", 64),
-        marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
-    ),
-    pytest.param(
-        GPUTarget("hip", "gfx1100", 32),
-        marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
-    ),
-    pytest.param(
-        GPUTarget("hip", "gfx1151", 32),
-        marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
-    ),
-    pytest.param(
-        GPUTarget("hip", "gfx1201", 32),
-        marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
-    ),
+    GPUTarget("hip", "gfx942", 64),
+    GPUTarget("hip", "gfx1100", 32),
+    GPUTarget("hip", "gfx1151", 32),
+    GPUTarget("hip", "gfx1201", 32),
 )
 
 
-@pytest.mark.parametrize(
-    "target", _KV_FREEZE_COMPILE_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}"
-)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("head_dim", [64, 128])
-def test_kv_freeze_8_target_compile_zero_spills(
+def _assert_zero_spill_kernels(
     target: GPUTarget,
-    dtype: torch.dtype,
-    head_dim: int,
+    expected_count: int,
+    compile_call: Callable[
+        [Callable[[object, object, dict[str, object]], object] | None], tuple[object, ...]
+    ],
+    *,
+    check_sgpr_spills: bool = True,
 ) -> None:
     if target.backend == "cuda":
         spill_counts: list[int] = []
@@ -241,24 +230,75 @@ def test_kv_freeze_8_target_compile_zero_spills(
             spill_counts.append(spills)
             return compiled
 
-        _quantization.compile_kv_freeze_kernels(
-            target, dtype=dtype, head_dim=head_dim, compile_fn=_compile_cuda
-        )
-        assert spill_counts == [0, 0]
+        compile_call(_compile_cuda)
+        assert spill_counts == [0] * expected_count
         return
 
-    compiled_k, compiled_v = _quantization.compile_kv_freeze_kernels(
-        target, dtype=dtype, head_dim=head_dim
-    )
-    for compiled in (compiled_k, compiled_v):
+    compiled_kernels = compile_call(None)
+    assert len(compiled_kernels) == expected_count
+    for compiled in compiled_kernels:
         assert compiled.asm.get("hsaco")  # type: ignore[attr-defined]
         assert compiled.metadata.global_scratch_size == 0  # type: ignore[attr-defined]
         amdgcn = compiled.asm.get("amdgcn", "")  # type: ignore[attr-defined]
         assert amdgcn
         vgpr_spills = re.search(r"vgpr_spill[^:]*:\s*(\d+)", amdgcn)
+        sgpr_spills = re.search(r"sgpr_spill[^:]*:\s*(\d+)", amdgcn)
         priv_size = re.search(r"\.private_segment_fixed_size:\s*(\d+)", amdgcn)
         assert vgpr_spills is not None or priv_size is not None
         if vgpr_spills is not None:
             assert int(vgpr_spills.group(1)) == 0
+        if check_sgpr_spills:
+            assert sgpr_spills is not None
+            assert int(sgpr_spills.group(1)) == 0
         if priv_size is not None:
             assert int(priv_size.group(1)) == 0
+
+
+@pytest.mark.parametrize("target", _KV_COMPILE_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_freeze_8_target_compile_zero_spills(
+    target: GPUTarget,
+    dtype: torch.dtype,
+    head_dim: int,
+) -> None:
+    # Pre-existing _quantize_value_k1024_kernel spills SGPRs into VGPRs on HIP
+    # (gfx942/1100/1151 at D=128, gfx1201 at D=64/128) with zero VGPR or scratch spills.
+    _assert_zero_spill_kernels(
+        target,
+        2,
+        lambda compile_fn: _quantization.compile_kv_freeze_kernels(
+            target, dtype=dtype, head_dim=head_dim, compile_fn=compile_fn
+        ),
+        check_sgpr_spills=False,
+    )
+
+
+@pytest.mark.parametrize("target", _KV_COMPILE_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    ("has_chunk_map", "is_causal", "contiguous_inputs"),
+    [(True, True, True), (True, True, False), (False, False, True)],
+)
+def test_kv_decode_8_target_compile_zero_spills(
+    target: GPUTarget,
+    dtype: torch.dtype,
+    head_dim: int,
+    has_chunk_map: bool,
+    is_causal: bool,
+    contiguous_inputs: bool,
+) -> None:
+    _assert_zero_spill_kernels(
+        target,
+        3,
+        lambda compile_fn: compile_kv_decode_kernels(
+            target,
+            dtype=dtype,
+            head_dim=head_dim,
+            has_chunk_map=has_chunk_map,
+            is_causal=is_causal,
+            contiguous_inputs=contiguous_inputs,
+            compile_fn=compile_fn,
+        ),
+    )

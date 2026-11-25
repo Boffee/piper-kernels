@@ -8,13 +8,17 @@ slow correctness paths, not exact PyTorch SDPA replacements.
 | Operator | Use when | Q/K/V layout | Input dtype |
 |---|---|---|---|
 | `piper_attention` | Every query attends all keys, or causal attention is needed | `[batch, heads, sequence, features]` | FP16, BF16 |
+| `piper_attention_decode` | Decoding or MTP verification against a frozen `PiperKVChunkPool` plus live tail | Query `[batch, q_heads, seq_q, features]`; chunked pool + `[batch, kv_heads, tail_cap, features]` | FP16, BF16 |
 | `SparsePiperAttention` | The model supplies a block layout and per-head sparse budgets | `[batch, sequence, heads, features]` | FP16, BF16, FP32 |
 | `sage_attention_2pp` | You specifically want the canonical SageAttention2++ 8+8 algorithm | `[batch, heads, sequence, features]` | FP16, BF16 |
 
-All three require head dimensions of 64 or 128, matching Q/K/V devices and dtypes,
-and a contiguous final feature dimension. Outer dimensions may be strided. They
-preserve the query shape and dtype and are inference-only. Use detached inputs or
-run under `torch.no_grad()` / `torch.inference_mode()`.
+All four require head dimensions of 64 or 128, a contiguous final feature dimension
+(outer dimensions may be strided), matching operand devices, and are inference-only
+(use detached inputs or run under `torch.no_grad()` / `torch.inference_mode()`).
+`piper_attention`, `SparsePiperAttention`, and `sage_attention_2pp` require matching
+Q/K/V dtypes and return the query shape and dtype, whereas `piper_attention_decode`
+reads quantized `PiperKVChunkPool` buffers plus an optional query-dtype tail and can
+also return FP32 natural-log `lse` via `return_lse=True`.
 
 ## Dense attention
 
@@ -179,15 +183,17 @@ Pool and operator contract:
   `head_dim` in `{64, 128}`, with all 6 buffers on the same device: `key_int8`
   (`[num_slots, kv_heads, 1024, head_dim]`), `value_int8`
   (`[num_slots, kv_heads, 16, head_dim, 64]`), `key_scale` (`float32`,
-  `[num_slots, kv_heads, 16]` on SM12x / RDNA4 / portable targets or
-  `[num_slots, kv_heads, 1024]` on SM8x), `key_center` and `value_mean` (`float32`,
-  `[num_slots, kv_heads, head_dim]`), and `value_scale` (`float32`,
-  `[num_slots, kv_heads, 1024]`). `key_int8` and `value_int8` must match in dtype
-  (`torch.int8` or `torch.uint8`).
+  `[num_slots, kv_heads, 1024]` on NVIDIA SM8x or `[num_slots, kv_heads, 16]`
+  elsewhere; `kv_chunk_storage_specs` defaults portable targets to `16`), `key_center`
+  and `value_mean` (`float32`, `[num_slots, kv_heads, head_dim]`), and `value_scale`
+  (`float32`, `[num_slots, kv_heads, 1024]`). `key_int8` and `value_int8` must match
+  in dtype (`torch.int8` or `torch.uint8`).
 - **Opaque target-family storage & host staging:** `value_int8`'s trailing 64-token axis
   uses target-specific ordering (WMMA-packed on RDNA4 `gfx1200`/`gfx1201`, unpermuted
-  elsewhere), and `freeze_kv_chunks_` enforces the active GPU's `key_scale` width
-  (`1024` on SM8x, `16` elsewhere). When allocating CPU staging buffers for GPU host-DMA
+  elsewhere), and on GPU (`cuda` / ROCm) both `freeze_kv_chunks_` and
+  `piper_attention_decode` enforce the active GPU's required `key_scale` width (`1024`
+  on NVIDIA SM8x, `16` on other supported GPUs), while portable CPU execution accepts
+  both `16` and `1024`. When allocating CPU staging buffers for GPU host-DMA
   swapping, pass the target GPU `device` (or `"sm80"` / `"sm120"` / `"gfx1201"`) to
   `kv_chunk_storage_specs` instead of `None`/`"cpu"`; frozen slab bytes are portable across
   devices in the same target family, not across differing target families.
@@ -208,6 +214,95 @@ Pool and operator contract:
   `slot_ids` within a single call must be distinct. `freeze_kv_chunks_` is inference-only
   (enforcing `InferenceMode` if any pool buffer is an inference tensor) and supports CUDA
   Graph capture and `torch.compile(fullgraph=True, dynamic=True)`.
+- **Grouped Split-KV decode & LSE wave merge:** `piper_attention_decode` keeps queries
+  and softmax probabilities in FP32 while dequantizing frozen INT8 K/V slots, so
+  outputs approximate FP32 SDPA rather than being bitwise identical to quantized-Q/P
+  `piper_attention` prefill. It executes native Triton Split-KV kernels on supported
+  GPUs (NVIDIA SM70+ and AMD ROCm; offline zero-spill compile verified across SM75,
+  SM80, SM89, SM120, `gfx942`, `gfx1100`, `gfx1151`, and `gfx1201`) and the portable
+  FP32-accumulation reference elsewhere, with `torch.compile(fullgraph=True, dynamic=True)`
+  and CUDA Graph capture support. It decodes `query` (`[batch, q_heads, seq_q, head_dim]`
+  in `float16`/`bfloat16`,
+  `q_heads` a multiple of `pool.kv_heads`, `seq_q >= 1`) against active slots addressed
+  through `chunk_to_slot` (`[batch, max_chunks]` `int32` or `None` for direct
+  `0..num_slots-1` indexing) and `num_chunks` (`[batch]` contiguous `int32`, clamped to
+  `[0, max_chunks]`), optionally combined with an unfrozen live tail (`tail_key`,
+  `tail_value` `[batch, kv_heads, tail_cap, head_dim]` and contiguous `tail_len`
+  `[batch]` `int32`, clamped to `[0, tail_cap]`; all three provided or all `None`). Slot
+  indices `< 0` or `>= pool.num_slots` are safely skipped with zero host readbacks.
+  `scale` defaults to `head_dim**-0.5` and, when supplied, must be finite and positive.
+  With `is_causal=True` (default) and a live tail, frozen chunks remain visible prior to
+  the live tail while tail tokens obey `token_idx <= active_tail - seq_q + q_pos`
+  (including `seq_q == 1` and `seq_q > active_tail`); with `is_causal=False`, all active
+  tail tokens up to `tail_len` are visible to every query token (`is_causal` is a no-op
+  without a tail). Pass `return_lse=True` to receive `(output, lse)` with FP32
+  natural-log `lse` (`[batch, q_heads, seq_q]`; `0.0` output and `-inf` LSE when zero
+  valid tokens exist). As numerical preconditions, inputs should keep the rotated FP32
+  dot product `q · k_center` finite (overflowing products yield `+inf` chunk bias and
+  `NaN`/`+inf` LSE) and keep active value buffers (`tail_value[:, :, :active_tail]` and
+  active pool value tensors) finite (non-finite active `V` entries can propagate IEEE
+  `0.0 * NaN` in causal or multi-split attention, matching dense SDPA). Native GPU kernels
+  use `active_chunks_hint` (non-negative int; `0`
+  derives splits from `max_chunks`) for launch parallelism only. Combine multi-wave
+  results with `merge_attention_lse(outputs, lses)`: it accepts strided `outputs`
+  sharing dtype in `{float16, bfloat16, float32, float64}` and matching-device `lses`
+  whose per-wave dtypes may vary independently within that set, returns `merged_out` in
+  `outputs[0].dtype` and `merged_lse` in `float64` whenever any input uses `float64` (else
+  `float32`), masks exact `-inf` waves, propagates `NaN` (`+inf` LSE yields `NaN`), and
+  supports differentiable autograd.
+
+```python
+import torch
+from piper_kernels import (
+    PiperKVChunkPool,
+    freeze_kv_chunks_,
+    merge_attention_lse,
+    piper_attention_decode,
+)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+pool = PiperKVChunkPool.empty(num_slots=4, kv_heads=2, head_dim=64, device=device)
+
+with torch.inference_mode():
+    freeze_kv_chunks_(
+        torch.randn(2, 2, 1024, 64, device=device, dtype=torch.bfloat16),
+        torch.randn(2, 2, 1024, 64, device=device, dtype=torch.bfloat16),
+        pool,
+        torch.tensor([1, 3], device=device, dtype=torch.int32),
+    )
+    query = torch.randn(1, 6, 3, 64, device=device, dtype=torch.bfloat16)
+    chunk_to_slot = torch.tensor([[1, 3]], device=device, dtype=torch.int32)
+    num_chunks = torch.tensor([2], device=device, dtype=torch.int32)
+    tail_key = torch.randn(1, 2, 16, 64, device=device, dtype=torch.bfloat16)
+    tail_value = torch.randn_like(tail_key)
+    tail_len = torch.tensor([5], device=device, dtype=torch.int32)
+
+    out, lse = piper_attention_decode(
+        query,
+        pool,
+        chunk_to_slot,
+        num_chunks,
+        tail_key=tail_key,
+        tail_value=tail_value,
+        tail_len=tail_len,
+        return_lse=True,
+    )
+    # Multi-wave example (frozen chunks first, tail wave second):
+    out_frozen, lse_frozen = piper_attention_decode(
+        query, pool, chunk_to_slot, num_chunks, return_lse=True
+    )
+    out_tail, lse_tail = piper_attention_decode(
+        query,
+        pool,
+        torch.empty((1, 0), device=device, dtype=torch.int32),
+        torch.zeros_like(num_chunks),
+        tail_key=tail_key,
+        tail_value=tail_value,
+        tail_len=tail_len,
+        return_lse=True,
+    )
+    merged_out, merged_lse = merge_attention_lse([out_frozen, out_tail], [lse_frozen, lse_tail])
+```
 
 ## Compile and fuse projections
 
