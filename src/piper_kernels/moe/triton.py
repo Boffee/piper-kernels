@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -2101,26 +2102,19 @@ def _launch_nvfp4_proj(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     gs_ptr: torch.Tensor,
-    topk_ids_flat: torch.Tensor,
-    slot_map_ptr: torch.Tensor,
-    tile_slots: torch.Tensor | None,
-    tile_pair_ids: torch.Tensor | None,
+    routing: _A16ChunkRouting,
     output: torch.Tensor,
     *,
     out_features: int,
     in_features: int,
     scale_cols: int,
     scale_stride: int,
-    num_experts: int,
     num_slots: int,
-    num_pairs: int,
-    top_k: int,
     split_k: int,
     block_n: int,
     block_k: int,
     num_warps: int,
     high_first: bool,
-    has_slot_map: bool,
     has_global_scale: bool,
     per_expert_input: bool,
     is_splitk: bool,
@@ -2130,22 +2124,22 @@ def _launch_nvfp4_proj(
     scale_u8 = scale.view(torch.uint8)
     n_tiles = triton.cdiv(out_features, block_n)
     with device_context(x.device):
-        if tile_slots is not None:
-            assert tile_pair_ids is not None
-            nvfp4_moe_batched_gemv_kernel[(n_tiles, tile_slots.shape[0], split_k)](
+        if routing.tile_slots is not None:
+            assert routing.tile_pair_ids is not None
+            nvfp4_moe_batched_gemv_kernel[(n_tiles, routing.tile_slots.shape[0], split_k)](
                 x,
                 qdata,
                 scale_u8,
                 gs_ptr,
-                tile_slots,
-                tile_pair_ids,
+                routing.tile_slots,
+                routing.tile_pair_ids,
                 output,
                 out_features,
                 in_features,
                 scale_cols,
                 scale_stride,
-                num_pairs,
-                top_k,
+                routing.num_pairs,
+                routing.top_k,
                 split_k,
                 block_m=_BATCH_BLOCK_M,
                 block_n=block_n,
@@ -2160,26 +2154,26 @@ def _launch_nvfp4_proj(
                 num_stages=1,
             )
         else:
-            nvfp4_moe_m1_gemv_kernel[(n_tiles, top_k, split_k)](
+            nvfp4_moe_m1_gemv_kernel[(n_tiles, routing.top_k, split_k)](
                 x,
                 qdata,
                 scale_u8,
                 gs_ptr,
-                topk_ids_flat,
-                slot_map_ptr,
+                routing.topk_ids_flat,
+                routing.slot_map_ptr,
                 output,
                 out_features,
                 in_features,
                 scale_cols,
                 scale_stride,
-                num_experts,
+                routing.num_experts,
                 num_slots,
-                top_k,
+                routing.top_k,
                 split_k,
                 block_n=block_n,
                 block_k=block_k,
                 high_first=high_first,
-                has_slot_map=has_slot_map,
+                has_slot_map=routing.has_slot_map,
                 has_global_scale=has_global_scale,
                 per_expert_input=per_expert_input,
                 is_splitk=is_splitk,
@@ -2187,75 +2181,69 @@ def _launch_nvfp4_proj(
             )
 
 
-def _run_nvfp4_chunk(
+@dataclass(frozen=True, slots=True)
+class _A16ChunkRouting:
+    topk_ids_flat: torch.Tensor
+    slot_map_ptr: torch.Tensor
+    tile_slots: torch.Tensor | None
+    tile_pair_ids: torch.Tensor | None
+    num_experts: int
+    num_pairs: int
+    top_k: int
+    has_slot_map: bool
+
+
+def _run_a16_chunk(
     active_x_chunk: torch.Tensor,
     topk_ids_chunk: torch.Tensor,
     topk_weights_chunk: torch.Tensor,
-    up_gate_qdata: torch.Tensor,
-    up_gate_scale: torch.Tensor,
-    down_qdata: torch.Tensor,
-    down_scale: torch.Tensor,
-    up_gate_global_scale: torch.Tensor | None,
-    down_global_scale: torch.Tensor | None,
-    expert_to_slot: torch.Tensor | None,
     out_chunk: torch.Tensor,
     *,
+    num_slots: int,
+    hidden_size: int,
+    intermediate_size: int,
+    up_gate_out: int,
+    expert_to_slot: torch.Tensor | None,
     target: AcceleratorTarget,
     batched: bool,
     accumulate: bool,
     group_size: int,
     activation_fn: str,
     gate_first: bool,
-    high_first: bool,
-    active_slots_hint: int,
-    split_k_up: int | None,
-    split_k_down: int | None,
-    up_scale_cols: int,
-    up_scale_stride: int,
-    down_scale_cols: int,
-    down_scale_stride: int,
+    split_k_up: int,
+    split_k_down: int,
+    up_row_scale: torch.Tensor | None,
+    down_row_scale: torch.Tensor | None,
+    up_global_scale: torch.Tensor | None,
+    down_global_scale: torch.Tensor | None,
+    post_scale_only: bool,
+    launch_proj: Callable[[bool, torch.Tensor, _A16ChunkRouting, torch.Tensor, int], None],
 ) -> None:
     device = active_x_chunk.device
     chunk_rows = active_x_chunk.shape[0]
     top_k = topk_ids_chunk.shape[1]
     num_pairs = chunk_rows * top_k
-    num_slots, hidden_size, packed_inter = down_qdata.shape
-    intermediate_size = 2 * packed_inter
-    up_gate_out = up_gate_qdata.shape[1]
     topk_ids_flat = topk_ids_chunk.reshape(-1)
     topk_weights_flat = topk_weights_chunk.reshape(-1)
     has_slot_map = expert_to_slot is not None
     slot_map_ptr = expert_to_slot if expert_to_slot is not None else topk_ids_flat
     num_experts = expert_to_slot.shape[0] if expert_to_slot is not None else num_slots
-
-    if batched:
-        tile_slots, tile_pair_ids, _ = _launch_moe_bucket(topk_ids_flat, expert_to_slot, num_slots)
-        use_dot, cast_fp32_to_bf16, post_scale_only, block_n, block_k, num_warps = (
-            _nvfp4_batched_config(
-                target,
-                rows=chunk_rows,
-                active_dtype=active_x_chunk.dtype,
-                logical_dtype=out_chunk.dtype,
-            )
-        )
-        tiles = _expected_bucket_tiles(num_pairs, num_slots, active_slots_hint, batched=True)
-        split_k_up = _select_nvfp4_split_k(
-            device, tiles, up_gate_out, hidden_size, block_n=block_n, block_k=block_k
-        )
-        split_k_down = _select_nvfp4_split_k(
-            device, tiles, hidden_size, intermediate_size, block_n=block_n, block_k=block_k
-        )
-    else:
-        tile_slots = tile_pair_ids = None
-        use_dot = cast_fp32_to_bf16 = False
-        post_scale_only = True
-        block_n, block_k, num_warps = (
-            _NVFP4_GEMV_BLOCK_N,
-            _NVFP4_GEMV_BLOCK_K,
-            _NVFP4_GEMV_NUM_WARPS,
-        )
-        assert split_k_up is not None
-        assert split_k_down is not None
+    tile_slots, tile_pair_ids = (
+        _launch_moe_bucket(topk_ids_flat, expert_to_slot, num_slots)[:2]
+        if batched
+        else (None, None)
+    )
+    routing = _A16ChunkRouting(
+        topk_ids_flat=topk_ids_flat,
+        slot_map_ptr=slot_map_ptr,
+        tile_slots=tile_slots,
+        tile_pair_ids=tile_pair_ids,
+        num_experts=num_experts,
+        num_pairs=num_pairs,
+        top_k=top_k,
+        has_slot_map=has_slot_map,
+    )
+    has_row_scale = up_row_scale is not None
 
     mid = torch.empty((num_pairs, up_gate_out), device=device, dtype=torch.float32)
     up_target = (
@@ -2263,51 +2251,25 @@ def _run_nvfp4_chunk(
         if split_k_up > 1
         else mid
     )
-    up_gs_ptr = up_gate_global_scale if up_gate_global_scale is not None else mid
     act_dtype = torch.float32 if group_size > 0 else out_chunk.dtype
     act = torch.empty((num_pairs, intermediate_size), device=device, dtype=act_dtype)
     down_partial = torch.empty(
         (split_k_down, num_pairs, hidden_size), device=device, dtype=torch.float32
     )
-    down_gs_ptr = down_global_scale if down_global_scale is not None else down_partial
 
     with device_context(device):
-        _launch_nvfp4_proj(
-            active_x_chunk,
-            up_gate_qdata,
-            up_gate_scale,
-            up_gs_ptr,
-            topk_ids_flat,
-            slot_map_ptr,
-            tile_slots,
-            tile_pair_ids,
-            up_target,
-            out_features=up_gate_out,
-            in_features=hidden_size,
-            scale_cols=up_scale_cols,
-            scale_stride=up_scale_stride,
-            num_experts=num_experts,
-            num_slots=num_slots,
-            num_pairs=num_pairs,
-            top_k=top_k,
-            split_k=split_k_up,
-            block_n=block_n,
-            block_k=block_k,
-            num_warps=num_warps,
-            high_first=high_first,
-            has_slot_map=has_slot_map,
-            has_global_scale=up_gate_global_scale is not None,
-            per_expert_input=False,
-            is_splitk=split_k_up > 1,
-            use_dot=use_dot,
-            cast_fp32_to_bf16=cast_fp32_to_bf16,
-        )
+        launch_proj(False, active_x_chunk, routing, up_target, split_k_up)
         if split_k_up > 1:
+            up_scale_ptr = (
+                up_row_scale
+                if up_row_scale is not None
+                else (up_global_scale if up_global_scale is not None else mid)
+            )
             nvfp4_moe_m1_reduce_kernel[
                 (triton.cdiv(up_gate_out, _NVFP4_REDUCE_BLOCK_N), num_pairs)
             ](
                 up_target,
-                up_gs_ptr,
+                up_scale_ptr,
                 topk_ids_flat,
                 slot_map_ptr,
                 mid,
@@ -2318,8 +2280,9 @@ def _run_nvfp4_chunk(
                 split_k_up,
                 block_n=_NVFP4_REDUCE_BLOCK_N,
                 has_slot_map=has_slot_map,
-                has_global_scale=up_gate_global_scale is not None,
+                has_global_scale=up_global_scale is not None,
                 post_scale_only=post_scale_only,
+                has_row_scale=has_row_scale,
                 num_warps=4,
             )
         moe_m1_activate_rotate_kernel[
@@ -2341,43 +2304,14 @@ def _run_nvfp4_chunk(
             has_slot_map=has_slot_map,
             num_warps=4,
         )
-        _launch_nvfp4_proj(
-            act,
-            down_qdata,
-            down_scale,
-            down_gs_ptr,
-            topk_ids_flat,
-            slot_map_ptr,
-            tile_slots,
-            tile_pair_ids,
-            down_partial,
-            out_features=hidden_size,
-            in_features=intermediate_size,
-            scale_cols=down_scale_cols,
-            scale_stride=down_scale_stride,
-            num_experts=num_experts,
-            num_slots=num_slots,
-            num_pairs=num_pairs,
-            top_k=top_k,
-            split_k=split_k_down,
-            block_n=block_n,
-            block_k=block_k,
-            num_warps=num_warps,
-            high_first=high_first,
-            has_slot_map=has_slot_map,
-            has_global_scale=down_global_scale is not None,
-            per_expert_input=True,
-            is_splitk=True,
-            use_dot=use_dot,
-            cast_fp32_to_bf16=cast_fp32_to_bf16,
-        )
+        launch_proj(True, act, routing, down_partial, split_k_down)
         moe_m1_weighted_reduce_kernel[
             (triton.cdiv(hidden_size, _WEIGHTED_REDUCE_BLOCK_N), chunk_rows)
         ](
             down_partial,
             down_partial,
-            down_partial,
-            down_gs_ptr,
+            down_row_scale if down_row_scale is not None else down_partial,
+            down_global_scale if down_global_scale is not None else down_partial,
             topk_ids_flat,
             topk_weights_flat,
             slot_map_ptr,
@@ -2395,6 +2329,7 @@ def _run_nvfp4_chunk(
             accumulate=accumulate,
             has_global_scale=down_global_scale is not None,
             post_scale_only=post_scale_only,
+            has_row_scale=has_row_scale,
             num_warps=4,
         )
 
@@ -3253,11 +3188,12 @@ def _prepare_int8_input_gpu(
     up_prep_plan: LinearExecutionPlan | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if prepared_data is not None:
-        assert prepared_scale is not None
         rows, hidden_size = input_2d.shape
-        return prepared_data.reshape(rows, hidden_size).contiguous(), prepared_scale.reshape(
-            rows
-        ).contiguous()
+        prep_2d = prepared_data.reshape(rows, hidden_size).contiguous()
+        if prepared_scale is not None:
+            return prep_2d, prepared_scale.reshape(rows).contiguous()
+        inp_q, inp_s = dynamic_quantize_rows(prep_2d)
+        return inp_q, inp_s.squeeze(-1).contiguous()
     assert up_prep_plan is not None
     return int8_backend.prepare_input_with_plan(
         input_2d.contiguous(),
@@ -3267,6 +3203,106 @@ def _prepare_int8_input_gpu(
         execution_plan=up_prep_plan,
         target=target,
     )
+
+
+def _dispatch_int8_prefill_chunks(
+    input_2d: torch.Tensor,
+    ids_2d: torch.Tensor,
+    weights_2d: torch.Tensor,
+    up_gate_qdata: torch.Tensor,
+    up_gate_scale: torch.Tensor,
+    down_qdata: torch.Tensor,
+    down_scale: torch.Tensor,
+    expert_to_slot: torch.Tensor | None,
+    prepared_data: torch.Tensor | None,
+    prepared_scale: torch.Tensor | None,
+    out_2d: torch.Tensor,
+    *,
+    resolved_target: AcceleratorTarget,
+    int8_backend: LinearBackend,
+    chunk_rows: int,
+    accumulate: bool,
+    group_size: int,
+    activation_fn: str,
+    gate_first: bool,
+    active_slots_hint: int,
+    up_gate_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_scales: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    down_block_size: int = 0,
+) -> None:
+    rows, hidden_size = input_2d.shape
+    swap_halves = activation_fn == "swiglu" and gate_first
+    prep_q_full = None if prepared_data is None else prepared_data.reshape(rows, hidden_size)
+    prep_s_full = None if prepared_scale is None else prepared_scale.reshape(rows)
+    up_prep_plan = (
+        None
+        if prepared_data is not None
+        else int8_backend.policy.select_execution_plan(resolved_target, in_features=hidden_size)
+    )
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        inp_q_chunk, inp_s_chunk = _prepare_int8_input_gpu(
+            input_2d[start:end],
+            None if prep_q_full is None else prep_q_full[start:end],
+            None if prep_s_full is None else prep_s_full[start:end],
+            group_size,
+            target=resolved_target,
+            int8_backend=int8_backend,
+            up_prep_plan=up_prep_plan,
+        )
+        _run_int8_prefill_chunk(
+            inp_q_chunk,
+            inp_s_chunk,
+            ids_2d[start:end],
+            weights_2d[start:end],
+            up_gate_qdata,
+            up_gate_scale,
+            down_qdata,
+            down_scale,
+            expert_to_slot,
+            out_2d[start:end],
+            target=resolved_target,
+            int8_backend=int8_backend,
+            accumulate=accumulate,
+            group_size=group_size,
+            activation_fn=activation_fn,
+            swap_halves=swap_halves,
+            active_slots_hint=active_slots_hint,
+            up_gate_block_scales=up_gate_block_scales,
+            up_gate_row_widths=up_gate_row_widths,
+            up_gate_slot_offsets=up_gate_slot_offsets,
+            up_gate_block_size=up_gate_block_size,
+            down_block_scales=down_block_scales,
+            down_row_widths=down_row_widths,
+            down_slot_offsets=down_slot_offsets,
+            down_block_size=down_block_size,
+        )
+
+
+def _iter_a16_chunks(
+    input_2d: torch.Tensor,
+    ids_2d: torch.Tensor,
+    weights_2d: torch.Tensor,
+    out_2d: torch.Tensor,
+    prepared_data: torch.Tensor | None,
+    group_size: int,
+    chunk_rows: int,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    rows, hidden_size = input_2d.shape
+    prep_full = None if prepared_data is None else prepared_data.reshape(rows, hidden_size)
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        active_chunk = _prepare_nvfp4_input_gpu(
+            input_2d[start:end],
+            None if prep_full is None else prep_full[start:end],
+            group_size,
+        )
+        yield active_chunk, ids_2d[start:end], weights_2d[start:end], out_2d[start:end]
 
 
 def _dispatch_int8_moe(
@@ -3298,12 +3334,6 @@ def _dispatch_int8_moe(
     top_k = ids_2d.shape[1]
     int8_backend = int8_backend_mod.select_linear_backend_for_target(resolved_target)
     assert int8_backend is not None
-    up_prep_plan = (
-        None
-        if prepared_data is not None
-        else int8_backend.policy.select_execution_plan(resolved_target, in_features=hidden_size)
-    )
-    swap_halves = activation_fn == "swiglu" and gate_first
     bytes_per_pair = _prefill_bytes_per_pair(
         is_int8=True,
         hidden_size=hidden_size,
@@ -3315,40 +3345,35 @@ def _dispatch_int8_moe(
     regime, chunk_rows = _select_moe_execution_regime(rows, top_k, bytes_per_pair)
 
     if regime == "prefill":
-        prep_q_full = None if prepared_data is None else prepared_data.reshape(rows, hidden_size)
-        prep_s_full = None if prepared_scale is None else prepared_scale.reshape(rows)
-        for start in range(0, rows, chunk_rows):
-            end = min(start + chunk_rows, rows)
-            inp_q_chunk, inp_s_chunk = _prepare_int8_input_gpu(
-                input_2d[start:end],
-                None if prep_q_full is None else prep_q_full[start:end],
-                None if prep_s_full is None else prep_s_full[start:end],
-                group_size,
-                target=resolved_target,
-                int8_backend=int8_backend,
-                up_prep_plan=up_prep_plan,
-            )
-            _run_int8_prefill_chunk(
-                inp_q_chunk,
-                inp_s_chunk,
-                ids_2d[start:end],
-                weights_2d[start:end],
-                up_gate_qdata,
-                up_gate_scale,
-                down_qdata,
-                down_scale,
-                expert_to_slot,
-                out_2d[start:end],
-                target=resolved_target,
-                int8_backend=int8_backend,
-                accumulate=accumulate,
-                group_size=group_size,
-                activation_fn=activation_fn,
-                swap_halves=swap_halves,
-                active_slots_hint=active_slots_hint,
-            )
+        _dispatch_int8_prefill_chunks(
+            input_2d,
+            ids_2d,
+            weights_2d,
+            up_gate_qdata,
+            up_gate_scale,
+            down_qdata,
+            down_scale,
+            expert_to_slot,
+            prepared_data,
+            prepared_scale,
+            out_2d,
+            resolved_target=resolved_target,
+            int8_backend=int8_backend,
+            chunk_rows=chunk_rows,
+            accumulate=accumulate,
+            group_size=group_size,
+            activation_fn=activation_fn,
+            gate_first=gate_first,
+            active_slots_hint=active_slots_hint,
+        )
         return
 
+    swap_halves = activation_fn == "swiglu" and gate_first
+    up_prep_plan = (
+        None
+        if prepared_data is not None
+        else int8_backend.policy.select_execution_plan(resolved_target, in_features=hidden_size)
+    )
     batched = regime == "batched"
     expected_tiles = _expected_bucket_tiles(
         chunk_rows * top_k, num_slots, active_slots_hint, batched=batched
@@ -3479,18 +3504,13 @@ def _dispatch_nvfp4_moe(
     regime, chunk_rows = _select_moe_execution_regime(rows, top_k, bytes_per_pair)
 
     if regime == "prefill":
-        prep_full = None if prepared_data is None else prepared_data.reshape(rows, hidden_size)
-        for start in range(0, rows, chunk_rows):
-            end = min(start + chunk_rows, rows)
-            active_chunk = _prepare_nvfp4_input_gpu(
-                input_2d[start:end],
-                None if prep_full is None else prep_full[start:end],
-                group_size,
-            )
+        for active_chunk, ids_chunk, weights_chunk, out_chunk in _iter_a16_chunks(
+            input_2d, ids_2d, weights_2d, out_2d, prepared_data, group_size, chunk_rows
+        ):
             _run_nvfp4_prefill_chunk(
                 active_chunk,
-                ids_2d[start:end],
-                weights_2d[start:end],
+                ids_chunk,
+                weights_chunk,
                 up_gate_qdata,
                 up_gate_scale,
                 down_qdata,
@@ -3498,7 +3518,7 @@ def _dispatch_nvfp4_moe(
                 up_gate_global_scale,
                 down_global_scale,
                 expert_to_slot,
-                out_2d[start:end],
+                out_chunk,
                 target=resolved_target,
                 accumulate=accumulate,
                 group_size=group_size,
@@ -3513,42 +3533,114 @@ def _dispatch_nvfp4_moe(
             )
         return
 
-    active_2d = _prepare_nvfp4_input_gpu(input_2d, prepared_data, group_size)
     batched = regime == "batched"
-    split_k_up = split_k_down = None
     if not batched:
         active_slots = _expected_bucket_tiles(top_k, num_slots, active_slots_hint, batched=False)
         split_k_up = _select_nvfp4_split_k(device, active_slots, up_gate_out, hidden_size)
         split_k_down = _select_nvfp4_split_k(device, active_slots, hidden_size, intermediate_size)
+        use_dot = cast_fp32_to_bf16 = False
+        post_scale_only = True
+        block_n, block_k, num_warps = (
+            _NVFP4_GEMV_BLOCK_N,
+            _NVFP4_GEMV_BLOCK_K,
+            _NVFP4_GEMV_NUM_WARPS,
+        )
 
-    for start in range(0, rows, chunk_rows):
-        end = min(start + chunk_rows, rows)
-        _run_nvfp4_chunk(
-            active_2d[start:end],
-            ids_2d[start:end],
-            weights_2d[start:end],
-            up_gate_qdata,
-            up_gate_scale,
-            down_qdata,
-            down_scale,
-            up_gate_global_scale,
-            down_global_scale,
-            expert_to_slot,
-            out_2d[start:end],
+    for active_chunk, ids_chunk, weights_chunk, out_chunk in _iter_a16_chunks(
+        input_2d, ids_2d, weights_2d, out_2d, prepared_data, group_size, chunk_rows
+    ):
+        if batched:
+            chunk_n = active_chunk.shape[0]
+            use_dot, cast_fp32_to_bf16, post_scale_only, block_n, block_k, num_warps = (
+                _nvfp4_batched_config(
+                    resolved_target,
+                    rows=chunk_n,
+                    active_dtype=active_chunk.dtype,
+                    logical_dtype=out_chunk.dtype,
+                )
+            )
+            tiles = _expected_bucket_tiles(
+                chunk_n * top_k, num_slots, active_slots_hint, batched=True
+            )
+            split_k_up = _select_nvfp4_split_k(
+                device, tiles, up_gate_out, hidden_size, block_n=block_n, block_k=block_k
+            )
+            split_k_down = _select_nvfp4_split_k(
+                device, tiles, hidden_size, intermediate_size, block_n=block_n, block_k=block_k
+            )
+
+        def _launch_nvfp4_step(
+            per_expert_input: bool,
+            x: torch.Tensor,
+            routing: _A16ChunkRouting,
+            output: torch.Tensor,
+            split_k: int,
+            *,
+            _bn: int = block_n,  # pyright: ignore[reportPossiblyUnboundVariable]
+            _bk: int = block_k,  # pyright: ignore[reportPossiblyUnboundVariable]
+            _nw: int = num_warps,  # pyright: ignore[reportPossiblyUnboundVariable]
+            _ud: bool = use_dot,  # pyright: ignore[reportPossiblyUnboundVariable]
+            _bf16: bool = cast_fp32_to_bf16,  # pyright: ignore[reportPossiblyUnboundVariable]
+        ) -> None:
+            if not per_expert_input:
+                q, s, gs = up_gate_qdata, up_gate_scale, up_gate_global_scale
+                n_out, n_in, sc, ss = up_gate_out, hidden_size, up_scale_cols, up_scale_stride
+            else:
+                q, s, gs = down_qdata, down_scale, down_global_scale
+                n_out, n_in, sc, ss = (
+                    hidden_size,
+                    intermediate_size,
+                    down_scale_cols,
+                    down_scale_stride,
+                )
+            _launch_nvfp4_proj(
+                x,
+                q,
+                s,
+                gs if gs is not None else output,
+                routing,
+                output,
+                out_features=n_out,
+                in_features=n_in,
+                scale_cols=sc,
+                scale_stride=ss,
+                num_slots=num_slots,
+                split_k=split_k,
+                block_n=_bn,
+                block_k=_bk,
+                num_warps=_nw,
+                high_first=high_first,
+                has_global_scale=gs is not None,
+                per_expert_input=per_expert_input,
+                is_splitk=per_expert_input or split_k > 1,
+                use_dot=_ud,
+                cast_fp32_to_bf16=_bf16,
+            )
+
+        _run_a16_chunk(
+            active_chunk,
+            ids_chunk,
+            weights_chunk,
+            out_chunk,
+            num_slots=num_slots,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            up_gate_out=up_gate_out,
+            expert_to_slot=expert_to_slot,
             target=resolved_target,
             batched=batched,
             accumulate=accumulate,
             group_size=group_size,
             activation_fn=activation_fn,
             gate_first=gate_first,
-            high_first=high_first,
-            active_slots_hint=active_slots_hint,
-            split_k_up=split_k_up,
-            split_k_down=split_k_down,
-            up_scale_cols=up_scale_cols,
-            up_scale_stride=up_scale_stride,
-            down_scale_cols=down_scale_cols,
-            down_scale_stride=down_scale_stride,
+            split_k_up=split_k_up,  # pyright: ignore[reportPossiblyUnboundVariable]
+            split_k_down=split_k_down,  # pyright: ignore[reportPossiblyUnboundVariable]
+            up_row_scale=None,
+            down_row_scale=None,
+            up_global_scale=up_gate_global_scale,
+            down_global_scale=down_global_scale,
+            post_scale_only=post_scale_only,  # pyright: ignore[reportPossiblyUnboundVariable]
+            launch_proj=_launch_nvfp4_step,
         )
 
 
@@ -3596,22 +3688,15 @@ def _launch_trellis_proj(
     row_widths: torch.Tensor | None,
     slot_offsets: torch.Tensor | None,
     block_size: int,
-    topk_ids_flat: torch.Tensor,
+    routing: _A16ChunkRouting,
     expert_to_slot: torch.Tensor | None,
-    slot_map_ptr: torch.Tensor,
-    tile_slots: torch.Tensor | None,
-    tile_pair_ids: torch.Tensor | None,
     output: torch.Tensor,
     *,
     out_features: int,
     in_features: int,
-    num_experts: int,
     num_slots: int,
-    num_pairs: int,
-    top_k: int,
     split_k: int,
     batched: bool,
-    has_slot_map: bool,
     per_expert_input: bool,
     is_splitk: bool,
 ) -> None:
@@ -3623,15 +3708,17 @@ def _launch_trellis_proj(
     block_m = _TRELLIS_GEMV_BATCH_BLOCK_M if batched else 1
 
     if batched:
-        assert tile_slots is not None
-        assert tile_pair_ids is not None
+        assert routing.tile_slots is not None
+        assert routing.tile_pair_ids is not None
         sub_tiles = _BATCH_BLOCK_M // block_m
-        grid_tiles = tile_slots.shape[0] * sub_tiles
-        active_slots = tile_slots.clamp(0, num_slots - 1).to(torch.int64) if variable_rows else None
-    else:
-        grid_tiles = top_k
+        grid_tiles = routing.tile_slots.shape[0] * sub_tiles
         active_slots = (
-            _resolve_m1_active_slots(topk_ids_flat, expert_to_slot, num_slots)
+            routing.tile_slots.clamp(0, num_slots - 1).to(torch.int64) if variable_rows else None
+        )
+    else:
+        grid_tiles = routing.top_k
+        active_slots = (
+            _resolve_m1_active_slots(routing.topk_ids_flat, expert_to_slot, num_slots)
             if variable_rows
             else None
         )
@@ -3662,10 +3749,10 @@ def _launch_trellis_proj(
             active_widths,
             active_offsets,
             slot_offsets,
-            None if batched else topk_ids_flat,
-            None if batched else slot_map_ptr,
-            tile_slots,
-            tile_pair_ids,
+            None if batched else routing.topk_ids_flat,
+            None if batched else routing.slot_map_ptr,
+            routing.tile_slots,
+            routing.tile_pair_ids,
             output,
             out_features,
             in_features,
@@ -3677,213 +3764,21 @@ def _launch_trellis_proj(
             num_wide_steps,
             bytes_per_block,
             slot_bytes,
-            num_experts,
+            routing.num_experts,
             num_slots,
-            num_pairs,
-            top_k,
+            routing.num_pairs,
+            routing.top_k,
             split_k,
             tile_steps=tile_steps,
             block_m=block_m,
             batched=batched,
-            has_slot_map=False if batched else has_slot_map,
+            has_slot_map=False if batched else routing.has_slot_map,
             per_expert_input=per_expert_input,
             is_splitk=is_splitk,
             variable_rows=variable_rows,
             has_slot_offsets=has_slot_offsets,
             exact_pow2=exact_pow2,
             num_warps=_TRELLIS_GEMV_NUM_WARPS,
-        )
-
-
-def _run_trellis_chunk(
-    active_x_chunk: torch.Tensor,
-    topk_ids_chunk: torch.Tensor,
-    topk_weights_chunk: torch.Tensor,
-    up_gate_qdata: torch.Tensor,
-    up_gate_block_scales: torch.Tensor,
-    up_gate_scale: torch.Tensor,
-    up_gate_row_widths: torch.Tensor | None,
-    up_gate_slot_offsets: torch.Tensor | None,
-    up_gate_block_size: int,
-    down_qdata: torch.Tensor,
-    down_block_scales: torch.Tensor,
-    down_scale: torch.Tensor,
-    down_row_widths: torch.Tensor | None,
-    down_slot_offsets: torch.Tensor | None,
-    down_block_size: int,
-    expert_to_slot: torch.Tensor | None,
-    out_chunk: torch.Tensor,
-    *,
-    target: AcceleratorTarget,
-    batched: bool,
-    accumulate: bool,
-    group_size: int,
-    activation_fn: str,
-    gate_first: bool,
-    active_slots_hint: int,
-    split_k_up: int | None,
-    split_k_down: int | None,
-) -> None:
-    device = active_x_chunk.device
-    chunk_rows = active_x_chunk.shape[0]
-    top_k = topk_ids_chunk.shape[1]
-    num_pairs = chunk_rows * top_k
-    num_slots, hidden_size, down_blocks = down_block_scales.shape
-    intermediate_size = down_blocks * down_block_size
-    up_gate_out, up_blocks = up_gate_block_scales.shape[1], up_gate_block_scales.shape[2]
-    topk_ids_flat = topk_ids_chunk.reshape(-1)
-    topk_weights_flat = topk_weights_chunk.reshape(-1)
-    has_slot_map = expert_to_slot is not None
-    slot_map_ptr = expert_to_slot if expert_to_slot is not None else topk_ids_flat
-    num_experts = expert_to_slot.shape[0] if expert_to_slot is not None else num_slots
-
-    if batched:
-        tile_slots, tile_pair_ids, max_tiles = _launch_moe_bucket(
-            topk_ids_flat, expert_to_slot, num_slots
-        )
-        tiles = min(
-            max_tiles,
-            _expected_bucket_tiles(num_pairs, num_slots, active_slots_hint, batched=True),
-        )
-        up_bytes = max(1, (up_gate_qdata.numel() // max(1, num_slots)) * tiles)
-        down_bytes = max(1, (down_qdata.numel() // max(1, num_slots)) * tiles)
-        split_k_up = _select_trellis_split_k(device, tiles, up_gate_out, up_blocks, up_bytes)
-        split_k_down = _select_trellis_split_k(device, tiles, hidden_size, down_blocks, down_bytes)
-    else:
-        tile_slots = tile_pair_ids = None
-        assert split_k_up is not None
-        assert split_k_down is not None
-
-    mid = torch.empty((num_pairs, up_gate_out), device=device, dtype=torch.float32)
-    up_target = (
-        torch.empty((split_k_up, num_pairs, up_gate_out), device=device, dtype=torch.float32)
-        if split_k_up > 1
-        else mid
-    )
-    act = torch.empty((num_pairs, intermediate_size), device=device, dtype=torch.float32)
-    down_partial = torch.empty(
-        (split_k_down, num_pairs, hidden_size), device=device, dtype=torch.float32
-    )
-
-    with device_context(device):
-        _launch_trellis_proj(
-            active_x_chunk,
-            up_gate_qdata,
-            up_gate_block_scales,
-            up_gate_scale,
-            up_gate_row_widths,
-            up_gate_slot_offsets,
-            up_gate_block_size,
-            topk_ids_flat,
-            expert_to_slot,
-            slot_map_ptr,
-            tile_slots,
-            tile_pair_ids,
-            up_target,
-            out_features=up_gate_out,
-            in_features=hidden_size,
-            num_experts=num_experts,
-            num_slots=num_slots,
-            num_pairs=num_pairs,
-            top_k=top_k,
-            split_k=split_k_up,
-            batched=batched,
-            has_slot_map=has_slot_map,
-            per_expert_input=False,
-            is_splitk=split_k_up > 1,
-        )
-        if split_k_up > 1:
-            nvfp4_moe_m1_reduce_kernel[
-                (triton.cdiv(up_gate_out, _NVFP4_REDUCE_BLOCK_N), num_pairs)
-            ](
-                up_target,
-                up_gate_scale,
-                topk_ids_flat,
-                slot_map_ptr,
-                mid,
-                up_gate_out,
-                num_experts,
-                num_slots,
-                num_pairs,
-                split_k_up,
-                block_n=_NVFP4_REDUCE_BLOCK_N,
-                has_slot_map=has_slot_map,
-                has_global_scale=False,
-                post_scale_only=True,
-                has_row_scale=True,
-                num_warps=4,
-            )
-        moe_m1_activate_rotate_kernel[
-            (triton.cdiv(intermediate_size, _ACTIVATE_BLOCK_SIZE), num_pairs)
-        ](
-            mid,
-            act,
-            out_chunk,
-            topk_ids_flat,
-            slot_map_ptr,
-            intermediate_size,
-            num_experts,
-            num_slots,
-            block_size=_ACTIVATE_BLOCK_SIZE,
-            group_size=group_size,
-            activation_fn=activation_fn,
-            gate_first=gate_first,
-            accelerator_backend=target.backend,
-            has_slot_map=has_slot_map,
-            num_warps=4,
-        )
-        _launch_trellis_proj(
-            act,
-            down_qdata,
-            down_block_scales,
-            down_scale,
-            down_row_widths,
-            down_slot_offsets,
-            down_block_size,
-            topk_ids_flat,
-            expert_to_slot,
-            slot_map_ptr,
-            tile_slots,
-            tile_pair_ids,
-            down_partial,
-            out_features=hidden_size,
-            in_features=intermediate_size,
-            num_experts=num_experts,
-            num_slots=num_slots,
-            num_pairs=num_pairs,
-            top_k=top_k,
-            split_k=split_k_down,
-            batched=batched,
-            has_slot_map=has_slot_map,
-            per_expert_input=True,
-            is_splitk=True,
-        )
-        moe_m1_weighted_reduce_kernel[
-            (triton.cdiv(hidden_size, _WEIGHTED_REDUCE_BLOCK_N), chunk_rows)
-        ](
-            down_partial,
-            down_partial,
-            down_scale,
-            down_scale,
-            topk_ids_flat,
-            topk_weights_flat,
-            slot_map_ptr,
-            out_chunk,
-            hidden_size,
-            out_chunk.stride(0),
-            num_experts,
-            num_slots,
-            num_pairs,
-            top_k,
-            split_k_down,
-            block_n=_WEIGHTED_REDUCE_BLOCK_N,
-            is_int8=False,
-            has_slot_map=has_slot_map,
-            accumulate=accumulate,
-            has_global_scale=False,
-            post_scale_only=True,
-            has_row_scale=True,
-            num_warps=4,
         )
 
 
@@ -3939,58 +3834,37 @@ def _dispatch_trellis_moe(
     regime, chunk_rows = _select_moe_execution_regime(rows, top_k, bytes_per_pair)
 
     if regime == "prefill" and int8_backend is not None:
-        swap_halves = activation_fn == "swiglu" and gate_first
-        prep_full = None if prepared_data is None else prepared_data.reshape(rows, hidden_size)
-        up_prep_plan = (
-            None
-            if prepared_data is not None
-            else int8_backend.policy.select_execution_plan(resolved_target, in_features=hidden_size)
+        _dispatch_int8_prefill_chunks(
+            input_2d,
+            ids_2d,
+            weights_2d,
+            up_gate_qdata,
+            up_gate_scale,
+            down_qdata,
+            down_scale,
+            expert_to_slot,
+            prepared_data,
+            None,
+            out_2d,
+            resolved_target=resolved_target,
+            int8_backend=int8_backend,
+            chunk_rows=chunk_rows,
+            accumulate=accumulate,
+            group_size=group_size,
+            activation_fn=activation_fn,
+            gate_first=gate_first,
+            active_slots_hint=active_slots_hint,
+            up_gate_block_scales=up_gate_block_scales,
+            up_gate_row_widths=up_gate_row_widths,
+            up_gate_slot_offsets=up_gate_slot_offsets,
+            up_gate_block_size=up_gate_block_size,
+            down_block_scales=down_block_scales,
+            down_row_widths=down_row_widths,
+            down_slot_offsets=down_slot_offsets,
+            down_block_size=down_block_size,
         )
-        for start in range(0, rows, chunk_rows):
-            end = min(start + chunk_rows, rows)
-            if prep_full is not None:
-                inp_q_chunk, inp_s_chunk = dynamic_quantize_rows(prep_full[start:end].contiguous())
-                inp_s_chunk = inp_s_chunk.squeeze(-1).contiguous()
-            else:
-                assert up_prep_plan is not None
-                inp_q_chunk, inp_s_chunk = int8_backend.prepare_input_with_plan(
-                    input_2d[start:end].contiguous(),
-                    hidden_size,
-                    group_size,
-                    activation_fn=None,
-                    execution_plan=up_prep_plan,
-                    target=resolved_target,
-                )
-            _run_int8_prefill_chunk(
-                inp_q_chunk,
-                inp_s_chunk,
-                ids_2d[start:end],
-                weights_2d[start:end],
-                up_gate_qdata,
-                up_gate_scale,
-                down_qdata,
-                down_scale,
-                expert_to_slot,
-                out_2d[start:end],
-                target=resolved_target,
-                int8_backend=int8_backend,
-                accumulate=accumulate,
-                group_size=group_size,
-                activation_fn=activation_fn,
-                swap_halves=swap_halves,
-                active_slots_hint=active_slots_hint,
-                up_gate_block_scales=up_gate_block_scales,
-                up_gate_row_widths=up_gate_row_widths,
-                up_gate_slot_offsets=up_gate_slot_offsets,
-                up_gate_block_size=up_gate_block_size,
-                down_block_scales=down_block_scales,
-                down_row_widths=down_row_widths,
-                down_slot_offsets=down_slot_offsets,
-                down_block_size=down_block_size,
-            )
         return
 
-    prep_full = None if prepared_data is None else prepared_data.reshape(rows, hidden_size)
     if regime == "prefill":
         # Non-INT8 accelerators (e.g. SM75) fall back to chunked batched A16 GEMV.
         a16_chunk_rows = min(rows, _BATCH_MAX_ROWS, max(1, _BUCKET_MAX_PAIRS // max(1, top_k)))
@@ -3999,50 +3873,106 @@ def _dispatch_trellis_moe(
         a16_chunk_rows = chunk_rows
         batched = regime == "batched"
 
-    split_k_up = split_k_down = None
+    up_slot_bytes = up_gate_qdata.numel() // max(1, num_slots)
+    down_slot_bytes = down_qdata.numel() // max(1, num_slots)
     if not batched:
         active_slots = _expected_bucket_tiles(top_k, num_slots, active_slots_hint, batched=False)
-        up_bytes = max(1, (up_gate_qdata.numel() // max(1, num_slots)) * active_slots)
-        down_bytes = max(1, (down_qdata.numel() // max(1, num_slots)) * active_slots)
-        split_k_up = _select_trellis_split_k(device, active_slots, up_gate_out, up_blocks, up_bytes)
+        split_k_up = _select_trellis_split_k(
+            device, active_slots, up_gate_out, up_blocks, max(1, up_slot_bytes * active_slots)
+        )
         split_k_down = _select_trellis_split_k(
-            device, active_slots, hidden_size, down_blocks, down_bytes
+            device, active_slots, hidden_size, down_blocks, max(1, down_slot_bytes * active_slots)
         )
 
-    for start in range(0, rows, a16_chunk_rows):
-        end = min(start + a16_chunk_rows, rows)
-        active_chunk = _prepare_nvfp4_input_gpu(
-            input_2d[start:end],
-            None if prep_full is None else prep_full[start:end],
-            group_size,
-        )
-        _run_trellis_chunk(
-            active_chunk,
-            ids_2d[start:end],
-            weights_2d[start:end],
-            up_gate_qdata,
-            up_gate_block_scales,
-            up_gate_scale,
-            up_gate_row_widths,
-            up_gate_slot_offsets,
-            up_gate_block_size,
-            down_qdata,
-            down_block_scales,
-            down_scale,
-            down_row_widths,
-            down_slot_offsets,
-            down_block_size,
+    def _launch_trellis_step(
+        per_expert_input: bool,
+        x: torch.Tensor,
+        routing: _A16ChunkRouting,
+        output: torch.Tensor,
+        split_k: int,
+    ) -> None:
+        if not per_expert_input:
+            q, bs, rs, rw, so, bsz, n_out, n_in = (
+                up_gate_qdata,
+                up_gate_block_scales,
+                up_gate_scale,
+                up_gate_row_widths,
+                up_gate_slot_offsets,
+                up_gate_block_size,
+                up_gate_out,
+                hidden_size,
+            )
+        else:
+            q, bs, rs, rw, so, bsz, n_out, n_in = (
+                down_qdata,
+                down_block_scales,
+                down_scale,
+                down_row_widths,
+                down_slot_offsets,
+                down_block_size,
+                hidden_size,
+                intermediate_size,
+            )
+        _launch_trellis_proj(
+            x,
+            q,
+            bs,
+            rs,
+            rw,
+            so,
+            bsz,
+            routing,
             expert_to_slot,
-            out_2d[start:end],
+            output,
+            out_features=n_out,
+            in_features=n_in,
+            num_slots=num_slots,
+            split_k=split_k,
+            batched=batched,
+            per_expert_input=per_expert_input,
+            is_splitk=per_expert_input or split_k > 1,
+        )
+
+    for active_chunk, ids_chunk, weights_chunk, out_chunk in _iter_a16_chunks(
+        input_2d, ids_2d, weights_2d, out_2d, prepared_data, group_size, a16_chunk_rows
+    ):
+        if batched:
+            num_pairs = active_chunk.shape[0] * top_k
+            max_tiles = _max_bucket_tiles(num_pairs, num_slots, _BATCH_BLOCK_M)
+            tiles = min(
+                max_tiles,
+                _expected_bucket_tiles(num_pairs, num_slots, active_slots_hint, batched=True),
+            )
+            split_k_up = _select_trellis_split_k(
+                device, tiles, up_gate_out, up_blocks, max(1, up_slot_bytes * tiles)
+            )
+            split_k_down = _select_trellis_split_k(
+                device, tiles, hidden_size, down_blocks, max(1, down_slot_bytes * tiles)
+            )
+        _run_a16_chunk(
+            active_chunk,
+            ids_chunk,
+            weights_chunk,
+            out_chunk,
+            num_slots=num_slots,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            up_gate_out=up_gate_out,
+            expert_to_slot=expert_to_slot,
             target=resolved_target,
             batched=batched,
             accumulate=accumulate,
             group_size=group_size,
             activation_fn=activation_fn,
             gate_first=gate_first,
-            active_slots_hint=active_slots_hint,
-            split_k_up=split_k_up,
-            split_k_down=split_k_down,
+            split_k_up=split_k_up,  # pyright: ignore[reportPossiblyUnboundVariable]
+            split_k_down=split_k_down,  # pyright: ignore[reportPossiblyUnboundVariable]
+            up_row_scale=up_gate_scale,
+            down_row_scale=down_scale,
+            up_global_scale=None,
+            down_global_scale=None,
+            post_scale_only=True,
+            launch_proj=_launch_trellis_step,
         )
 
 
@@ -4808,6 +4738,77 @@ def _compile_int8_kernels(
     return compiled_int8
 
 
+def _compile_a16_epilogue(
+    compiled: dict[str, triton.compiler.CompiledKernel],
+    target: GPUTarget,
+    accel: AcceleratorTarget,
+    *,
+    reduce_key: str,
+    active_ty: str,
+    out_ty: str,
+    group_size: int,
+    activation_fn: str,
+    gate_first: bool,
+    has_slot_map: bool,
+    has_global_scale: bool,
+    post_scale_only: bool,
+    has_row_scale: bool,
+    is_splitk: bool,
+    accumulate: bool,
+    compile_fn: Callable[[ASTSource, GPUTarget, dict[str, object]], triton.compiler.CompiledKernel],
+) -> None:
+    if is_splitk:
+        compiled[reduce_key] = compile_fn(
+            ASTSource(
+                nvfp4_moe_m1_reduce_kernel,
+                {
+                    "partial_ptr": "*fp32",
+                    "weight_global_scale_ptr": "*fp32",
+                    "topk_ids_ptr": "*i64",
+                    "expert_to_slot_ptr": "*i64",
+                    "output_ptr": "*fp32",
+                    "out_features": "i32",
+                    "num_experts": "i32",
+                    "num_slots": "i32",
+                    "num_pairs": "i32",
+                    "split_k": "i32",
+                },
+                constexprs={
+                    "block_n": _NVFP4_REDUCE_BLOCK_N,
+                    "has_slot_map": has_slot_map,
+                    "has_global_scale": has_global_scale,
+                    "post_scale_only": post_scale_only,
+                    "has_row_scale": has_row_scale,
+                },
+            ),
+            target,
+            {"num_warps": 4},
+        )
+    compiled["activate_rotate"] = _compile_activate_rotate(
+        target,
+        active_ty=active_ty,
+        out_ty=out_ty,
+        group_size=group_size,
+        activation_fn=activation_fn,
+        gate_first=gate_first,
+        accelerator_backend=accel.backend,
+        has_slot_map=has_slot_map,
+        use_compact_map=False,
+        compile_fn=compile_fn,
+    )
+    compiled["weighted_reduce"] = _compile_weighted_reduce(
+        target,
+        out_ty=out_ty,
+        is_int8=False,
+        has_slot_map=has_slot_map,
+        accumulate=accumulate,
+        has_global_scale=has_global_scale,
+        post_scale_only=post_scale_only,
+        has_row_scale=has_row_scale,
+        compile_fn=compile_fn,
+    )
+
+
 def _compile_nvfp4_kernels(
     target: GPUTarget,
     accel: AcceleratorTarget,
@@ -4932,53 +4933,22 @@ def _compile_nvfp4_kernels(
             gemv_opts,
         ),
     }
-    if is_splitk:
-        compiled_nvfp4["nvfp4_reduce"] = compile_fn(
-            ASTSource(
-                nvfp4_moe_m1_reduce_kernel,
-                {
-                    "partial_ptr": "*fp32",
-                    "weight_global_scale_ptr": "*fp32",
-                    "topk_ids_ptr": "*i64",
-                    "expert_to_slot_ptr": "*i64",
-                    "output_ptr": "*fp32",
-                    "out_features": "i32",
-                    "num_experts": "i32",
-                    "num_slots": "i32",
-                    "num_pairs": "i32",
-                    "split_k": "i32",
-                },
-                constexprs={
-                    "block_n": _NVFP4_REDUCE_BLOCK_N,
-                    "has_slot_map": has_slot_map,
-                    "has_global_scale": has_global_scale,
-                    "post_scale_only": post_scale_only,
-                    "has_row_scale": False,
-                },
-            ),
-            target,
-            {"num_warps": 4},
-        )
-    compiled_nvfp4["activate_rotate"] = _compile_activate_rotate(
+    _compile_a16_epilogue(
+        compiled_nvfp4,
         target,
+        accel,
+        reduce_key="nvfp4_reduce",
         active_ty=active_ty,
         out_ty=out_ty,
         group_size=group_size,
         activation_fn=activation_fn,
         gate_first=gate_first,
-        accelerator_backend=accel.backend,
         has_slot_map=has_slot_map,
-        use_compact_map=False,
-        compile_fn=compile_fn,
-    )
-    compiled_nvfp4["weighted_reduce"] = _compile_weighted_reduce(
-        target,
-        out_ty=out_ty,
-        is_int8=False,
-        has_slot_map=has_slot_map,
-        accumulate=accumulate,
         has_global_scale=has_global_scale,
         post_scale_only=post_scale_only,
+        has_row_scale=False,
+        is_splitk=is_splitk,
+        accumulate=accumulate,
         compile_fn=compile_fn,
     )
     return compiled_nvfp4
@@ -5205,54 +5175,22 @@ def _compile_trellis_kernels(
             {"num_warps": _TRELLIS_GEMV_NUM_WARPS},
         ),
     }
-    if is_splitk:
-        compiled["trellis_reduce"] = compile_fn(
-            ASTSource(
-                nvfp4_moe_m1_reduce_kernel,
-                {
-                    "partial_ptr": "*fp32",
-                    "weight_global_scale_ptr": "*fp32",
-                    "topk_ids_ptr": "*i64",
-                    "expert_to_slot_ptr": "*i64",
-                    "output_ptr": "*fp32",
-                    "out_features": "i32",
-                    "num_experts": "i32",
-                    "num_slots": "i32",
-                    "num_pairs": "i32",
-                    "split_k": "i32",
-                },
-                constexprs={
-                    "block_n": _NVFP4_REDUCE_BLOCK_N,
-                    "has_slot_map": has_slot_map,
-                    "has_global_scale": False,
-                    "post_scale_only": True,
-                    "has_row_scale": True,
-                },
-            ),
-            target,
-            {"num_warps": 4},
-        )
-    compiled["activate_rotate"] = _compile_activate_rotate(
+    _compile_a16_epilogue(
+        compiled,
         target,
+        accel,
+        reduce_key="trellis_reduce",
         active_ty="*fp32",
         out_ty=out_ty,
         group_size=group_size,
         activation_fn=activation_fn,
         gate_first=gate_first,
-        accelerator_backend=accel.backend,
         has_slot_map=has_slot_map,
-        use_compact_map=False,
-        compile_fn=compile_fn,
-    )
-    compiled["weighted_reduce"] = _compile_weighted_reduce(
-        target,
-        out_ty=out_ty,
-        is_int8=False,
-        has_slot_map=has_slot_map,
-        accumulate=accumulate,
         has_global_scale=False,
         post_scale_only=True,
         has_row_scale=True,
+        is_splitk=is_splitk,
+        accumulate=accumulate,
         compile_fn=compile_fn,
     )
     return compiled
@@ -5306,6 +5244,7 @@ def compile_moe_kernels(
     out_ty = _TRITON_FLOAT_POINTER_TYPES[logical_dtype]
     accel = AcceleratorTarget.from_compiler_target(target)
 
+    has_int8_backend = is_int8
     if is_trellis:
         from piper_kernels.linear.convrot.int8 import _backend as int8_backend_mod  # noqa: PLC0415
 
@@ -5323,16 +5262,19 @@ def compile_moe_kernels(
             not (accel.is_nvidia_cuda and not accel.cuda_capability_at_least(8))
             and int8_backend_mod.select_linear_backend_for_target(accel) is not None
         )
-        bytes_per_pair = _prefill_bytes_per_pair(
-            is_int8=has_int8_backend,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            up_gate_out=up_gate_out,
-            logical_elem_bytes=logical_dtype.itemsize,
-            group_size=group_size,
-        )
-        regime, chunk_rows = _select_moe_execution_regime(rows, top_k, bytes_per_pair)
-        if regime == "prefill" and has_int8_backend:
+
+    bytes_per_pair = _prefill_bytes_per_pair(
+        is_int8=has_int8_backend,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        up_gate_out=up_gate_out,
+        logical_elem_bytes=logical_dtype.itemsize,
+        group_size=group_size,
+    )
+    regime, chunk_rows = _select_moe_execution_regime(rows, top_k, bytes_per_pair)
+
+    if regime == "prefill" and has_int8_backend:
+        if is_trellis:
             return _compile_trellis_prefill_kernels(
                 target,
                 accel,
@@ -5354,68 +5296,25 @@ def compile_moe_kernels(
                 accumulate=accumulate,
                 compile_fn=compile_fn,
             )
-        if regime == "prefill":
-            a16_chunk_rows = min(rows, _BATCH_MAX_ROWS, max(1, _BUCKET_MAX_PAIRS // max(1, top_k)))
-            batched = a16_chunk_rows > 1
-            num_pairs = a16_chunk_rows * top_k
-        else:
-            batched = regime == "batched"
-            num_pairs = chunk_rows * top_k
-        compiled = _compile_trellis_kernels(
+        return _compile_int8_prefill_kernels(
             target,
             accel,
-            batched=batched,
+            rows=chunk_rows,
+            top_k=top_k,
+            num_slots=num_slots,
+            active_slots_hint=active_slots_hint,
             out_ty=out_ty,
-            block_size=block_size,
-            variable_rows=variable_rows,
-            has_slot_offsets=has_slot_offsets,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
             group_size=group_size,
             activation_fn=activation_fn,
             gate_first=gate_first,
+            high_first=high_first,
             has_slot_map=has_slot_map,
-            split_k=split_k,
             accumulate=accumulate,
             compile_fn=compile_fn,
         )
-        if batched:
-            compiled["bucket"] = _compile_bucket_kernel(
-                target,
-                num_pairs=num_pairs,
-                has_slot_map=has_slot_map,
-                compile_fn=compile_fn,
-            )
-        return compiled
-
-    bytes_per_pair = _prefill_bytes_per_pair(
-        is_int8=is_int8,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        up_gate_out=up_gate_out,
-        logical_elem_bytes=logical_dtype.itemsize,
-        group_size=group_size,
-    )
-    regime, chunk_rows = _select_moe_execution_regime(rows, top_k, bytes_per_pair)
-
-    if regime == "prefill":
-        if is_int8:
-            return _compile_int8_prefill_kernels(
-                target,
-                accel,
-                rows=chunk_rows,
-                top_k=top_k,
-                num_slots=num_slots,
-                active_slots_hint=active_slots_hint,
-                out_ty=out_ty,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                group_size=group_size,
-                activation_fn=activation_fn,
-                gate_first=gate_first,
-                high_first=high_first,
-                has_slot_map=has_slot_map,
-                accumulate=accumulate,
-                compile_fn=compile_fn,
-            )
+    if regime == "prefill" and not is_trellis:
         return _compile_nvfp4_prefill_kernels(
             target,
             accel,
@@ -5438,9 +5337,32 @@ def compile_moe_kernels(
             compile_fn=compile_fn,
         )
 
-    batched = regime == "batched"
-    num_pairs = chunk_rows * top_k
-    if is_int8:
+    if regime == "prefill":
+        a16_chunk_rows = min(rows, _BATCH_MAX_ROWS, max(1, _BUCKET_MAX_PAIRS // max(1, top_k)))
+        batched = a16_chunk_rows > 1
+        num_pairs = a16_chunk_rows * top_k
+    else:
+        batched = regime == "batched"
+        num_pairs = chunk_rows * top_k
+
+    if is_trellis:
+        compiled = _compile_trellis_kernels(
+            target,
+            accel,
+            batched=batched,
+            out_ty=out_ty,
+            block_size=block_size,
+            variable_rows=variable_rows,
+            has_slot_offsets=has_slot_offsets,
+            group_size=group_size,
+            activation_fn=activation_fn,
+            gate_first=gate_first,
+            has_slot_map=has_slot_map,
+            split_k=split_k,
+            accumulate=accumulate,
+            compile_fn=compile_fn,
+        )
+    elif is_int8:
         compiled = _compile_int8_kernels(
             target,
             accel,

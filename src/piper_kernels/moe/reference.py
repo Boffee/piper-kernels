@@ -77,26 +77,23 @@ def _decode_trellis_slot(
     safe_slot_1d: torch.Tensor,
     block_size: int,
 ) -> torch.Tensor:
+    slot_block_scales = torch.index_select(block_scales, 0, safe_slot_1d).squeeze(0)
     if row_widths is None:
         layout = TrellisLayout.from_storage(block_size, qdata.shape[3])
         slot_qdata = torch.index_select(qdata, 0, safe_slot_1d).squeeze(0)
-        slot_block_scales = torch.index_select(block_scales, 0, safe_slot_1d).squeeze(0)
         return decode_reference(slot_qdata, slot_block_scales, layout).reshape(
             slot_block_scales.shape[0], -1
         )
-    slot_index = int(safe_slot_1d.item())
-    slot_block_scales = block_scales[slot_index]
-    slot_widths = row_widths[slot_index]
+    slot_widths = torch.index_select(row_widths, 0, safe_slot_1d).squeeze(0)
     if slot_offsets is None:
-        stream = qdata[slot_index]
+        stream = torch.index_select(qdata, 0, safe_slot_1d).squeeze(0)
+        base_offset = None
     else:
-        slot_offset = int(slot_offsets[slot_index].item())
-        if slot_offset < 0:
-            raise ValueError(
-                f"ConvRot Trellis MoE slot_offsets must be non-negative, got {slot_offset}"
-            )
-        stream = qdata[slot_offset:]
-    return decode_variable_rows_reference(stream, slot_block_scales, slot_widths, block_size)
+        stream = qdata
+        base_offset = torch.index_select(slot_offsets, 0, safe_slot_1d).squeeze(0)
+    return decode_variable_rows_reference(
+        stream, slot_block_scales, slot_widths, block_size, base_offset=base_offset
+    )
 
 
 def _make_slot_evaluator(

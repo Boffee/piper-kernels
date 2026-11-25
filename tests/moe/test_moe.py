@@ -1831,13 +1831,16 @@ def test_cpu_trellis_validation_and_empty_hp() -> None:
         up_gate_block_size=128,
         down_block_size=128,
     )
-    with pytest.raises(ValueError, match="non-negative"):
-        moe_ffn(
-            torch.randn((1, 128), dtype=torch.bfloat16),
-            bad_offset_w,
-            torch.tensor([[0, 1]], dtype=torch.int64),
-            torch.tensor([[0.5, 0.5]], dtype=torch.bfloat16),
-        )
+    # Negative slot_offsets violate caller preconditions (no host readback); fallback clamps safely.
+    bad_offset_out = moe_ffn(
+        torch.randn((1, 128), dtype=torch.bfloat16),
+        bad_offset_w,
+        torch.tensor([[0, 1]], dtype=torch.int64),
+        torch.tensor([[0.5, 0.5]], dtype=torch.bfloat16),
+    )
+    assert bad_offset_out.shape == (1, 128)
+    assert bad_offset_out.dtype == torch.bfloat16
+    assert torch.isfinite(bad_offset_out).all()
 
 
 def test_cpu_trellis_aliasing_and_autograd_guards() -> None:
@@ -5654,5 +5657,81 @@ def test_gpu_trellis_cuda_graph_replay(
             out=out_buf.clone(),
             accumulate=True,
         )
+        graph.replay()
+        torch.testing.assert_close(out_buf, expected_eager, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.parametrize("layout_kind", ["uniform", "var2d", "var1d"])
+def test_gpu_trellis_reference_cuda_graph_replay(layout_kind: TrellisLayoutKind) -> None:
+    torch.manual_seed(995 + int(layout_kind == "var1d"))
+    weights = _make_trellis_moe_weights(
+        4,
+        256,
+        256,
+        group_size=64,
+        dtype=torch.bfloat16,
+        device="cuda",
+        layouts=(layout_kind, layout_kind),
+        seed=996,
+    )
+    x_buf = torch.randn((2, 256), device="cuda", dtype=torch.bfloat16)
+    ids_buf = torch.randint(0, 4, (2, 2), device="cuda", dtype=torch.int64)
+    wts_buf = torch.rand((2, 2), device="cuda", dtype=torch.bfloat16) + 0.1
+    slot_map_buf = torch.tensor([1, 2, -1, 0], device="cuda", dtype=torch.int64)
+    out_buf = torch.full((2, 256), 0.25, device="cuda", dtype=torch.bfloat16)
+
+    def _run_ref(out_target: torch.Tensor) -> torch.Tensor:
+        return moe_reference.moe_ffn_reference(
+            x_buf,
+            ids_buf,
+            wts_buf,
+            weights.up_gate_qdata,
+            weights.up_gate_scale,
+            weights.down_qdata,
+            weights.down_scale,
+            expert_to_slot=slot_map_buf,
+            out=out_target,
+            accumulate=True,
+            group_size=weights.group_size,
+            activation_fn=weights.activation_fn,
+            gate_first=weights.gate_first,
+            up_gate_block_scales=weights.up_gate_block_scales,
+            down_block_scales=weights.down_block_scales,
+            up_gate_row_widths=weights.up_gate_row_widths,
+            down_row_widths=weights.down_row_widths,
+            up_gate_slot_offsets=weights.up_gate_slot_offsets,
+            down_slot_offsets=weights.down_slot_offsets,
+            up_gate_block_size=weights.up_gate_block_size,
+            down_block_size=weights.down_block_size,
+        )
+
+    for _ in range(2):
+        _run_ref(out_buf)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_ref(out_buf)
+
+    patterns = [
+        (
+            torch.randint(0, 4, (2, 2), device="cuda", dtype=torch.int64),
+            torch.tensor([3, 0, -1, 1], device="cuda", dtype=torch.int64),
+        ),
+        (
+            torch.zeros((2, 2), device="cuda", dtype=torch.int64),
+            torch.tensor([2, -1, -1, -1], device="cuda", dtype=torch.int64),
+        ),
+        (
+            torch.randint(0, 4, (2, 2), device="cuda", dtype=torch.int64),
+            torch.full((4,), -1, device="cuda", dtype=torch.int64),
+        ),
+    ]
+    for new_ids, new_slots in patterns:
+        x_buf.normal_()
+        ids_buf.copy_(new_ids)
+        slot_map_buf.copy_(new_slots)
+        out_buf.fill_(0.5)
+        expected_eager = _run_ref(out_buf.clone())
         graph.replay()
         torch.testing.assert_close(out_buf, expected_eager, rtol=1e-4, atol=1e-4)
