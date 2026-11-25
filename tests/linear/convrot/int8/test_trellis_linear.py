@@ -19,12 +19,16 @@ from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import reference as convrot_reference
 from piper_kernels.linear.convrot.int8.trellis_triton import compile_trellis_kernels, linear_a16
 from piper_kernels.linear.convrot.int8.trellis_triton import linear as triton_trellis_linear
-from piper_kernels.trellis import TrellisLayout, TrellisStorage, resolve_layout
+from piper_kernels.trellis import TrellisHessian, TrellisLayout, TrellisStorage, resolve_layout
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
 from piper_kernels.weights.sharding import shard_quantized_weight
 
 _gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+_nvidia = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="trellis encoding requires an NVIDIA GPU",
+)
 _multi_gpu = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >= 2 GPUs")
 
 
@@ -203,6 +207,34 @@ def test_from_storage_and_from_hp_cpu_rejection() -> None:
         ConvRotTrellisTensor.from_hp(
             torch.randn(4, 256, dtype=torch.bfloat16), group_size=64, bits_per_weight=4.5
         )
+    with pytest.raises(ValueError, match="hessian_damping requires hessian"):
+        ConvRotTrellisTensor.from_hp(
+            torch.randn(4, 256, dtype=torch.bfloat16),
+            group_size=64,
+            bits_per_weight=4.5,
+            hessian_damping=0.01,
+        )
+
+
+@pytest.mark.gpu
+@_nvidia
+def test_gpu_from_hp_forwards_hessian() -> None:
+    torch.manual_seed(995)
+    weight = (torch.randn(16, 512, dtype=torch.bfloat16, device="cuda") * 0.02).contiguous()
+    hessian = torch.eye(512, device="cuda") + 0.25
+    factor = TrellisHessian.from_hessian(hessian, group_size=256)
+    direct = ConvRotTrellisTensor.from_hp(
+        weight, group_size=256, bits_per_weight=3.0, hessian=factor
+    )
+    storage = TrellisStorage.from_hp(weight, group_size=256, bits_per_weight=3.0, hessian=factor)
+    assert torch.equal(direct.bitstreams, storage.bitstreams)
+    assert torch.equal(direct.block_scales, storage.block_scales)
+    assert torch.equal(direct.scale, storage.scale)
+    x = torch.randn(4, 512, dtype=torch.bfloat16, device="cuda") * 0.1
+    rtol, atol = _tolerance(torch.bfloat16)
+    torch.testing.assert_close(
+        F.linear(x, direct), F.linear(x, direct.dequantize()), rtol=rtol, atol=atol
+    )
 
 
 def test_views_transpose_conversion_serialization_and_matmul_contracts() -> None:

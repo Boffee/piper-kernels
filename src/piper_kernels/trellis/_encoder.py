@@ -42,6 +42,7 @@ from ._layout import (
     STATE_BITS,
     TrellisLayout,
 )
+from ._reference import decode_states
 
 _MIN_SCALE = 1e-8
 _FP8_NORMAL_FLOOR = 2.0**-9
@@ -52,6 +53,8 @@ _FP8_REFIT_RADIUS = 8
 _ROW_MULTIPLIERS = tuple(2.0 ** (i / 16) for i in range(-4, 25))
 """Row-scale candidates ``m · s_c0``: 29 values in 4.4% steps from 0.84 to 2.83."""
 _MAX_CHUNK_WEIGHTS = 1 << 24
+_MAX_LDLQ_CHUNK_ROWS = 4096
+_MAX_LDLQ_CHUNK_WEIGHTS = 1 << 27
 
 _LCG_MULTIPLIER = tl.constexpr(LCG_MULTIPLIER)
 _LCG_INCREMENT = tl.constexpr(LCG_INCREMENT)
@@ -262,18 +265,17 @@ def _estimate_initial_scales(
     return row_scale, p2, block_scale
 
 
-def _encode_rows(
-    w_rows: torch.Tensor, layout: TrellisLayout
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Encode finite rotated FP32 rows ``[R, K]`` on an SM80+ CUDA device."""
+def _search_and_refit_blocks(
+    w_flat: torch.Tensor,
+    p2_flat: torch.Tensor,
+    block_scale: torch.Tensor,
+    layout: TrellisLayout,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stages 2 and 3: L=12 scale search, wrap-overlap L=16 Viterbi, and FP8 refit."""
     block_size = layout.block_size
-    w = w_rows.reshape(-1, block_size)
-    num_blocks = w.shape[0]
+    num_blocks = w_flat.shape[0]
     widths = layout.compute_step_widths()
-
-    # 1. Analytical per-block & row scale selection.
-    row_scale, p2, block_scale = _estimate_initial_scales(w_rows, layout)
-    w_norm_h = ((w / p2[:, None]).clamp(-256.0, 256.0) * FP16_SCALE).to(torch.float16)
+    w_norm_h = ((w_flat / p2_flat[:, None]).clamp(-256.0, 256.0) * FP16_SCALE).to(torch.float16)
 
     # 2. Cost-only L=12 FP8 block-scale refinement (no backpointers).
     cands = _compute_fp8_window(block_scale, _FP8_SEARCH_RADIUS)
@@ -305,11 +307,11 @@ def _encode_rows(
 
     refit_win = _compute_fp8_window(block_scale, _FP8_REFIT_RADIUS).contiguous()
     final_scale = torch.empty_like(block_scale)
-    with device_context(w.device):
+    with device_context(w_flat.device):
         _refit_fp8_kernel[(num_blocks,)](
-            w,
+            w_flat,
             states,
-            p2,
+            p2_flat,
             refit_win,
             final_scale,
             num_blocks,
@@ -319,7 +321,70 @@ def _encode_rows(
             num_warps=4,
             enable_fp_fusion=False,
         )
+    return states, final_scale
+
+
+def _encode_rows(
+    w_rows: torch.Tensor, layout: TrellisLayout
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Encode finite rotated FP32 rows ``[R, K]`` on an SM80+ CUDA device."""
+    row_scale, p2, block_scale = _estimate_initial_scales(w_rows, layout)
+    states, final_scale = _search_and_refit_blocks(
+        w_rows.reshape(-1, layout.block_size), p2, block_scale, layout
+    )
     return states, final_scale, row_scale
+
+
+def _encode_rows_ldlq(
+    w_rows: torch.Tensor,
+    layout: TrellisLayout,
+    feedback: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Encode ``w_rows [R, K]`` via Block-LDLQ from right to left using ``feedback``."""
+    rows, cols = w_rows.shape
+    block_size = layout.block_size
+    blocks_per_row = cols // block_size
+    device = w_rows.device
+    tile_t = triton.next_power_of_2(block_size)
+    c_q = 2.0 ** (-2.0 * layout.block_bits / block_size)
+
+    row_scale, _, _ = _estimate_initial_scales(w_rows, layout)
+    bitstreams = torch.empty(
+        (rows, blocks_per_row, layout.bytes_per_block), dtype=torch.uint8, device=device
+    )
+    block_scales = torch.empty((rows, blocks_per_row), dtype=torch.float8_e4m3fn, device=device)
+
+    w_work = w_rows.clone()
+    best_s = torch.empty(rows, dtype=torch.float32, device=device)
+    cap_amax = torch.empty(rows, dtype=torch.float32, device=device)
+
+    for block_idx in range(blocks_per_row - 1, -1, -1):
+        start = block_idx * block_size
+        end = start + block_size
+        w_block = w_work[:, start:end].contiguous()
+        with device_context(device):
+            _estimate_block_scales_kernel[(rows,)](
+                w_block,
+                best_s,
+                cap_amax,
+                rows,
+                c_q,
+                block_size=block_size,
+                tile_t=tile_t,
+                num_warps=4,
+            )
+        block_scale = _round_fp8((best_s / row_scale).clamp(min=_FP8_NORMAL_FLOOR))
+        states, final_scale = _search_and_refit_blocks(w_block, row_scale, block_scale, layout)
+        bitstreams[:, block_idx, :] = pack_states(states, layout)
+        final_scale_fp8 = final_scale.to(torch.float8_e4m3fn)
+        block_scales[:, block_idx] = final_scale_fp8
+        if block_idx > 0:
+            q_block = decode_states(states, final_scale_fp8).to(torch.float32)
+            # Use original rotated weights so (W_orig - W_hat) @ L_tilde = W_target - W_hat.
+            delta_block = w_rows[:, start:end] - q_block * row_scale[:, None]
+            w_work[:, :start].addmm_(delta_block, feedback[start:end, :start])
+
+    return bitstreams, block_scales, row_scale
 
 
 @functools.cache
@@ -356,12 +421,16 @@ def pack_states(states: torch.Tensor, layout: TrellisLayout) -> torch.Tensor:
 
 
 def encode_matrix(
-    rotated: torch.Tensor, layout: TrellisLayout
+    rotated: torch.Tensor,
+    layout: TrellisLayout,
+    *,
+    feedback: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Trellis-coded storage of a rotated FP32 matrix ``[R, K]`` on an SM80+ CUDA device.
 
     Returns ``(bitstreams [R, K/T, bytes] uint8, block_scales [R, K/T] float8_e4m3fn,
-    scale [R, 1] float32)``. The values must be finite.
+    scale [R, 1] float32)``. When ``feedback`` is supplied, encodes blocks from right to left
+    via Block-LDLQ error propagation. The values must be finite.
     """
     rows, cols = rotated.shape
     blocks_per_row = cols // layout.block_size
@@ -371,18 +440,29 @@ def encode_matrix(
     )
     block_scales = torch.empty(rows, blocks_per_row, dtype=torch.float8_e4m3fn, device=device)
     scale = torch.empty(rows, 1, dtype=torch.float32, device=device)
-    chunk_rows = max(1, _MAX_CHUNK_WEIGHTS // cols)
-    for start_row in range(0, rows, chunk_rows):
-        end_row = min(rows, start_row + chunk_rows)
-        states, chunk_block_scales, chunk_scale = _encode_rows(
-            rotated[start_row:end_row].contiguous(), layout
-        )
-        packed = pack_states(states, layout)
-        bitstreams[start_row:end_row] = packed.view(end_row - start_row, blocks_per_row, -1)
-        block_scales[start_row:end_row] = chunk_block_scales.view(-1, blocks_per_row).to(
-            torch.float8_e4m3fn
-        )
-        scale[start_row:end_row] = chunk_scale[:, None]
+    if feedback is None:
+        chunk_rows = max(1, _MAX_CHUNK_WEIGHTS // cols)
+        for start_row in range(0, rows, chunk_rows):
+            end_row = min(rows, start_row + chunk_rows)
+            states, chunk_block_scales, chunk_scale = _encode_rows(
+                rotated[start_row:end_row].contiguous(), layout
+            )
+            packed = pack_states(states, layout)
+            bitstreams[start_row:end_row] = packed.view(end_row - start_row, blocks_per_row, -1)
+            block_scales[start_row:end_row] = chunk_block_scales.view(-1, blocks_per_row).to(
+                torch.float8_e4m3fn
+            )
+            scale[start_row:end_row] = chunk_scale[:, None]
+    else:
+        chunk_rows = max(1, min(_MAX_LDLQ_CHUNK_ROWS, _MAX_LDLQ_CHUNK_WEIGHTS // cols))
+        for start_row in range(0, rows, chunk_rows):
+            end_row = min(rows, start_row + chunk_rows)
+            chunk_bits, chunk_bscales, chunk_scale = _encode_rows_ldlq(
+                rotated[start_row:end_row].contiguous(), layout, feedback
+            )
+            bitstreams[start_row:end_row] = chunk_bits
+            block_scales[start_row:end_row] = chunk_bscales
+            scale[start_row:end_row] = chunk_scale[:, None]
     return bitstreams, block_scales, scale
 
 
