@@ -55,8 +55,8 @@ def _validate_uniform_storage(
         if 8 * bytes_per_block < lowest or 8 * bytes_per_block > highest:
             raise ValueError(
                 f"trellis blocks of {block_size} weights take {(lowest + 7) // 8} to "
-                f"{highest // 8} whole bytes (3 to 6 bits per weight), got "
-                f"{8 * bytes_per_block} bits"
+                f"{highest // 8} whole bytes ({MIN_BITS_PER_WEIGHT} to {MAX_BITS_PER_WEIGHT} "
+                f"bits per weight), got {8 * bytes_per_block} bits"
             )
         layout = None
     if block_scales.dtype is not torch.float8_e4m3fn or tuple(block_scales.shape) != (
@@ -174,7 +174,7 @@ class ConvRotTrellisTensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright:
 
     Caller preconditions match trellis decoding: E4M3 block scales must be non-NaN
     (not ``0x7F`` or ``0xFF``), and variable-row ``row_widths`` must lie in
-    ``[ceil(3 * block_size / 8), floor(6 * block_size / 8)]`` and fit within
+    ``[ceil(2 * block_size / 8), floor(6 * block_size / 8)]`` and fit within
     ``bitstreams``. Wrapping and inference never issue host readbacks or synchronizations.
     """
 

@@ -51,7 +51,8 @@ class EncoderVector:
 # Cases, as (rows, cols, block_bits, seed, min_sqnr_db); the block size is the format's
 # choice for cols: 4/5-bit steps at 4.5 bits per weight with scales, then 224-weight
 # blocks at that rate; 4-bit steps; 3/4-bit steps at 3.5; 3-bit steps; 5/6-bit steps at
-# 5.5; 6-bit steps; and 112-weight blocks, whose final overlap spans the whole sequence.
+# 5.5; 6-bit steps; 112-weight blocks, whose final overlap spans the whole sequence;
+# 2/3-bit steps at 2.5; and 2-bit steps.
 ENCODER_VECTORS = (
     EncoderVector(6, 512, 1144, 1, 22.5),
     EncoderVector(6, 448, 1000, 2, 24.0),
@@ -61,4 +62,6 @@ ENCODER_VECTORS = (
     EncoderVector(6, 512, 1400, 6, 30.0),
     EncoderVector(6, 512, 1536, 7, 30.5),
     EncoderVector(4, 336, 496, 8, 24.8),
+    EncoderVector(6, 512, 632, 9, 12.0),
+    EncoderVector(6, 512, 512, 10, 9.2),
 )

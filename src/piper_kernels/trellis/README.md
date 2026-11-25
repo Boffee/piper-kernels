@@ -1,6 +1,6 @@
 # Trellis-coded weights
 
-Trellis coding stores a ConvRot INT8 weight in 3 to 6 bits per weight. It can be
+Trellis coding stores a ConvRot INT8 weight in 2 to 6 bits per weight. It can be
 executed directly in memory via `ConvRotTrellisTensor` (`F.linear`) or decoded
 at load time via `ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` into
 ordinary ConvRot INT8 storage. This README owns the format and its encoder; the
@@ -34,7 +34,7 @@ each tensor's rate comes from its own shape, rates can differ between tensors.
 `copy_from_trellis_` also accept a variable-row layout via `row_widths`
 (`uint8 [out]`): `bitstreams` becomes 1-D `uint8 [total_bytes]`, storing each row
 `r`'s `in / T` blocks of `row_widths[r]` bytes back-to-back with row byte offsets
-`(in / T) · prefix_sum(row_widths)`. Each row width must lie in `[⌈3·T / 8⌉,
+`(in / T) · prefix_sum(row_widths)`. Each row width must lie in `[⌈2·T / 8⌉,
 ⌊6·T / 8⌋]` and `(in / T) · sum(row_widths)` must fit within `bitstreams.numel()`;
 both are caller preconditions (no host readback or synchronization at decode time).
 
@@ -81,7 +81,7 @@ runtime check.
 | Value | Supported | Why |
 |---|---|---|
 | Block size `T` | 16 to 256 | A 16-bit window never wraps twice; one decode tile covers a block |
-| Bits per block `B` | Whole bytes from `3·T` to `6·T` bits | 3- to 6-bit steps, the rates the encoder supports |
+| Bits per block `B` | Whole bytes from `2·T` to `6·T` bits | 2- to 6-bit steps, the rates the encoder supports |
 
 Whole bytes cost at most 1/32 bit per weight of rate granularity at `T = 256`, and
 let the rate come from the tensor shape instead of more metadata.
@@ -97,7 +97,7 @@ weight in FP32 and encodes each block. When using `bits_per_weight`, the rate
 counts the block's FP8 scale: a block of `T` weights stores
 `⌊bits_per_weight · T⌋ - 8` bits, rounded down to whole bytes. At 4.5 bits per
 weight a 256-weight block takes 143 bytes, 4- and 5-bit steps; at 3.5 it takes
-111 bytes, 3- and 4-bit steps.
+111 bytes, 3- and 4-bit steps; at 2.5 it takes 79 bytes, 2- and 3-bit steps.
 
 The [encoder](_encoder.py) minimizes each block's squared error in the rotated
 basis against the exact INT8 decode, without calibration data. Stage 1 analytically
@@ -108,9 +108,9 @@ and refits each block's E4M3 scale in FP32. The module docstring describes each 
 
 On Gaussian rows, which ConvRot-rotated weights resemble, the weight SQNR is:
 
-| Bits per weight | 3.03 | 3.5 | 4.03 | 4.5 | 5.5 | 6.03 |
-|---|---|---|---|---|---|---|
-| SQNR (dB) | 17.5 | 20.3 | 23.4 | 26.2 | 32.1 | 35.2 |
+| Bits per weight | 2.03 | 2.5 | 3.03 | 3.5 | 4.03 | 4.5 | 5.5 | 6.03 |
+|---|---|---|---|---|---|---|---|---|
+| SQNR (dB) | 11.5 | 14.3 | 17.5 | 20.3 | 23.4 | 26.2 | 32.1 | 35.2 |
 
 Peak-aware scale selection prevents outlier blocks from clipping, though extreme
 post-rotation outliers remain bounded by 1MAD's ~3.2σ tail range.
@@ -146,6 +146,7 @@ Triton 3.9+, and its inline PTX is NVIDIA-only.
 Encoding runs offline on NVIDIA SM80+ GPUs. On an RTX 5090 with PyTorch 2.15 and Triton
 3.9, `TrellisStorage.from_hp` encoded a 4096×5120 Gaussian BF16 weight with group
 size 256 at 91 to 103 M weights/s across 3 to 6 bits per weight (102.9 M weights/s at
-4.5 bits per weight; 103.5 M weights/s at 4.03 bits per weight). Search batches target 4
+4.5 bits per weight; 103.5 M weights/s at 4.03 bits per weight) and 52 to 58 M
+weights/s at 2.03 to 2.5 bits per weight (1 pair = 2 rows/CTA in shared memory). Search batches target 4
 GiB of backpointers; peak allocations on the Gaussian matrix were 4.4 GiB beyond the
 input weight. Batches and row chunks give identical results.

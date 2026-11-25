@@ -58,11 +58,14 @@ def test_triton_matches_research_encodings(vector: ResearchVector) -> None:
 @pytest.mark.parametrize(
     "layout",
     [
+        TrellisLayout(256, 512),
+        TrellisLayout(256, 632),
         TrellisLayout(256, 768),
         TrellisLayout(256, 1144),
         TrellisLayout(224, 1000),
         TrellisLayout(256, 1400),
         TrellisLayout(256, 1536),
+        TrellisLayout(16, 32),
         TrellisLayout(16, 56),  # every window near the wrap
         TrellisLayout(200, 1088),  # a partial step tile
     ],
@@ -101,10 +104,11 @@ def _random_variable_storage(
 @pytest.mark.parametrize(
     ("block_size", "widths", "blocks_per_row"),
     [
-        (256, [96, 112, 128, 144, 160, 176, 192, 143, 145, 96, 192], 3),  # 33 blocks (% 8 != 0)
-        (224, [84, 98, 112, 126, 140, 154, 168], 3),
-        (200, [75, 100, 136, 150, 99], 3),
-        (16, [6, 7, 8, 9, 10, 11, 12], 3),
+        # 39 blocks (% 8 != 0)
+        (256, [64, 79, 96, 112, 128, 144, 160, 176, 192, 143, 145, 64, 192], 3),
+        (224, [56, 70, 84, 98, 112, 126, 140, 154, 168], 3),
+        (200, [50, 75, 100, 136, 150, 99], 3),
+        (16, [4, 5, 6, 7, 8, 9, 10, 11, 12], 3),
         (256, [144], 5),
         (256, [], 2),
     ],

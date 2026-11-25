@@ -138,7 +138,7 @@ def _make_weight(
 
 
 def _variable_row_widths(out_features: int, block_size: int) -> list[int]:
-    lo = (3 * block_size + 7) // 8
+    lo = (2 * block_size + 7) // 8
     hi = (6 * block_size) // 8
     mid = (lo + hi) // 2
     choices = (lo, mid, hi)
@@ -741,13 +741,23 @@ def test_gpu_small_batch_a16_gemv_matches_reference(
 @pytest.mark.parametrize(
     ("out_features", "in_features", "block_size", "group_size", "bytes_per_block", "variable_rows"),
     [
+        (128, 512, 256, 256, 64, False),  # 2.0 bpw
         (301, 512, 256, 64, 111, False),  # 3.5 bpw + N tail
         (128, 512, 256, 256, 176, False),  # 5.5 bpw
         (96, 2688, 224, 16, None, True),  # non-pow2 block size + variable-row
+        (64, 64, 16, 16, 4, False),  # minimal block_size=16 at 2.0 bpw
         (64, 64, 16, 16, 7, False),  # minimal block_size=16
         (64, 65536, 256, 256, 143, False),  # triggers Split-K > 1 (> 2 MiB, low N)
     ],
-    ids=["3.5bpw-tail", "5.5bpw", "bs224-variable", "bs16", "splitk-n64-k65536"],
+    ids=[
+        "2.0bpw",
+        "3.5bpw-tail",
+        "5.5bpw",
+        "bs224-variable",
+        "bs16-2bpw",
+        "bs16",
+        "splitk-n64-k65536",
+    ],
 )
 def test_gpu_gemv_variants_rates_nonpow2_and_splitk(
     out_features: int,
@@ -979,7 +989,21 @@ def test_gpu_pin_memory_h2d_copy_and_direct_zero_k(variable_rows: bool) -> None:
     gpu_dst.copy_(pinned, non_blocking=True)
     torch.cuda.synchronize()
     assert gpu_dst.is_pinned() is False
-    assert torch.equal(gpu_dst.dequantize(torch.float32).cpu(), pinned.dequantize(torch.float32))
+    assert torch.equal(gpu_dst.bitstreams.cpu(), pinned.bitstreams)
+    assert torch.equal(
+        gpu_dst.block_scales.view(torch.uint8).cpu(), pinned.block_scales.view(torch.uint8)
+    )
+    assert torch.equal(gpu_dst.scale.cpu(), pinned.scale)
+    if variable_rows:
+        assert gpu_dst.row_widths is not None
+        assert pinned.row_widths is not None
+        assert torch.equal(gpu_dst.row_widths.cpu(), pinned.row_widths)
+    torch.testing.assert_close(
+        gpu_dst.dequantize(torch.float32).cpu(),
+        pinned.dequantize(torch.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
     # Direct Triton entrypoints must handle K == 0 cleanly without ZeroDivisionError.
     if not variable_rows:

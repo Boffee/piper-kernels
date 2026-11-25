@@ -63,7 +63,7 @@ class TrellisStorage:
         in FP32 for ConvRot ``group_size`` and encoded there. Specify either
         ``bits_per_weight`` (the stored rate counting each block's FP8 scale: each block
         takes the most whole bytes within it) or an exact whole-byte ``bytes_per_block``,
-        both yielding 3 to 6 code bits per weight. The block size is the largest multiple
+        both yielding 2 to 6 code bits per weight. The block size is the largest multiple
         of 16, up to 256, that divides ``in``. For example, 4.5 bits per weight or
         ``bytes_per_block=143`` stores each 256-weight block in 143 bytes plus its scale.
 
