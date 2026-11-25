@@ -204,7 +204,7 @@ multiple of 16) and at most `131_071`, and three bitstream layouts independently
 
 Caller preconditions (not checked via host readbacks when wrapping or dispatching): E4M3
 `block_scales` must be non-NaN (`0x7F`/`0xFF` excluded), each variable-row width must lie in
-`[⌈3·block_size / 8⌉, ⌊6·block_size / 8⌋]`, each slot's `(in / block_size) · sum(row_widths[s])`
+`[⌈2·block_size / 8⌉, ⌊6·block_size / 8⌋]`, each slot's `(in / block_size) · sum(row_widths[s])`
 must fit within `slot_bytes` (2-D) or `qdata.numel() - slot_offsets[s]` (1-D), and `slot_offsets`
 must be non-negative and within `qdata.numel()`. At runtime, single-token, small-batch, and
 non-INT8 GPUs (such as NVIDIA SM75) keep high-precision activations via fused in-register A16

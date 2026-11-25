@@ -63,7 +63,7 @@ class MoEWeights:
 
     For ``"convrot_trellis"``, wrapping and dispatch perform no host readbacks: callers must
     ensure E4M3 ``block_scales`` are non-NaN (not ``0x7F`` or ``0xFF``), variable-row
-    ``row_widths`` lie in ``[ceil(3 * block_size / 8), floor(6 * block_size / 8)]`` with each
+    ``row_widths`` lie in ``[ceil(2 * block_size / 8), floor(6 * block_size / 8)]`` with each
     slot fitting in ``slot_bytes`` (2-D) or ``qdata.numel() - slot_offsets[s]`` (1-D), and
     ``slot_offsets`` are non-negative and within ``qdata.numel()``.
     """

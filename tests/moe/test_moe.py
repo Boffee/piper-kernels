@@ -121,7 +121,7 @@ def _make_trellis_proj_slab(
             None,
         )
 
-    low_bytes = (3 * block_size + 7) // 8
+    low_bytes = (2 * block_size + 7) // 8
     high_bytes = (6 * block_size) // 8
     # Vary widths across both rows and slots (especially making 1-D slot totals asymmetric).
     row_widths = torch.randint(
@@ -5241,7 +5241,7 @@ def test_gpu_trellis_m1_and_batched_parity(
         # Narrow out_features + deep K triggers split_k_up > 1 and nvfp4_moe_m1_reduce_kernel.
         w_splitk = _make_trellis_moe_weights(
             2,
-            32768,
+            36864,
             64,
             group_size=64,
             activation_fn="gelu_tanh",
@@ -5252,7 +5252,7 @@ def test_gpu_trellis_m1_and_batched_parity(
         )
         sm_count = torch.cuda.get_device_properties(0).multi_processor_count
         for splitk_rows in (1, 2):
-            x_sk = torch.randn((splitk_rows, 32768), device="cuda", dtype=torch.bfloat16)
+            x_sk = torch.randn((splitk_rows, 36864), device="cuda", dtype=torch.bfloat16)
             ids_sk = torch.zeros((splitk_rows, 1), device="cuda", dtype=torch.int64)
             wts_sk = torch.full((splitk_rows, 1), 0.75, device="cuda", dtype=torch.bfloat16)
             out_sk, launches_sk = _record_triton_launches(
