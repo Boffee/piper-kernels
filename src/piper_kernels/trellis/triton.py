@@ -501,6 +501,7 @@ def decode_slots_int8_out(
     row_widths: torch.Tensor | None = None,
     slot_offsets: torch.Tensor | None = None,
     active_counts: torch.Tensor | None = None,
+    row_offsets: torch.Tensor | None = None,
 ) -> None:
     """Decode uniform or variable-row ``[chunk_slots, rows, ...]`` trellis weights to INT8."""
     chunk_slots, rows_per_slot, blocks_per_row = block_scales_u8.shape
@@ -519,7 +520,7 @@ def decode_slots_int8_out(
         bitstreams_bytes = bitstreams.numel()
         block_bits = step_bits = num_wide_steps = bytes_per_block = 0
         slot_bytes = bitstreams.shape[1] if per_slot_2d else 0
-        row_widths_arg = row_widths.view(-1)
+        row_widths_arg = row_widths.contiguous().view(-1)
     else:
         layout = TrellisLayout.from_storage(block_size, bitstreams.shape[3])
         resolved_block_size = layout.block_size
@@ -533,13 +534,19 @@ def decode_slots_int8_out(
 
     with device_context(bitstreams.device):
         row_offsets_arg = (
-            compute_row_offsets_2d(row_widths, dtype=torch.int32).view(-1)
-            if row_widths is not None
-            else None
+            None
+            if row_widths is None
+            else (
+                compute_row_offsets_2d(row_widths, dtype=torch.int32)
+                if row_offsets is None
+                else row_offsets
+            )
+            .contiguous()
+            .view(-1)
         )
         decode_slots_int8_kernel[grid](
             bitstreams,
-            block_scales_u8.view(-1),
+            block_scales_u8.contiguous().view(-1),
             q_out,
             row_widths_arg,
             row_offsets_arg,

@@ -1278,7 +1278,7 @@ def nvfp4_moe_grouped_gemm_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["slot_start", "slot_end"])
+@triton.jit(do_not_specialize=["slot_start", "slot_end", "n_start", "n_rows"])
 def int8_moe_grouped_gemm_kernel(
     input_ptr,
     weight_ptr,
@@ -1300,10 +1300,14 @@ def int8_moe_grouped_gemm_kernel(
     accumulator_seed: tl.constexpr = 0,
     slot_start=0,
     slot_end=0,
+    n_start=0,
+    n_rows=0,
     slot_window: tl.constexpr = False,
 ):
     """Grouped ConvRot INT8 W8A8 GEMM over contiguous slot-compacted tiles."""
-    num_pid_n = tl.cdiv(out_features, block_n)
+    active_n_rows = n_rows if slot_window else out_features
+    n_base = n_start if slot_window else 0
+    num_pid_n = tl.cdiv(active_n_rows, block_n)
     tile_idx, pid_n = _swizzle_grouped_pid(tl.program_id(0), max_tiles, num_pid_n, group_m)
     slot = tl.load(tile_slots_ptr + tile_idx).to(tl.int64)
     if slot < 0:
@@ -1316,22 +1320,22 @@ def int8_moe_grouped_gemm_kernel(
 
     offs_m = tl.arange(0, block_m)
     offs_m_i64 = offs_m.to(tl.int64)
-    offs_n = pid_n * block_n + tl.arange(0, block_n)
-    offs_n_i64 = offs_n.to(tl.int64)
+    offs_n_local = pid_n * block_n + tl.arange(0, block_n)
+    offs_n_global_i64 = (n_base + offs_n_local).to(tl.int64)
     m_valid = offs_m < tile_len
-    n_valid = offs_n < out_features
+    n_valid = offs_n_local < active_n_rows
     k_stride = in_features.to(tl.int64)
     slot_input_ptr = input_ptr + m_start * k_stride
     weight_slot = (slot - slot_start) if slot_window else slot
-    slot_weight_ptr = weight_ptr + weight_slot * out_features.to(tl.int64) * k_stride
+    slot_weight_ptr = weight_ptr + weight_slot * tl.full((), active_n_rows, tl.int64) * k_stride
 
     acc = _accumulate_int8_tile(
         slot_input_ptr,
         slot_weight_ptr,
         offs_m,
-        offs_n,
+        offs_n_local,
         tile_len,
-        out_features,
+        active_n_rows,
         in_features,
         0,
         tl.cdiv(in_features, block_k),
@@ -1344,16 +1348,24 @@ def int8_moe_grouped_gemm_kernel(
     )
     centered = acc - accumulator_seed
     in_scales = tl.load(input_scale_ptr + m_start + offs_m_i64, mask=m_valid, other=0.0)
-    w_scale = tl.load(weight_scale_ptr + slot * out_features + offs_n_i64, mask=n_valid, other=0.0)
+    w_scale = tl.load(
+        weight_scale_ptr + slot * out_features + offs_n_global_i64,
+        mask=n_valid,
+        other=0.0,
+    )
     out_vals = (centered.to(tl.float32) * in_scales[:, None] * w_scale[None, :]).to(
         output_ptr.dtype.element_ty
     )
 
     if swap_halves:
         half_n = out_features // 2
-        col_out = tl.where(offs_n_i64 < half_n, offs_n_i64 + half_n, offs_n_i64 - half_n)
+        col_out = tl.where(
+            offs_n_global_i64 < half_n,
+            offs_n_global_i64 + half_n,
+            offs_n_global_i64 - half_n,
+        )
     else:
-        col_out = offs_n_i64
+        col_out = offs_n_global_i64
 
     tl.store(
         output_ptr + (m_start + offs_m_i64)[:, None] * out_features + col_out[None, :],
@@ -2886,9 +2898,12 @@ def _launch_int8_grouped_gemm(
     accumulator_seed: int,
     slot_start: int = 0,
     slot_end: int = 0,
+    n_start: int = 0,
+    n_rows: int = 0,
     slot_window: bool = False,
 ) -> None:
-    grid = (max_tiles * triton.cdiv(out_features, block_n),)
+    active_n_rows = n_rows if slot_window else out_features
+    grid = (max_tiles * triton.cdiv(active_n_rows, block_n),)
     with device_context(x_q.device):
         int8_moe_grouped_gemm_kernel[grid](
             x_q,
@@ -2911,11 +2926,145 @@ def _launch_int8_grouped_gemm(
             accumulator_seed=accumulator_seed,
             slot_start=slot_start,
             slot_end=slot_end,
+            n_start=n_start,
+            n_rows=n_rows,
             slot_window=slot_window,
             **compiler_options,
             num_stages=num_stages,
             num_warps=num_warps,
         )
+
+
+def _run_prefill_int8_proj(
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    tile_slots: torch.Tensor,
+    tile_m_start: torch.Tensor,
+    tile_m_len: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    block_scales: torch.Tensor | None,
+    row_widths: torch.Tensor | None,
+    slot_offsets: torch.Tensor | None,
+    block_size: int,
+    slot_counts: torch.Tensor,
+    num_slots: int,
+    max_tiles: int,
+    out_features: int,
+    in_features: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_warps: int,
+    num_stages: int,
+    compiler_options: dict[str, object],
+    swap_halves: bool,
+    accumulator_seed: int,
+) -> None:
+    if block_scales is None:
+        _launch_int8_grouped_gemm(
+            x_q,
+            qdata,
+            tile_slots,
+            tile_m_start,
+            tile_m_len,
+            x_scale,
+            scale,
+            output,
+            max_tiles=max_tiles,
+            out_features=out_features,
+            in_features=in_features,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            compiler_options=compiler_options,
+            swap_halves=swap_halves,
+            aligned_nk=(out_features % block_n == 0 and in_features % block_k == 0),
+            accumulator_seed=accumulator_seed,
+        )
+        return
+
+    slot_decoded_bytes = out_features * in_features
+    if slot_decoded_bytes <= _TRELLIS_SCRATCH_BYTES:
+        max_chunk_slots = min(num_slots, _TRELLIS_SCRATCH_BYTES // max(1, slot_decoded_bytes))
+        n_chunk = out_features
+    else:
+        max_chunk_slots = 1
+        raw_chunk_rows = max(1, _TRELLIS_SCRATCH_BYTES // max(1, in_features))
+        n_chunk = (
+            (raw_chunk_rows // block_n) * block_n if raw_chunk_rows >= block_n else raw_chunk_rows
+        )
+
+    scratch = torch.empty(
+        (max_chunk_slots, n_chunk, in_features), device=x_q.device, dtype=torch.int8
+    )
+    block_scales_u8 = block_scales.view(torch.uint8)
+    for slot_start in range(0, num_slots, max_chunk_slots):
+        slot_end = min(slot_start + max_chunk_slots, num_slots)
+        window_slots = slot_end - slot_start
+        window_counts = slot_counts[slot_start:slot_end]
+        window_slot_offsets = None if slot_offsets is None else slot_offsets[slot_start:slot_end]
+        window_widths = None if row_widths is None else row_widths[slot_start:slot_end]
+        window_offsets = (
+            None
+            if window_widths is None
+            else compute_row_offsets_2d(window_widths, dtype=torch.int32)
+        )
+        for n_start in range(0, out_features, n_chunk):
+            n_end = min(n_start + n_chunk, out_features)
+            n_rows = n_end - n_start
+            q_view = scratch[:window_slots, :n_rows]
+            if row_widths is None:
+                chunk_streams = (
+                    qdata[slot_start:slot_end, n_start:n_end].contiguous()
+                    if n_rows < out_features
+                    else qdata[slot_start:slot_end]
+                )
+            elif slot_offsets is None:
+                chunk_streams = qdata[slot_start:slot_end]
+            else:
+                chunk_streams = qdata
+            decode_slots_int8_out(
+                chunk_streams,
+                block_scales_u8[slot_start:slot_end, n_start:n_end],
+                q_view,
+                block_size=block_size,
+                row_widths=None if window_widths is None else window_widths[:, n_start:n_end],
+                slot_offsets=window_slot_offsets,
+                active_counts=window_counts,
+                row_offsets=None if window_offsets is None else window_offsets[:, n_start:n_end],
+            )
+            _launch_int8_grouped_gemm(
+                x_q,
+                q_view,
+                tile_slots,
+                tile_m_start,
+                tile_m_len,
+                x_scale,
+                scale,
+                output,
+                max_tiles=max_tiles,
+                out_features=out_features,
+                in_features=in_features,
+                block_m=block_m,
+                block_n=block_n,
+                block_k=block_k,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                compiler_options=compiler_options,
+                swap_halves=swap_halves,
+                aligned_nk=(n_rows % block_n == 0 and in_features % block_k == 0),
+                accumulator_seed=accumulator_seed,
+                slot_start=slot_start,
+                slot_end=slot_end,
+                n_start=n_start,
+                n_rows=n_rows,
+                slot_window=True,
+            )
 
 
 def _run_int8_prefill_chunk(
@@ -2937,13 +3086,27 @@ def _run_int8_prefill_chunk(
     activation_fn: str,
     swap_halves: bool,
     active_slots_hint: int,
+    up_gate_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_scales: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    down_block_size: int = 0,
 ) -> None:
     device = input_q_chunk.device
     chunk_rows = input_q_chunk.shape[0]
     top_k = topk_ids_chunk.shape[1]
     num_pairs = chunk_rows * top_k
-    num_slots, hidden_size, intermediate_size = down_qdata.shape
-    up_gate_out = up_gate_qdata.shape[1]
+    if down_block_scales is not None:
+        assert up_gate_block_scales is not None
+        num_slots, hidden_size, down_blocks = down_block_scales.shape
+        intermediate_size = down_blocks * down_block_size
+        up_gate_out = up_gate_block_scales.shape[1]
+    else:
+        num_slots, hidden_size, intermediate_size = down_qdata.shape
+        up_gate_out = up_gate_qdata.shape[1]
     block_m, block_n, block_k, num_warps, num_stages, compiler_options = _int8_prefill_config(
         target,
         chunk_rows=chunk_rows,
@@ -2951,9 +3114,15 @@ def _run_int8_prefill_chunk(
         num_slots=num_slots,
         active_slots_hint=active_slots_hint,
     )
-    tile_slots, tile_m_start, tile_m_len, compact_to_pair, pair_to_compact, max_tiles, _ = (
-        _launch_moe_prefill_bucket(topk_ids_chunk.reshape(-1), expert_to_slot, num_slots, block_m)
-    )
+    (
+        tile_slots,
+        tile_m_start,
+        tile_m_len,
+        compact_to_pair,
+        pair_to_compact,
+        max_tiles,
+        slot_counts,
+    ) = _launch_moe_prefill_bucket(topk_ids_chunk.reshape(-1), expert_to_slot, num_slots, block_m)
     expected_tiles = _expected_bucket_tiles(
         num_pairs, num_slots, active_slots_hint, block_m=block_m, batched=True
     )
@@ -2977,15 +3146,21 @@ def _run_int8_prefill_chunk(
     )
     # Zero mid so inactive compacted tail rows produce finite zeroed activations.
     mid = torch.zeros((num_pairs, up_gate_out), device=device, dtype=out_chunk.dtype)
-    _launch_int8_grouped_gemm(
+    _run_prefill_int8_proj(
         x_compact,
+        x_scale_compact,
         up_gate_qdata,
+        up_gate_scale,
         tile_slots,
         tile_m_start,
         tile_m_len,
-        x_scale_compact,
-        up_gate_scale,
         mid,
+        block_scales=up_gate_block_scales,
+        row_widths=up_gate_row_widths,
+        slot_offsets=up_gate_slot_offsets,
+        block_size=up_gate_block_size,
+        slot_counts=slot_counts,
+        num_slots=num_slots,
         max_tiles=max_tiles,
         out_features=up_gate_out,
         in_features=hidden_size,
@@ -2996,9 +3171,9 @@ def _run_int8_prefill_chunk(
         num_stages=num_stages,
         compiler_options=compiler_options,
         swap_halves=swap_halves,
-        aligned_nk=(up_gate_out % block_n == 0 and hidden_size % block_k == 0),
         accumulator_seed=up_seed,
     )
+    del x_compact, x_scale_compact
     down_prep_plan = int8_backend.policy.select_execution_plan(
         target, in_features=intermediate_size, rows=num_pairs, out_features=None
     )
@@ -3010,16 +3185,23 @@ def _run_int8_prefill_chunk(
         execution_plan=down_prep_plan,
         target=target,
     )
+    del mid
     down_out = torch.empty((num_pairs, hidden_size), device=device, dtype=torch.float32)
-    _launch_int8_grouped_gemm(
+    _run_prefill_int8_proj(
         act_q,
+        act_s,
         down_qdata,
+        down_scale,
         tile_slots,
         tile_m_start,
         tile_m_len,
-        act_s,
-        down_scale,
         down_out,
+        block_scales=down_block_scales,
+        row_widths=down_row_widths,
+        slot_offsets=down_slot_offsets,
+        block_size=down_block_size,
+        slot_counts=slot_counts,
+        num_slots=num_slots,
         max_tiles=max_tiles,
         out_features=hidden_size,
         in_features=intermediate_size,
@@ -3030,9 +3212,9 @@ def _run_int8_prefill_chunk(
         num_stages=num_stages,
         compiler_options=compiler_options,
         swap_halves=False,
-        aligned_nk=(hidden_size % block_n == 0 and intermediate_size % block_k == 0),
         accumulator_seed=down_seed,
     )
+    del act_q, act_s
     _launch_moe_prefill_weighted_reduce(
         down_out,
         pair_to_compact,
@@ -3705,239 +3887,6 @@ def _run_trellis_chunk(
         )
 
 
-def _run_trellis_prefill_proj(
-    x_q: torch.Tensor,
-    x_scale: torch.Tensor,
-    qdata: torch.Tensor,
-    block_scales: torch.Tensor,
-    scale: torch.Tensor,
-    row_widths: torch.Tensor | None,
-    slot_offsets: torch.Tensor | None,
-    block_size: int,
-    tile_slots: torch.Tensor,
-    tile_m_start: torch.Tensor,
-    tile_m_len: torch.Tensor,
-    slot_counts: torch.Tensor,
-    output: torch.Tensor,
-    *,
-    num_slots: int,
-    max_tiles: int,
-    out_features: int,
-    in_features: int,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    num_warps: int,
-    num_stages: int,
-    compiler_options: dict[str, object],
-    swap_halves: bool,
-    accumulator_seed: int,
-) -> None:
-    max_chunk_slots = min(
-        num_slots, max(1, _TRELLIS_SCRATCH_BYTES // max(1, out_features * in_features))
-    )
-    scratch = torch.empty(
-        (max_chunk_slots, out_features, in_features), device=x_q.device, dtype=torch.int8
-    )
-    block_scales_u8 = block_scales.view(torch.uint8)
-    aligned_nk = out_features % block_n == 0 and in_features % block_k == 0
-    for slot_start in range(0, num_slots, max_chunk_slots):
-        slot_end = min(slot_start + max_chunk_slots, num_slots)
-        q_view = scratch[: slot_end - slot_start]
-        chunk_streams = qdata if slot_offsets is not None else qdata[slot_start:slot_end]
-        decode_slots_int8_out(
-            chunk_streams,
-            block_scales_u8[slot_start:slot_end],
-            q_view,
-            block_size=block_size,
-            row_widths=None if row_widths is None else row_widths[slot_start:slot_end],
-            slot_offsets=None if slot_offsets is None else slot_offsets[slot_start:slot_end],
-            active_counts=slot_counts[slot_start:slot_end],
-        )
-        _launch_int8_grouped_gemm(
-            x_q,
-            q_view,
-            tile_slots,
-            tile_m_start,
-            tile_m_len,
-            x_scale,
-            scale,
-            output,
-            max_tiles=max_tiles,
-            out_features=out_features,
-            in_features=in_features,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            compiler_options=compiler_options,
-            swap_halves=swap_halves,
-            aligned_nk=aligned_nk,
-            accumulator_seed=accumulator_seed,
-            slot_start=slot_start,
-            slot_end=slot_end,
-            slot_window=True,
-        )
-
-
-def _run_trellis_prefill_chunk(
-    input_q_chunk: torch.Tensor,
-    input_s_chunk: torch.Tensor,
-    topk_ids_chunk: torch.Tensor,
-    topk_weights_chunk: torch.Tensor,
-    up_gate_qdata: torch.Tensor,
-    up_gate_block_scales: torch.Tensor,
-    up_gate_scale: torch.Tensor,
-    up_gate_row_widths: torch.Tensor | None,
-    up_gate_slot_offsets: torch.Tensor | None,
-    up_gate_block_size: int,
-    down_qdata: torch.Tensor,
-    down_block_scales: torch.Tensor,
-    down_scale: torch.Tensor,
-    down_row_widths: torch.Tensor | None,
-    down_slot_offsets: torch.Tensor | None,
-    down_block_size: int,
-    expert_to_slot: torch.Tensor | None,
-    out_chunk: torch.Tensor,
-    *,
-    target: AcceleratorTarget,
-    int8_backend: LinearBackend,
-    accumulate: bool,
-    group_size: int,
-    activation_fn: str,
-    swap_halves: bool,
-    active_slots_hint: int,
-) -> None:
-    device = input_q_chunk.device
-    chunk_rows = input_q_chunk.shape[0]
-    top_k = topk_ids_chunk.shape[1]
-    num_pairs = chunk_rows * top_k
-    num_slots, hidden_size, down_blocks = down_block_scales.shape
-    intermediate_size = down_blocks * down_block_size
-    up_gate_out = up_gate_block_scales.shape[1]
-    block_m, block_n, block_k, num_warps, num_stages, compiler_options = _int8_prefill_config(
-        target,
-        chunk_rows=chunk_rows,
-        top_k=top_k,
-        num_slots=num_slots,
-        active_slots_hint=active_slots_hint,
-    )
-    (
-        tile_slots,
-        tile_m_start,
-        tile_m_len,
-        compact_to_pair,
-        pair_to_compact,
-        max_tiles,
-        slot_counts,
-    ) = _launch_moe_prefill_bucket(topk_ids_chunk.reshape(-1), expert_to_slot, num_slots, block_m)
-    expected_tiles = _expected_bucket_tiles(
-        num_pairs, num_slots, active_slots_hint, block_m=block_m, batched=True
-    )
-    up_seed = rdna4_int8_accumulator_seed(
-        target, hidden_size, expected_tiles * triton.cdiv(up_gate_out, block_n)
-    )
-    down_seed = rdna4_int8_accumulator_seed(
-        target, intermediate_size, expected_tiles * triton.cdiv(hidden_size, block_n)
-    )
-    x_compact = torch.empty((num_pairs, hidden_size), device=device, dtype=torch.int8)
-    x_scale_compact = torch.empty((num_pairs,), device=device, dtype=torch.float32)
-    _launch_moe_prefill_gather(
-        input_q_chunk,
-        input_s_chunk,
-        compact_to_pair,
-        x_compact,
-        x_scale_compact,
-        hidden_size,
-        top_k,
-        has_scale=True,
-    )
-
-    mid = torch.zeros((num_pairs, up_gate_out), device=device, dtype=out_chunk.dtype)
-    _run_trellis_prefill_proj(
-        x_compact,
-        x_scale_compact,
-        up_gate_qdata,
-        up_gate_block_scales,
-        up_gate_scale,
-        up_gate_row_widths,
-        up_gate_slot_offsets,
-        up_gate_block_size,
-        tile_slots,
-        tile_m_start,
-        tile_m_len,
-        slot_counts,
-        mid,
-        num_slots=num_slots,
-        max_tiles=max_tiles,
-        out_features=up_gate_out,
-        in_features=hidden_size,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        compiler_options=compiler_options,
-        swap_halves=swap_halves,
-        accumulator_seed=up_seed,
-    )
-    del x_compact, x_scale_compact
-
-    down_prep_plan = int8_backend.policy.select_execution_plan(
-        target, in_features=intermediate_size, rows=num_pairs, out_features=None
-    )
-    act_q, act_s = int8_backend.prepare_input_with_plan(
-        mid,
-        intermediate_size,
-        group_size,
-        activation_fn=activation_fn,
-        execution_plan=down_prep_plan,
-        target=target,
-    )
-    del mid
-
-    down_out = torch.empty((num_pairs, hidden_size), device=device, dtype=torch.float32)
-    _run_trellis_prefill_proj(
-        act_q,
-        act_s,
-        down_qdata,
-        down_block_scales,
-        down_scale,
-        down_row_widths,
-        down_slot_offsets,
-        down_block_size,
-        tile_slots,
-        tile_m_start,
-        tile_m_len,
-        slot_counts,
-        down_out,
-        num_slots=num_slots,
-        max_tiles=max_tiles,
-        out_features=hidden_size,
-        in_features=intermediate_size,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        compiler_options=compiler_options,
-        swap_halves=False,
-        accumulator_seed=down_seed,
-    )
-    del act_q, act_s
-
-    _launch_moe_prefill_weighted_reduce(
-        down_out,
-        pair_to_compact,
-        topk_weights_chunk.reshape(-1),
-        out_chunk,
-        hidden_size,
-        top_k,
-        accumulate=accumulate,
-    )
-
-
 def _dispatch_trellis_moe(
     input_2d: torch.Tensor,
     ids_2d: torch.Tensor,
@@ -4012,23 +3961,15 @@ def _dispatch_trellis_moe(
                     execution_plan=up_prep_plan,
                     target=resolved_target,
                 )
-            _run_trellis_prefill_chunk(
+            _run_int8_prefill_chunk(
                 inp_q_chunk,
                 inp_s_chunk,
                 ids_2d[start:end],
                 weights_2d[start:end],
                 up_gate_qdata,
-                up_gate_block_scales,
                 up_gate_scale,
-                up_gate_row_widths,
-                up_gate_slot_offsets,
-                up_gate_block_size,
                 down_qdata,
-                down_block_scales,
                 down_scale,
-                down_row_widths,
-                down_slot_offsets,
-                down_block_size,
                 expert_to_slot,
                 out_2d[start:end],
                 target=resolved_target,
@@ -4038,6 +3979,14 @@ def _dispatch_trellis_moe(
                 activation_fn=activation_fn,
                 swap_halves=swap_halves,
                 active_slots_hint=active_slots_hint,
+                up_gate_block_scales=up_gate_block_scales,
+                up_gate_row_widths=up_gate_row_widths,
+                up_gate_slot_offsets=up_gate_slot_offsets,
+                up_gate_block_size=up_gate_block_size,
+                down_block_scales=down_block_scales,
+                down_row_widths=down_row_widths,
+                down_slot_offsets=down_slot_offsets,
+                down_block_size=down_block_size,
             )
         return
 
@@ -4536,6 +4485,8 @@ def _compile_int8_prefill_kernels(
         "in_features": "i32",
         "slot_start": "i32",
         "slot_end": "i32",
+        "n_start": "i32",
+        "n_rows": "i32",
     }
     opts = {"num_stages": num_stages, "num_warps": num_warps, **compiler_options}
     compiled = _compile_prefill_utility_kernels(

@@ -5464,6 +5464,53 @@ def test_gpu_trellis_prefill_edge_cases() -> None:
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(
+    not _INT8_MOE_GPU_AVAILABLE, reason="requires SM80+ CUDA or supported ROCm INT8 MoE"
+)
+@pytest.mark.parametrize(
+    ("up_layout", "down_layout"),
+    [("uniform", "uniform"), ("var1d", "var2d")],
+)
+def test_gpu_trellis_prefill_intra_expert_row_windowing(
+    up_layout: TrellisLayoutKind,
+    down_layout: TrellisLayoutKind,
+) -> None:
+    torch.manual_seed(976 + int(up_layout == "var1d"))
+    # Single expert where up_gate=72 MiB and down=36 MiB both exceed the 32 MiB scratch cap.
+    weights = _make_trellis_moe_weights(
+        1,
+        4608,
+        8192,
+        group_size=64,
+        activation_fn="swiglu",
+        gate_first=True,
+        dtype=torch.bfloat16,
+        device="cuda",
+        layouts=(up_layout, down_layout),
+        seed=977,
+    )
+    x = torch.randn((24, 4608), device="cuda", dtype=torch.bfloat16)
+    topk_ids = torch.zeros((24, 1), device="cuda", dtype=torch.int64)
+    topk_weights = torch.full((24, 1), 0.75, device="cuda", dtype=torch.bfloat16)
+
+    # Warm JIT/caches first, then measure peak workspace during windowed execution.
+    _ = moe_ffn(x, weights, topk_ids, topk_weights)
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    actual, launches = _record_triton_launches(lambda: moe_ffn(x, weights, topk_ids, topk_weights))
+    torch.cuda.synchronize()
+    peak_delta = torch.cuda.max_memory_allocated() - baseline
+
+    decode_launches = [name for name in launches if "decode_slots_int8_kernel" in name]
+    grouped_launches = [name for name in launches if "int8_moe_grouped_gemm_kernel" in name]
+    assert len(decode_launches) == 5  # 3 up_gate windows (straddling half_n=8192) + 2 down windows
+    assert len(grouped_launches) == 5
+    assert peak_delta < 56 * 1024 * 1024
+    _assert_trellis_prefill_matches_oracle(actual, x, weights, topk_ids, topk_weights)
+
+
+@pytest.mark.gpu
 @pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
 @pytest.mark.parametrize("layout_kind", ["uniform", "var1d"])
 def test_gpu_trellis_compile_dynamic_all_regimes(layout_kind: TrellisLayoutKind) -> None:
