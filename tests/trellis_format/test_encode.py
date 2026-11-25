@@ -23,8 +23,11 @@ _nvidia = pytest.mark.skipif(
         (5120, 4, TrellisLayout(256, 1016)),
         (5120, 3.5, TrellisLayout(256, 888)),
         (5120, 3.03125, TrellisLayout(256, 768)),
+        (5120, 2.5, TrellisLayout(256, 632)),
+        (5120, 2.03125, TrellisLayout(256, 512)),
         (5120, 6.05, TrellisLayout(256, 1536)),
         (336, 4.5, TrellisLayout(112, 496)),
+        (272, 2.5, TrellisLayout(16, 32)),
         (272, 4.5, TrellisLayout(16, 64)),
     ],
 )
@@ -37,8 +40,8 @@ def test_resolve_layout_takes_the_most_whole_bytes_within_the_rate(
 @pytest.mark.parametrize(
     ("in_features", "bits_per_weight", "message"),
     [
-        (5120, 3, "store 3.03125 to 6.03125 bits per weight"),
-        (5120, 6.1, "store 3.03125 to 6.03125 bits per weight"),
+        (5120, 2, "store 2.03125 to 6.03125 bits per weight"),
+        (5120, 6.1, "store 2.03125 to 6.03125 bits per weight"),
         (100, 4.5, "multiple of 16 wide, got 100"),
     ],
 )
@@ -51,7 +54,13 @@ def test_resolve_layout_rejects_unsupported_rates(
 
 @pytest.mark.parametrize(
     "layout",
-    [TrellisLayout(256, 1144), TrellisLayout(224, 1000), TrellisLayout(16, 96)],
+    [
+        TrellisLayout(256, 512),
+        TrellisLayout(256, 1144),
+        TrellisLayout(224, 1000),
+        TrellisLayout(16, 32),
+        TrellisLayout(16, 96),
+    ],
     ids=str,
 )
 def test_pack_states_inverts_the_decoder_windows(layout: TrellisLayout) -> None:
@@ -86,7 +95,8 @@ def _sqnr_db(reference: torch.Tensor, approximation: torch.Tensor) -> float:
 
 
 @pytest.mark.parametrize(
-    ("bits_per_weight", "min_sqnr_db"), [(3.5, 19.5), (4.5, 25.5), (5.5, 31.0)]
+    ("bits_per_weight", "min_sqnr_db"),
+    [(2.03125, 10.5), (2.5, 13.5), (3.5, 19.5), (4.5, 25.5), (5.5, 31.0)],
 )
 @pytest.mark.gpu
 @_nvidia
@@ -232,7 +242,10 @@ def test_from_hp_encodes_large_finite_weights_without_overflow() -> None:
 @pytest.mark.parametrize(
     ("cols", "bytes_per_block", "bits_per_weight"),
     [
+        (512, 64, 2.03125),
         (512, 143, 4.5),
+        (448, 56, 2.036),
+        (448, 70, 2.536),
         (448, 84, 3.036),
         (448, 125, 4.5),
         (448, 168, 6.05),
@@ -263,7 +276,7 @@ def test_from_hp_bytes_per_block_matches_bits_per_weight(
         (torch.zeros(2, 256, dtype=torch.float64), 256, 4.5, "float64"),
         (torch.zeros(2, 320), 256, 4.5, "not divisible by group size 256"),
         (torch.zeros(2, 256), 32, 4.5, "group size must be one of"),
-        (torch.zeros(2, 256), 256, 2.5, "bits per weight"),
+        (torch.zeros(2, 256), 256, 1.5, "bits per weight"),
     ],
 )
 def test_from_hp_validates_its_arguments(
@@ -287,8 +300,8 @@ def test_from_hp_validates_its_arguments(
             TypeError,
             "bytes_per_block must be an integer",
         ),
-        ({"group_size": 256, "bytes_per_block": 95}, ValueError, "take 96 to 192 whole bytes"),
-        ({"group_size": 256, "bytes_per_block": 193}, ValueError, "take 96 to 192 whole bytes"),
+        ({"group_size": 256, "bytes_per_block": 63}, ValueError, "take 64 to 192 whole bytes"),
+        ({"group_size": 256, "bytes_per_block": 193}, ValueError, "take 64 to 192 whole bytes"),
     ],
 )
 def test_from_hp_validates_bytes_per_block_arguments(

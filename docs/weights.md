@@ -9,7 +9,7 @@ calibration, and model quality.
 | Format | Stored representation | Execution |
 |---|---|---|
 | `ConvRotInt8Tensor` | Grouped rotation, INT8 values, FP32 scale per output | Linear and Conv3D, with optimized NVIDIA/AMD kernels and portable fallback; embedding lookups. |
-| `ConvRotTrellisTensor` | Packed 3–6 bpw trellis bitstreams, FP8 block scales, FP32 row scale | Linear (`F.linear`) via Triton kernels on supported NVIDIA/AMD GPUs and CPU fallback. |
+| `ConvRotTrellisTensor` | Packed 2–6 bpw trellis bitstreams, FP8 block scales, FP32 row scale | Linear (`F.linear`) via Triton kernels on supported NVIDIA/AMD GPUs and CPU fallback. |
 | `PiperNVFP4Tensor` | Packed FP4 values, FP8 block scales, optional FP32 global scale | Native W4A4 linear and fusions target exact NVIDIA SM120; weight-only W4A16 (`act_quant_kwargs=None`) targets NVIDIA SM75+ and supported AMD ROCm GPUs. |
 | `ConvRotNVFP4Tensor` | NVFP4 in a grouped rotated basis | Same W4A4 and W4A16 GPU targets, plus a CPU reference fallback for weight-only W4A16. |
 
@@ -372,7 +372,7 @@ same scale and activation options as `from_hp`, including
 
 ## Encode, execute, and decode trellis-coded weights
 
-Trellis coding packs a rotated ConvRot INT8 weight to 3–6 bits per weight for
+Trellis coding packs a rotated ConvRot INT8 weight to 2–6 bits per weight for
 offline export (`block_size <= 256`, independent of ConvRot `group_size`):
 
 ```python
@@ -414,7 +414,7 @@ A checkpoint stores `(bitstreams, block_scales, scale, block_size, group_size)`.
 `resolve_block_size`, and `resolve_layout`. `ConvRotTrellisTensor.from_quantized`,
 `ConvRotInt8Tensor.from_trellis`, and `copy_from_trellis_` accept optional
 `row_widths` (`uint8 [out]`) with 1-D row-concatenated `bitstreams`
-(`uint8 [total_bytes]`), where valid row widths (`3–6` code bits per weight)
+(`uint8 [total_bytes]`), where valid row widths (`2–6` code bits per weight)
 and bitstream capacity are caller preconditions. `TrellisStorage.from_hp`
 requires an NVIDIA SM80+ GPU and validates finite input weights. GPU decoding and
 execution require a supported Triton GPU (validated on NVIDIA decode and AMD

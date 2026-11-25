@@ -58,10 +58,13 @@ def _geometry(L: int, min_k: int) -> tuple[int, int, int]:
     """``(threads, loop_bits, pairs_per_cta)`` for ``(L, min_k)``.
 
     Each pair holds two rows packed in ``half2``, giving 12 rows/CTA except at
-    ``L=16, min_k=3`` where 32 KiB/pair fits 3 pairs (6 rows) in 96 KiB.
+    ``L=16, min_k=2`` (64 KiB/pair fits 1 pair = 2 rows in 64 KiB) and
+    ``L=16, min_k=3`` (32 KiB/pair fits 3 pairs = 6 rows in 96 KiB).
     """
     if L == 12:
         return (64, 2, 6)
+    if min_k == 2:
+        return (1024, 2, 1)
     if min_k == 3:
         return (512, 3, 3)
     return (256, 4, 6)
@@ -85,25 +88,55 @@ def _pair_offset_bytes(p: int, pairs: int, cap: int) -> int:
 
 @gluon.constexpr_function
 def _phys_const(v: int) -> int:
-    """1-way bank-conflict-free XOR swizzle across all L in {12, 16} and k in {3..6}."""
+    """1-way bank-conflict-free XOR swizzle across all L in {12, 16} and k in {2..6}."""
     return v ^ (((v >> 5) ^ (v >> 7)) & 31)
 
 
 @gluon.constexpr_function
-def _in_offsets(group: int, pair: bool) -> tuple[int, ...]:
-    if pair:
-        return tuple(_phys_const(((i & 7) << group) | ((i >> 3) << (group - 1))) for i in range(16))
-    return tuple(_phys_const(i << group) for i in range(16))
+def _split_count(ka: int) -> int:
+    return 1 << (4 - ka) if ka < 4 else 1
 
 
 @gluon.constexpr_function
-def _state_steps(out_bits: int, pair: bool) -> tuple[int, ...]:
-    if pair:
-        return tuple(
-            _ONE_MAD_A.value * (((i & 7) << out_bits) | ((i >> 3) << (out_bits - 1))) & _U32
-            for i in range(16)
-        )
-    return tuple(_ONE_MAD_A.value * (i << out_bits) & _U32 for i in range(16))
+def _in_offsets(group: int, split: int) -> tuple[int, ...]:
+    if split == 1:
+        return tuple(_phys_const(i << group) for i in range(16))
+    split_bits = split.bit_length() - 1
+    mask = (16 // split) - 1
+    return tuple(
+        _phys_const(((i & mask) << group) | ((i >> (4 - split_bits)) << (group - split_bits)))
+        for i in range(16)
+    )
+
+
+@gluon.constexpr_function
+def _state_steps(out_bits: int, split: int) -> tuple[int, ...]:
+    if split == 1:
+        return tuple(_ONE_MAD_A.value * (i << out_bits) & _U32 for i in range(16))
+    split_bits = split.bit_length() - 1
+    mask = (16 // split) - 1
+    return tuple(
+        _ONE_MAD_A.value
+        * (((i & mask) << out_bits) | ((i >> (4 - split_bits)) << (out_bits - split_bits)))
+        & _U32
+        for i in range(16)
+    )
+
+
+@gluon.constexpr_function
+def _split_out_offsets(out_bits: int, split: int) -> tuple[int, ...]:
+    if split == 1:
+        return (0,)
+    shift = out_bits - (split.bit_length() - 1)
+    return tuple(4 * _phys_const(s << shift) for s in range(split))
+
+
+@gluon.constexpr_function
+def _split_bp_offsets(idx_bits: int, split: int) -> tuple[int, ...]:
+    if split == 1:
+        return (0,)
+    shift = idx_bits - (split.bit_length() - 1)
+    return tuple(s << shift for s in range(split))
 
 
 @gluon.constexpr_function
@@ -344,17 +377,18 @@ def _step_h2(
 ):  # fmt: skip
     THREADS: gl.constexpr = _geometry(L, MIN_K)[0]
     LB: gl.constexpr = _geometry(L, MIN_K)[1]
-    PAIR: gl.constexpr = KA == 3
+    SPLIT: gl.constexpr = _split_count(KA)
+    COUNT: gl.constexpr = 16 // SPLIT
     PARTS: gl.constexpr = 1 << (KA - 4) if KA > 4 else 1
     PART_BITS: gl.constexpr = KA - 4 if KA > 4 else 0
     OUT_BITS: gl.constexpr = L - KA
     GROUP: gl.constexpr = L - KE - KA
     LOW_P: gl.constexpr = _low_pairs(PAIRS)
     IDX_BITS: gl.constexpr = OUT_BITS - LB
-    OFFSETS: gl.constexpr = _in_offsets(GROUP, PAIR)
-    STEPS: gl.constexpr = _state_steps(OUT_BITS, PAIR)
-    SEC_OUT_OFF: gl.constexpr = 4 * _phys_const(1 << (OUT_BITS - 1)) if PAIR else 0
-    SEC_BP_OFF: gl.constexpr = (1 << (IDX_BITS - 1)) if PAIR else 0
+    OFFSETS: gl.constexpr = _in_offsets(GROUP, SPLIT)
+    STEPS: gl.constexpr = _state_steps(OUT_BITS, SPLIT)
+    SPLIT_OUT_OFFS: gl.constexpr = _split_out_offsets(OUT_BITS, SPLIT)
+    SPLIT_BP_OFFS: gl.constexpr = _split_bp_offsets(IDX_BITS, SPLIT)
 
     tid = _thread_index(THREADS)
     part = tid & (PARTS - 1)
@@ -393,24 +427,12 @@ def _step_h2(
         bp_off = e << IDX_BITS
         for p in gl.static_range(PAIRS):
             base_addr = low_addr if p < LOW_P else high_addr
-            if PAIR:
-                best0, arg0 = _argmin_h2(wp[p], q, ins, p, 0, 8, COST_ONLY)
-                best1, arg1 = _argmin_h2(wp[p], q, ins, p, 8, 8, COST_ONLY)
+            for s in gl.static_range(SPLIT):
+                best, arg = _argmin_h2(wp[p], q, ins, p, s * COUNT, COUNT, COST_ONLY)
                 _store_step_output(
-                    base_addr, out_off, bp_base[p] + bp_off if not COST_ONLY else bp_pair_ptr,
-                    arg0, best0, part, is_owner, do_bp, _pair_offset_bytes(p, PAIRS, CAP),
-                    1, COST_ONLY,
-                )  # fmt: skip
-                _store_step_output(
-                    base_addr, out_off ^ SEC_OUT_OFF,
-                    bp_base[p] + bp_off + SEC_BP_OFF if not COST_ONLY else bp_pair_ptr,
-                    arg1, best1, part, is_owner, do_bp, _pair_offset_bytes(p, PAIRS, CAP),
-                    1, COST_ONLY,
-                )  # fmt: skip
-            else:
-                best, arg = _argmin_h2(wp[p], q, ins, p, 0, 16, COST_ONLY)
-                _store_step_output(
-                    base_addr, out_off, bp_base[p] + bp_off if not COST_ONLY else bp_pair_ptr,
+                    base_addr,
+                    out_off ^ SPLIT_OUT_OFFS[s],
+                    bp_base[p] + bp_off + SPLIT_BP_OFFS[s] if not COST_ONLY else bp_pair_ptr,
                     arg, best, part, is_owner, do_bp, _pair_offset_bytes(p, PAIRS, CAP),
                     PARTS, COST_ONLY,
                 )  # fmt: skip
@@ -466,12 +488,12 @@ def _reduce_final_min(
 ):  # fmt: skip
     TL: gl.constexpr = _thread_layout(THREADS)
     LOW_P: gl.constexpr = _low_pairs(PAIRS)
-    tid = gl.arange(0, THREADS, TL)
-    red_buf = gl.allocate_shared_memory(gl.uint32, [32], _IDENTITY)
+    NUM_WARPS: gl.constexpr = THREADS // 32
+    tid = _thread_index(THREADS)
+    red_buf = gl.allocate_shared_memory(gl.uint32, [2 * NUM_WARPS], _IDENTITY)
     red_addr = _shared_address(red_buf)
     lane = tid & 31
     warp = tid >> 5
-    NUM_WARPS: gl.constexpr = THREADS // 32
     is_lane0 = (lane == 0).to(gl.int32)
     z_i32 = gl.zeros_like(tid)
 
@@ -507,15 +529,19 @@ def _reduce_final_min(
                 )
         _st_shared_u32_if(red_addr + warp * 4, best, is_lane0, 0)
         if not COST_ONLY:
-            _st_shared_u32_if(red_addr + (16 + warp) * 4, arg, is_lane0, 0)
+            _st_shared_u32_if(red_addr + (NUM_WARPS + warp) * 4, arg, is_lane0, 0)
         gl.barrier()
         if NUM_WARPS > 1:
             b = red_buf.gather(z_i32, 0)
-            a = red_buf.gather(gl.full([THREADS], 16, gl.int32, TL), 0) if not COST_ONLY else b
+            a = (
+                red_buf.gather(gl.full([THREADS], NUM_WARPS, gl.int32, TL), 0)
+                if not COST_ONLY
+                else b
+            )
             for w_i in gl.static_range(1, NUM_WARPS):
                 bw = red_buf.gather(gl.full([THREADS], w_i, gl.int32, TL), 0)
                 aw = (
-                    red_buf.gather(gl.full([THREADS], 16 + w_i, gl.int32, TL), 0)
+                    red_buf.gather(gl.full([THREADS], NUM_WARPS + w_i, gl.int32, TL), 0)
                     if not COST_ONLY
                     else a
                 )

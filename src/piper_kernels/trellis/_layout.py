@@ -13,9 +13,9 @@ from fractions import Fraction
 STATE_BITS = 16
 """Bits in a trellis state: each weight decodes from a 16-bit window of its stream."""
 
-MIN_BITS_PER_WEIGHT = 3
+MIN_BITS_PER_WEIGHT = 2
 MAX_BITS_PER_WEIGHT = 6
-"""Every step shifts in between 3 and 6 new bits."""
+"""Every step shifts in between 2 and 6 new bits."""
 
 MIN_BLOCK_SIZE = STATE_BITS
 MAX_BLOCK_SIZE = 256
@@ -47,7 +47,7 @@ class TrellisLayout:
     ``step_bits`` or ``step_bits + 1`` bits with ``step_bits = block_bits //
     block_size``. Steps of both widths are interleaved by a fixed rule, so these
     two numbers determine every step's width. ``block_size`` is from 16 to 256,
-    and ``block_bits`` a multiple of 8 from 3 to 6 bits per weight.
+    and ``block_bits`` a multiple of 8 from 2 to 6 bits per weight.
     """
 
     block_size: int
@@ -61,8 +61,8 @@ class TrellisLayout:
         if self.block_bits % 8 or not lowest <= self.block_bits <= highest:
             raise ValueError(
                 f"trellis blocks of {size} weights take {(lowest + 7) // 8} to "
-                f"{highest // 8} whole bytes (3 to 6 bits per weight), got "
-                f"{self.block_bits} bits"
+                f"{highest // 8} whole bytes ({MIN_BITS_PER_WEIGHT} to {MAX_BITS_PER_WEIGHT} "
+                f"bits per weight), got {self.block_bits} bits"
             )
 
     @classmethod
@@ -135,7 +135,7 @@ def resolve_layout(in_features: int, bits_per_weight: float) -> TrellisLayout:
 
     ``bits_per_weight`` counts each block's code bits and its FP8 scale; a block of
     ``resolve_block_size(in_features)`` weights takes the most whole bytes within
-    it. Raises ``ValueError`` when that leaves a block outside 3 to 6 code bits per
+    it. Raises ``ValueError`` when that leaves a block outside 2 to 6 code bits per
     weight.
     """
     block_size = resolve_block_size(in_features)

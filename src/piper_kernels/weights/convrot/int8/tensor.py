@@ -215,9 +215,9 @@ class ConvRotInt8Tensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright: ig
 
         Each row is stored as ``in / T`` blocks of ``T = block_size``
         weights (16 to 256). With ``row_widths=None``, ``bitstreams`` is uint8
-        ``[out, in / T, bytes]``, where the bytes per block set the rate: 3 to 6
+        ``[out, in / T, bytes]``, where the bytes per block set the rate: 2 to 6
         bits per weight. With ``row_widths`` (uint8 ``[out]``), rows may use
-        different rates in ``[ceil(3·T/8), floor(6·T/8)]`` bytes per block and
+        different rates in ``[ceil(2·T/8), floor(6·T/8)]`` bytes per block and
         ``bitstreams`` is 1-D uint8 holding the concatenated rows
         (``(in / T) · sum(row_widths)`` bytes at minimum; both row-width bounds
         and bitstream capacity are caller preconditions). ``block_scales`` is FP8

@@ -140,7 +140,7 @@ def test_encoder_triton_kernels_compile(target: GPUTarget) -> None:
 
 @pytest.mark.parametrize("architecture", [80, 120])
 @pytest.mark.parametrize(("state_bits", "cost_only"), [(16, False), (12, True)])
-@pytest.mark.parametrize("step_widths", [(3, 4), (4, 5), (5, 6), (6,)], ids=str)
+@pytest.mark.parametrize("step_widths", [(2,), (2, 3), (3, 4), (4, 5), (5, 6), (6,)], ids=str)
 def test_encoder_persistent_forward_compiles(
     architecture: int, state_bits: int, cost_only: bool, step_widths: tuple[int, ...]
 ) -> None:

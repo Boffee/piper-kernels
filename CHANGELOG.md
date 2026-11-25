@@ -7,6 +7,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- 2-bit trellis-coded weight storage (`2` to `6` code bits per weight across
+  `TrellisLayout`, `TrellisStorage.from_hp`, `ConvRotInt8Tensor.from_trellis`/
+  `copy_from_trellis_`, and `ConvRotTrellisTensor` direct `F.linear` execution,
+  including mixed-rate `row_widths` down to 2 bits per weight), enabling cross-weight
+  and per-row allocations targeting 3.0–3.5 average bits per weight. Validated on CPU and
+  NVIDIA RTX 5090 (`sm120`), with offline compilation across `sm80`/`sm120` and AMD
+  targets.
 - Direct `F.linear` execution for packed ConvRot trellis weights via
   `piper_kernels.weights.convrot.trellis.ConvRotTrellisTensor` (supporting both
   uniform and variable-row bitstreams, `dequantize()`, and `torch.compile`), using

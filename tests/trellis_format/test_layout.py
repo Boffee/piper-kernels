@@ -7,6 +7,8 @@ import pytest
 from piper_kernels.trellis import TrellisLayout, resolve_block_size, resolve_layout
 
 LAYOUTS = [
+    TrellisLayout(256, 512),
+    TrellisLayout(256, 632),
     TrellisLayout(256, 768),
     TrellisLayout(256, 888),
     TrellisLayout(256, 1144),
@@ -14,6 +16,7 @@ LAYOUTS = [
     TrellisLayout(256, 1400),
     TrellisLayout(256, 1536),
     TrellisLayout(200, 1088),
+    TrellisLayout(16, 32),
     TrellisLayout(16, 56),
 ]
 
@@ -25,7 +28,7 @@ def test_step_widths_spread_wide_steps_evenly(layout: TrellisLayout) -> None:
     assert len(widths) == layout.block_size
     assert sum(widths) == layout.block_bits
     assert set(widths) <= {layout.step_bits, layout.step_bits + 1}
-    assert 3 <= min(widths) <= max(widths) <= 6
+    assert 2 <= min(widths) <= max(widths) <= 6
     wide = [width == layout.step_bits + 1 for width in widths]
     for t in range(layout.block_size + 1):
         assert sum(wide[:t]) == t * layout.num_wide_steps // layout.block_size
@@ -53,9 +56,9 @@ def test_rate_follows_from_the_stored_bytes() -> None:
     [
         ((15, 48), "hold 16 to 256 weights, got 15"),
         ((257, 1032), "hold 16 to 256 weights, got 257"),
-        ((256, 760), "take 96 to 192 whole bytes"),
-        ((256, 1544), "take 96 to 192 whole bytes"),
-        ((256, 1145), "take 96 to 192 whole bytes"),
+        ((256, 504), "take 64 to 192 whole bytes"),
+        ((256, 1544), "take 64 to 192 whole bytes"),
+        ((256, 1145), "take 64 to 192 whole bytes"),
     ],
 )
 def test_layout_rejects_unsupported_rates(arguments: tuple[int, int], message: str) -> None:

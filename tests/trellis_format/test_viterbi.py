@@ -14,19 +14,27 @@ _nvidia = pytest.mark.skipif(
     reason="the persistent forward requires an NVIDIA GPU",
 )
 
+_VR23 = TrellisLayout(256, 632).compute_step_widths()
 _VR45 = TrellisLayout(256, 1144).compute_step_widths()
 _MIX45 = (4, 4, 4, 5, 5, 5, 4, 5)
 """A de Bruijn cycle covering all 8 adjacent 2-width step pairs."""
 _WIDTHS = {
+    "k2": (2,) * 16,
     "k3": (3,) * 16,
     "k4": (4,) * 16,
     "k5": (5,) * 16,
     "k6": (6,) * 16,
+    "vr23": _VR23,
+    "b520": TrellisLayout(256, 520).compute_step_widths(),
+    "b760": TrellisLayout(256, 760).compute_step_widths(),
     "vr34": TrellisLayout(256, 888).compute_step_widths(),
     "vr45": _VR45,
     "vr56": TrellisLayout(256, 1400).compute_step_widths(),
+    "vr23_224": TrellisLayout(224, 552).compute_step_widths(),
     "vr45_224": TrellisLayout(224, 1000).compute_step_widths(),
+    "window23": _VR23[-32:] + _VR23[:32],
     "window45": _VR45[-32:] + _VR45[:32],
+    "mix23": tuple(k - 2 for k in _MIX45),
     "mix34": tuple(k - 1 for k in _MIX45),
     "mix45": _MIX45,
     "mix56": tuple(k + 1 for k in _MIX45),
@@ -190,7 +198,7 @@ def test_viterbi_handles_extreme_normalized_inputs_and_validates_overlap() -> No
 
 @pytest.mark.gpu
 @_nvidia
-@pytest.mark.parametrize("min_step_bits", [3, 4, 5, 6])
+@pytest.mark.parametrize("min_step_bits", [2, 3, 4, 5, 6])
 @pytest.mark.parametrize("state_bits", [16, 12])
 def test_encoder_forward_kernels_do_not_spill(state_bits: int, min_step_bits: int) -> None:
     """No register spills and shared memory fits opt-in limit across all schedules."""
@@ -198,13 +206,16 @@ def test_encoder_forward_kernels_do_not_spill(state_bits: int, min_step_bits: in
     if not gluon.supports_device(torch.device("cuda")):
         pytest.skip("this GPU or Triton release does not run the persistent forward")
     k = min_step_bits
-    widths = (k,) * 256 if k == 6 else TrellisLayout(256, 256 * k + 120).compute_step_widths()
+    schedules = [(k,) * 256] if k in (2, 6) else []
+    if k < 6:
+        schedules.append(TrellisLayout(256, 256 * k + 120).compute_step_widths())
     index = torch.cuda.current_device()
-    for cost_only in (False, True):
-        spec = gluon._specialization(state_bits, widths, cost_only)
-        kernel = gluon._compiled(spec, index)
-        assert kernel.n_spills == 0
-        assert kernel.metadata.shared <= gluon.SHARED_NEED
+    for widths in schedules:
+        for cost_only in (False, True):
+            spec = gluon._specialization(state_bits, widths, cost_only)
+            kernel = gluon._compiled(spec, index)
+            assert kernel.n_spills == 0
+            assert kernel.metadata.shared <= gluon.SHARED_NEED
 
 
 def test_persistent_forward_scope() -> None:
