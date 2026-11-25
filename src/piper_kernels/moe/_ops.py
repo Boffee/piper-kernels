@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 from torch._guards import detect_fake_mode
@@ -14,9 +15,17 @@ from torch._subclasses.fake_tensor import FakeTensor
 from piper_kernels._input_activations import parse_input_activation
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.trellis._layout import (
+    MAX_BITS_PER_WEIGHT,
+    MIN_BITS_PER_WEIGHT,
+    TrellisLayout,
+    validate_block_size,
+)
 from piper_kernels.weights.convrot._rotation import validate_group_size
 
 from . import reference
+
+type _MoEWeightKind = Literal["nvfp4", "convrot_int8", "convrot_trellis"]
 
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Largest K avoiding signed int32 wrap on 128 x 128 worst-case int8 products.
@@ -56,6 +65,102 @@ def _validate_global_scale(
     _require_strided_contiguous(scale, name=name, device=device)
 
 
+def _validate_trellis_projection(
+    *,
+    name: str,
+    qdata: torch.Tensor,
+    block_scales: torch.Tensor,
+    scale: torch.Tensor,
+    row_widths: torch.Tensor | None,
+    slot_offsets: torch.Tensor | None,
+    block_size: int | torch.SymInt,
+    num_slots: int,
+    out_features: int,
+    in_features: int,
+    device: torch.device,
+) -> int:
+    if isinstance(block_size, bool) or not isinstance(block_size, (int, torch.SymInt)):
+        raise TypeError(f"MoE {name}_block_size must be an integer, got {block_size!r}")
+    resolved_block_size = int(block_size) if isinstance(block_size, torch.SymInt) else block_size
+    validate_block_size(resolved_block_size)
+    if in_features % resolved_block_size:
+        raise ValueError(
+            f"ConvRot Trellis MoE {name} width {in_features} must be divisible by "
+            f"block_size {resolved_block_size}"
+        )
+    expected_blocks = in_features // resolved_block_size
+
+    _require_strided_contiguous(qdata, name=f"{name}_qdata", device=device)
+    _require_strided_contiguous(block_scales, name=f"{name}_block_scales", device=device)
+    _require_strided_contiguous(scale, name=f"{name}_scale", device=device)
+
+    if qdata.dtype is not torch.uint8:
+        raise ValueError(f"ConvRot Trellis MoE {name}_qdata must be uint8, got {qdata.dtype}")
+    if block_scales.dtype is not torch.float8_e4m3fn or tuple(block_scales.shape) != (
+        num_slots,
+        out_features,
+        expected_blocks,
+    ):
+        raise ValueError(
+            f"ConvRot Trellis MoE {name}_block_scales must be float8_e4m3fn with shape "
+            f"{(num_slots, out_features, expected_blocks)}, "
+            f"got {block_scales.dtype} {tuple(block_scales.shape)}"
+        )
+    if scale.dtype is not torch.float32 or tuple(scale.shape) != (num_slots, out_features):
+        raise ValueError(
+            f"ConvRot Trellis MoE {name}_scale must be float32 with shape "
+            f"{(num_slots, out_features)}, got {scale.dtype} {tuple(scale.shape)}"
+        )
+
+    if row_widths is None:
+        if slot_offsets is not None:
+            raise ValueError(f"ConvRot Trellis MoE {name}_slot_offsets requires {name}_row_widths")
+        if qdata.ndim != 4 or tuple(qdata.shape[:3]) != (num_slots, out_features, expected_blocks):
+            raise ValueError(
+                f"ConvRot Trellis MoE uniform {name}_qdata must have shape "
+                f"{(num_slots, out_features, expected_blocks, 'bytes')}, got {tuple(qdata.shape)}"
+            )
+        bytes_per_block = qdata.shape[3]
+        if type(bytes_per_block) is int:
+            TrellisLayout.from_storage(resolved_block_size, bytes_per_block)
+        else:
+            lowest = MIN_BITS_PER_WEIGHT * resolved_block_size
+            highest = MAX_BITS_PER_WEIGHT * resolved_block_size
+            if 8 * bytes_per_block < lowest or 8 * bytes_per_block > highest:
+                raise ValueError(
+                    f"ConvRot Trellis blocks of {resolved_block_size} weights take "
+                    f"{(lowest + 7) // 8} to {highest // 8} bytes, got {8 * bytes_per_block} bits"
+                )
+        return resolved_block_size
+
+    _require_strided_contiguous(row_widths, name=f"{name}_row_widths", device=device)
+    if row_widths.dtype is not torch.uint8 or tuple(row_widths.shape) != (num_slots, out_features):
+        raise ValueError(
+            f"ConvRot Trellis MoE {name}_row_widths must be uint8 with shape "
+            f"{(num_slots, out_features)}, got {row_widths.dtype} {tuple(row_widths.shape)}"
+        )
+    if slot_offsets is None:
+        if qdata.ndim != 2 or qdata.shape[0] != num_slots:
+            raise ValueError(
+                f"ConvRot Trellis MoE 2-D variable-row {name}_qdata must have shape "
+                f"{(num_slots, 'slot_bytes')}, got {tuple(qdata.shape)}"
+            )
+        return resolved_block_size
+
+    _require_strided_contiguous(slot_offsets, name=f"{name}_slot_offsets", device=device)
+    if slot_offsets.dtype is not torch.int64 or tuple(slot_offsets.shape) != (num_slots,):
+        raise ValueError(
+            f"ConvRot Trellis MoE {name}_slot_offsets must be int64 with shape {(num_slots,)}, "
+            f"got {slot_offsets.dtype} {tuple(slot_offsets.shape)}"
+        )
+    if qdata.ndim != 1:
+        raise ValueError(
+            f"ConvRot Trellis MoE 1-D variable-row {name}_qdata must be 1-D [total_bytes], "
+            f"got {tuple(qdata.shape)}"
+        )
+    return resolved_block_size
+
+
 def _validate_weight_storage(
     up_gate_qdata: torch.Tensor,
     up_gate_scale: torch.Tensor,
@@ -68,7 +173,15 @@ def _validate_weight_storage(
     activation_fn: str,
     gate_first: bool,
     high_first: bool,
-) -> tuple[bool, int, int, int, torch.device]:
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
+) -> tuple[_MoEWeightKind, int, int, int, torch.device]:
     parse_input_activation(activation_fn, name="MoE")
     if not isinstance(gate_first, bool) or not isinstance(high_first, bool):
         raise TypeError("MoE gate_first and high_first must be booleans")
@@ -76,12 +189,96 @@ def _validate_weight_storage(
         raise TypeError(f"MoE group_size must be an integer, got {group_size!r}")
     if isinstance(group_size, torch.SymInt):
         group_size = int(group_size)
+
+    device = up_gate_qdata.device
+    has_trellis_arg = (
+        any(
+            tensor is not None
+            for tensor in (
+                up_gate_block_scales,
+                down_block_scales,
+                up_gate_row_widths,
+                down_row_widths,
+                up_gate_slot_offsets,
+                down_slot_offsets,
+            )
+        )
+        or (up_gate_block_size != 0)
+        or (down_block_size != 0)
+    )
+    if has_trellis_arg:
+        if high_first:
+            raise ValueError("ConvRot Trellis MoE weights do not support high_first nibble packing")
+        validate_group_size(group_size)
+        if up_gate_global_scale is not None or down_global_scale is not None:
+            raise ValueError("ConvRot Trellis MoE weights do not use per-expert global scales")
+        if (
+            up_gate_block_scales is None
+            or down_block_scales is None
+            or up_gate_block_scales.ndim != 3
+            or down_block_scales.ndim != 3
+        ):
+            raise ValueError(
+                "ConvRot Trellis MoE weights require 3-D up_gate_block_scales and down_block_scales"
+            )
+        if up_gate_block_scales.shape[0] != down_block_scales.shape[0]:
+            raise ValueError("MoE up_gate and down tensors must have matching slot counts")
+        if isinstance(down_block_size, bool) or not isinstance(
+            down_block_size, (int, torch.SymInt)
+        ):
+            raise TypeError(f"MoE down_block_size must be an integer, got {down_block_size!r}")
+        resolved_down_bs = (
+            int(down_block_size) if isinstance(down_block_size, torch.SymInt) else down_block_size
+        )
+        validate_block_size(resolved_down_bs)
+        num_slots, hidden_size, down_blocks = down_block_scales.shape
+        intermediate_size = int(down_blocks) * resolved_down_bs
+        if hidden_size <= 0 or intermediate_size <= 0:
+            raise ValueError("MoE hidden_size and intermediate_size must be positive")
+        if hidden_size % group_size or intermediate_size % group_size:
+            raise ValueError(
+                f"ConvRot Trellis MoE dimensions must be divisible by group_size {group_size}"
+            )
+        if hidden_size > _INT8_MAX_REDUCTION_WIDTH or intermediate_size > _INT8_MAX_REDUCTION_WIDTH:
+            raise ValueError(
+                f"ConvRot Trellis MoE widths must not exceed {_INT8_MAX_REDUCTION_WIDTH} "
+                f"for INT32 accumulation, got hidden_size={hidden_size}, "
+                f"intermediate_size={intermediate_size}"
+            )
+        up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+        _validate_trellis_projection(
+            name="up_gate",
+            qdata=up_gate_qdata,
+            block_scales=up_gate_block_scales,
+            scale=up_gate_scale,
+            row_widths=up_gate_row_widths,
+            slot_offsets=up_gate_slot_offsets,
+            block_size=up_gate_block_size,
+            num_slots=int(num_slots),
+            out_features=up_gate_out,
+            in_features=int(hidden_size),
+            device=device,
+        )
+        _validate_trellis_projection(
+            name="down",
+            qdata=down_qdata,
+            block_scales=down_block_scales,
+            scale=down_scale,
+            row_widths=down_row_widths,
+            slot_offsets=down_slot_offsets,
+            block_size=resolved_down_bs,
+            num_slots=int(num_slots),
+            out_features=int(hidden_size),
+            in_features=intermediate_size,
+            device=device,
+        )
+        return "convrot_trellis", int(num_slots), int(hidden_size), intermediate_size, device
+
     if up_gate_qdata.ndim != 3 or down_qdata.ndim != 3:
         raise ValueError("MoE qdata tensors must be 3-D [num_slots, out, in]")
     if up_gate_qdata.shape[0] != down_qdata.shape[0]:
         raise ValueError("MoE up_gate and down tensors must have matching slot counts")
 
-    device = up_gate_qdata.device
     for tensor, name in (
         (up_gate_qdata, "up_gate_qdata"),
         (up_gate_scale, "up_gate_scale"),
@@ -132,7 +329,7 @@ def _validate_weight_storage(
             num_slots=num_slots,
             device=device,
         )
-        return False, int(num_slots), int(hidden_size), int(intermediate_size), device
+        return "nvfp4", int(num_slots), int(hidden_size), int(intermediate_size), device
 
     if up_gate_qdata.dtype is torch.int8:
         if high_first:
@@ -163,10 +360,11 @@ def _validate_weight_storage(
             or tuple(down_scale.shape) != (num_slots, hidden_size)
         ):
             raise ValueError("ConvRot INT8 MoE weight storage shapes or dtypes are invalid")
-        return True, int(num_slots), int(hidden_size), int(intermediate_size), device
+        return "convrot_int8", int(num_slots), int(hidden_size), int(intermediate_size), device
 
     raise ValueError(
-        f"MoE up_gate_qdata must be uint8 (NVFP4) or int8 (ConvRot INT8), got {up_gate_qdata.dtype}"
+        f"MoE up_gate_qdata must be uint8 (NVFP4/Trellis) or int8 (ConvRot INT8), "
+        f"got {up_gate_qdata.dtype}"
     )
 
 
@@ -191,7 +389,15 @@ def _validate_op_operands(
     gate_first: bool,
     high_first: bool,
     active_slots_hint: int,
-) -> tuple[bool, int, int]:
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
+) -> tuple[_MoEWeightKind, int, int]:
     if not isinstance(accumulate, bool):
         raise TypeError("MoE accumulate must be a bool")
     if isinstance(active_slots_hint, bool) or not isinstance(
@@ -203,7 +409,7 @@ def _validate_op_operands(
     if active_slots_hint < 0:
         raise ValueError("MoE active_slots_hint must be non-negative")
 
-    is_int8, num_slots, hidden_size, _inter, weight_device = _validate_weight_storage(
+    weight_format, num_slots, hidden_size, _inter, weight_device = _validate_weight_storage(
         up_gate_qdata,
         up_gate_scale,
         down_qdata,
@@ -214,6 +420,14 @@ def _validate_op_operands(
         activation_fn=activation_fn,
         gate_first=gate_first,
         high_first=high_first,
+        up_gate_block_scales=up_gate_block_scales,
+        down_block_scales=down_block_scales,
+        up_gate_row_widths=up_gate_row_widths,
+        down_row_widths=down_row_widths,
+        up_gate_slot_offsets=up_gate_slot_offsets,
+        down_slot_offsets=down_slot_offsets,
+        up_gate_block_size=up_gate_block_size,
+        down_block_size=down_block_size,
     )
 
     if input.ndim < 2 or input.shape[-1] != hidden_size:
@@ -257,7 +471,7 @@ def _validate_op_operands(
         )
         if tuple(prepared_data.shape) != (rows, hidden_size):
             raise ValueError("MoE prepared_input does not match input shape")
-        if is_int8:
+        if weight_format == "convrot_int8":
             if prepared_data.dtype is not torch.int8:
                 raise ValueError("ConvRot INT8 prepared_input data must be int8")
             if prepared_scale is None or prepared_scale.dtype is not torch.float32:
@@ -273,11 +487,11 @@ def _validate_op_operands(
                 )
         else:
             if prepared_scale is not None:
-                raise ValueError("NVFP4 MoE prepared_input scale must be None")
+                raise ValueError("MoE prepared_input scale must be None for rotated A16 weights")
             expected_prepared_dtype = torch.float32 if group_size > 0 else input.dtype
             if prepared_data.dtype is not expected_prepared_dtype:
                 raise ValueError(
-                    f"NVFP4 MoE prepared_input data must be {expected_prepared_dtype}, "
+                    f"MoE prepared_input data must be {expected_prepared_dtype}, "
                     f"got {prepared_data.dtype}"
                 )
 
@@ -308,7 +522,7 @@ def _validate_op_operands(
                 "Inplace update to inference tensor outside InferenceMode is not allowed."
             )
 
-    return is_int8, num_slots, rows
+    return weight_format, num_slots, rows
 
 
 def _reject_autograd(
@@ -321,6 +535,8 @@ def _reject_autograd(
     prepared_data: torch.Tensor | None,
     prepared_scale: torch.Tensor | None,
     out: torch.Tensor | None,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
 ) -> None:
     if not torch.is_grad_enabled():
         return
@@ -335,6 +551,8 @@ def _reject_autograd(
             down_scale,
             up_gate_global_scale,
             down_global_scale,
+            up_gate_block_scales,
+            down_block_scales,
         )
     ):
         raise RuntimeError("MoE weights do not support autograd")
@@ -403,6 +621,12 @@ def _reject_weight_aliasing(
     down_scale: torch.Tensor,
     up_gate_global_scale: torch.Tensor | None,
     down_global_scale: torch.Tensor | None,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
 ) -> None:
     for weight_tensor in (
         up_gate_qdata,
@@ -411,6 +635,12 @@ def _reject_weight_aliasing(
         down_scale,
         up_gate_global_scale,
         down_global_scale,
+        up_gate_block_scales,
+        down_block_scales,
+        up_gate_row_widths,
+        down_row_widths,
+        up_gate_slot_offsets,
+        down_slot_offsets,
     ):
         if weight_tensor is not None and _tensors_overlap(out, weight_tensor):
             raise ValueError("MoE out tensor must not alias weight storage")
@@ -437,6 +667,14 @@ def _validate_before_mutating(
     gate_first: bool,
     high_first: bool,
     active_slots_hint: int,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
 ) -> None:
     _validate_op_operands(
         input,
@@ -458,6 +696,14 @@ def _validate_before_mutating(
         gate_first=gate_first,
         high_first=high_first,
         active_slots_hint=active_slots_hint,
+        up_gate_block_scales=up_gate_block_scales,
+        down_block_scales=down_block_scales,
+        up_gate_row_widths=up_gate_row_widths,
+        down_row_widths=down_row_widths,
+        up_gate_slot_offsets=up_gate_slot_offsets,
+        down_slot_offsets=down_slot_offsets,
+        up_gate_block_size=up_gate_block_size,
+        down_block_size=down_block_size,
     )
     if input.device.type != "meta":
         _reject_weight_aliasing(
@@ -468,19 +714,30 @@ def _validate_before_mutating(
             down_scale,
             up_gate_global_scale,
             down_global_scale,
+            up_gate_block_scales,
+            down_block_scales,
+            up_gate_row_widths,
+            down_row_widths,
+            up_gate_slot_offsets,
+            down_slot_offsets,
         )
 
 
-def _resolve_gpu_target(device: torch.device, is_int8: bool) -> AcceleratorTarget | None:
+def _resolve_gpu_target(
+    device: torch.device,
+    weight_format: _MoEWeightKind,
+) -> AcceleratorTarget | None:
     if device.type != "cuda" or not runtime.supports_device(device):
         return None
     target = AcceleratorTarget.from_device(device)
-    if is_int8:
+    if weight_format == "convrot_int8":
         if target.is_nvidia_cuda and not target.cuda_capability_at_least(8):
             return None
         from piper_kernels.linear.convrot.int8 import _backend as int8_backend  # noqa: PLC0415
 
         return target if int8_backend.select_linear_backend_for_target(target) is not None else None
+    if weight_format == "convrot_trellis":
+        return target
     return target if target.supports_nvfp4_w4a16 else None
 
 
@@ -505,8 +762,16 @@ def _run_moe_ffn(
     gate_first: bool,
     high_first: bool,
     active_slots_hint: int,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
 ) -> torch.Tensor:
-    is_int8, num_slots, rows = _validate_op_operands(
+    weight_format, num_slots, rows = _validate_op_operands(
         input,
         topk_ids,
         topk_weights,
@@ -526,6 +791,14 @@ def _run_moe_ffn(
         gate_first=gate_first,
         high_first=high_first,
         active_slots_hint=active_slots_hint,
+        up_gate_block_scales=up_gate_block_scales,
+        down_block_scales=down_block_scales,
+        up_gate_row_widths=up_gate_row_widths,
+        down_row_widths=down_row_widths,
+        up_gate_slot_offsets=up_gate_slot_offsets,
+        down_slot_offsets=down_slot_offsets,
+        up_gate_block_size=up_gate_block_size,
+        down_block_size=down_block_size,
     )
 
     is_concrete = (
@@ -542,6 +815,12 @@ def _run_moe_ffn(
             down_scale,
             up_gate_global_scale,
             down_global_scale,
+            up_gate_block_scales,
+            down_block_scales,
+            up_gate_row_widths,
+            down_row_widths,
+            up_gate_slot_offsets,
+            down_slot_offsets,
         )
 
     top_k = topk_ids.shape[-1]
@@ -574,7 +853,7 @@ def _run_moe_ffn(
             if prepared_scale is not None and _tensors_overlap(out, prepared_scale):
                 prepared_scale = prepared_scale.clone()
 
-    target = _resolve_gpu_target(resolved_input.device, is_int8)
+    target = _resolve_gpu_target(resolved_input.device, weight_format)
     if target is not None:
         from . import triton as moe_triton  # noqa: PLC0415
 
@@ -599,6 +878,14 @@ def _run_moe_ffn(
             gate_first=gate_first,
             high_first=high_first,
             active_slots_hint=active_slots_hint,
+            up_gate_block_scales=up_gate_block_scales,
+            down_block_scales=down_block_scales,
+            up_gate_row_widths=up_gate_row_widths,
+            down_row_widths=down_row_widths,
+            up_gate_slot_offsets=up_gate_slot_offsets,
+            down_slot_offsets=down_slot_offsets,
+            up_gate_block_size=up_gate_block_size,
+            down_block_size=down_block_size,
         )
 
     return reference.moe_ffn_reference(
@@ -620,6 +907,14 @@ def _run_moe_ffn(
         activation_fn=activation_fn,
         gate_first=gate_first,
         high_first=high_first,
+        up_gate_block_scales=up_gate_block_scales,
+        down_block_scales=down_block_scales,
+        up_gate_row_widths=up_gate_row_widths,
+        down_row_widths=down_row_widths,
+        up_gate_slot_offsets=up_gate_slot_offsets,
+        down_slot_offsets=down_slot_offsets,
+        up_gate_block_size=up_gate_block_size,
+        down_block_size=down_block_size,
     )
 
 
@@ -642,6 +937,14 @@ def moe_ffn(
     gate_first: bool = True,
     high_first: bool = False,
     active_slots_hint: int = 0,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
 ) -> torch.Tensor:
     """Execute a slot-indirect quantized MoE FFN and return a fresh output tensor."""
     return _run_moe_ffn(
@@ -664,6 +967,14 @@ def moe_ffn(
         gate_first=gate_first,
         high_first=high_first,
         active_slots_hint=active_slots_hint,
+        up_gate_block_scales=up_gate_block_scales,
+        down_block_scales=down_block_scales,
+        up_gate_row_widths=up_gate_row_widths,
+        down_row_widths=down_row_widths,
+        up_gate_slot_offsets=up_gate_slot_offsets,
+        down_slot_offsets=down_slot_offsets,
+        up_gate_block_size=up_gate_block_size,
+        down_block_size=down_block_size,
     )
 
 
@@ -686,6 +997,14 @@ def _moe_ffn_fake(
     gate_first: bool = True,
     high_first: bool = False,
     active_slots_hint: int = 0,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
 ) -> torch.Tensor:
     _reject_autograd(
         input,
@@ -697,6 +1016,8 @@ def _moe_ffn_fake(
         prepared_data,
         prepared_scale,
         None,
+        up_gate_block_scales,
+        down_block_scales,
     )
     _validate_op_operands(
         input,
@@ -718,6 +1039,14 @@ def _moe_ffn_fake(
         gate_first=gate_first,
         high_first=high_first,
         active_slots_hint=active_slots_hint,
+        up_gate_block_scales=up_gate_block_scales,
+        down_block_scales=down_block_scales,
+        up_gate_row_widths=up_gate_row_widths,
+        down_row_widths=down_row_widths,
+        up_gate_slot_offsets=up_gate_slot_offsets,
+        down_slot_offsets=down_slot_offsets,
+        up_gate_block_size=up_gate_block_size,
+        down_block_size=down_block_size,
     )
     return torch.empty_like(input, memory_format=torch.contiguous_format)
 
@@ -743,6 +1072,14 @@ def moe_ffn_(
     gate_first: bool = True,
     high_first: bool = False,
     active_slots_hint: int = 0,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
 ) -> None:
     """Execute a slot-indirect quantized MoE FFN into caller-owned ``out``."""
     _run_moe_ffn(
@@ -765,6 +1102,14 @@ def moe_ffn_(
         gate_first=gate_first,
         high_first=high_first,
         active_slots_hint=active_slots_hint,
+        up_gate_block_scales=up_gate_block_scales,
+        down_block_scales=down_block_scales,
+        up_gate_row_widths=up_gate_row_widths,
+        down_row_widths=down_row_widths,
+        up_gate_slot_offsets=up_gate_slot_offsets,
+        down_slot_offsets=down_slot_offsets,
+        up_gate_block_size=up_gate_block_size,
+        down_block_size=down_block_size,
     )
 
 
@@ -789,6 +1134,14 @@ def _moe_ffn_inplace_fake(
     gate_first: bool = True,
     high_first: bool = False,
     active_slots_hint: int = 0,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
 ) -> None:
     _reject_autograd(
         input,
@@ -800,6 +1153,8 @@ def _moe_ffn_inplace_fake(
         prepared_data,
         prepared_scale,
         out,
+        up_gate_block_scales,
+        down_block_scales,
     )
     _validate_op_operands(
         input,
@@ -821,6 +1176,14 @@ def _moe_ffn_inplace_fake(
         gate_first=gate_first,
         high_first=high_first,
         active_slots_hint=active_slots_hint,
+        up_gate_block_scales=up_gate_block_scales,
+        down_block_scales=down_block_scales,
+        up_gate_row_widths=up_gate_row_widths,
+        down_row_widths=down_row_widths,
+        up_gate_slot_offsets=up_gate_slot_offsets,
+        down_slot_offsets=down_slot_offsets,
+        up_gate_block_size=up_gate_block_size,
+        down_block_size=down_block_size,
     )
     _reject_weight_aliasing(
         out,
@@ -830,6 +1193,12 @@ def _moe_ffn_inplace_fake(
         down_scale,
         up_gate_global_scale,
         down_global_scale,
+        up_gate_block_scales,
+        down_block_scales,
+        up_gate_row_widths,
+        down_row_widths,
+        up_gate_slot_offsets,
+        down_slot_offsets,
     )
 
 
@@ -852,6 +1221,14 @@ def _moe_ffn_autograd(
     gate_first: bool = True,
     high_first: bool = False,
     active_slots_hint: int = 0,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
 ) -> torch.Tensor:
     _reject_autograd(
         input,
@@ -863,6 +1240,8 @@ def _moe_ffn_autograd(
         prepared_data,
         prepared_scale,
         None,
+        up_gate_block_scales,
+        down_block_scales,
     )
     with torch._C._AutoDispatchBelowAutograd():
         return torch.ops.piper_kernels.moe_ffn.default(
@@ -883,6 +1262,14 @@ def _moe_ffn_autograd(
             gate_first=gate_first,
             high_first=high_first,
             active_slots_hint=active_slots_hint,
+            up_gate_block_scales=up_gate_block_scales,
+            down_block_scales=down_block_scales,
+            up_gate_row_widths=up_gate_row_widths,
+            down_row_widths=down_row_widths,
+            up_gate_slot_offsets=up_gate_slot_offsets,
+            down_slot_offsets=down_slot_offsets,
+            up_gate_block_size=up_gate_block_size,
+            down_block_size=down_block_size,
         )
 
 
@@ -907,6 +1294,14 @@ def _moe_ffn_inplace_autograd(
     gate_first: bool = True,
     high_first: bool = False,
     active_slots_hint: int = 0,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
 ) -> None:
     _reject_autograd(
         input,
@@ -918,6 +1313,8 @@ def _moe_ffn_inplace_autograd(
         prepared_data,
         prepared_scale,
         out,
+        up_gate_block_scales,
+        down_block_scales,
     )
     # Validate eagerly above ADInplaceOrView so rejected calls leave out._version intact.
     if not torch.compiler.is_compiling() and detect_fake_mode() is None:
@@ -941,6 +1338,14 @@ def _moe_ffn_inplace_autograd(
             gate_first=gate_first,
             high_first=high_first,
             active_slots_hint=active_slots_hint,
+            up_gate_block_scales=up_gate_block_scales,
+            down_block_scales=down_block_scales,
+            up_gate_row_widths=up_gate_row_widths,
+            down_row_widths=down_row_widths,
+            up_gate_slot_offsets=up_gate_slot_offsets,
+            down_slot_offsets=down_slot_offsets,
+            up_gate_block_size=up_gate_block_size,
+            down_block_size=down_block_size,
         )
     with torch._C._AutoDispatchBelowAutograd():
         torch.ops.piper_kernels.moe_ffn_.default(
@@ -963,6 +1368,14 @@ def _moe_ffn_inplace_autograd(
             gate_first=gate_first,
             high_first=high_first,
             active_slots_hint=active_slots_hint,
+            up_gate_block_scales=up_gate_block_scales,
+            down_block_scales=down_block_scales,
+            up_gate_row_widths=up_gate_row_widths,
+            down_row_widths=down_row_widths,
+            up_gate_slot_offsets=up_gate_slot_offsets,
+            down_slot_offsets=down_slot_offsets,
+            up_gate_block_size=up_gate_block_size,
+            down_block_size=down_block_size,
         )
 
 

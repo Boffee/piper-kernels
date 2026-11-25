@@ -12,6 +12,8 @@ from collections.abc import Callable
 import torch
 
 from piper_kernels._input_activations import apply_input_activation, parse_input_activation
+from piper_kernels.trellis._layout import TrellisLayout
+from piper_kernels.trellis._reference import decode_reference, decode_variable_rows_reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
 
 
@@ -67,6 +69,33 @@ def _prepare_nvfp4_reference_rows(
     return input_2d
 
 
+def _decode_trellis_slot(
+    qdata: torch.Tensor,
+    block_scales: torch.Tensor,
+    row_widths: torch.Tensor | None,
+    slot_offsets: torch.Tensor | None,
+    safe_slot_1d: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    slot_block_scales = torch.index_select(block_scales, 0, safe_slot_1d).squeeze(0)
+    if row_widths is None:
+        layout = TrellisLayout.from_storage(block_size, qdata.shape[3])
+        slot_qdata = torch.index_select(qdata, 0, safe_slot_1d).squeeze(0)
+        return decode_reference(slot_qdata, slot_block_scales, layout).reshape(
+            slot_block_scales.shape[0], -1
+        )
+    slot_widths = torch.index_select(row_widths, 0, safe_slot_1d).squeeze(0)
+    if slot_offsets is None:
+        stream = torch.index_select(qdata, 0, safe_slot_1d).squeeze(0)
+        base_offset = None
+    else:
+        stream = qdata
+        base_offset = torch.index_select(slot_offsets, 0, safe_slot_1d).squeeze(0)
+    return decode_variable_rows_reference(
+        stream, slot_block_scales, slot_widths, block_size, base_offset=base_offset
+    )
+
+
 def _make_slot_evaluator(
     input_2d: torch.Tensor,
     up_gate_qdata: torch.Tensor,
@@ -83,8 +112,50 @@ def _make_slot_evaluator(
     activation_fn: str,
     gate_first: bool,
     high_first: bool,
+    up_gate_block_scales: torch.Tensor | None,
+    down_block_scales: torch.Tensor | None,
+    up_gate_row_widths: torch.Tensor | None,
+    down_row_widths: torch.Tensor | None,
+    up_gate_slot_offsets: torch.Tensor | None,
+    down_slot_offsets: torch.Tensor | None,
+    up_gate_block_size: int,
+    down_block_size: int,
 ) -> Callable[[int, torch.Tensor], torch.Tensor]:
     rows, hidden_size = input_2d.shape
+    if up_gate_block_scales is not None:
+        assert down_block_scales is not None
+        active_2d = _prepare_nvfp4_reference_rows(input_2d, prepared_data, group_size)
+
+        def eval_trellis(row_index: int, safe_slot_1d: torch.Tensor) -> torch.Tensor:
+            up_q = _decode_trellis_slot(
+                up_gate_qdata,
+                up_gate_block_scales,
+                up_gate_row_widths,
+                up_gate_slot_offsets,
+                safe_slot_1d,
+                up_gate_block_size,
+            )
+            up_s = torch.index_select(up_gate_scale, 0, safe_slot_1d).squeeze(0)
+            up_w = up_q.float() * up_s.unsqueeze(1)
+            mid = active_2d[row_index : row_index + 1].float() @ up_w.t()
+            activated = _activate_intermediate(mid, activation_fn, gate_first=gate_first).to(
+                logical_dtype
+            )
+            act_rot = rotate_groups(activated.float(), group_size)
+            down_q = _decode_trellis_slot(
+                down_qdata,
+                down_block_scales,
+                down_row_widths,
+                down_slot_offsets,
+                safe_slot_1d,
+                down_block_size,
+            )
+            down_s = torch.index_select(down_scale, 0, safe_slot_1d).squeeze(0)
+            down_w = down_q.float() * down_s.unsqueeze(1)
+            return act_rot @ down_w.t()
+
+        return eval_trellis
+
     if up_gate_qdata.dtype is torch.int8:
         from piper_kernels.linear.convrot.int8 import reference as int8_ref  # noqa: PLC0415
 
@@ -184,13 +255,21 @@ def moe_ffn_reference(
     activation_fn: str = "swiglu",
     gate_first: bool = True,
     high_first: bool = False,
+    up_gate_block_scales: torch.Tensor | None = None,
+    down_block_scales: torch.Tensor | None = None,
+    up_gate_row_widths: torch.Tensor | None = None,
+    down_row_widths: torch.Tensor | None = None,
+    up_gate_slot_offsets: torch.Tensor | None = None,
+    down_slot_offsets: torch.Tensor | None = None,
+    up_gate_block_size: int = 0,
+    down_block_size: int = 0,
 ) -> torch.Tensor:
     """Run an independent PyTorch reference across routed expert slots."""
     parse_input_activation(activation_fn, name="MoE")
     rows = math.prod(input.shape[:-1])
     hidden_size = input.shape[-1]
     top_k = topk_ids.shape[-1]
-    num_slots = down_qdata.shape[0]
+    num_slots = down_block_scales.shape[0] if down_block_scales is not None else down_qdata.shape[0]
     result = torch.zeros_like(input, memory_format=torch.contiguous_format) if out is None else out
     out_2d = result.view(rows, hidden_size) if rows else result.reshape(0, hidden_size)
 
@@ -216,6 +295,14 @@ def moe_ffn_reference(
             activation_fn=activation_fn,
             gate_first=gate_first,
             high_first=high_first,
+            up_gate_block_scales=up_gate_block_scales,
+            down_block_scales=down_block_scales,
+            up_gate_row_widths=up_gate_row_widths,
+            down_row_widths=down_row_widths,
+            up_gate_slot_offsets=up_gate_slot_offsets,
+            down_slot_offsets=down_slot_offsets,
+            up_gate_block_size=up_gate_block_size,
+            down_block_size=down_block_size,
         )
         topk_ids_2d = topk_ids.reshape(rows, top_k)
         topk_weights_2d = topk_weights.reshape(rows, top_k)

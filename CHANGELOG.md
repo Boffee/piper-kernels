@@ -24,14 +24,17 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Offload-first single-token (`M = 1`), small-batch, and prefill (`M > 1`) quantized MoE
   FFN execution (`piper_kernels.moe`: `MoEWeights`, `PreparedMoEInput`, `prepare_moe_input`,
   and `moe_ffn`) across expert-major `[num_slots, ...]` slabs for NVFP4 W4A16, ConvRot NVFP4
-  W4A16, and ConvRot INT8 W8A8, with on-device slot bucketing/compaction, grouped matrix
-  execution, and `expert_to_slot` miss skipping in native GPU kernels (and graph-safe masked
-  fallback elsewhere), SwiGLU (`gate_first` configurable) and `tanh`-GELU activations,
-  reusable input preparation, and optional caller-owned `out=` accumulation. Validated on CPU
-  and AMD RX 9070 XT (`gfx1201`) across eager execution,
-  `torch.compile(fullgraph=True, dynamic=True)`, and CUDA Graph replay; NVIDIA
-  `sm75`/`sm80`/`sm89`/`sm120` and AMD `gfx942`/`gfx1100`/`gfx1151` targets validated via
-  offline compilation.
+  W4A16, ConvRot INT8 W8A8, and ConvRot Trellis (`"convrot_trellis"` supporting uniform 4-D,
+  slot-swappable 2-D variable-row, and packed 1-D variable-row + `slot_offsets` layouts per
+  projection, hybrid fused in-register A16 Split-K GEMV at small batches / SM75 and bounded
+  active-slot scratch decode + ConvRot INT8 W8A8 grouped GEMM at prefill on SM80+ / ROCm),
+  with on-device slot bucketing/compaction, grouped matrix execution, and `expert_to_slot` miss
+  skipping in native GPU kernels (and graph-safe masked fallback elsewhere), SwiGLU
+  (`gate_first` configurable) and `tanh`-GELU activations, reusable input preparation, and
+  optional caller-owned `out=` accumulation. Validated on CPU and AMD RX 9070 XT (`gfx1201`)
+  across eager execution, `torch.compile(fullgraph=True, dynamic=True)`, and CUDA Graph
+  replay; NVIDIA `sm75`/`sm80`/`sm89`/`sm120` and AMD `gfx942`/`gfx1100`/`gfx1151` targets
+  validated via offline compilation.
 
 ### Changed
 

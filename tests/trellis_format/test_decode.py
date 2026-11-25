@@ -137,14 +137,50 @@ def test_triton_variable_rows_matches_reference(
 
 
 def test_variable_rows_reference_handles_strided_and_rejects_bad_shapes() -> None:
-    bitstreams, scales, row_widths = _random_variable_storage(256, [96, 144], 2, seed=17)
+    bitstreams, scales, row_widths = _random_variable_storage(256, [64, 144, 192], 2, seed=17)
     strided = torch.stack((bitstreams, bitstreams), dim=1)[:, 0]
+    expected = decode_variable_rows_reference(bitstreams, scales, row_widths, 256)
+    assert torch.equal(decode_variable_rows_reference(strided, scales, row_widths, 256), expected)
+
+    pad = 13
+    packed = torch.cat(
+        (
+            torch.full((pad,), 0xA5, dtype=torch.uint8),
+            bitstreams,
+            torch.full((5,), 0x5A, dtype=torch.uint8),
+        )
+    )
     assert torch.equal(
-        decode_variable_rows_reference(strided, scales, row_widths, 256),
-        decode_variable_rows_reference(bitstreams, scales, row_widths, 256),
+        decode_variable_rows_reference(
+            packed, scales, row_widths, 256, base_offset=torch.tensor(pad, dtype=torch.int64)
+        ),
+        expected,
+    )
+    zero_expected = decode_variable_rows_reference(
+        torch.empty((0,), dtype=torch.uint8), scales, row_widths, 256
+    )
+    assert torch.equal(
+        decode_variable_rows_reference(
+            bitstreams, scales, row_widths, 256, base_offset=torch.tensor(-5, dtype=torch.int64)
+        ),
+        zero_expected,
+    )
+    assert torch.equal(
+        decode_variable_rows_reference(
+            bitstreams,
+            scales,
+            row_widths,
+            256,
+            base_offset=torch.tensor(bitstreams.numel() + 7, dtype=torch.int64),
+        ),
+        zero_expected,
     )
     with pytest.raises(ValueError, match="invalid variable-row trellis reference input shapes"):
         decode_variable_rows_reference(bitstreams, scales, row_widths[:1], 256)
+    with pytest.raises(ValueError, match="base_offset must be a 0-D tensor"):
+        decode_variable_rows_reference(
+            bitstreams, scales, row_widths, 256, base_offset=torch.tensor([0], dtype=torch.int64)
+        )
 
 
 @pytest.mark.gpu
@@ -153,11 +189,13 @@ def test_variable_rows_reference_handles_strided_and_rejects_bad_shapes() -> Non
 def test_triton_variable_rows_bounds_clamp_handles_truncated_bitstreams(num_bytes: int) -> None:
     from piper_kernels.trellis.triton import decode_variable_rows_int8_out  # noqa: PLC0415
 
-    bitstreams = torch.zeros(num_bytes, dtype=torch.uint8, device="cuda")
-    scales = torch.zeros(1, 1, dtype=torch.uint8, device="cuda")
+    bitstreams = torch.arange(1, 1 + num_bytes, dtype=torch.uint8, device="cuda")
+    scales = torch.full((1, 1), 0x3C, dtype=torch.uint8, device="cuda")
     row_widths = torch.tensor([6], dtype=torch.uint8, device="cuda")
     values = torch.empty(1, 16, dtype=torch.int8, device="cuda")
 
     decode_variable_rows_int8_out(bitstreams, scales, row_widths, 16, values)
-    torch.cuda.synchronize()
-    assert values.shape == (1, 16)
+    expected = decode_variable_rows_reference(
+        bitstreams.cpu(), scales.view(torch.float8_e4m3fn).cpu(), row_widths.cpu(), 16
+    )
+    assert torch.equal(values.cpu(), expected)

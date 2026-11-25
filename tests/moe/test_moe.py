@@ -34,11 +34,14 @@ from piper_kernels.moe import (
 )
 from piper_kernels.moe import reference as moe_reference
 from piper_kernels.moe import triton as moe_triton
+from piper_kernels.trellis import resolve_block_size, resolve_layout
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
-MoEFormat = Literal["nvfp4_w4a16", "convrot_nvfp4_w4a16", "convrot_int8"]
+MoEFormat = Literal["nvfp4_w4a16", "convrot_nvfp4_w4a16", "convrot_int8", "convrot_trellis"]
+TrellisLayoutKind = Literal["uniform", "var2d", "var1d"]
 ActivationKind = Literal["swiglu", "gelu_tanh"]
 
 _INT8_MOE_GPU_AVAILABLE = w4a16_nvfp4_available() and (
@@ -81,6 +84,199 @@ def _make_dense_weights(
     return up_gate_hp, down_hp
 
 
+def _finite_e4m3(shape: tuple[int, ...], generator: torch.Generator) -> torch.Tensor:
+    codes = torch.randint(0x18, 0x48, shape, dtype=torch.uint8, generator=generator)
+    return codes.view(torch.float8_e4m3fn)
+
+
+def _make_trellis_proj_slab(
+    num_slots: int,
+    out_features: int,
+    in_features: int,
+    *,
+    block_size: int,
+    layout_kind: TrellisLayoutKind,
+    generator: torch.Generator,
+    device: str | torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    blocks_per_row = in_features // block_size
+    block_scales = _finite_e4m3((num_slots, out_features, blocks_per_row), generator)
+    scale = (torch.rand((num_slots, out_features), generator=generator) * 0.03 + 0.005) / max(
+        1.0, (in_features / 256.0) ** 0.5
+    )
+    if layout_kind == "uniform":
+        bpb = resolve_layout(block_size, 4.5).bytes_per_block
+        qdata = torch.randint(
+            0,
+            256,
+            (num_slots, out_features, blocks_per_row, bpb),
+            dtype=torch.uint8,
+            generator=generator,
+        )
+        return (
+            qdata.to(device),
+            block_scales.to(device),
+            scale.to(device),
+            None,
+            None,
+        )
+
+    low_bytes = (2 * block_size + 7) // 8
+    high_bytes = (6 * block_size) // 8
+    # Vary widths across both rows and slots (especially making 1-D slot totals asymmetric).
+    row_widths = torch.randint(
+        low_bytes,
+        high_bytes + 1,
+        (num_slots, out_features),
+        dtype=torch.uint8,
+        generator=generator,
+    )
+    if num_slots > 1 and out_features > 0:
+        row_widths[0, 0] = low_bytes
+        row_widths[1, -1] = high_bytes
+    slot_totals = [int(row_widths[slot].sum().item()) * blocks_per_row for slot in range(num_slots)]
+    if layout_kind == "var2d":
+        slot_bytes = max(slot_totals, default=0) + 17
+        qdata = torch.zeros((num_slots, slot_bytes), dtype=torch.uint8)
+        for slot, total in enumerate(slot_totals):
+            qdata[slot, :total] = torch.randint(
+                0, 256, (total,), dtype=torch.uint8, generator=generator
+            )
+        return (
+            qdata.to(device),
+            block_scales.to(device),
+            scale.to(device),
+            row_widths.to(device),
+            None,
+        )
+
+    chunks: list[torch.Tensor] = []
+    offsets: list[int] = []
+    cursor = 0
+    for total in slot_totals:
+        offsets.append(cursor)
+        chunks.append(torch.randint(0, 256, (total,), dtype=torch.uint8, generator=generator))
+        # Non-zero gap ensures kernels index via slot_offsets rather than assuming tight packing.
+        chunks.append(torch.full((13,), 0xA5, dtype=torch.uint8))
+        cursor += total + 13
+    qdata_1d = torch.cat(chunks) if chunks else torch.empty((0,), dtype=torch.uint8)
+    slot_offsets = torch.tensor(offsets, dtype=torch.int64, device=device)
+    return (
+        qdata_1d.to(device),
+        block_scales.to(device),
+        scale.to(device),
+        row_widths.to(device),
+        slot_offsets,
+    )
+
+
+def _make_trellis_moe_weights(
+    num_slots: int,
+    hidden_size: int,
+    intermediate_size: int,
+    *,
+    group_size: int = 64,
+    activation_fn: ActivationKind = "swiglu",
+    gate_first: bool = True,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str | torch.device = "cpu",
+    layouts: tuple[TrellisLayoutKind, TrellisLayoutKind] = ("uniform", "uniform"),
+    seed: int = 101,
+) -> MoEWeights:
+    up_layout, down_layout = layouts
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    up_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    resolved_up_bs = resolve_block_size(hidden_size)
+    resolved_dn_bs = resolve_block_size(intermediate_size)
+    up_qd, up_bs, up_sc, up_rw, up_so = _make_trellis_proj_slab(
+        num_slots,
+        up_out,
+        hidden_size,
+        block_size=resolved_up_bs,
+        layout_kind=up_layout,
+        generator=generator,
+        device=device,
+    )
+    dn_qd, dn_bs, dn_sc, dn_rw, dn_so = _make_trellis_proj_slab(
+        num_slots,
+        hidden_size,
+        intermediate_size,
+        block_size=resolved_dn_bs,
+        layout_kind=down_layout,
+        generator=generator,
+        device=device,
+    )
+    return MoEWeights.from_quantized(
+        up_qd,
+        up_sc,
+        dn_qd,
+        dn_sc,
+        logical_dtype=dtype,
+        group_size=group_size,
+        activation_fn=activation_fn,
+        gate_first=gate_first,
+        up_gate_block_scales=up_bs,
+        down_block_scales=dn_bs,
+        up_gate_row_widths=up_rw,
+        down_row_widths=dn_rw,
+        up_gate_slot_offsets=up_so,
+        down_slot_offsets=dn_so,
+        up_gate_block_size=resolved_up_bs,
+        down_block_size=resolved_dn_bs,
+    )
+
+
+def _decode_trellis_moe_weights_to_int8(weights: MoEWeights) -> MoEWeights:
+    assert weights.up_gate_block_scales is not None
+    assert weights.down_block_scales is not None
+    num_slots = weights.num_slots
+    up_int8: list[torch.Tensor] = []
+    dn_int8: list[torch.Tensor] = []
+    for slot in range(num_slots):
+        up_stream = (
+            weights.up_gate_qdata[slot]
+            if weights.up_gate_slot_offsets is None
+            else weights.up_gate_qdata[int(weights.up_gate_slot_offsets[slot].item()) :]
+        )
+        dn_stream = (
+            weights.down_qdata[slot]
+            if weights.down_slot_offsets is None
+            else weights.down_qdata[int(weights.down_slot_offsets[slot].item()) :]
+        )
+        up_t = ConvRotInt8Tensor.from_trellis(
+            up_stream,
+            weights.up_gate_block_scales[slot],
+            weights.up_gate_scale[slot],
+            block_size=weights.up_gate_block_size,
+            group_size=weights.group_size,
+            logical_dtype=weights.logical_dtype,
+            row_widths=None
+            if weights.up_gate_row_widths is None
+            else weights.up_gate_row_widths[slot],
+        )
+        dn_t = ConvRotInt8Tensor.from_trellis(
+            dn_stream,
+            weights.down_block_scales[slot],
+            weights.down_scale[slot],
+            block_size=weights.down_block_size,
+            group_size=weights.group_size,
+            logical_dtype=weights.logical_dtype,
+            row_widths=None if weights.down_row_widths is None else weights.down_row_widths[slot],
+        )
+        up_int8.append(up_t.qdata)
+        dn_int8.append(dn_t.qdata)
+    return MoEWeights.from_quantized(
+        torch.stack(up_int8).contiguous(),
+        weights.up_gate_scale.contiguous(),
+        torch.stack(dn_int8).contiguous(),
+        weights.down_scale.contiguous(),
+        logical_dtype=weights.logical_dtype,
+        group_size=weights.group_size,
+        activation_fn=weights.activation_fn,
+        gate_first=weights.gate_first,
+    )
+
+
 def _make_moe_weights(
     num_slots: int,
     hidden_size: int,
@@ -94,6 +290,18 @@ def _make_moe_weights(
     device: str | torch.device = "cpu",
     seed: int = 101,
 ) -> MoEWeights:
+    if weight_format == "convrot_trellis":
+        return _make_trellis_moe_weights(
+            num_slots,
+            hidden_size,
+            intermediate_size,
+            group_size=group_size,
+            activation_fn=activation_fn,
+            gate_first=gate_first,
+            dtype=dtype,
+            device=device,
+            seed=seed,
+        )
     up_gate_hp, down_hp = _make_dense_weights(
         num_slots,
         hidden_size,
@@ -149,6 +357,26 @@ def _reference_for_weights(
         activation_fn=weights.activation_fn,
         gate_first=weights.gate_first,
         high_first=weights.high_first,
+        up_gate_block_scales=(
+            None if weights.up_gate_block_scales is None else weights.up_gate_block_scales.cpu()
+        ),
+        down_block_scales=(
+            None if weights.down_block_scales is None else weights.down_block_scales.cpu()
+        ),
+        up_gate_row_widths=(
+            None if weights.up_gate_row_widths is None else weights.up_gate_row_widths.cpu()
+        ),
+        down_row_widths=(
+            None if weights.down_row_widths is None else weights.down_row_widths.cpu()
+        ),
+        up_gate_slot_offsets=(
+            None if weights.up_gate_slot_offsets is None else weights.up_gate_slot_offsets.cpu()
+        ),
+        down_slot_offsets=(
+            None if weights.down_slot_offsets is None else weights.down_slot_offsets.cpu()
+        ),
+        up_gate_block_size=weights.up_gate_block_size,
+        down_block_size=weights.down_block_size,
     )
 
 
@@ -185,7 +413,45 @@ def _oracle_slot_output(
     weights: MoEWeights,
     slot: int,
 ) -> torch.Tensor:
-    if weights.weight_format == "convrot_int8":
+    if weights.weight_format == "convrot_trellis":
+        assert weights.up_gate_block_scales is not None
+        assert weights.down_block_scales is not None
+        up_stream = (
+            weights.up_gate_qdata[slot].cpu()
+            if weights.up_gate_slot_offsets is None
+            else weights.up_gate_qdata[int(weights.up_gate_slot_offsets[slot].item()) :].cpu()
+        )
+        dn_stream = (
+            weights.down_qdata[slot].cpu()
+            if weights.down_slot_offsets is None
+            else weights.down_qdata[int(weights.down_slot_offsets[slot].item()) :].cpu()
+        )
+        up_t = ConvRotTrellisTensor.from_quantized(
+            up_stream,
+            weights.up_gate_block_scales[slot].cpu(),
+            weights.up_gate_scale[slot].cpu(),
+            block_size=weights.up_gate_block_size,
+            group_size=weights.group_size,
+            logical_dtype=weights.logical_dtype,
+            row_widths=(
+                None
+                if weights.up_gate_row_widths is None
+                else weights.up_gate_row_widths[slot].cpu()
+            ),
+        )
+        down_t = ConvRotTrellisTensor.from_quantized(
+            dn_stream,
+            weights.down_block_scales[slot].cpu(),
+            weights.down_scale[slot].cpu(),
+            block_size=weights.down_block_size,
+            group_size=weights.group_size,
+            logical_dtype=weights.logical_dtype,
+            row_widths=(
+                None if weights.down_row_widths is None else weights.down_row_widths[slot].cpu()
+            ),
+        )
+        mid = F.linear(x_row.float(), up_t.dequantize(torch.float32))
+    elif weights.weight_format == "convrot_int8":
         up_w = ConvRotInt8Tensor.from_quantized(
             weights.up_gate_qdata[slot].cpu(),
             weights.up_gate_scale[slot].cpu(),
@@ -566,6 +832,7 @@ def test_validation_errors_leave_caller_out_untouched() -> None:
         ("nvfp4_w4a16", 0),
         ("convrot_nvfp4_w4a16", 64),
         ("convrot_int8", 64),
+        ("convrot_trellis", 64),
     ],
 )
 @pytest.mark.parametrize(
@@ -718,6 +985,7 @@ def test_cpu_slot_indirection_misses_accumulate_and_strided_out() -> None:
         ("nvfp4_w4a16", 0),
         ("convrot_nvfp4_w4a16", 64),
         ("convrot_int8", 64),
+        ("convrot_trellis", 64),
     ],
 )
 def test_cpu_two_wave_prepared_input_accumulation(
@@ -1334,6 +1602,448 @@ assert torch.isfinite(res_nvfp4).all()
     assert cpu_result.returncode == 0, cpu_result.stdout + cpu_result.stderr
 
 
+@pytest.mark.parametrize(
+    ("up_layout", "down_layout"),
+    [
+        ("uniform", "uniform"),
+        ("var2d", "var2d"),
+        ("var1d", "var1d"),
+        ("var1d", "var2d"),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_cpu_trellis_layouts_dtypes_block_sizes(
+    up_layout: TrellisLayoutKind,
+    down_layout: TrellisLayoutKind,
+    dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(145 + int(dtype is torch.float16))
+    # Distinct up/down block sizes (256 vs 128) and mixed layouts across slots.
+    weights = _make_trellis_moe_weights(
+        3,
+        256,
+        128,
+        group_size=64,
+        dtype=dtype,
+        layouts=(up_layout, down_layout),
+        seed=150,
+    )
+    assert weights.weight_format == "convrot_trellis"
+    assert weights.num_slots == 3
+    assert weights.hidden_size == 256
+    assert weights.intermediate_size == 128
+    assert weights.up_gate_block_size == 256
+    assert weights.down_block_size == 128
+
+    x = torch.randn((2, 256), dtype=dtype)
+    topk_ids = torch.tensor([[2, 0], [1, 1]], dtype=torch.int64)
+    topk_weights = torch.tensor([[0.6, 0.4], [0.3, 0.7]], dtype=dtype)
+    actual = moe_ffn(x, weights, topk_ids, topk_weights)
+    expected = _reference_for_weights(x, weights, topk_ids, topk_weights)
+    oracle = _independent_moe_oracle(x, weights, topk_ids, topk_weights)
+    assert torch.equal(actual, expected)
+    _assert_matches_reference(actual, oracle, weight_format="convrot_trellis", dtype=dtype)
+
+    if up_layout == "var1d" and down_layout == "var1d" and dtype is torch.bfloat16:
+        # Non-power-of-two T = 224 on widths divisible by 224 and group_size=16.
+        weights_224 = _make_trellis_moe_weights(
+            2,
+            448,
+            224,
+            group_size=16,
+            activation_fn="gelu_tanh",
+            dtype=dtype,
+            layouts=("var1d", "var2d"),
+            seed=151,
+        )
+        assert weights_224.up_gate_block_size == 224
+        assert weights_224.down_block_size == 224
+        x_224 = torch.randn((1, 448), dtype=dtype)
+        ids_224 = torch.tensor([[1, 0]], dtype=torch.int64)
+        wts_224 = torch.tensor([[0.55, 0.45]], dtype=dtype)
+        out_224 = moe_ffn(x_224, weights_224, ids_224, wts_224)
+        oracle_224 = _independent_moe_oracle(x_224, weights_224, ids_224, wts_224)
+        assert torch.equal(out_224, _reference_for_weights(x_224, weights_224, ids_224, wts_224))
+        _assert_matches_reference(out_224, oracle_224, weight_format="convrot_trellis", dtype=dtype)
+
+
+def test_cpu_trellis_validation_and_empty_hp() -> None:
+    # MoEWeights.from_hp validates trellis arguments and builds valid empty storage for num_slots=0.
+    empty_up, empty_dn = _make_dense_weights(0, 256, 256, dtype=torch.bfloat16, seed=152)
+    empty_w = MoEWeights.from_hp(
+        empty_up,
+        empty_dn,
+        weight_format="convrot_trellis",
+        group_size=64,
+        bits_per_weight=4.5,
+    )
+    assert empty_w.weight_format == "convrot_trellis"
+    assert empty_w.num_slots == 0
+    assert empty_w.up_gate_qdata.ndim == 4
+    assert empty_w.up_gate_block_size == 256
+    assert empty_w.down_block_size == 256
+
+    up_hp, dn_hp = _make_dense_weights(1, 256, 256, dtype=torch.bfloat16, seed=153)
+    with pytest.raises(ValueError, match="bits_per_weight"):
+        MoEWeights.from_hp(
+            up_hp, dn_hp, weight_format="convrot_int8", group_size=64, bits_per_weight=4.5
+        )
+    with pytest.raises(ValueError, match="specify exactly one"):
+        MoEWeights.from_hp(empty_up, empty_dn, weight_format="convrot_trellis", group_size=64)
+    with pytest.raises(ValueError, match="specify exactly one"):
+        MoEWeights.from_hp(
+            empty_up,
+            empty_dn,
+            weight_format="convrot_trellis",
+            group_size=64,
+            bits_per_weight=4.5,
+            bytes_per_block=143,
+        )
+
+    weights = _make_trellis_moe_weights(
+        2,
+        128,
+        128,
+        group_size=64,
+        dtype=torch.bfloat16,
+        layouts=("var1d", "var2d"),
+        seed=154,
+    )
+    # Storage and metadata validation errors.
+    with pytest.raises(ValueError, match="high_first"):
+        MoEWeights.from_quantized(
+            weights.up_gate_qdata,
+            weights.up_gate_scale,
+            weights.down_qdata,
+            weights.down_scale,
+            logical_dtype=torch.bfloat16,
+            group_size=64,
+            high_first=True,
+            up_gate_block_scales=weights.up_gate_block_scales,
+            down_block_scales=weights.down_block_scales,
+            up_gate_row_widths=weights.up_gate_row_widths,
+            down_row_widths=weights.down_row_widths,
+            up_gate_slot_offsets=weights.up_gate_slot_offsets,
+            down_slot_offsets=weights.down_slot_offsets,
+            up_gate_block_size=128,
+            down_block_size=128,
+        )
+    with pytest.raises(ValueError, match="global scales"):
+        MoEWeights.from_quantized(
+            weights.up_gate_qdata,
+            weights.up_gate_scale,
+            weights.down_qdata,
+            weights.down_scale,
+            logical_dtype=torch.bfloat16,
+            group_size=64,
+            up_gate_global_scale=torch.ones((2,), dtype=torch.float32),
+            up_gate_block_scales=weights.up_gate_block_scales,
+            down_block_scales=weights.down_block_scales,
+            up_gate_row_widths=weights.up_gate_row_widths,
+            down_row_widths=weights.down_row_widths,
+            up_gate_slot_offsets=weights.up_gate_slot_offsets,
+            down_slot_offsets=weights.down_slot_offsets,
+            up_gate_block_size=128,
+            down_block_size=128,
+        )
+    with pytest.raises(ValueError, match="slot_offsets requires"):
+        MoEWeights.from_quantized(
+            weights.up_gate_qdata,
+            weights.up_gate_scale,
+            weights.down_qdata,
+            weights.down_scale,
+            logical_dtype=torch.bfloat16,
+            group_size=64,
+            up_gate_block_scales=weights.up_gate_block_scales,
+            down_block_scales=weights.down_block_scales,
+            up_gate_row_widths=None,
+            down_row_widths=weights.down_row_widths,
+            up_gate_slot_offsets=weights.up_gate_slot_offsets,
+            down_slot_offsets=weights.down_slot_offsets,
+            up_gate_block_size=128,
+            down_block_size=128,
+        )
+    with pytest.raises(ValueError, match="2-D variable-row"):
+        MoEWeights.from_quantized(
+            weights.up_gate_qdata,
+            weights.up_gate_scale,
+            weights.down_qdata.reshape(-1),
+            weights.down_scale,
+            logical_dtype=torch.bfloat16,
+            group_size=64,
+            up_gate_block_scales=weights.up_gate_block_scales,
+            down_block_scales=weights.down_block_scales,
+            up_gate_row_widths=weights.up_gate_row_widths,
+            down_row_widths=weights.down_row_widths,
+            up_gate_slot_offsets=weights.up_gate_slot_offsets,
+            down_slot_offsets=None,
+            up_gate_block_size=128,
+            down_block_size=128,
+        )
+    with pytest.raises(ValueError, match="1-D variable-row"):
+        MoEWeights.from_quantized(
+            weights.up_gate_qdata.unsqueeze(0),
+            weights.up_gate_scale,
+            weights.down_qdata,
+            weights.down_scale,
+            logical_dtype=torch.bfloat16,
+            group_size=64,
+            up_gate_block_scales=weights.up_gate_block_scales,
+            down_block_scales=weights.down_block_scales,
+            up_gate_row_widths=weights.up_gate_row_widths,
+            down_row_widths=weights.down_row_widths,
+            up_gate_slot_offsets=weights.up_gate_slot_offsets,
+            down_slot_offsets=weights.down_slot_offsets,
+            up_gate_block_size=128,
+            down_block_size=128,
+        )
+    with pytest.raises(ValueError, match="slot_offsets must be int64"):
+        MoEWeights.from_quantized(
+            weights.up_gate_qdata,
+            weights.up_gate_scale,
+            weights.down_qdata.reshape(-1),
+            weights.down_scale,
+            logical_dtype=torch.bfloat16,
+            group_size=64,
+            up_gate_block_scales=weights.up_gate_block_scales,
+            down_block_scales=weights.down_block_scales,
+            up_gate_row_widths=weights.up_gate_row_widths,
+            down_row_widths=weights.down_row_widths,
+            up_gate_slot_offsets=weights.up_gate_slot_offsets,
+            down_slot_offsets=torch.zeros((2,), dtype=torch.int32),
+            up_gate_block_size=128,
+            down_block_size=128,
+        )
+
+    bad_offset_w = MoEWeights.from_quantized(
+        weights.up_gate_qdata,
+        weights.up_gate_scale,
+        weights.down_qdata,
+        weights.down_scale,
+        logical_dtype=torch.bfloat16,
+        group_size=64,
+        up_gate_block_scales=weights.up_gate_block_scales,
+        down_block_scales=weights.down_block_scales,
+        up_gate_row_widths=weights.up_gate_row_widths,
+        down_row_widths=weights.down_row_widths,
+        up_gate_slot_offsets=torch.tensor([-1, 0], dtype=torch.int64),
+        down_slot_offsets=weights.down_slot_offsets,
+        up_gate_block_size=128,
+        down_block_size=128,
+    )
+    # Negative slot_offsets violate caller preconditions (no host readback); fallback clamps safely.
+    bad_offset_out = moe_ffn(
+        torch.randn((1, 128), dtype=torch.bfloat16),
+        bad_offset_w,
+        torch.tensor([[0, 1]], dtype=torch.int64),
+        torch.tensor([[0.5, 0.5]], dtype=torch.bfloat16),
+    )
+    assert bad_offset_out.shape == (1, 128)
+    assert bad_offset_out.dtype == torch.bfloat16
+    assert torch.isfinite(bad_offset_out).all()
+
+
+def test_cpu_trellis_aliasing_and_autograd_guards() -> None:
+    weights = _make_trellis_moe_weights(
+        2,
+        128,
+        128,
+        group_size=64,
+        dtype=torch.bfloat16,
+        layouts=("var1d", "var2d"),
+        seed=154,
+    )
+    x = torch.randn((1, 128), dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    wts = torch.tensor([[0.6, 0.4]], dtype=torch.bfloat16)
+    out = torch.full((1, 128), 3.0, dtype=torch.bfloat16)
+    before = out.clone()
+
+    # Prepared input validation & leaving caller out untouched.
+    for bad_prep in (
+        PreparedMoEInput(
+            data=torch.zeros((1, 128), dtype=torch.int8),
+            scale=torch.ones((1,), dtype=torch.float32),
+            logical_dtype=torch.bfloat16,
+            group_size=64,
+            is_int8=True,
+        ),
+        PreparedMoEInput(
+            data=torch.zeros((1, 128), dtype=torch.float32),
+            scale=torch.ones((1,), dtype=torch.float32),
+            logical_dtype=torch.bfloat16,
+            group_size=64,
+            is_int8=False,
+        ),
+    ):
+        with pytest.raises(ValueError, match=r"(prepared_input|scale must be None)"):
+            moe_ffn(x, weights, ids, wts, out=out, accumulate=True, prepared_input=bad_prep)
+        assert torch.equal(out, before)
+
+    # Autograd guard on FP8 block_scales.
+    with torch.enable_grad():
+        assert weights.up_gate_block_scales is not None
+        with pytest.raises(RuntimeError, match="autograd"):
+            torch.ops.piper_kernels.moe_ffn(
+                x,
+                ids,
+                wts,
+                weights.up_gate_qdata,
+                weights.up_gate_scale,
+                weights.down_qdata,
+                weights.down_scale,
+                group_size=64,
+                up_gate_block_scales=weights.up_gate_block_scales.clone().requires_grad_(True),
+                down_block_scales=weights.down_block_scales,
+                up_gate_row_widths=weights.up_gate_row_widths,
+                down_row_widths=weights.down_row_widths,
+                up_gate_slot_offsets=weights.up_gate_slot_offsets,
+                down_slot_offsets=weights.down_slot_offsets,
+                up_gate_block_size=128,
+                down_block_size=128,
+            )
+
+    # Out aliasing any trellis metadata tensor is rejected before mutation.
+    buf = torch.ones((4096,), dtype=torch.uint8)
+    out_alias = buf[:256].view(torch.bfloat16).view(1, 128)
+    assert weights.up_gate_block_scales is not None
+    assert weights.down_block_scales is not None
+    assert weights.up_gate_row_widths is not None
+    assert weights.down_row_widths is not None
+    assert weights.up_gate_slot_offsets is not None
+    alias_bs_up = buf[:512].view(torch.float8_e4m3fn).view(2, 256, 1)
+    alias_bs_dn = buf[:256].view(torch.float8_e4m3fn).view(2, 128, 1)
+    alias_rw_up = buf[:512].view(2, 256)
+    alias_rw_dn = buf[:256].view(2, 128)
+    alias_so = buf[:16].view(torch.int64).zero_()
+    alias_cases: list[dict[str, object]] = [
+        {"up_gate_block_scales": alias_bs_up},
+        {"down_block_scales": alias_bs_dn},
+        {"up_gate_row_widths": alias_rw_up},
+        {"down_row_widths": alias_rw_dn},
+        {"up_gate_slot_offsets": alias_so},
+        {
+            "down_row_widths": alias_rw_dn,
+            "down_slot_offsets": alias_so,
+            "down_qdata": torch.zeros((256,), dtype=torch.uint8),
+        },
+    ]
+    for overrides in alias_cases:
+        w_alias = MoEWeights.from_quantized(
+            overrides.get("up_gate_qdata", weights.up_gate_qdata),  # type: ignore[arg-type]
+            weights.up_gate_scale,
+            overrides.get("down_qdata", weights.down_qdata),  # type: ignore[arg-type]
+            weights.down_scale,
+            logical_dtype=torch.bfloat16,
+            group_size=64,
+            up_gate_block_scales=overrides.get(
+                "up_gate_block_scales",
+                weights.up_gate_block_scales,  # type: ignore[arg-type]
+            ),
+            down_block_scales=overrides.get(
+                "down_block_scales",
+                weights.down_block_scales,  # type: ignore[arg-type]
+            ),
+            up_gate_row_widths=overrides.get(
+                "up_gate_row_widths",
+                weights.up_gate_row_widths,  # type: ignore[arg-type]
+            ),
+            down_row_widths=overrides.get(
+                "down_row_widths",
+                weights.down_row_widths,  # type: ignore[arg-type]
+            ),
+            up_gate_slot_offsets=overrides.get(
+                "up_gate_slot_offsets",
+                weights.up_gate_slot_offsets,  # type: ignore[arg-type]
+            ),
+            down_slot_offsets=overrides.get("down_slot_offsets", None),  # type: ignore[arg-type]
+            up_gate_block_size=128,
+            down_block_size=128,
+        )
+        snapshot = buf.clone()
+        with pytest.raises(ValueError, match="alias weight storage"):
+            moe_ffn(x, w_alias, ids[:, :0], wts[:, :0], out=out_alias)
+        assert torch.equal(buf, snapshot)
+
+
+def test_cpu_trellis_prepared_waves_misses_and_meta() -> None:
+    torch.manual_seed(156)
+    for layout in ("uniform", "var2d", "var1d"):
+        w = _make_trellis_moe_weights(
+            4,
+            128,
+            128,
+            group_size=64,
+            dtype=torch.bfloat16,
+            layouts=(layout, layout),
+            seed=157,
+        )
+        x = torch.randn((3, 128), dtype=torch.bfloat16)
+        ids = torch.tensor([[0, 2], [1, 3], [-1, 5]], dtype=torch.int64)
+        wts = torch.tensor([[0.6, 0.4], [0.5, 0.5], [0.2, 0.8]], dtype=torch.bfloat16)
+        slot_map = torch.tensor([2, 0, -1, 3], dtype=torch.int64)
+        prep = prepare_moe_input(x, w)
+        assert prep.data.dtype is torch.float32
+        assert prep.scale is None
+        out = torch.full((3, 128), 1.0, dtype=torch.bfloat16)
+        expected = _reference_for_weights(
+            x, w, ids, wts, expert_to_slot=slot_map, out=out, accumulate=True
+        )
+        moe_ffn(
+            x,
+            w,
+            ids,
+            wts,
+            expert_to_slot=slot_map,
+            out=out,
+            accumulate=True,
+            prepared_input=prep,
+        )
+        assert torch.equal(out, expected)
+
+    # Zero-slot / zero-row / FakeTensor / meta dispatch on 1-D trellis storage.
+    w_1d = _make_trellis_moe_weights(
+        2,
+        128,
+        128,
+        group_size=64,
+        dtype=torch.bfloat16,
+        layouts=("var1d", "var1d"),
+        seed=158,
+    )
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        fx = torch.empty((2, 128), dtype=torch.bfloat16)
+        fids = torch.empty((2, 2), dtype=torch.int64)
+        fwts = torch.empty((2, 2), dtype=torch.bfloat16)
+        fprep = prepare_moe_input(fx, w_1d)
+        fout = moe_ffn(fx, w_1d, fids, fwts, prepared_input=fprep)
+        assert fout.shape == (2, 128)
+        assert fout.dtype is torch.bfloat16
+
+    meta_w = MoEWeights.from_quantized(
+        torch.empty((1024,), dtype=torch.uint8, device="meta"),
+        torch.empty((2, 256), dtype=torch.float32, device="meta"),
+        torch.empty((512,), dtype=torch.uint8, device="meta"),
+        torch.empty((2, 128), dtype=torch.float32, device="meta"),
+        logical_dtype=torch.bfloat16,
+        group_size=64,
+        up_gate_block_scales=torch.empty((2, 256, 1), dtype=torch.float8_e4m3fn, device="meta"),
+        down_block_scales=torch.empty((2, 128, 1), dtype=torch.float8_e4m3fn, device="meta"),
+        up_gate_row_widths=torch.empty((2, 256), dtype=torch.uint8, device="meta"),
+        down_row_widths=torch.empty((2, 128), dtype=torch.uint8, device="meta"),
+        up_gate_slot_offsets=torch.empty((2,), dtype=torch.int64, device="meta"),
+        down_slot_offsets=torch.empty((2,), dtype=torch.int64, device="meta"),
+        up_gate_block_size=128,
+        down_block_size=128,
+    )
+    meta_x = torch.empty((2, 128), dtype=torch.bfloat16, device="meta")
+    meta_ids = torch.empty((2, 2), dtype=torch.int64, device="meta")
+    meta_wts = torch.empty((2, 2), dtype=torch.bfloat16, device="meta")
+    meta_out = moe_ffn(meta_x, meta_w, meta_ids, meta_wts)
+    assert meta_out.device.type == "meta"
+    assert meta_out.shape == (2, 128)
+
+
 @pytest.mark.parametrize("target", _NVIDIA_TARGETS)
 @pytest.mark.parametrize(
     ("weight_format", "group_size", "logical_dtype"),
@@ -1931,6 +2641,7 @@ def test_gpu_launch_canary_nvfp4_and_int8() -> None:
     [
         ("nvfp4_w4a16", 0),
         ("convrot_nvfp4_w4a16", 64),
+        ("convrot_trellis", 64),
         pytest.param(
             "convrot_int8",
             64,
@@ -1971,6 +2682,7 @@ def test_gpu_faketensor_prepare_and_ffn(weight_format: MoEFormat, group_size: in
     [
         ("nvfp4_w4a16", 0),
         ("convrot_nvfp4_w4a16", 64),
+        ("convrot_trellis", 64),
         pytest.param(
             "convrot_int8",
             64,
@@ -4209,3 +4921,817 @@ def test_gpu_prefill_noncurrent_device() -> None:
             _assert_matches_reference(
                 actual, expected, weight_format=weight_format, dtype=torch.bfloat16
             )
+
+
+_NVIDIA_TRELLIS_TARGETS = [GPUTarget("cuda", 75, 32), *_NVIDIA_TARGETS]
+_TRELLIS_COMPILE_LAYOUTS = [
+    pytest.param((False, False, 256, 512, 512), id="uniform-256"),
+    pytest.param((True, False, 256, 512, 512), id="var2d-256"),
+    pytest.param((True, True, 224, 896, 896), id="var1d-224"),
+]
+_TRELLIS_COMPILE_REGIMES = [
+    pytest.param(("m1", 1, 2, 1, False), id="m1"),
+    pytest.param(("batched", 4, 2, 2, True), id="batched"),
+    pytest.param(("prefill", 256, 6, 1, True), id="prefill"),
+]
+
+
+@pytest.mark.parametrize("target", _NVIDIA_TRELLIS_TARGETS)
+@pytest.mark.parametrize("layout_spec", _TRELLIS_COMPILE_LAYOUTS)
+@pytest.mark.parametrize("regime_spec", _TRELLIS_COMPILE_REGIMES)
+def test_offline_nvidia_trellis_compile_zero_spills(
+    target: GPUTarget,
+    layout_spec: tuple[bool, bool, int, int, int],
+    regime_spec: tuple[str, int, int, int, bool],
+) -> None:
+    variable_rows, has_slot_offsets, block_size, hidden_size, inter_size = layout_spec
+    regime, rows, top_k, split_k, accumulate = regime_spec
+    spill_records: dict[triton.compiler.CompiledKernel, int] = {}
+
+    def _compile(
+        source: ASTSource, tgt: GPUTarget, options: dict[str, object]
+    ) -> triton.compiler.CompiledKernel:
+        compiled, spills = compile_with_spill_stores(source, tgt, options)
+        spill_records[compiled] = spills
+        return compiled
+
+    compiled = moe_triton.compile_moe_kernels(
+        target,
+        weight_format="convrot_trellis",
+        logical_dtype=torch.bfloat16,
+        rows=rows,
+        top_k=top_k,
+        num_slots=64,
+        hidden_size=hidden_size,
+        intermediate_size=inter_size,
+        group_size=64,
+        split_k=split_k,
+        accumulate=accumulate,
+        block_size=block_size,
+        variable_rows=variable_rows,
+        has_slot_offsets=has_slot_offsets,
+        compiler=_compile,
+    )
+    if regime == "prefill" and target.arch >= 80:
+        assert {"trellis_decode", "int8_grouped_up", "int8_grouped_down"}.issubset(compiled)
+    else:
+        assert {"trellis_gemv_up", "trellis_gemv_down"}.issubset(compiled)
+        if regime == "m1":
+            assert "trellis_reduce" not in compiled
+        elif regime == "batched":
+            assert {"bucket", "trellis_reduce"}.issubset(compiled)
+        else:
+            assert "bucket" in compiled
+    for name, kernel in compiled.items():
+        assert kernel.asm.get("cubin")
+        ptx = kernel.asm.get("ptx", "")
+        assert ptx
+        assert spill_records[kernel] == 0
+        assert kernel.metadata.shared <= _SM120_SHARED_MEMORY_LIMIT
+        if name.startswith("int8_grouped"):
+            assert "mma.sync" in ptx
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="ROCm HIP compiler is Linux-only")
+@pytest.mark.parametrize(("arch", "warp_size"), _AMD_TARGETS)
+@pytest.mark.parametrize("layout_spec", _TRELLIS_COMPILE_LAYOUTS)
+@pytest.mark.parametrize("regime_spec", _TRELLIS_COMPILE_REGIMES)
+def test_offline_amd_trellis_compile_matrix_and_fences(
+    arch: str,
+    warp_size: int,
+    layout_spec: tuple[bool, bool, int, int, int],
+    regime_spec: tuple[str, int, int, int, bool],
+) -> None:
+    variable_rows, has_slot_offsets, block_size, hidden_size, inter_size = layout_spec
+    regime, rows, top_k, split_k, accumulate = regime_spec
+    target = GPUTarget("hip", arch, warp_size)
+    compiled = moe_triton.compile_moe_kernels(
+        target,
+        weight_format="convrot_trellis",
+        logical_dtype=torch.bfloat16,
+        rows=rows,
+        top_k=top_k,
+        num_slots=64,
+        hidden_size=hidden_size,
+        intermediate_size=inter_size,
+        group_size=64,
+        split_k=split_k,
+        accumulate=accumulate,
+        block_size=block_size,
+        variable_rows=variable_rows,
+        has_slot_offsets=has_slot_offsets,
+    )
+    if regime == "prefill":
+        assert {"trellis_decode", "int8_grouped_up", "int8_grouped_down"}.issubset(compiled)
+    else:
+        assert {"trellis_gemv_up", "trellis_gemv_down"}.issubset(compiled)
+        if regime == "m1":
+            assert "trellis_reduce" not in compiled
+        else:
+            assert {"bucket", "trellis_reduce"}.issubset(compiled)
+    expected_int8_isa = "v_mfma_i32" if arch == "gfx942" else "v_wmma_i32"
+    for name, kernel in compiled.items():
+        _assert_clean_amd_compile(
+            kernel,
+            arch,
+            check_vgpr_spills=True,
+            check_lds_fences=name.startswith("int8_grouped"),
+        )
+        if name.startswith("int8_grouped"):
+            assert expected_int8_isa in kernel.asm["amdgcn"]
+
+
+def test_offline_trellis_compile_validation_errors() -> None:
+    sm80 = GPUTarget("cuda", 80, 32)
+    with pytest.raises(ValueError, match="high_first"):
+        moe_triton.compile_moe_kernels(
+            sm80, weight_format="convrot_trellis", group_size=64, high_first=True
+        )
+    with pytest.raises(ValueError, match="variable_rows=True"):
+        moe_triton.compile_moe_kernels(
+            sm80,
+            weight_format="convrot_trellis",
+            group_size=64,
+            variable_rows=False,
+            has_slot_offsets=True,
+        )
+    with pytest.raises(ValueError, match="block_size"):
+        moe_triton.compile_moe_kernels(
+            sm80,
+            weight_format="convrot_trellis",
+            group_size=64,
+            hidden_size=256,
+            intermediate_size=256,
+            block_size=24,
+        )
+    with pytest.raises(ValueError, match="divisible"):
+        moe_triton.compile_moe_kernels(
+            sm80,
+            weight_format="convrot_trellis",
+            group_size=64,
+            hidden_size=320,
+            intermediate_size=256,
+            block_size=256,
+        )
+    with pytest.raises(ValueError, match="bytes_per_block"):
+        moe_triton.compile_moe_kernels(
+            sm80,
+            weight_format="convrot_trellis",
+            group_size=64,
+            hidden_size=256,
+            intermediate_size=256,
+            block_size=256,
+            variable_rows=True,
+            bytes_per_block=143,
+        )
+
+
+def _assert_trellis_prefill_matches_oracle(
+    actual: torch.Tensor,
+    x: torch.Tensor,
+    weights: MoEWeights,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    expert_to_slot: torch.Tensor | None = None,
+    out_before: torch.Tensor | None = None,
+    accumulate: bool = False,
+) -> None:
+    assert actual.dtype is weights.logical_dtype
+    assert torch.isfinite(actual).all()
+    if _INT8_MOE_GPU_AVAILABLE:
+        int8_oracle_weights = _decode_trellis_moe_weights_to_int8(weights)
+        expected_w8a8 = moe_ffn(
+            x,
+            int8_oracle_weights,
+            topk_ids,
+            topk_weights,
+            expert_to_slot=expert_to_slot,
+            out=None if out_before is None else out_before.clone(),
+            accumulate=accumulate,
+        )
+        rtol = 1e-4 if weights.logical_dtype is torch.float32 else 1e-3
+        atol = 1e-4 if weights.logical_dtype is torch.float32 else 1e-3
+        torch.testing.assert_close(actual, expected_w8a8, rtol=rtol, atol=atol)
+        return
+    expected_a16 = _reference_for_weights(
+        x,
+        weights,
+        topk_ids,
+        topk_weights,
+        expert_to_slot=expert_to_slot,
+        out=out_before,
+        accumulate=accumulate,
+    )
+    _assert_matches_reference(
+        actual, expected_a16, weight_format="convrot_trellis", dtype=weights.logical_dtype
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.parametrize("rows", [1, 4, 8])
+@pytest.mark.parametrize(
+    ("up_layout", "down_layout"),
+    [
+        ("uniform", "uniform"),
+        ("var2d", "var2d"),
+        ("var1d", "var1d"),
+        ("var1d", "var2d"),
+    ],
+)
+def test_gpu_trellis_m1_and_batched_parity(
+    rows: int,
+    up_layout: TrellisLayoutKind,
+    down_layout: TrellisLayoutKind,
+) -> None:
+    torch.manual_seed(960 + rows)
+    # Cover asymmetric block sizes (256 vs 128), misses, duplicate experts, and out accumulation.
+    weights = _make_trellis_moe_weights(
+        4,
+        256,
+        128,
+        group_size=64,
+        activation_fn="swiglu",
+        gate_first=(rows != 4),
+        dtype=torch.bfloat16,
+        device="cuda",
+        layouts=(up_layout, down_layout),
+        seed=961 + rows,
+    )
+    x = torch.randn((rows, 256), device="cuda", dtype=torch.bfloat16)
+    topk_ids = torch.randint(0, 6, (rows, 3), device="cuda", dtype=torch.int64)
+    topk_ids[0, 0] = topk_ids[0, 1] = 2  # duplicate slot hit within row
+    topk_weights = torch.rand((rows, 3), device="cuda", dtype=torch.bfloat16) + 0.1
+    slot_map = torch.tensor([1, -1, 0, 3, -1, 2], device="cuda", dtype=torch.int64)
+
+    out, launches = _record_triton_launches(
+        lambda: moe_ffn(x, weights, topk_ids, topk_weights, expert_to_slot=slot_map)
+    )
+    assert any("trellis_moe_gemv_kernel" in name for name in launches)
+    _assert_matches_reference(
+        out,
+        _reference_for_weights(x, weights, topk_ids, topk_weights, expert_to_slot=slot_map),
+        weight_format="convrot_trellis",
+        dtype=torch.bfloat16,
+    )
+
+    # Preserve caller-owned strided out on all-miss accumulate and verify two-wave prepared reuse.
+    if up_layout == down_layout:
+        all_miss = torch.full((rows, 3), -1, device="cuda", dtype=torch.int64)
+        backing = torch.full((rows, 288), float("nan"), device="cuda", dtype=torch.bfloat16)
+        out_view = backing[:, :256]
+        out_view.fill_(2.5)
+        moe_ffn(x, weights, all_miss, topk_weights, out=out_view, accumulate=True)
+        assert torch.equal(out_view, torch.full_like(out_view, 2.5))
+        assert torch.isnan(backing[:, 256:]).all()
+
+        prep = prepare_moe_input(x, weights)
+        wave1 = torch.tensor([1, -1, 0, -1, -1, -1], device="cuda", dtype=torch.int64)
+        wave2 = torch.tensor([-1, -1, -1, 3, -1, 2], device="cuda", dtype=torch.int64)
+        acc = torch.full_like(x, 0.5)
+        expected_acc = _reference_for_weights(
+            x, weights, topk_ids, topk_weights, expert_to_slot=slot_map, out=acc, accumulate=True
+        )
+        moe_ffn(
+            x,
+            weights,
+            topk_ids,
+            topk_weights,
+            expert_to_slot=wave1,
+            out=acc,
+            accumulate=True,
+            prepared_input=prep,
+        )
+        moe_ffn(
+            x,
+            weights,
+            topk_ids,
+            topk_weights,
+            expert_to_slot=wave2,
+            out=acc,
+            accumulate=True,
+            prepared_input=prep,
+        )
+        _assert_matches_reference(
+            acc, expected_acc, weight_format="convrot_trellis", dtype=torch.bfloat16
+        )
+
+    # Extra coverage: non-pow2 T=224, GeLU, FP16/FP32, and wide Split-K > 1.
+    if rows == 1 and up_layout == "var1d" and down_layout == "var1d":
+        for dtype, act in ((torch.float16, "gelu_tanh"), (torch.float32, "swiglu")):
+            w_224 = _make_trellis_moe_weights(
+                3,
+                448,
+                224,
+                group_size=16,
+                activation_fn=act,
+                dtype=dtype,
+                device="cuda",
+                layouts=("var1d", "var2d"),
+                seed=965,
+            )
+            x_224 = torch.randn((1, 448), device="cuda", dtype=dtype)
+            ids_224 = torch.tensor([[0, 2]], device="cuda", dtype=torch.int64)
+            wts_224 = torch.tensor([[0.6, 0.4]], device="cuda", dtype=dtype)
+            _assert_matches_reference(
+                moe_ffn(x_224, w_224, ids_224, wts_224),
+                _reference_for_weights(x_224, w_224, ids_224, wts_224),
+                weight_format="convrot_trellis",
+                dtype=dtype,
+            )
+    if rows == 4 and up_layout == "uniform" and down_layout == "uniform":
+        # Narrow out_features + deep K triggers split_k_up > 1 and nvfp4_moe_m1_reduce_kernel.
+        w_splitk = _make_trellis_moe_weights(
+            2,
+            36864,
+            64,
+            group_size=64,
+            activation_fn="gelu_tanh",
+            dtype=torch.bfloat16,
+            device="cuda",
+            layouts=("var1d", "uniform"),
+            seed=966,
+        )
+        sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+        for splitk_rows in (1, 2):
+            x_sk = torch.randn((splitk_rows, 36864), device="cuda", dtype=torch.bfloat16)
+            ids_sk = torch.zeros((splitk_rows, 1), device="cuda", dtype=torch.int64)
+            wts_sk = torch.full((splitk_rows, 1), 0.75, device="cuda", dtype=torch.bfloat16)
+            out_sk, launches_sk = _record_triton_launches(
+                lambda x_sk=x_sk, ids_sk=ids_sk, wts_sk=wts_sk: moe_ffn(
+                    x_sk, w_splitk, ids_sk, wts_sk, active_slots_hint=1
+                )
+            )
+            assert any("trellis_moe_gemv_kernel" in name for name in launches_sk)
+            if sm_count >= 32:
+                assert any("nvfp4_moe_m1_reduce_kernel" in name for name in launches_sk)
+            _assert_matches_reference(
+                out_sk,
+                _reference_for_weights(x_sk, w_splitk, ids_sk, wts_sk),
+                weight_format="convrot_trellis",
+                dtype=torch.bfloat16,
+            )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.parametrize(
+    ("up_layout", "down_layout"),
+    [
+        ("uniform", "uniform"),
+        ("var2d", "var2d"),
+        ("var1d", "var1d"),
+        ("var1d", "var2d"),
+    ],
+)
+def test_gpu_trellis_prefill_parity_and_multichunk(
+    up_layout: TrellisLayoutKind,
+    down_layout: TrellisLayoutKind,
+) -> None:
+    torch.manual_seed(970 + int(up_layout == "var1d"))
+    rows = 32 if up_layout == down_layout else 64
+    weights = _make_trellis_moe_weights(
+        6,
+        256,
+        128,
+        group_size=64,
+        activation_fn="swiglu" if up_layout != "var2d" else "gelu_tanh",
+        gate_first=(down_layout == "uniform"),
+        dtype=torch.float16 if up_layout == "var2d" else torch.bfloat16,
+        device="cuda",
+        layouts=(up_layout, down_layout),
+        seed=971,
+    )
+    dtype = weights.logical_dtype
+    x = torch.randn((rows, 256), device="cuda", dtype=dtype)
+    topk_ids = torch.randint(0, 8, (rows, 2), device="cuda", dtype=torch.int64)
+    topk_weights = torch.rand((rows, 2), device="cuda", dtype=dtype) + 0.1
+    # Map subsets of experts with unmapped slots (slots 4 and 5 stay inactive and get skipped).
+    slot_map = torch.tensor([1, -1, 0, 3, -1, 2, -1, -1], device="cuda", dtype=torch.int64)
+
+    actual = moe_ffn(x, weights, topk_ids, topk_weights, expert_to_slot=slot_map)
+    _assert_trellis_prefill_matches_oracle(
+        actual, x, weights, topk_ids, topk_weights, expert_to_slot=slot_map
+    )
+
+    # Prepared input reuse across prefill waves with accumulate=True.
+    prep = prepare_moe_input(x, weights)
+    wave1 = torch.tensor([1, -1, 0, -1, -1, -1, -1, -1], device="cuda", dtype=torch.int64)
+    wave2 = torch.tensor([-1, -1, -1, 3, -1, 2, -1, -1], device="cuda", dtype=torch.int64)
+    out_acc = torch.full_like(x, 0.75)
+    oracle_acc = out_acc.clone()
+    moe_ffn(
+        x,
+        weights,
+        topk_ids,
+        topk_weights,
+        expert_to_slot=wave1,
+        out=out_acc,
+        accumulate=True,
+        prepared_input=prep,
+    )
+    moe_ffn(
+        x,
+        weights,
+        topk_ids,
+        topk_weights,
+        expert_to_slot=wave2,
+        out=out_acc,
+        accumulate=True,
+        prepared_input=prep,
+    )
+    if _INT8_MOE_GPU_AVAILABLE:
+        int8_oracle = _decode_trellis_moe_weights_to_int8(weights)
+        prep_i8 = prepare_moe_input(x, int8_oracle)
+        moe_ffn(
+            x,
+            int8_oracle,
+            topk_ids,
+            topk_weights,
+            expert_to_slot=wave1,
+            out=oracle_acc,
+            accumulate=True,
+            prepared_input=prep_i8,
+        )
+        moe_ffn(
+            x,
+            int8_oracle,
+            topk_ids,
+            topk_weights,
+            expert_to_slot=wave2,
+            out=oracle_acc,
+            accumulate=True,
+            prepared_input=prep_i8,
+        )
+        torch.testing.assert_close(out_acc, oracle_acc, rtol=1e-4, atol=1e-4)
+    else:
+        _assert_matches_reference(
+            out_acc,
+            _reference_for_weights(
+                x,
+                weights,
+                topk_ids,
+                topk_weights,
+                expert_to_slot=slot_map,
+                out=oracle_acc,
+                accumulate=True,
+            ),
+            weight_format="convrot_trellis",
+            dtype=dtype,
+        )
+
+    if up_layout == "var1d" and down_layout == "var2d":
+        # Non-pow2 T=224 in prefill regime.
+        w_224 = _make_trellis_moe_weights(
+            4,
+            448,
+            224,
+            group_size=16,
+            dtype=torch.bfloat16,
+            device="cuda",
+            layouts=("var1d", "var2d"),
+            seed=974,
+        )
+        x_224 = torch.randn((32, 448), device="cuda", dtype=torch.bfloat16)
+        ids_224 = torch.randint(0, 4, (32, 2), device="cuda", dtype=torch.int64)
+        wts_224 = torch.rand((32, 2), device="cuda", dtype=torch.bfloat16) + 0.1
+        _assert_trellis_prefill_matches_oracle(
+            moe_ffn(x_224, w_224, ids_224, wts_224), x_224, w_224, ids_224, wts_224
+        )
+
+    if up_layout == "var1d" and down_layout == "var1d" and _INT8_MOE_GPU_AVAILABLE:
+        # 3 slots x 5632 x 2048 > 32 MiB decoded scratch forces multiple decode + GEMM windows.
+        w_multi = _make_trellis_moe_weights(
+            3,
+            2048,
+            2816,
+            group_size=64,
+            dtype=torch.bfloat16,
+            device="cuda",
+            layouts=("var1d", "uniform"),
+            seed=975,
+        )
+        x_m = torch.randn((24, 2048), device="cuda", dtype=torch.bfloat16)
+        ids_m = torch.randint(0, 3, (24, 2), device="cuda", dtype=torch.int64)
+        wts_m = torch.rand((24, 2), device="cuda", dtype=torch.bfloat16) + 0.1
+        out_m, launches_m = _record_triton_launches(lambda: moe_ffn(x_m, w_multi, ids_m, wts_m))
+        decode_launches = [name for name in launches_m if "decode_slots_int8_kernel" in name]
+        grouped_launches = [name for name in launches_m if "int8_moe_grouped_gemm_kernel" in name]
+        assert len(decode_launches) >= 3  # >=2 up windows + >=1 down window
+        assert len(grouped_launches) >= 3
+        _assert_trellis_prefill_matches_oracle(out_m, x_m, w_multi, ids_m, wts_m)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+def test_gpu_trellis_prefill_edge_cases() -> None:
+    torch.manual_seed(973)
+    weights = _make_trellis_moe_weights(
+        3,
+        256,
+        128,
+        group_size=64,
+        dtype=torch.float32,
+        device="cuda",
+        layouts=("var1d", "var2d"),
+        seed=973,
+    )
+    x = torch.randn((24, 256), device="cuda", dtype=torch.float32)
+    ids_i32 = torch.randint(0, 4, (24, 2), device="cuda", dtype=torch.int32)
+    wts = torch.rand((24, 2), device="cuda", dtype=torch.float32) + 0.1
+    map_i32 = torch.tensor([1, -1, 0, 2], device="cuda", dtype=torch.int32)
+
+    direct = moe_ffn(x, weights, ids_i32, wts, expert_to_slot=map_i32)
+    _assert_trellis_prefill_matches_oracle(direct, x, weights, ids_i32, wts, expert_to_slot=map_i32)
+    prep = prepare_moe_input(x, weights)
+    alias_out = x.clone()
+    moe_ffn(
+        alias_out,
+        weights,
+        ids_i32,
+        wts,
+        expert_to_slot=map_i32,
+        out=alias_out,
+        prepared_input=prep,
+    )
+    torch.testing.assert_close(alias_out, direct, rtol=1e-5, atol=1e-5)
+
+    all_miss = torch.full((24, 2), -1, device="cuda", dtype=torch.int32)
+    backing = torch.full((24, 288), float("nan"), device="cuda", dtype=torch.float32)
+    out_view = backing[:, :256]
+    out_view.fill_(1.75)
+    moe_ffn(x, weights, all_miss, wts, out=out_view, accumulate=True)
+    assert torch.equal(out_view, torch.full_like(out_view, 1.75))
+    assert torch.isnan(backing[:, 256:]).all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not _INT8_MOE_GPU_AVAILABLE, reason="requires SM80+ CUDA or supported ROCm INT8 MoE"
+)
+@pytest.mark.parametrize(
+    ("up_layout", "down_layout"),
+    [("uniform", "uniform"), ("var1d", "var2d")],
+)
+def test_gpu_trellis_prefill_intra_expert_row_windowing(
+    up_layout: TrellisLayoutKind,
+    down_layout: TrellisLayoutKind,
+) -> None:
+    torch.manual_seed(976 + int(up_layout == "var1d"))
+    # Single expert where up_gate=72 MiB and down=36 MiB both exceed the 32 MiB scratch cap.
+    weights = _make_trellis_moe_weights(
+        1,
+        4608,
+        8192,
+        group_size=64,
+        activation_fn="swiglu",
+        gate_first=True,
+        dtype=torch.bfloat16,
+        device="cuda",
+        layouts=(up_layout, down_layout),
+        seed=977,
+    )
+    x = torch.randn((24, 4608), device="cuda", dtype=torch.bfloat16)
+    topk_ids = torch.zeros((24, 1), device="cuda", dtype=torch.int64)
+    topk_weights = torch.full((24, 1), 0.75, device="cuda", dtype=torch.bfloat16)
+
+    # Warm JIT/caches first, then measure peak workspace during windowed execution.
+    _ = moe_ffn(x, weights, topk_ids, topk_weights)
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    actual, launches = _record_triton_launches(lambda: moe_ffn(x, weights, topk_ids, topk_weights))
+    torch.cuda.synchronize()
+    peak_delta = torch.cuda.max_memory_allocated() - baseline
+
+    decode_launches = [name for name in launches if "decode_slots_int8_kernel" in name]
+    grouped_launches = [name for name in launches if "int8_moe_grouped_gemm_kernel" in name]
+    assert len(decode_launches) == 5  # 3 up_gate windows (straddling half_n=8192) + 2 down windows
+    assert len(grouped_launches) == 5
+    assert peak_delta < 56 * 1024 * 1024
+    _assert_trellis_prefill_matches_oracle(actual, x, weights, topk_ids, topk_weights)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.parametrize("layout_kind", ["uniform", "var1d"])
+def test_gpu_trellis_compile_dynamic_all_regimes(layout_kind: TrellisLayoutKind) -> None:
+    torch.manual_seed(980 + int(layout_kind == "var1d"))
+    weights = _make_trellis_moe_weights(
+        4,
+        256,
+        256,
+        group_size=64,
+        dtype=torch.bfloat16,
+        device="cuda",
+        layouts=(layout_kind, layout_kind),
+        seed=981,
+    )
+    slot_map = torch.tensor([2, -1, 0, 3], device="cuda", dtype=torch.int64)
+
+    def run_fn(
+        inp: torch.Tensor,
+        r_ids: torch.Tensor,
+        r_wts: torch.Tensor,
+        out_buf: torch.Tensor,
+    ) -> torch.Tensor:
+        prep = prepare_moe_input(inp, weights)
+        return moe_ffn(
+            inp,
+            weights,
+            r_ids,
+            r_wts,
+            expert_to_slot=slot_map,
+            out=out_buf,
+            accumulate=True,
+            prepared_input=prep,
+        )
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    counted = torch.compile(run_fn, fullgraph=True, dynamic=True, backend=counter)
+    with torch.inference_mode():
+        # Start above top_k=2 so Dynamo duck-sizing does not specialize rows == top_k.
+        for rows in (3, 8, 12, 32):
+            x_c = torch.randn((rows, 256), device="cuda", dtype=torch.bfloat16)
+            ids_c = torch.randint(0, 4, (rows, 2), device="cuda", dtype=torch.int64)
+            wts_c = torch.rand((rows, 2), device="cuda", dtype=torch.bfloat16) + 0.1
+            out_c = torch.ones_like(x_c)
+            counted(x_c, ids_c, wts_c, out_c)
+    assert counter.frame_count == 1
+
+    torch._dynamo.reset()
+    compiled = torch.compile(run_fn, fullgraph=True, dynamic=True, options=compile_options())
+    with torch.inference_mode():
+        for rows in (3, 8, 12, 32, 1):
+            x_d = torch.randn((rows, 256), device="cuda", dtype=torch.bfloat16)
+            ids_d = torch.randint(0, 4, (rows, 2), device="cuda", dtype=torch.int64)
+            wts_d = torch.rand((rows, 2), device="cuda", dtype=torch.bfloat16) + 0.1
+            out_eager = torch.ones_like(x_d)
+            out_comp = out_eager.clone()
+            run_fn(x_d, ids_d, wts_d, out_eager)
+            compiled(x_d, ids_d, wts_d, out_comp)
+            torch.testing.assert_close(out_comp, out_eager, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.parametrize(
+    "rows",
+    [
+        pytest.param(1, id="m1"),
+        pytest.param(4, id="batched"),
+        pytest.param(32, id="prefill"),
+    ],
+)
+@pytest.mark.parametrize("layout_kind", ["uniform", "var2d", "var1d"])
+def test_gpu_trellis_cuda_graph_replay(
+    rows: int,
+    layout_kind: TrellisLayoutKind,
+) -> None:
+    torch.manual_seed(990 + rows + int(layout_kind == "var1d"))
+    weights = _make_trellis_moe_weights(
+        4,
+        256,
+        256,
+        group_size=64,
+        dtype=torch.bfloat16,
+        device="cuda",
+        layouts=(layout_kind, layout_kind),
+        seed=991 + rows,
+    )
+    x_buf = torch.randn((rows, 256), device="cuda", dtype=torch.bfloat16)
+    ids_buf = torch.randint(0, 4, (rows, 2), device="cuda", dtype=torch.int64)
+    wts_buf = torch.rand((rows, 2), device="cuda", dtype=torch.bfloat16) + 0.1
+    slot_map_buf = torch.tensor([1, 2, -1, 0], device="cuda", dtype=torch.int64)
+    out_buf = torch.full((rows, 256), 0.25, device="cuda", dtype=torch.bfloat16)
+
+    for _ in range(2):
+        moe_ffn(
+            x_buf,
+            weights,
+            ids_buf,
+            wts_buf,
+            expert_to_slot=slot_map_buf,
+            out=out_buf,
+            accumulate=True,
+        )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        moe_ffn(
+            x_buf,
+            weights,
+            ids_buf,
+            wts_buf,
+            expert_to_slot=slot_map_buf,
+            out=out_buf,
+            accumulate=True,
+        )
+
+    patterns = [
+        (
+            torch.randint(0, 4, (rows, 2), device="cuda", dtype=torch.int64),
+            torch.tensor([3, 0, -1, 1], device="cuda", dtype=torch.int64),
+        ),
+        (
+            torch.zeros((rows, 2), device="cuda", dtype=torch.int64),
+            torch.tensor([2, -1, -1, -1], device="cuda", dtype=torch.int64),
+        ),
+        (
+            torch.randint(0, 4, (rows, 2), device="cuda", dtype=torch.int64),
+            torch.full((4,), -1, device="cuda", dtype=torch.int64),
+        ),
+    ]
+    for new_ids, new_slots in patterns:
+        x_buf.normal_()
+        ids_buf.copy_(new_ids)
+        slot_map_buf.copy_(new_slots)
+        out_buf.fill_(0.5)
+        expected_eager = moe_ffn(
+            x_buf,
+            weights,
+            ids_buf,
+            wts_buf,
+            expert_to_slot=slot_map_buf,
+            out=out_buf.clone(),
+            accumulate=True,
+        )
+        graph.replay()
+        torch.testing.assert_close(out_buf, expected_eager, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.parametrize("layout_kind", ["uniform", "var2d", "var1d"])
+def test_gpu_trellis_reference_cuda_graph_replay(layout_kind: TrellisLayoutKind) -> None:
+    torch.manual_seed(995 + int(layout_kind == "var1d"))
+    weights = _make_trellis_moe_weights(
+        4,
+        256,
+        256,
+        group_size=64,
+        dtype=torch.bfloat16,
+        device="cuda",
+        layouts=(layout_kind, layout_kind),
+        seed=996,
+    )
+    x_buf = torch.randn((2, 256), device="cuda", dtype=torch.bfloat16)
+    ids_buf = torch.randint(0, 4, (2, 2), device="cuda", dtype=torch.int64)
+    wts_buf = torch.rand((2, 2), device="cuda", dtype=torch.bfloat16) + 0.1
+    slot_map_buf = torch.tensor([1, 2, -1, 0], device="cuda", dtype=torch.int64)
+    out_buf = torch.full((2, 256), 0.25, device="cuda", dtype=torch.bfloat16)
+
+    def _run_ref(out_target: torch.Tensor) -> torch.Tensor:
+        return moe_reference.moe_ffn_reference(
+            x_buf,
+            ids_buf,
+            wts_buf,
+            weights.up_gate_qdata,
+            weights.up_gate_scale,
+            weights.down_qdata,
+            weights.down_scale,
+            expert_to_slot=slot_map_buf,
+            out=out_target,
+            accumulate=True,
+            group_size=weights.group_size,
+            activation_fn=weights.activation_fn,
+            gate_first=weights.gate_first,
+            up_gate_block_scales=weights.up_gate_block_scales,
+            down_block_scales=weights.down_block_scales,
+            up_gate_row_widths=weights.up_gate_row_widths,
+            down_row_widths=weights.down_row_widths,
+            up_gate_slot_offsets=weights.up_gate_slot_offsets,
+            down_slot_offsets=weights.down_slot_offsets,
+            up_gate_block_size=weights.up_gate_block_size,
+            down_block_size=weights.down_block_size,
+        )
+
+    for _ in range(2):
+        _run_ref(out_buf)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_ref(out_buf)
+
+    patterns = [
+        (
+            torch.randint(0, 4, (2, 2), device="cuda", dtype=torch.int64),
+            torch.tensor([3, 0, -1, 1], device="cuda", dtype=torch.int64),
+        ),
+        (
+            torch.zeros((2, 2), device="cuda", dtype=torch.int64),
+            torch.tensor([2, -1, -1, -1], device="cuda", dtype=torch.int64),
+        ),
+        (
+            torch.randint(0, 4, (2, 2), device="cuda", dtype=torch.int64),
+            torch.full((4,), -1, device="cuda", dtype=torch.int64),
+        ),
+    ]
+    for new_ids, new_slots in patterns:
+        x_buf.normal_()
+        ids_buf.copy_(new_ids)
+        slot_map_buf.copy_(new_slots)
+        out_buf.fill_(0.5)
+        expected_eager = _run_ref(out_buf.clone())
+        graph.replay()
+        torch.testing.assert_close(out_buf, expected_eager, rtol=1e-4, atol=1e-4)

@@ -173,12 +173,14 @@ renormalization and transposed weights raise `NotImplementedError`.
 ## Run a quantized MoE FFN
 
 `piper_kernels.moe` provides offload-first single-token (`M = 1`), small-batch, and prefill
-(`M > 1`) execution across
-expert-major quantized slabs stored as `[num_slots, ...]`: NVFP4 W4A16 (`"nvfp4_w4a16"`),
-ConvRot NVFP4 W4A16 (`"convrot_nvfp4_w4a16"`), and ConvRot INT8 W8A8 (`"convrot_int8"`). Each
-contiguous slab holds `up_gate_qdata`, `up_gate_scale`, `down_qdata`, `down_scale`, and optional
-per-slot `float32` NVFP4 global scales (`[num_slots]`, `[num_slots, 1]`, or
-`[num_slots, 1, 1]`), so runtimes can wrap resident slabs or staging buffers zero-copy with
+(`M > 1`) execution across expert-major quantized slabs stored as `[num_slots, ...]`: NVFP4 W4A16
+(`"nvfp4_w4a16"`), ConvRot NVFP4 W4A16 (`"convrot_nvfp4_w4a16"`), ConvRot INT8 W8A8
+(`"convrot_int8"`), and ConvRot Trellis (`"convrot_trellis"`). Each contiguous slab holds
+`up_gate_qdata`, `up_gate_scale`, `down_qdata`, `down_scale`, optional per-slot `float32` NVFP4
+global scales (`[num_slots]`, `[num_slots, 1]`, or `[num_slots, 1, 1]`), and for ConvRot Trellis
+the per-block E4M3 scales (`up_gate_block_scales`, `down_block_scales`), independent projection block
+sizes (`up_gate_block_size`, `down_block_size`), and optional variable-row metadata (`row_widths`,
+`slot_offsets`), so runtimes can wrap resident slabs or staging buffers zero-copy with
 `MoEWeights.from_quantized`.
 
 NVFP4 slabs use packed `uint8` nibbles and `SWIZZLE_32_4_4` `float8_e4m3fn` 16-value block scales
@@ -187,6 +189,27 @@ on widths divisible by 16 (and `group_size` for ConvRot). ConvRot INT8 slabs use
 `{16, 64, 256}`, and widths up to `131_071` so INT32 accumulators never wrap; GPU INT8 kernels
 target NVIDIA SM80+ and supported AMD ROCm GPUs, while earlier CUDA targets and CPU run the
 portable reference.
+
+ConvRot Trellis (`"convrot_trellis"`) slabs store `float8_e4m3fn` block scales
+`[num_slots, out, in / block_size]`, `float32` per-row scales (`[num_slots, out]` or
+`[num_slots, out, 1]`), `group_size` in `{16, 64, 256}`, widths divisible by `block_size` (16..256,
+multiple of 16) and at most `131_071`, and three bitstream layouts independently per projection:
+
+- Uniform 4-D: `uint8 [num_slots, out, in / block_size, bytes_per_block]` (`row_widths=None`,
+  `slot_offsets=None`).
+- Variable-row 2-D: `uint8 [num_slots, slot_bytes]` with `row_widths: uint8 [num_slots, out]` and
+  `slot_offsets=None` (per-slot uniform stride for CPU-offloaded slot swapping).
+- Variable-row 1-D: `uint8 [total_bytes]` with `row_widths: uint8 [num_slots, out]` and
+  `slot_offsets: int64 [num_slots]` (packed resident/wave slab with arbitrary per-slot byte offsets).
+
+Caller preconditions (not checked via host readbacks when wrapping or dispatching): E4M3
+`block_scales` must be non-NaN (`0x7F`/`0xFF` excluded), each variable-row width must lie in
+`[⌈2·block_size / 8⌉, ⌊6·block_size / 8⌋]`, each slot's `(in / block_size) · sum(row_widths[s])`
+must fit within `slot_bytes` (2-D) or `qdata.numel() - slot_offsets[s]` (1-D), and `slot_offsets`
+must be non-negative and within `qdata.numel()`. At runtime, single-token, small-batch, and
+non-INT8 GPUs (such as NVIDIA SM75) keep high-precision activations via fused in-register A16
+execution, while larger batches on SM80+ and supported AMD ROCm GPUs skip unrouted slots and stream
+active slots through a bounded decoded INT8 scratch workspace for ConvRot INT8 W8A8 execution.
 
 ```python
 import torch
@@ -233,10 +256,10 @@ Set `gate_first=False` when checkpoints pack `[up | gate]` halves (matching Pipe
 convention), and pass `activation_fn="gelu_tanh"` for `tanh`-GELU experts without a paired gate
 projection. `prepare_moe_input` returns an independent snapshot safe to reuse across waves
 even when accumulating into `out=input` (storing FP32 rotated activations for
-`"convrot_nvfp4_w4a16"` across FP16, BF16, and FP32 inputs). Calling `moe_ffn`
-without `out` returns a freshly allocated contiguous tensor; multi-row (`M > 1`) calls
-compact and batch active expert slots on-device across NVFP4 W4A16 and ConvRot INT8 (chunked
-under a bounded workspace for large prompts).
+`"convrot_nvfp4_w4a16"` and `"convrot_trellis"` across FP16, BF16, and FP32 inputs). Calling
+`moe_ffn` without `out` returns a freshly allocated contiguous tensor; multi-row (`M > 1`) calls
+compact and batch active expert slots on-device across NVFP4 W4A16, ConvRot INT8, and ConvRot
+Trellis (chunked under a bounded workspace for large prompts).
 Caller-supplied `out` must match input
 shape/dtype/device, have `stride(-1) == 1` with disjoint rows (`out.view(rows, H).stride(0) >= H`
 when `rows > 1`), must not use negated/conjugated views or alias weight storage, and must be
