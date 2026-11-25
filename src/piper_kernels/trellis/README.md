@@ -1,9 +1,11 @@
 # Trellis-coded weights
 
 Trellis coding stores a ConvRot INT8 weight in 2 to 6 bits per weight. It can be
-executed directly in memory via `ConvRotTrellisTensor` (`F.linear`) or decoded
-at load time via `ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` into
-ordinary ConvRot INT8 storage. This README owns the format and its encoder; the
+executed directly in memory via `ConvRotTrellisTensor` (`F.linear`) and
+`piper_kernels.moe` (`"convrot_trellis"` across uniform 4-D, 2-D variable-row, and
+1-D variable-row + `slot_offsets` expert slabs) or decoded at load time via
+`ConvRotInt8Tensor.from_trellis` and `copy_from_trellis_` into ordinary ConvRot
+INT8 storage. This README owns the format and its encoder; the
 [weights guide](../../../docs/weights.md#encode-execute-and-decode-trellis-coded-weights)
 shows the API.
 
@@ -37,6 +39,9 @@ each tensor's rate comes from its own shape, rates can differ between tensors.
 `(in / T) · prefix_sum(row_widths)`. Each row width must lie in `[⌈2·T / 8⌉,
 ⌊6·T / 8⌋]` and `(in / T) · sum(row_widths)` must fit within `bitstreams.numel()`;
 both are caller preconditions (no host readback or synchronization at decode time).
+`"convrot_trellis"` MoE 2-D and 1-D variable-row slabs follow the same per-slot
+`row_widths` bounds and require non-negative `slot_offsets` whose per-slot ranges fit
+within `bitstreams.numel()`.
 
 `piper_kernels.trellis` exports `TrellisLayout`, `resolve_block_size`, and
 `resolve_layout` alongside `TrellisStorage`.
@@ -69,12 +74,12 @@ A block's `B` bits are stored most significant bit first.
 
 Both products are single IEEE FP32 multiplies of exactly representable values, so
 CUDA, HIP and the PyTorch reference decode identical INT8 values by construction.
-Tests confirm decoding on NVIDIA hardware and both decoding and direct
-`ConvRotTrellisTensor` linear execution on AMD RX 9070 XT (`gfx1201`); NVIDIA
-direct `ConvRotTrellisTensor` execution (`sm75`, `sm80`, `sm89`, `sm120`) and
-AMD `gfx942`, `gfx1100`, and `gfx1151` have offline compile coverage only. Scales
-must not be NaN encodings (`0x7F`, `0xFF`); this is a caller precondition, not a
-runtime check.
+Tests confirm decoding on NVIDIA hardware and decoding, direct
+`ConvRotTrellisTensor` linear execution, and `piper_kernels.moe` `"convrot_trellis"`
+execution on AMD RX 9070 XT (`gfx1201`); NVIDIA direct linear and MoE execution
+(`sm75`, `sm80`, `sm89`, `sm120`) and AMD `gfx942`, `gfx1100`, and `gfx1151` have
+offline compile coverage only. Scales must not be NaN encodings (`0x7F`, `0xFF`);
+this is a caller precondition, not a runtime check.
 
 ## Layout limits
 
