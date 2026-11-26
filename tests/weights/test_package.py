@@ -93,6 +93,8 @@ trellis = ConvRotTrellisTensor.from_quantized(
 )
 assert trellis.dequantize().shape == (8, 64)
 assert trellis.clone().float().shape == (8, 64)
+assert shard_quantized_weight(trellis, dim=0, start=0, length=4).shape == (4, 64)
+assert shard_quantized_weight(trellis, dim=1, start=0, length=16).shape == (8, 16)
 assert torch.isfinite(trellis.dequantize()).all()
 assert not any(name.startswith("piper_kernels.linear") for name in sys.modules)
 """

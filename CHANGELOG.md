@@ -13,6 +13,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   `PiperNVFP4Tensor` (2-D and 3-D), `ConvRotNVFP4Tensor`, and `ConvRotTrellisTensor`.
 - `PiperNVFP4Tensor.from_quantized` and `ConvRotNVFP4Tensor.from_quantized` zero-copy
   packed-storage constructors.
+- `Shard(0)` and `Shard(1)` sharding support for both uniform and variable-row
+  (`row_widths`) 2–6 bpw `ConvRotTrellisTensor` weights in
+  `piper_kernels.weights.sharding.shard_quantized_weight`, plus
+  `trellis_row_shard_byte_range` (`ByteRange(offset, length)`) for zero-materialization
+  row-shard bitstream offset calculations.
 
 ### Changed
 
