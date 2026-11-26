@@ -1,4 +1,4 @@
-"""TorchAO-compatible NVFP4 weight in a grouped ConvRot basis."""
+"""NVFP4 weight in a grouped ConvRot basis."""
 
 from __future__ import annotations
 
@@ -7,12 +7,20 @@ from typing import Any, ClassVar, cast
 
 import torch
 from torch._guards import detect_fake_mode
-from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
-from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
+from torch._subclasses.fake_tensor import FakeTensor
 
 from piper_kernels.weights._views import require_untransposed
 from piper_kernels.weights.convrot._rotation import rotate_groups, validate_group_size
-from piper_kernels.weights.nvfp4.tensor import PiperNVFP4Tensor, _quantize_hp
+from piper_kernels.weights.nvfp4 import _layout
+from piper_kernels.weights.nvfp4.tensor import (
+    NVFP4ActQuant,
+    PiperNVFP4Tensor,
+    _quantize_hp_tensors,
+    _validate_nvfp4_global_scales,
+    _validate_nvfp4_hp_inputs,
+    _validate_nvfp4_options,
+    _validate_nvfp4_storage,
+)
 
 
 class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
@@ -25,35 +33,31 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
     ]
     group_size: int
 
-    def __new__(  # noqa: PLR0913, PLR0917
+    def __new__(
         cls,
         qdata: torch.Tensor,
         scale: torch.Tensor,
         block_size: int,
-        orig_dtype: torch.dtype,
+        dtype: torch.dtype,
         group_size: int,
         per_tensor_scale: torch.Tensor | None = None,
         act_per_tensor_scale: torch.Tensor | None = None,
         is_swizzled_scales: bool = False,
-        use_triton_kernel: bool = False,
-        act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
+        act_quant: NVFP4ActQuant | None = None,
         high_first: bool = False,
     ) -> ConvRotNVFP4Tensor:
         validate_group_size(group_size)
-        if orig_dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise ValueError("ConvRot NVFP4 logical dtype must be FP16, BF16, or FP32")
         tensor = super().__new__(
             cls,
             qdata,
             scale,
             block_size,
-            orig_dtype,
-            per_tensor_scale,
-            act_per_tensor_scale,
-            is_swizzled_scales,
-            use_triton_kernel,
-            act_quant_kwargs,
-            high_first,
+            dtype,
+            per_tensor_scale=per_tensor_scale,
+            act_per_tensor_scale=act_per_tensor_scale,
+            is_swizzled_scales=is_swizzled_scales,
+            act_quant=act_quant,
+            high_first=high_first,
         )
         if tensor.ndim != 2:
             raise ValueError("ConvRot NVFP4 weight must be two-dimensional")
@@ -68,71 +72,121 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         return convrot
 
     @classmethod
-    def from_torchao(
+    def from_quantized(  # type: ignore[override]
         cls,
-        tensor: TorchAONVFP4Tensor,
+        qdata: torch.Tensor,
+        scale: torch.Tensor,
         *,
-        group_size: int | None = None,
+        group_size: int,
+        logical_dtype: torch.dtype = torch.bfloat16,
+        block_size: int = _layout.BLOCK_SIZE,
+        per_tensor_scale: torch.Tensor | None = None,
+        act_per_tensor_scale: torch.Tensor | None = None,
+        is_swizzled_scales: bool = False,
+        act_quant: NVFP4ActQuant | None = None,
+        high_first: bool = False,
     ) -> ConvRotNVFP4Tensor:
-        """Attach ConvRot metadata to canonical TorchAO NVFP4 storage without copying."""
-        if group_size is None:
-            raise TypeError("ConvRot NVFP4 wrapping requires a group size")
+        """Wrap packed rotated NVFP4 checkpoint storage zero-copy when contiguous."""
         validate_group_size(group_size)
-        if isinstance(tensor, cls):
-            if tensor.group_size != group_size:
-                raise ValueError(
-                    f"ConvRot NVFP4 tensor uses group size {tensor.group_size}, not {group_size}"
-                )
-            return tensor
-        return cls._from_torchao_storage(tensor, group_size)
+        _validate_nvfp4_storage(
+            qdata,
+            scale,
+            block_size,
+            logical_dtype,
+            per_tensor_scale=per_tensor_scale,
+            act_per_tensor_scale=act_per_tensor_scale,
+            is_swizzled_scales=is_swizzled_scales,
+            act_quant=act_quant,
+            high_first=high_first,
+            require_contiguous=False,
+            allowed_ndims=(2,),
+        )
+        features = qdata.shape[1] * 2
+        if features % group_size:
+            raise ValueError(
+                f"ConvRot NVFP4 weight features {features} must be divisible "
+                f"by group size {group_size}"
+            )
+        return cls(
+            qdata.contiguous(),
+            scale.contiguous(),
+            block_size,
+            logical_dtype,
+            group_size,
+            per_tensor_scale=None if per_tensor_scale is None else per_tensor_scale.contiguous(),
+            act_per_tensor_scale=(
+                None if act_per_tensor_scale is None else act_per_tensor_scale.contiguous()
+            ),
+            is_swizzled_scales=is_swizzled_scales,
+            act_quant=act_quant,
+            high_first=high_first,
+        )
 
     @classmethod
     def from_hp(
         cls,
         hp_tensor: torch.Tensor,
         *,
-        block_size: int = 16,
+        block_size: int = _layout.BLOCK_SIZE,
         per_tensor_scale: torch.Tensor | None = None,
         compute_per_tensor_scale: bool = False,
         act_per_tensor_scale: torch.Tensor | None = None,
         is_swizzled_scales: bool = False,
-        use_triton_kernel: bool = False,
-        act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
+        act_quant: NVFP4ActQuant | None = None,
         group_size: int | None = None,
     ) -> ConvRotNVFP4Tensor:
         """Rotate and quantize a high-precision weight into ConvRot NVFP4 storage.
 
-        The NVFP4 arguments otherwise match TorchAO's :meth:`NVFP4Tensor.to_nvfp4`
-        builder. ``compute_per_tensor_scale=True`` derives the optional global weight
-        scale from the rotated weight, avoiding both a second rotation in the caller and
-        an incorrect scale from the logical basis. ``hp_tensor`` is detached before
-        conversion; checkpoint quantization is an inference transform and does not retain
-        an autograd graph.
+        ``compute_per_tensor_scale=True`` derives the optional global weight scale
+        from the rotated weight, avoiding both a second rotation in the caller and
+        an incorrect scale from the logical basis. ``hp_tensor`` is detached
+        before conversion; checkpoint quantization is an inference transform and
+        does not retain an autograd graph.
         """
         if group_size is None:
             raise TypeError("ConvRot NVFP4 quantization requires a group size")
+        validate_group_size(group_size)
+        if hp_tensor.ndim != 2:
+            raise ValueError("ConvRot NVFP4 weight must be two-dimensional")
+        _validate_nvfp4_hp_inputs(
+            hp_tensor,
+            block_size=block_size,
+            per_tensor_scale=per_tensor_scale,
+            compute_per_tensor_scale=compute_per_tensor_scale,
+            act_per_tensor_scale=act_per_tensor_scale,
+            is_swizzled_scales=is_swizzled_scales,
+            act_quant=act_quant,
+        )
         rotated = rotate_groups(hp_tensor.detach().float(), group_size)
         if (
             not compute_per_tensor_scale
             and rotated.device.type != "meta"
+            and not isinstance(rotated, FakeTensor)
             and not torch.compiler.is_compiling()
             and detect_fake_mode() is None
             and not bool(torch.isfinite(rotated).all())
         ):
             raise ValueError("ConvRot NVFP4 rotation produced non-finite weights")
-        return cls._from_torchao_storage(
-            _quantize_hp(
-                rotated,
-                block_size=block_size,
-                per_tensor_scale=per_tensor_scale,
-                compute_per_tensor_scale=compute_per_tensor_scale,
-                act_per_tensor_scale=act_per_tensor_scale,
-                is_swizzled_scales=is_swizzled_scales,
-                use_triton_kernel=use_triton_kernel,
-                act_quant_kwargs=act_quant_kwargs,
-            ),
+        qdata, scales, effective_per_tensor_scale = _quantize_hp_tensors(
+            rotated,
+            block_size=block_size,
+            per_tensor_scale=per_tensor_scale,
+            compute_per_tensor_scale=compute_per_tensor_scale,
+            act_per_tensor_scale=act_per_tensor_scale,
+            is_swizzled_scales=is_swizzled_scales,
+            act_quant=act_quant,
+            validate=False,
+        )
+        return cls(
+            qdata,
+            scales,
+            block_size,
+            hp_tensor.dtype,
             group_size,
-            orig_dtype=hp_tensor.dtype,
+            per_tensor_scale=effective_per_tensor_scale,
+            act_per_tensor_scale=act_per_tensor_scale,
+            is_swizzled_scales=is_swizzled_scales,
+            act_quant=act_quant,
         )
 
     @classmethod
@@ -142,13 +196,12 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         *,
         quant_type: int | None = None,
         logical_dtype: torch.dtype = torch.bfloat16,
-        block_size: int = 16,
+        block_size: int = _layout.BLOCK_SIZE,
         per_tensor_scale: torch.Tensor | None = None,
         compute_per_tensor_scale: bool = False,
         act_per_tensor_scale: torch.Tensor | None = None,
         is_swizzled_scales: bool = False,
-        use_triton_kernel: bool = False,
-        act_quant_kwargs: QuantizeTensorToNVFP4Kwargs | None = None,
+        act_quant: NVFP4ActQuant | None = None,
         group_size: int | None = None,
         high_first: bool = False,
     ) -> ConvRotNVFP4Tensor:
@@ -160,8 +213,25 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         """
         if group_size is None:
             raise TypeError("ConvRot NVFP4 GGUF conversion requires a group size")
-        if block_size != 16:
+        validate_group_size(group_size)
+        _validate_nvfp4_options(
+            block_size=block_size,
+            dtype=logical_dtype,
+            is_swizzled_scales=is_swizzled_scales,
+            act_quant=act_quant,
+            high_first=high_first,
+        )
+        if block_size != _layout.BLOCK_SIZE:
             raise ValueError("ConvRot NVFP4 GGUF conversion requires block size 16")
+        if compute_per_tensor_scale and per_tensor_scale is not None:
+            raise ValueError("NVFP4 from_gguf cannot both compute and receive a per-tensor scale")
+        _validate_nvfp4_global_scales(
+            per_tensor_scale,
+            act_per_tensor_scale,
+            device=data.device,
+            ndim=2,
+            experts=0,
+        )
         from piper_kernels.weights.convrot.nvfp4._gguf import convert  # noqa: PLC0415
 
         qdata, scale, effective_per_tensor_scale = convert(
@@ -180,12 +250,11 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             block_size,
             logical_dtype,
             group_size,
-            effective_per_tensor_scale,
-            act_per_tensor_scale,
-            is_swizzled_scales,
-            use_triton_kernel,
-            act_quant_kwargs,
-            high_first,
+            per_tensor_scale=effective_per_tensor_scale,
+            act_per_tensor_scale=act_per_tensor_scale,
+            is_swizzled_scales=is_swizzled_scales,
+            act_quant=act_quant,
+            high_first=high_first,
         )
 
     def copy_from_gguf_(
@@ -204,7 +273,7 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
         convert(
             data,
             quant_type=quant_type,
-            logical_dtype=self.orig_dtype,
+            logical_dtype=self.dtype,
             group_size=self.group_size,
             per_tensor_scale=None if compute_per_tensor_scale else self.per_tensor_scale,
             compute_per_tensor_scale=compute_per_tensor_scale,
@@ -214,6 +283,17 @@ class ConvRotNVFP4Tensor(PiperNVFP4Tensor):
             per_tensor_scale_out=self.per_tensor_scale if compute_per_tensor_scale else None,
         )
         return self
+
+    def _validate_storage_for_export(self) -> None:
+        super()._validate_storage_for_export()
+        if self.ndim != 2:
+            raise ValueError("ConvRot NVFP4 weight must be two-dimensional")
+        validate_group_size(self.group_size)
+        if self.shape[-1] % self.group_size:
+            raise ValueError(
+                f"ConvRot NVFP4 weight features {self.shape[-1]} must be divisible "
+                f"by group size {self.group_size}"
+            )
 
     def _stable_hash_for_caching(self) -> str:
         """Include the rotation group in AOTAutograd's persistent-cache key."""

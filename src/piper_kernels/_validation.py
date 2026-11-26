@@ -1,6 +1,6 @@
 """Compile-safe scalar validation helpers shared across Piper Kernels.
 
-Keep this module strictly free of Triton and TorchAO imports so portable CPU
+Keep this module strictly free of Triton imports so portable CPU
 and optional-dependency suites can import it anywhere.
 """
 

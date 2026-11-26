@@ -198,7 +198,9 @@ def test_from_quantized_reuses_contiguous_storage_and_canonicalizes_strided() ->
 def test_from_storage_and_from_hp_cpu_rejection() -> None:
     bitstreams, block_scales, scale, _ = _make_trellis_inputs(4, 256, block_size=256)
     storage = TrellisStorage(bitstreams, block_scales, scale, block_size=256)
-    wrapped = ConvRotTrellisTensor.from_storage(storage, group_size=64, logical_dtype=torch.float32)
+    wrapped = ConvRotTrellisTensor.from_trellis_storage(
+        storage, group_size=64, logical_dtype=torch.float32
+    )
     assert wrapped.shape == (4, 256)
     assert wrapped.dtype is torch.float32
     assert wrapped.bitstreams.data_ptr() == bitstreams.data_ptr()

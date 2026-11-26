@@ -13,10 +13,6 @@ from _accelerators import mock_cuda_target, w4a16_nvfp4_available
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 from triton.backends.compiler import GPUTarget
 
 from piper_kernels import compile_options
@@ -73,14 +69,14 @@ def _make_nvfp4_weight(
             group_size=group_size,
             compute_per_tensor_scale=two_level,
             is_swizzled_scales=True,
-            act_quant_kwargs=None,
+            act_quant=None,
         )
     else:
         base = PiperNVFP4Tensor.from_hp(
             dense,
             compute_per_tensor_scale=two_level,
             is_swizzled_scales=True,
-            act_quant_kwargs=None,
+            act_quant=None,
         )
     if high_first:
         qdata = ((base.qdata & 0x0F) << 4) | (base.qdata >> 4)
@@ -89,13 +85,12 @@ def _make_nvfp4_weight(
                 qdata,
                 base.scale,
                 base.block_size,
-                base.orig_dtype,
+                base.dtype,
                 base.group_size,
                 base.per_tensor_scale,
                 base.act_per_tensor_scale,
                 base.is_swizzled_scales,
-                base.use_triton_kernel,
-                base.act_quant_kwargs,
+                base.act_quant,
                 high_first=True,
             )
         else:
@@ -103,12 +98,11 @@ def _make_nvfp4_weight(
                 qdata,
                 base.scale,
                 base.block_size,
-                base.orig_dtype,
+                base.dtype,
                 base.per_tensor_scale,
                 base.act_per_tensor_scale,
                 base.is_swizzled_scales,
-                base.use_triton_kernel,
-                base.act_quant_kwargs,
+                base.act_quant,
                 high_first=True,
             )
     return base.to(device)
@@ -279,7 +273,7 @@ weight = ConvRotNVFP4Tensor.from_hp(
     group_size=64,
     compute_per_tensor_scale=True,
     is_swizzled_scales=True,
-    act_quant_kwargs=None,
+    act_quant=None,
 )
 source = torch.randn(3, 256, dtype=torch.bfloat16)
 bias = torch.randn(64, dtype=torch.float32)
@@ -299,9 +293,9 @@ q_meta = torch.empty(128, 128, dtype=torch.uint8, device="meta")
 s_meta = torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta")
 gs_meta = torch.empty((), device="meta")
 x_meta = torch.empty(2, 256, dtype=torch.bfloat16, device="meta")
-plain_meta = PiperNVFP4Tensor(q_meta, s_meta, 16, torch.bfloat16, gs_meta, None, True, False, None)
+plain_meta = PiperNVFP4Tensor(q_meta, s_meta, 16, torch.bfloat16, gs_meta, None, True, None)
 convrot_meta = ConvRotNVFP4Tensor(
-    q_meta, s_meta, 16, torch.bfloat16, 64, gs_meta, None, True, False, None
+    q_meta, s_meta, 16, torch.bfloat16, 64, gs_meta, None, True, None
 )
 assert F.linear(x_meta, plain_meta).shape == (2, 128)
 assert F.linear(x_meta, convrot_meta).shape == (2, 128)
@@ -323,10 +317,10 @@ def test_meta_weight_only_linear_supports_shapes_and_preserves_unsplit_graph(
     global_scale = torch.empty((), device="meta")
     if group_size > 0:
         weight: PiperNVFP4Tensor = ConvRotNVFP4Tensor(
-            qdata, scale, 16, dtype, group_size, global_scale, None, True, False, None
+            qdata, scale, 16, dtype, group_size, global_scale, None, True, None
         )
     else:
-        weight = PiperNVFP4Tensor(qdata, scale, 16, dtype, global_scale, None, True, False, None)
+        weight = PiperNVFP4Tensor(qdata, scale, 16, dtype, global_scale, None, True, None)
     input_value = torch.empty(shape, dtype=dtype, device="meta")
     bias = torch.empty(128, dtype=dtype, device="meta")
 
@@ -365,10 +359,8 @@ def test_meta_weight_only_ffn_is_not_folded_into_w4a4_ffn(group_size: int) -> No
         )
         gs = torch.empty((), device="meta")
         if group_size > 0:
-            return ConvRotNVFP4Tensor(
-                q, s, 16, torch.bfloat16, group_size, gs, None, True, False, None
-            )
-        return PiperNVFP4Tensor(q, s, 16, torch.bfloat16, gs, None, True, False, None)
+            return ConvRotNVFP4Tensor(q, s, 16, torch.bfloat16, group_size, gs, None, True, None)
+        return PiperNVFP4Tensor(q, s, 16, torch.bfloat16, gs, None, True, None)
 
     w_gate = _meta_w(512, 256)
     w_up = _meta_w(512, 256)
@@ -394,21 +386,15 @@ def test_meta_w4a4_linear_preserves_prepare_split_for_small_m(
     group_size: int,
     rows: int,
 ) -> None:
-    act_quant = QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=True,
-    )
     q = torch.empty(128, 128, dtype=torch.uint8, device="meta")
     s = torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta")
     gs = torch.empty((), device="meta")
     if group_size > 0:
         w: PiperNVFP4Tensor = ConvRotNVFP4Tensor(
-            q, s, 16, torch.bfloat16, group_size, gs, None, True, False, act_quant
+            q, s, 16, torch.bfloat16, group_size, gs, None, True, "dynamic"
         )
     else:
-        w = PiperNVFP4Tensor(q, s, 16, torch.bfloat16, gs, None, True, False, act_quant)
+        w = PiperNVFP4Tensor(q, s, 16, torch.bfloat16, gs, None, True, "dynamic")
     x = torch.empty(rows, 256, dtype=torch.bfloat16, device="meta")
 
     def repeated(inp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -433,9 +419,9 @@ def test_meta_weight_only_rejects_activation_scales(group_size: int) -> None:
     s = torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta")
     gs = torch.empty((), device="meta")
     w: PiperNVFP4Tensor = (
-        ConvRotNVFP4Tensor(q, s, 16, torch.bfloat16, group_size, gs, None, True, False, None)
+        ConvRotNVFP4Tensor(q, s, 16, torch.bfloat16, group_size, gs, None, True, None)
         if group_size > 0
-        else PiperNVFP4Tensor(q, s, 16, torch.bfloat16, gs, None, True, False, None)
+        else PiperNVFP4Tensor(q, s, 16, torch.bfloat16, gs, None, True, None)
     )
     x = torch.empty(4, 256, dtype=torch.bfloat16, device="meta")
     F.linear(x, w)
@@ -472,10 +458,10 @@ def test_attention_output_pass_skips_weight_only_linear(
     gs_meta = torch.empty((), device="meta")
     meta_weight: PiperNVFP4Tensor = (
         ConvRotNVFP4Tensor(
-            q_meta, s_meta, 16, torch.bfloat16, group_size, gs_meta, None, True, False, None
+            q_meta, s_meta, 16, torch.bfloat16, group_size, gs_meta, None, True, None
         )
         if group_size > 0
-        else PiperNVFP4Tensor(q_meta, s_meta, 16, torch.bfloat16, gs_meta, None, True, False, None)
+        else PiperNVFP4Tensor(q_meta, s_meta, 16, torch.bfloat16, gs_meta, None, True, None)
     )
     F.linear(torch.empty(2, 256, dtype=torch.bfloat16, device="meta"), meta_weight)
 
@@ -785,12 +771,11 @@ def test_gpu_w4a16_handles_noncontiguous_3d_ragged_and_empty_inputs(
             weight.qdata[:0],
             weight.scale[:0],
             weight.block_size,
-            weight.orig_dtype,
+            weight.dtype,
             group_size,
             weight.per_tensor_scale,
             None,
             True,
-            False,
             None,
             high_first=high_first,
         )
@@ -799,11 +784,10 @@ def test_gpu_w4a16_handles_noncontiguous_3d_ragged_and_empty_inputs(
             weight.qdata[:0],
             weight.scale[:0],
             weight.block_size,
-            weight.orig_dtype,
+            weight.dtype,
             weight.per_tensor_scale,
             None,
             True,
-            False,
             None,
             high_first=high_first,
         )
@@ -855,7 +839,7 @@ def test_gpu_w4a16_splitk_is_deterministic_and_accurate(rows: int, group_size: i
 @pytest.mark.parametrize("high_first", [False, True])
 @pytest.mark.parametrize("two_level", [False, True])
 @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_gpu_large_m_w4a16_identity_matches_torchao_dequantize(
+def test_gpu_large_m_w4a16_identity_matches_dequantize(
     high_first: bool,
     two_level: bool,
     output_dtype: torch.dtype,
@@ -871,7 +855,7 @@ def test_gpu_large_m_w4a16_identity_matches_torchao_dequantize(
     )
     actual = F.linear(torch.eye(144, device="cuda", dtype=output_dtype), weight).T
     q_low = ((weight.qdata & 0x0F) << 4) | (weight.qdata >> 4) if high_first else weight.qdata
-    expected = TorchAONVFP4Tensor(
+    expected = PiperNVFP4Tensor(
         q_low,
         weight.scale,
         16,
@@ -893,7 +877,7 @@ def test_gpu_w4a16_mixed_bias_avoids_pre_bias_fp16_overflow(rows: int) -> None:
         dense,
         compute_per_tensor_scale=True,
         is_swizzled_scales=True,
-        act_quant_kwargs=None,
+        act_quant=None,
     ).to("cuda")
     x = torch.full((rows, 32), 3000.0, device="cuda", dtype=torch.float16)
     bias = torch.full((16,), -40000.0, device="cuda", dtype=torch.float32)
@@ -927,7 +911,7 @@ def test_gpu_w4a16_convrot_fp16_preserves_rotation_range(rows: int) -> None:
     scale = torch.ones((32, 16), dtype=torch.float8_e4m3fn, device="cuda")
     per_tensor_scale = torch.tensor(1.0 / 16.0, dtype=torch.float32, device="cuda")
     weight = ConvRotNVFP4Tensor(
-        qdata, scale, 16, torch.float16, 16, per_tensor_scale, None, True, False, None
+        qdata, scale, 16, torch.float16, 16, per_tensor_scale, None, True, None
     )
 
     actual = F.linear(x, weight)
@@ -951,7 +935,7 @@ def test_gpu_w4a16_large_m_preserves_weight_scale_and_gemm_range() -> None:
     q_small = torch.full((16, 8), 0x22, dtype=torch.uint8, device="cuda")
     s_ones = torch.ones((32, 16), dtype=torch.float8_e4m3fn, device="cuda")
     gs_huge = torch.tensor(100_000.0, dtype=torch.float32, device="cuda")
-    w_huge = PiperNVFP4Tensor(q_small, s_ones, 16, torch.float16, gs_huge, None, True, False, None)
+    w_huge = PiperNVFP4Tensor(q_small, s_ones, 16, torch.float16, gs_huge, None, True, None)
     x_small = torch.full((17, 16), 0.001, device="cuda", dtype=torch.float16)
     actual_1 = F.linear(x_small, w_huge)
     expected_1 = nvfp4_reference.linear_w4a16(
@@ -964,7 +948,7 @@ def test_gpu_w4a16_large_m_preserves_weight_scale_and_gemm_range() -> None:
     # Case 2: large unbiased FP16 dot product scaled down by fractional global scale.
     q_wide = torch.full((16, 16), 0x22, dtype=torch.uint8, device="cuda")
     gs_frac = torch.tensor(1.0 / 16.0, dtype=torch.float32, device="cuda")
-    w_frac = PiperNVFP4Tensor(q_wide, s_ones, 16, torch.float16, gs_frac, None, True, False, None)
+    w_frac = PiperNVFP4Tensor(q_wide, s_ones, 16, torch.float16, gs_frac, None, True, None)
     x_large = torch.full((17, 32), 3000.0, device="cuda", dtype=torch.float16)
     actual_2 = F.linear(x_large, w_frac)
     expected_2 = nvfp4_reference.linear_w4a16(
@@ -977,9 +961,7 @@ def test_gpu_w4a16_large_m_preserves_weight_scale_and_gemm_range() -> None:
     # Case 3: extreme BF16 product of block scale and global scale with tiny activations.
     s_max = torch.full((32, 16), 448.0, dtype=torch.float8_e4m3fn, device="cuda")
     gs_extreme = torch.tensor(1e37, dtype=torch.float32, device="cuda")
-    w_extreme = PiperNVFP4Tensor(
-        q_small, s_max, 16, torch.bfloat16, gs_extreme, None, True, False, None
-    )
+    w_extreme = PiperNVFP4Tensor(q_small, s_max, 16, torch.bfloat16, gs_extreme, None, True, None)
     x_tiny = torch.full((17, 16), 1e-37, device="cuda", dtype=torch.bfloat16)
     actual_3 = F.linear(x_tiny, w_extreme)
     expected_3 = nvfp4_reference.linear_w4a16(
@@ -1025,12 +1007,12 @@ def test_gpu_w4a16_preserves_zero_and_tiny_global_scales(rows: int) -> None:
     x_huge = torch.full((rows, 16), 1e37, device="cuda", dtype=torch.float32)
 
     w_zero = PiperNVFP4Tensor(
-        q, s_ones, 16, torch.float32, torch.tensor(0.0, device="cuda"), None, True, False, None
+        q, s_ones, 16, torch.float32, torch.tensor(0.0, device="cuda"), None, True, None
     )
     assert torch.equal(F.linear(x_huge, w_zero), torch.zeros(rows, 16, device="cuda"))
 
     gs_tiny = torch.tensor(1e-30, device="cuda", dtype=torch.float32)
-    w_tiny = PiperNVFP4Tensor(q, s_ones, 16, torch.float32, gs_tiny, None, True, False, None)
+    w_tiny = PiperNVFP4Tensor(q, s_ones, 16, torch.float32, gs_tiny, None, True, None)
     actual_tiny = F.linear(x_huge, w_tiny)
     expected_tiny = nvfp4_reference.linear_w4a16(
         x_huge.cpu(), q.cpu(), s_ones.cpu(), gs_tiny.cpu(), None
@@ -1043,7 +1025,7 @@ def test_gpu_w4a16_preserves_zero_and_tiny_global_scales(rows: int) -> None:
         torch.float8_e4m3fn
     )
     gs_rep = torch.tensor(2.0**-141, device="cuda", dtype=torch.float32)
-    w_rep = PiperNVFP4Tensor(q, s_rep, 16, torch.float32, gs_rep, None, True, False, None)
+    w_rep = PiperNVFP4Tensor(q, s_rep, 16, torch.float32, gs_rep, None, True, None)
     x_rep = torch.full((rows, 16), 3e38, device="cuda", dtype=torch.float32)
     actual_rep = F.linear(x_rep, w_rep)
     expected_rep = nvfp4_reference.linear_w4a16(
@@ -1057,7 +1039,7 @@ def test_gpu_w4a16_preserves_zero_and_tiny_global_scales(rows: int) -> None:
         s_max = torch.full((32, 16), 448.0, device="cuda", dtype=torch.float32).to(
             torch.float8_e4m3fn
         )
-        w_fp16 = PiperNVFP4Tensor(q, s_max, 16, torch.float16, gs_fp16, None, True, False, None)
+        w_fp16 = PiperNVFP4Tensor(q, s_max, 16, torch.float16, gs_fp16, None, True, None)
         x_fp16 = torch.ones((rows, 16), device="cuda", dtype=torch.float16)
         actual_fp16 = F.linear(x_fp16, w_fp16)
         expected_fp16 = nvfp4_reference.linear_w4a16(

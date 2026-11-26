@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import torch
-from torchao.prototype.mx_formats.kernels import f4_unpacked_to_f32, pack_uint4, unpack_uint4
-from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.stochastic_quantization import stochastic_codebook_indices
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.nvfp4 import _layout
+from piper_kernels.weights.nvfp4._quantization import (
+    e2m1_unpacked_to_f32,
+    pack_uint4,
+    unpack_uint4,
+)
 from piper_kernels.weights.nvfp4.tensor import PiperNVFP4Tensor
 
 
@@ -73,10 +76,9 @@ def _refill_(
     rounding_seed: int | None,
 ) -> None:
     """Encode one merged rotated weight into the existing NVFP4 storage."""
-
     per_tensor_scale = None
     if weight.per_tensor_scale is not None:
-        per_tensor_scale = per_tensor_amax_to_scale(merged.detach().abs().amax()).clamp_min(
+        per_tensor_scale = _layout.per_tensor_amax_to_scale(merged.detach().abs().amax()).clamp_min(
             _layout.MIN_WEIGHT_GLOBAL_SCALE
         )
     encoded = PiperNVFP4Tensor.from_hp(
@@ -85,8 +87,7 @@ def _refill_(
         per_tensor_scale=per_tensor_scale,
         act_per_tensor_scale=weight.act_per_tensor_scale,
         is_swizzled_scales=weight.is_swizzled_scales,
-        use_triton_kernel=False,
-        act_quant_kwargs=weight.act_quant_kwargs,
+        act_quant=weight.act_quant,
     )
     if rounding_seed is not None:
         _stochastic_recode_(
@@ -122,7 +123,7 @@ def _stochastic_recode_(
         torch.zeros_like(source, dtype=torch.float32),
     )
     deterministic = unpack_uint4(encoded.qdata.contiguous().view(torch.uint8))
-    codebook = f4_unpacked_to_f32(torch.arange(16, device=source.device, dtype=torch.uint8))
+    codebook = e2m1_unpacked_to_f32(torch.arange(16, device=source.device, dtype=torch.uint8))
     codes = stochastic_codebook_indices(
         normalized,
         codebook,

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, cast
 
 import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
-from torchao.utils import TorchAOBaseTensor
 
 from piper_kernels.weights._dispatch import require_untransposed
 
@@ -63,7 +62,7 @@ class _FlatQuantizedWeightView(torch.Tensor):
 class _FSDPAllGatherMetadata:
     """Host metadata carried from ``fsdp_pre_all_gather`` to ``fsdp_post_all_gather``."""
 
-    cls: type[TorchAOBaseTensor]
+    cls: type[QuantizedWeight]
     local_rows: int
     features: int
     world_size: int
@@ -176,7 +175,9 @@ def _require_fsdp_weight(weight: QuantizedWeight, operation: str) -> torch.Tenso
         raise NotImplementedError(
             f"{type(weight).__name__} {operation} requires canonical or flat block-scale storage"
         )
-    return weight.scale.view(expected_2d)
+    return (
+        weight.scale if tuple(weight.scale.shape) == expected_2d else weight.scale.view(expected_2d)
+    )
 
 
 def _optional_tensors(weight: QuantizedWeight, names: list[str]) -> dict[str, torch.Tensor]:
@@ -225,7 +226,7 @@ def fsdp_pre_all_gather(
         layout = _nvfp4_layout()
         reswizzle = weight.is_swizzled_scales and local_rows % layout.SCALE_ROW_TILE != 0
         if reswizzle:
-            from torchao.prototype.mx_formats.utils import from_blocked  # noqa: PLC0415
+            from piper_kernels.weights.nvfp4._layout import from_blocked  # noqa: PLC0415
 
             scale_to_gather = from_blocked(
                 canonical_scale.view(torch.uint8),
@@ -297,7 +298,7 @@ def _prepare_refresh_scale(
                 f"contiguous={target_weight.scale.is_contiguous()}"
             )
         if metadata.reswizzle_nvfp4_scales:
-            from torchao.prototype.mx_formats.utils import to_blocked  # noqa: PLC0415
+            from piper_kernels.weights.nvfp4._layout import to_blocked  # noqa: PLC0415
 
             return to_blocked(gathered_scale).view(expected_target_scale_shape)
         return gathered_scale
@@ -473,7 +474,7 @@ def fsdp_post_all_gather(
         return None
 
     if metadata.reswizzle_nvfp4_scales:
-        from torchao.prototype.mx_formats.utils import to_blocked  # noqa: PLC0415
+        from piper_kernels.weights.nvfp4._layout import to_blocked  # noqa: PLC0415
 
         scale_full = (
             to_blocked(gathered_scale).view(expected_target_scale_shape).view(torch.float8_e4m3fn)
@@ -490,7 +491,7 @@ def fsdp_post_all_gather(
         extra_inner_tensors = ()
 
     updated_attrs = dict(metadata.attributes)
-    updated_attrs["orig_dtype" if "orig_dtype" in updated_attrs else "dtype"] = param_dtype
+    updated_attrs["dtype"] = param_dtype
     tensors = {"qdata": qdata_full, "scale": scale_full, **metadata.optional_tensors}
     unsharded = metadata.cls.__tensor_unflatten__(tensors, updated_attrs, None, None)
     return cast(torch.Tensor, unsharded), extra_inner_tensors
@@ -643,11 +644,11 @@ def _new_zeros_dispatch(
             )
 
     updated = dict(metadata)
-    updated["orig_dtype" if "orig_dtype" in updated else "dtype"] = logical_dtype
+    updated["dtype"] = logical_dtype
     return cast(torch.Tensor, type(weight).__tensor_unflatten__(tensors, updated, None, None))
 
 
-def register_fsdp_ops(cls: type[TorchAOBaseTensor]) -> None:
+def register_fsdp_ops(cls: type[QuantizedWeight]) -> None:
     """Register FSDP2 parameter-sharding and unshard ATen handlers."""
     aten = torch.ops.aten
     cls.implements(aten.split.Tensor)(_split_dispatch)

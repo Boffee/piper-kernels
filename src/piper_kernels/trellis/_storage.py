@@ -348,7 +348,6 @@ class TrellisStorage:
         ``ValueError`` when the rotated weight (or raw Hessian) is not finite. Results are
         deterministic on a given device and software stack. ``hp_tensor`` is detached first.
         """
-        # The INT8 package needs TorchAO, which importing this package must not.
         from piper_kernels.weights.convrot.int8._quantization import (  # noqa: PLC0415
             validate_hp_weight,
         )

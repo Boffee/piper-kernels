@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import cast
 
 import torch
-from torchao.prototype.mx_formats.utils import from_blocked, to_blocked
 
 from piper_kernels.weights._dispatch import QuantizedWeight
 from piper_kernels.weights._views import require_untransposed
@@ -68,7 +67,7 @@ def _nvfp4_scales(weight: PiperNVFP4Tensor, dim: int, start: int, length: int) -
     # Only block scales are unpacked; the FP4 weight payload stays quantized.
     scale_bytes = weight.scale.view(torch.uint8)
     plain = (
-        from_blocked(scale_bytes, rows, features // weight.block_size)
+        _layout.from_blocked(scale_bytes, rows, features // weight.block_size)
         if weight.is_swizzled_scales
         else scale_bytes.view(rows, features // weight.block_size)
     )
@@ -77,7 +76,9 @@ def _nvfp4_scales(weight: PiperNVFP4Tensor, dim: int, start: int, length: int) -
     if weight.is_swizzled_scales:
         shard_rows = length if dim == 0 else rows
         shard_features = length if dim == 1 else features
-        selected = to_blocked(selected).view(_layout.scale_shape(shard_rows, shard_features))
+        selected = _layout.to_blocked(selected).view(
+            _layout.scale_shape(shard_rows, shard_features)
+        )
     return selected.view(weight.scale.dtype)
 
 
@@ -109,9 +110,11 @@ def shard_quantized_weight[Weight: QuantizedWeight](
     if isinstance(weight, ConvRotInt8Tensor):
         scale = weight.scale.narrow(0, start, length) if dim == 0 else weight.scale
         divisor = 1
-    else:
+    elif isinstance(weight, PiperNVFP4Tensor):
         scale = _nvfp4_scales(weight, dim, start, length)
         divisor = 2 if dim == 1 else 1
+    else:
+        raise TypeError("shard_quantized_weight requires a Piper quantized weight")
     qdata = weight.qdata.narrow(dim, start // divisor, length // divisor)
     names, metadata = weight.__tensor_flatten__()
     tensors = {name: getattr(weight, name) for name in names}

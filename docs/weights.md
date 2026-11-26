@@ -10,10 +10,10 @@ calibration, and model quality.
 |---|---|---|
 | `ConvRotInt8Tensor` | Grouped rotation, INT8 values, FP32 scale per output | Linear and Conv3D, with optimized NVIDIA/AMD kernels and portable fallback; embedding lookups. |
 | `ConvRotTrellisTensor` | Packed 2–6 bpw trellis bitstreams, FP8 block scales, FP32 row scale | Linear (`F.linear`) via Triton kernels on supported NVIDIA/AMD GPUs and CPU fallback. |
-| `PiperNVFP4Tensor` | Packed FP4 values, FP8 block scales, optional FP32 global scale | Native W4A4 linear and fusions target exact NVIDIA SM120; weight-only W4A16 (`act_quant_kwargs=None`) targets NVIDIA SM75+ and supported AMD ROCm GPUs. |
+| `PiperNVFP4Tensor` | Packed FP4 values, FP8 block scales, optional FP32 global scale | Native W4A4 linear and fusions target exact NVIDIA SM120; weight-only W4A16 (`act_quant=None`) targets NVIDIA SM75+ and supported AMD ROCm GPUs. |
 | `ConvRotNVFP4Tensor` | NVFP4 in a grouped rotated basis | Same W4A4 and W4A16 GPU targets, plus a CPU reference fallback for weight-only W4A16. |
 
-See [installation](../README.md#installation) for format extras and platform setup.
+See [installation](../README.md#installation) for platform setup.
 Weight construction and storage are separate from execution support: being able
 to load a format does not imply a fast kernel on that device.
 
@@ -84,7 +84,7 @@ codes compared with separately materialized low-precision activations.
 ## Construct and run NVFP4
 
 This complete example supports both full W4A4 execution (requires an NVIDIA SM120
-GPU and the NVFP4 dependencies) and weight-only W4A16 execution (`act_quant_kwargs=None`,
+GPU) and weight-only W4A16 execution (`act_quant=None`,
 supported on NVIDIA SM75+ and Linux/Windows AMD `gfx942`, `gfx1100`, `gfx1151`,
 `gfx1200`, and `gfx1201`). The native path requires 16-value blocks, swizzled
 scales, and FP16, BF16, or FP32 activations matching the logical weight dtype.
@@ -93,22 +93,15 @@ ConvRot input widths must also divide into rotation groups.
 ```python
 import torch
 import torch.nn.functional as F
-from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 
-activation_quantization = QuantizeTensorToNVFP4Kwargs(
-    block_size=16,
-    is_swizzled_scales=True,
-    use_triton_kernel=False,
-    use_dynamic_per_tensor_scale=True,
-)
 dense_weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
 x = torch.randn(2, 256, device="cuda", dtype=torch.bfloat16)
 options = dict(
     compute_per_tensor_scale=True,
     is_swizzled_scales=True,
-    act_quant_kwargs=activation_quantization,
+    act_quant="dynamic",
 )
 nvfp4_weight = PiperNVFP4Tensor.from_hp(dense_weight, **options)
 rotated_weight = ConvRotNVFP4Tensor.from_hp(dense_weight, group_size=64, **options)
@@ -118,33 +111,31 @@ with torch.inference_mode():
 assert output.shape == rotated_output.shape == (2, 128)
 ```
 
-For W4A16 weight-only execution across SM75+, supported ROCm GPUs, and CPU (where
-ConvRot weight-only runs on the portable reference while ordinary NVFP4 delegates to
-TorchAO or dequantized linear), construct the same tensors with `act_quant_kwargs=None`
-and `act_per_tensor_scale=None`. Set `act_quant_kwargs` as shown above on SM120 when
-you want W4A4 activations, including compiled FFN and sparse attention fusions.
+For W4A16 weight-only execution across SM75+, supported ROCm GPUs, and CPU, construct
+the same tensors with `act_quant=None` and `act_per_tensor_scale=None`. Set `act_quant="dynamic"` or `act_quant="static"` on
+SM120 when you want W4A4 activations, including compiled FFN and sparse attention fusions.
 
 `compute_per_tensor_scale=True` computes the weight global scale (after rotation
 for ConvRot; mutually exclusive with `per_tensor_scale`). For static activation
-scaling, set `use_dynamic_per_tensor_scale=False` and pass a finite positive FP32
-scalar `act_per_tensor_scale` on the weight device calibrated in the stored basis;
+scaling, pass `act_quant="static"` and a finite positive FP32 scalar
+`act_per_tensor_scale` on the weight device calibrated in the stored basis;
 omitting it fixes unit global scaling (`1.0`, still computing 16-value block
 scales). The same scale contract applies to NVFP4/ConvRot FFN and sparse output
 fusions; see [compilation](#compile-a-model) for preparation sharing.
 
 Zero scales decode a block as zero without NaNs, and independent vs fused backends need
-not agree bitwise (`use_triton_kernel=True` in `from_hp` selects TorchAO's `1/64` normal
-floor instead of Piper's `1/512` E4M3 floor).
+not agree bitwise.
 
-`PiperNVFP4Tensor.from_torchao(existing)` wraps TorchAO storage without copying;
-`ConvRotNVFP4Tensor.from_torchao(existing, group_size=...)` attaches rotation
-metadata to values already in that basis (see
-[ordinary NVFP4](../src/piper_kernels/weights/nvfp4/tensor.py) and
-[ConvRot NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) for packed
-constructors and fields, and [NVFP4 reference](../src/piper_kernels/linear/nvfp4/reference.py)
-for `linear` / `linear_w4a16` numerical checks). Native W4A4 ConvRot NVFP4 requires
-SM120; weight-only and unsupported paths either use portable fallbacks or raise when
-the backend constraints are unmet.
+To wrap existing packed NVFP4 storage without copying contiguous buffers, use
+`from_quantized`:
+- `PiperNVFP4Tensor.from_quantized(qdata, scale, logical_dtype=..., is_swizzled_scales=..., act_quant=..., high_first=...)`
+- `ConvRotNVFP4Tensor.from_quantized(qdata, scale, group_size=..., logical_dtype=..., ...)`
+(see [ordinary NVFP4](../src/piper_kernels/weights/nvfp4/tensor.py) and
+[ConvRot NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) for fields, and
+[NVFP4 reference](../src/piper_kernels/linear/nvfp4/reference.py) for `linear` /
+`linear_w4a16` numerical checks). Native W4A4 ConvRot NVFP4 requires SM120; weight-only
+and unsupported paths either use portable fallbacks or raise when the backend
+constraints are unmet.
 
 ## Look up embedding rows
 
@@ -405,7 +396,7 @@ from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
 storage = TrellisStorage.from_hp(weight, group_size=256, bits_per_weight=4.5)
 
 # Keep packed trellis storage in memory for direct F.linear execution:
-trellis_weight = ConvRotTrellisTensor.from_storage(
+trellis_weight = ConvRotTrellisTensor.from_trellis_storage(
     storage,
     group_size=256,
     logical_dtype=weight.dtype,
@@ -522,6 +513,17 @@ residual before entering it in hybrid TP+SP Attention + FSDP2 FFN blocks) so bot
 attention and FFN residual updates fold without recompiles.
 
 ## Storage and checkpoint compatibility
+
+All four quantized weight formats subclass `piper_kernels.weights.QuantizedWeight`,
+which exposes a format-independent zero-copy transport boundary for runtime loaders
+and offloaders:
+
+- `tensors, metadata = weight.as_storage()` validates untransposed contiguous
+  storage and returns a dictionary of raw storage `torch.Tensor` buffers alongside a
+  dictionary of plain non-tensor metadata (no tensor references or transpose state).
+- `type(weight).from_storage(gpu_tensors, metadata)` reconstructs the concrete
+  quantized weight zero-copy around caller-owned buffers while enforcing boundary
+  metadata and layout preconditions.
 
 Same-shape `view`/`view_as`, transposes, and matching `as_strided` views share
 storage, and FSDP2 setup also uses an opaque 1-D flat view handle (`view(-1)` or

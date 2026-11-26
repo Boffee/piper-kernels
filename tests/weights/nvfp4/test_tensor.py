@@ -1,51 +1,58 @@
-"""Tests for Piper's semantic TorchAO NVFP4 wrapper."""
+"""Tests for Piper's NVFP4 weight tensor."""
 
 import pytest
 import torch
 from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    QuantizeTensorToNVFP4Kwargs,
-    per_tensor_amax_to_scale,
-)
 
 from piper_kernels import compile_options
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
-from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
+from piper_kernels.weights.nvfp4 import NVFP4ActQuant, PiperNVFP4Tensor
 
 
-def _quantization(dynamic: bool) -> QuantizeTensorToNVFP4Kwargs:
-    return QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
+def _act_quant(dynamic: bool) -> NVFP4ActQuant:
+    return "dynamic" if dynamic else "static"
+
+
+def _per_tensor_amax_to_scale(amax: torch.Tensor) -> torch.Tensor:
+    return amax.to(torch.float32) / (448.0 * 6.0)
+
+
+def test_from_quantized_reuses_contiguous_and_canonicalizes_strided() -> None:
+    qdata = torch.empty(128, 128, dtype=torch.uint8, device="meta")
+    scale = torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta")
+    per_tensor_scale = torch.empty((), dtype=torch.float32, device="meta")
+    act_per_tensor_scale = torch.empty((), dtype=torch.float32, device="meta")
+
+    wrapped = PiperNVFP4Tensor.from_quantized(
+        qdata,
+        scale,
+        logical_dtype=torch.bfloat16,
+        per_tensor_scale=per_tensor_scale,
+        act_per_tensor_scale=act_per_tensor_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=dynamic,
+        act_quant=_act_quant(False),
     )
-
-
-def test_from_torchao_reuses_storage_and_metadata() -> None:
-    source = TorchAONVFP4Tensor(
-        torch.empty(128, 128, dtype=torch.uint8, device="meta"),
-        torch.empty(128, 16, dtype=torch.float8_e4m3fn, device="meta"),
-        16,
-        torch.bfloat16,
-        torch.empty((), device="meta"),
-        torch.empty((), device="meta"),
-        True,
-        False,
-        _quantization(False),
-    )
-
-    wrapped = PiperNVFP4Tensor.from_torchao(source)
 
     assert type(wrapped) is PiperNVFP4Tensor
-    assert wrapped.qdata is source.qdata
-    assert wrapped.scale is source.scale
-    assert wrapped.per_tensor_scale is source.per_tensor_scale
-    assert wrapped.act_per_tensor_scale is source.act_per_tensor_scale
-    assert wrapped.act_quant_kwargs == source.act_quant_kwargs
-    assert PiperNVFP4Tensor.from_torchao(wrapped) is wrapped
+    assert wrapped.qdata is qdata
+    assert wrapped.scale is scale
+    assert wrapped.per_tensor_scale is per_tensor_scale
+    assert wrapped.act_per_tensor_scale is act_per_tensor_scale
+    assert wrapped.act_quant == "static"
+    assert wrapped.dtype is torch.bfloat16
+
+    strided_q = torch.arange(256 * 128, dtype=torch.uint8).view(128, 256)[:, ::2]
+    assert not strided_q.is_contiguous()
+    canonical = PiperNVFP4Tensor.from_quantized(
+        strided_q,
+        torch.ones(32, 64, dtype=torch.float8_e4m3fn),
+        is_swizzled_scales=True,
+        high_first=True,
+    )
+    assert canonical.qdata.is_contiguous()
+    assert torch.equal(canonical.qdata, strided_q.contiguous())
+    assert canonical.high_first is True
 
 
 def test_high_first_preserves_storage_and_dequantizes_logically() -> None:
@@ -108,38 +115,45 @@ def test_high_first_requires_a_bool() -> None:
 
 
 def test_dequantize_accepts_an_output_dtype() -> None:
+    torch.manual_seed(417)
     source = torch.randn(32, 256, dtype=torch.bfloat16)
-    weight = PiperNVFP4Tensor.from_hp(source)
+    unswizzled = PiperNVFP4Tensor.from_hp(source, compute_per_tensor_scale=True)
+    swizzled = PiperNVFP4Tensor.from_hp(
+        source,
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+    )
 
-    actual = weight.dequantize(torch.float32)
-    expected = TorchAONVFP4Tensor.dequantize(weight, torch.float32)
+    actual = unswizzled.dequantize(torch.float32)
 
     assert actual.dtype is torch.float32
-    assert torch.equal(actual, expected)
+    assert torch.equal(actual, swizzled.dequantize(torch.float32))
+    assert (actual - source.float()).abs().mean() < 0.15
 
 
-def test_from_hp_matches_torchao_quantization_with_computed_global_scale() -> None:
+def test_from_hp_computes_global_scale_and_detaches() -> None:
     torch.manual_seed(418)
     source = torch.randn(128, 256, dtype=torch.bfloat16).requires_grad_()
-    per_tensor_scale = per_tensor_amax_to_scale(source.float().abs().amax())
+    per_tensor_scale = _per_tensor_amax_to_scale(source.detach().float().abs().amax())
 
     weight = PiperNVFP4Tensor.from_hp(
         source,
         compute_per_tensor_scale=True,
         is_swizzled_scales=True,
-        act_quant_kwargs=_quantization(True),
+        act_quant=_act_quant(True),
     )
-    expected = TorchAONVFP4Tensor.to_nvfp4(
+    expected = PiperNVFP4Tensor.from_hp(
         source.detach(),
         per_tensor_scale=per_tensor_scale,
         is_swizzled_scales=True,
-        act_quant_kwargs=_quantization(True),
+        act_quant=_act_quant(True),
     )
 
     assert type(weight) is PiperNVFP4Tensor
     assert not weight.requires_grad
     assert torch.equal(weight.qdata, expected.qdata)
     assert torch.equal(weight.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+    assert weight.per_tensor_scale is not None
     assert torch.equal(weight.per_tensor_scale, per_tensor_scale)
 
 
@@ -220,14 +234,13 @@ def test_from_hp_swizzles_experts_independently(rows, features, scale_kind, devi
 def test_device_copy_preserves_piper_wrapper() -> None:
     source = PiperNVFP4Tensor(
         torch.empty(128, 128, dtype=torch.uint8),
-        torch.empty(128, 16, dtype=torch.float8_e4m3fn),
+        torch.empty(32, 64, dtype=torch.float8_e4m3fn),
         16,
         torch.bfloat16,
         torch.empty(()),
         torch.empty(()),
         True,
-        False,
-        _quantization(False),
+        _act_quant(False),
     )
 
     moved = source.to(device="meta")
@@ -242,20 +255,19 @@ def test_dtype_copy_preserves_concrete_piper_subclass() -> None:
 
     source = DerivedPiperNVFP4Tensor(
         torch.empty(128, 128, dtype=torch.uint8),
-        torch.empty(128, 16, dtype=torch.float8_e4m3fn),
+        torch.empty(32, 64, dtype=torch.float8_e4m3fn),
         16,
         torch.bfloat16,
         torch.empty(()),
         torch.empty(()),
         True,
-        False,
-        _quantization(False),
+        _act_quant(False),
     )
 
     moved = source.to(dtype=torch.float16)
 
     assert type(moved) is DerivedPiperNVFP4Tensor
-    assert moved.orig_dtype is torch.float16
+    assert moved.dtype is torch.float16
     assert moved.qdata is source.qdata
     assert moved.scale is source.scale
     assert moved.per_tensor_scale is source.per_tensor_scale
@@ -266,14 +278,13 @@ def test_dtype_copy_preserves_concrete_piper_subclass() -> None:
 def test_explicit_dtype_copy_duplicates_storage(positional: bool) -> None:
     source = PiperNVFP4Tensor(
         torch.empty(128, 128, dtype=torch.uint8),
-        torch.empty(128, 16, dtype=torch.float8_e4m3fn),
+        torch.empty(32, 64, dtype=torch.float8_e4m3fn),
         16,
         torch.bfloat16,
         torch.empty(()),
         torch.empty(()),
         True,
-        False,
-        _quantization(False),
+        _act_quant(False),
     )
 
     moved = (
@@ -282,7 +293,7 @@ def test_explicit_dtype_copy_duplicates_storage(positional: bool) -> None:
         else source.to(dtype=torch.float16, copy=True)
     )
 
-    assert moved.orig_dtype is torch.float16
+    assert moved.dtype is torch.float16
     assert moved.qdata is not source.qdata
     assert moved.scale is not source.scale
     assert moved.per_tensor_scale is not source.per_tensor_scale
@@ -310,15 +321,14 @@ def test_cuda_semantic_linear_matches_portable_reference(
     torch.manual_seed(417)
     input = torch.randn(257, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
     weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
-    activation_scale = None if dynamic else per_tensor_amax_to_scale(input.abs().amax())
-    torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+    activation_scale = None if dynamic else _per_tensor_amax_to_scale(input.abs().amax())
+    piper_weight = PiperNVFP4Tensor.from_hp(
         weight,
-        per_tensor_scale=per_tensor_amax_to_scale(weight.abs().amax()),
+        compute_per_tensor_scale=True,
         act_per_tensor_scale=activation_scale,
         is_swizzled_scales=True,
-        act_quant_kwargs=_quantization(dynamic),
+        act_quant=_act_quant(dynamic),
     )
-    piper_weight = PiperNVFP4Tensor.from_torchao(torchao_weight)
     bias = torch.randn(128, device="cuda", dtype=bias_dtype) if bias_dtype is not None else None
 
     expected = nvfp4_reference.linear(
@@ -353,20 +363,19 @@ def test_cuda_high_first_linear_matches_low_first() -> None:
     low = PiperNVFP4Tensor.from_hp(
         source,
         compute_per_tensor_scale=True,
-        act_per_tensor_scale=per_tensor_amax_to_scale(input.abs().amax()),
+        act_per_tensor_scale=_per_tensor_amax_to_scale(input.abs().amax()),
         is_swizzled_scales=True,
-        act_quant_kwargs=_quantization(False),
+        act_quant=_act_quant(False),
     )
     high = PiperNVFP4Tensor(
         ((low.qdata & 0x0F) << 4) | (low.qdata >> 4),
         low.scale,
         low.block_size,
-        low.orig_dtype,
+        low.dtype,
         low.per_tensor_scale,
         low.act_per_tensor_scale,
         low.is_swizzled_scales,
-        low.use_triton_kernel,
-        low.act_quant_kwargs,
+        low.act_quant,
         high_first=True,
     )
 
@@ -396,7 +405,7 @@ def test_cuda_autocast_normalizes_semantic_linear(
         source,
         compute_per_tensor_scale=True,
         is_swizzled_scales=True,
-        act_quant_kwargs=_quantization(True),
+        act_quant=_act_quant(True),
     )
     bias = torch.randn(128, device="cuda", dtype=torch.float32) * 0.01
 

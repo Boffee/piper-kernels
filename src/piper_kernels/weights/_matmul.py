@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 import torch
-from torchao.utils import TorchAOBaseTensor
 
-from piper_kernels.weights._dispatch import unsupported_operation_dispatch
-
-if TYPE_CHECKING:
-    from piper_kernels.weights._dispatch import QuantizedWeight
+from piper_kernels.weights._dispatch import QuantizedWeight, unsupported_operation_dispatch
 
 
 def _matrix_product_dispatch(
@@ -24,8 +20,8 @@ def _matrix_product_dispatch(
     activation, weight = args[1:3] if has_bias else args[:2]
     if (
         not isinstance(activation, torch.Tensor)
-        or isinstance(activation, TorchAOBaseTensor)
-        or not isinstance(weight, TorchAOBaseTensor)
+        or isinstance(activation, QuantizedWeight)
+        or not isinstance(weight, QuantizedWeight)
         or weight.ndim != 2
         or not getattr(weight, "transposed", False)
     ):
@@ -34,7 +30,7 @@ def _matrix_product_dispatch(
         )
     if activation.ndim != 2 and func is not torch.ops.aten.matmul.default:
         raise ValueError(f"{func} requires a 2-D activation")
-    canonical = cast("QuantizedWeight", weight)._transpose()
+    canonical = weight._transpose()
     if not has_bias:
         return torch.nn.functional.linear(activation, canonical)
 
@@ -69,7 +65,7 @@ def _torch_matmul_dispatch(
     return _matmul(*args, **kwargs)
 
 
-def register_matrix_ops(cls: type[TorchAOBaseTensor]) -> None:
+def register_matrix_ops(cls: type[QuantizedWeight]) -> None:
     """Keep DTensor's transpose/mm/addmm decomposition on Piper's linear path."""
     aten = torch.ops.aten
     cls.implements([aten.mm.default, aten.matmul.default, aten.addmm.default])(

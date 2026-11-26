@@ -8,7 +8,6 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
@@ -32,13 +31,7 @@ def _weight(wrapper, rows=32):
         per_tensor_scale=torch.tensor(0.25),
         act_per_tensor_scale=torch.tensor(0.5),
         is_swizzled_scales=False,
-        use_triton_kernel=True,
-        act_quant_kwargs=QuantizeTensorToNVFP4Kwargs(
-            block_size=16,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=True,
-        ),
+        act_quant="dynamic",
         high_first=True,
     )
 

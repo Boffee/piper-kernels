@@ -535,14 +535,14 @@ def _quantize_nvfp4_batch(
                     group_size=group_size,
                     compute_per_tensor_scale=compute_per_tensor_scale,
                     is_swizzled_scales=True,
-                    act_quant_kwargs=None,
+                    act_quant=None,
                 )
             else:
                 quantized_weight = PiperNVFP4Tensor.from_hp(
                     slot_source,
                     compute_per_tensor_scale=compute_per_tensor_scale,
                     is_swizzled_scales=True,
-                    act_quant_kwargs=None,
+                    act_quant=None,
                 )
             qdata = quantized_weight.qdata
             if high_first:

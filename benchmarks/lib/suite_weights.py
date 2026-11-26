@@ -76,11 +76,7 @@ def _support(
         reason = "native NVFP4 execution requires exact NVIDIA SM120"
     if reason is not None:
         return reason
-    return (
-        "quantized weight construction requires TorchAO"
-        if importlib.util.find_spec("torchao") is None
-        else None
-    )
+    return None
 
 
 def _dense_weight(rows: int, columns: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
@@ -99,17 +95,7 @@ def _pack_weight(
     from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
     from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
-    if format_name in ("nvfp4_w4a16", "convrot_nvfp4_w4a16"):
-        activation = None
-    else:
-        from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
-
-        activation = QuantizeTensorToNVFP4Kwargs(
-            block_size=16,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=True,
-        )
+    activation = None if format_name in ("nvfp4_w4a16", "convrot_nvfp4_w4a16") else "dynamic"
 
     if format_name in ("convrot_nvfp4", "convrot_nvfp4_w4a16"):
         return ConvRotNVFP4Tensor.from_hp(
@@ -117,13 +103,13 @@ def _pack_weight(
             group_size=_group_size(weight.shape[1]),
             compute_per_tensor_scale=True,
             is_swizzled_scales=True,
-            act_quant_kwargs=activation,
+            act_quant=activation,
         ).to(device)
     return PiperNVFP4Tensor.from_hp(
         weight,
         compute_per_tensor_scale=True,
         is_swizzled_scales=True,
-        act_quant_kwargs=activation,
+        act_quant=activation,
     ).to(device)
 
 

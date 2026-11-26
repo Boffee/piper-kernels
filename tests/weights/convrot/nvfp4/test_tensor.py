@@ -8,11 +8,6 @@ from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    QuantizeTensorToNVFP4Kwargs,
-    per_tensor_amax_to_scale,
-)
 
 from piper_kernels import compile_options
 from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_linear
@@ -20,21 +15,17 @@ from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.nvfp4 import NVFP4ActQuant, PiperNVFP4Tensor
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 
-def _quantization(dynamic: bool) -> QuantizeTensorToNVFP4Kwargs:
-    return QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=dynamic,
-    )
+def _act_quant(dynamic: bool) -> NVFP4ActQuant:
+    return "dynamic" if dynamic else "static"
 
 
 def _meta_weight(*, group_size: int = 16) -> ConvRotNVFP4Tensor:
     output_features, input_features = 128, 256
-    source = TorchAONVFP4Tensor(
+    return ConvRotNVFP4Tensor.from_quantized(
         torch.empty(
             output_features,
             input_features // 2,
@@ -46,28 +37,35 @@ def _meta_weight(*, group_size: int = 16) -> ConvRotNVFP4Tensor:
             dtype=torch.float8_e4m3fn,
             device="meta",
         ),
-        16,
-        torch.bfloat16,
-        torch.empty((), device="meta"),
-        None,
-        True,
-        False,
-        _quantization(True),
+        group_size=group_size,
+        logical_dtype=torch.bfloat16,
+        per_tensor_scale=torch.empty((), device="meta"),
+        is_swizzled_scales=True,
+        act_quant=_act_quant(True),
     )
-    return ConvRotNVFP4Tensor.from_torchao(source, group_size=group_size)
 
 
-def test_from_torchao_reuses_storage_and_attaches_rotation_metadata() -> None:
+def test_from_quantized_reuses_storage_and_validates_group_size() -> None:
     source = _meta_weight()
+    rebuilt = ConvRotNVFP4Tensor.from_quantized(
+        source.qdata,
+        source.scale,
+        group_size=16,
+        logical_dtype=source.dtype,
+        per_tensor_scale=source.per_tensor_scale,
+        is_swizzled_scales=True,
+        act_quant=source.act_quant,
+    )
 
-    wrapped = ConvRotNVFP4Tensor.from_torchao(source, group_size=16)
-
-    assert wrapped is source
-    assert wrapped.group_size == 16
-    with pytest.raises(ValueError, match="uses group size 16, not 64"):
-        ConvRotNVFP4Tensor.from_torchao(source, group_size=64)
-    with pytest.raises(TypeError, match="requires a group size"):
-        ConvRotNVFP4Tensor.from_torchao(source)
+    assert type(rebuilt) is ConvRotNVFP4Tensor
+    assert rebuilt.qdata is source.qdata
+    assert rebuilt.scale is source.scale
+    assert rebuilt.per_tensor_scale is source.per_tensor_scale
+    assert rebuilt.group_size == 16
+    with pytest.raises(ValueError, match="group size"):
+        ConvRotNVFP4Tensor.from_quantized(source.qdata, source.scale, group_size=12)
+    with pytest.raises(TypeError, match="group_size"):
+        ConvRotNVFP4Tensor.from_quantized(source.qdata, source.scale)  # type: ignore[call-arg]
 
 
 def test_high_first_preserves_storage_and_rotation_metadata() -> None:
@@ -90,11 +88,11 @@ def test_high_first_preserves_storage_and_rotation_metadata() -> None:
 
 
 @pytest.mark.parametrize("group_size", [16, 64, 256])
-def test_from_hp_matches_explicit_rotation_and_torchao_quantization(group_size: int) -> None:
+def test_from_hp_matches_explicit_rotation_and_quantization(group_size: int) -> None:
     torch.manual_seed(610 + group_size)
     logical_weight = torch.randn(128, 256, dtype=torch.bfloat16)
     rotated_weight = rotate_groups(logical_weight.float(), group_size)
-    per_tensor_scale = per_tensor_amax_to_scale(rotated_weight.abs().amax())
+    per_tensor_scale = nvfp4_layout.per_tensor_amax_to_scale(rotated_weight.abs().amax())
     activation_scale = torch.tensor(0.5)
 
     weight = ConvRotNVFP4Tensor.from_hp(
@@ -103,14 +101,14 @@ def test_from_hp_matches_explicit_rotation_and_torchao_quantization(group_size: 
         per_tensor_scale=per_tensor_scale,
         act_per_tensor_scale=activation_scale,
         is_swizzled_scales=True,
-        act_quant_kwargs=_quantization(False),
+        act_quant=_act_quant(False),
     )
-    expected = TorchAONVFP4Tensor.to_nvfp4(
+    expected = PiperNVFP4Tensor.from_hp(
         rotated_weight,
         per_tensor_scale=per_tensor_scale,
         act_per_tensor_scale=activation_scale,
         is_swizzled_scales=True,
-        act_quant_kwargs=_quantization(False),
+        act_quant=_act_quant(False),
     )
 
     assert type(weight) is ConvRotNVFP4Tensor
@@ -120,21 +118,21 @@ def test_from_hp_matches_explicit_rotation_and_torchao_quantization(group_size: 
     assert torch.equal(weight.scale.view(torch.uint8), expected.scale.view(torch.uint8))
     assert weight.per_tensor_scale is per_tensor_scale
     assert weight.act_per_tensor_scale is activation_scale
-    assert weight.act_quant_kwargs == expected.act_quant_kwargs
+    assert weight.act_quant == expected.act_quant
 
 
 def test_from_hp_computes_global_scale_in_the_rotated_basis() -> None:
     torch.manual_seed(874)
     logical_weight = torch.randn(128, 256, dtype=torch.bfloat16)
     rotated_weight = rotate_groups(logical_weight.float(), 64)
-    expected_scale = per_tensor_amax_to_scale(rotated_weight.float().abs().amax())
+    expected_scale = nvfp4_layout.per_tensor_amax_to_scale(rotated_weight.float().abs().amax())
 
     weight = ConvRotNVFP4Tensor.from_hp(
         logical_weight,
         group_size=64,
         compute_per_tensor_scale=True,
         is_swizzled_scales=True,
-        act_quant_kwargs=_quantization(True),
+        act_quant=_act_quant(True),
     )
 
     assert weight.per_tensor_scale is not None
@@ -205,15 +203,14 @@ def test_device_and_dtype_copies_preserve_wrapper_and_group_size() -> None:
         torch.empty(()),
         None,
         True,
-        False,
-        _quantization(True),
+        _act_quant(True),
     )
 
     moved = source.to(device="meta", dtype=torch.float16)
 
     assert type(moved) is ConvRotNVFP4Tensor
     assert moved.device.type == "meta"
-    assert moved.orig_dtype is torch.float16
+    assert moved.dtype is torch.float16
     assert moved.group_size == 64
 
 
@@ -223,7 +220,7 @@ def test_dtype_copy_reuses_packed_storage() -> None:
     moved = source.to(dtype=torch.float16)
 
     assert type(moved) is ConvRotNVFP4Tensor
-    assert moved.orig_dtype is torch.float16
+    assert moved.dtype is torch.float16
     assert moved.group_size == source.group_size
     assert moved.qdata is source.qdata
     assert moved.scale is source.scale
@@ -237,7 +234,7 @@ def test_explicit_dtype_copy_duplicates_packed_storage() -> None:
     moved = source.to(dtype=torch.float16, copy=True)
 
     assert type(moved) is ConvRotNVFP4Tensor
-    assert moved.orig_dtype is torch.float16
+    assert moved.dtype is torch.float16
     assert moved.group_size == source.group_size
     assert moved.qdata is not source.qdata
     assert moved.scale is not source.scale
@@ -263,29 +260,25 @@ def test_tensor_flatten_round_trip_preserves_storage_and_metadata() -> None:
     assert rebuilt.per_tensor_scale is source.per_tensor_scale
     assert rebuilt.act_per_tensor_scale is source.act_per_tensor_scale
     assert rebuilt.block_size == source.block_size
-    assert rebuilt.orig_dtype is source.orig_dtype
+    assert rebuilt.dtype is source.dtype
     assert rebuilt.group_size == source.group_size
     assert rebuilt.is_swizzled_scales is source.is_swizzled_scales
-    assert rebuilt.use_triton_kernel is source.use_triton_kernel
-    assert rebuilt.act_quant_kwargs == source.act_quant_kwargs
+    assert rebuilt.act_quant == source.act_quant
     assert rebuilt.high_first is True
 
 
 def test_stable_hash_distinguishes_rotation_groups() -> None:
     source = _meta_weight(group_size=16)
-    other = ConvRotNVFP4Tensor.from_torchao(
-        TorchAONVFP4Tensor(
-            source.qdata,
-            source.scale,
-            source.block_size,
-            source.orig_dtype,
-            source.per_tensor_scale,
-            source.act_per_tensor_scale,
-            source.is_swizzled_scales,
-            source.use_triton_kernel,
-            source.act_quant_kwargs,
-        ),
+    other = ConvRotNVFP4Tensor.from_quantized(
+        source.qdata,
+        source.scale,
         group_size=64,
+        logical_dtype=source.dtype,
+        block_size=source.block_size,
+        per_tensor_scale=source.per_tensor_scale,
+        act_per_tensor_scale=source.act_per_tensor_scale,
+        is_swizzled_scales=source.is_swizzled_scales,
+        act_quant=source.act_quant,
     )
 
     assert source._stable_hash_for_caching() != other._stable_hash_for_caching()
@@ -296,8 +289,19 @@ def test_dequantize_returns_the_unrotated_logical_weight(output_dtype: torch.dty
     torch.manual_seed(611)
     logical_weight = torch.randn(128, 256, dtype=torch.bfloat16)
     rotated_weight = rotate_groups(logical_weight, 16)
-    source = TorchAONVFP4Tensor.to_nvfp4(rotated_weight)
-    weight = ConvRotNVFP4Tensor.from_torchao(source, group_size=16)
+    source = PiperNVFP4Tensor.from_hp(rotated_weight)
+    weight = ConvRotNVFP4Tensor.from_quantized(
+        source.qdata,
+        source.scale,
+        group_size=16,
+        logical_dtype=source.dtype,
+        block_size=source.block_size,
+        per_tensor_scale=source.per_tensor_scale,
+        act_per_tensor_scale=source.act_per_tensor_scale,
+        is_swizzled_scales=source.is_swizzled_scales,
+        act_quant=source.act_quant,
+        high_first=source.high_first,
+    )
 
     actual = weight.dequantize() if output_dtype is None else weight.dequantize(output_dtype)
     expected = rotate_groups(source.dequantize(output_dtype), 16)
@@ -314,19 +318,15 @@ def _cpu_weight_case(
 ) -> ConvRotNVFP4Tensor:
     generator = torch.Generator().manual_seed(seed)
     logical_weight = torch.randn(32, 256, dtype=torch.bfloat16, generator=generator)
-    rotated_weight = rotate_groups(logical_weight, group_size)
     activation_scale = torch.tensor(0.5)
-    source = TorchAONVFP4Tensor.to_nvfp4(
-        rotated_weight,
-        per_tensor_scale=(
-            per_tensor_amax_to_scale(rotated_weight.abs().amax()) if two_level_scaling else None
-        ),
+    return ConvRotNVFP4Tensor.from_hp(
+        logical_weight,
+        group_size=group_size,
+        compute_per_tensor_scale=two_level_scaling,
         act_per_tensor_scale=activation_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
-        act_quant_kwargs=_quantization(False),
+        act_quant=_act_quant(False),
     )
-    return ConvRotNVFP4Tensor.from_torchao(source, group_size=group_size)
 
 
 def _cpu_addmm_case(
@@ -341,8 +341,8 @@ def _cpu_addmm_case(
         two_level_scaling=two_level_scaling,
     )
     generator = torch.Generator().manual_seed(seed + 1)
-    mat1 = torch.randn(weight.shape[0], 4, dtype=weight.orig_dtype, generator=generator)
-    mat2 = torch.randn(4, weight.shape[1], dtype=weight.orig_dtype, generator=generator)
+    mat1 = torch.randn(weight.shape[0], 4, dtype=weight.dtype, generator=generator)
+    mat2 = torch.randn(4, weight.shape[1], dtype=weight.dtype, generator=generator)
     return weight, mat1, mat2
 
 
@@ -353,7 +353,7 @@ def _cpu_add_case(
 ) -> tuple[ConvRotNVFP4Tensor, torch.Tensor]:
     weight = _cpu_weight_case(group_size=group_size, seed=seed)
     generator = torch.Generator().manual_seed(seed + 2)
-    update = torch.randn(weight.shape, dtype=weight.orig_dtype, generator=generator)
+    update = torch.randn(weight.shape, dtype=weight.dtype, generator=generator)
     return weight, update
 
 
@@ -365,7 +365,7 @@ def test_addmm_updates_rotated_storage_in_place(
     alpha: float,
 ) -> None:
     weight, mat1, mat2 = _cpu_addmm_case(group_size=group_size)
-    rotated_before = TorchAONVFP4Tensor.dequantize(weight, torch.float32)
+    rotated_before = PiperNVFP4Tensor.dequantize(weight, torch.float32)
     expected_dense = torch.addmm(
         rotated_before,
         mat1.float(),
@@ -373,16 +373,15 @@ def test_addmm_updates_rotated_storage_in_place(
         beta=beta,
         alpha=alpha,
     )
-    expected = TorchAONVFP4Tensor.to_nvfp4(
+    expected = PiperNVFP4Tensor.from_hp(
         expected_dense,
         block_size=weight.block_size,
-        per_tensor_scale=per_tensor_amax_to_scale(expected_dense.abs().amax()).clamp_min(
-            torch.finfo(torch.float32).tiny
-        ),
+        per_tensor_scale=nvfp4_layout.per_tensor_amax_to_scale(
+            expected_dense.abs().amax()
+        ).clamp_min(torch.finfo(torch.float32).tiny),
         act_per_tensor_scale=weight.act_per_tensor_scale,
         is_swizzled_scales=weight.is_swizzled_scales,
-        use_triton_kernel=False,
-        act_quant_kwargs=weight.act_quant_kwargs,
+        act_quant=weight.act_quant,
     )
     qdata = weight.qdata
     scale = weight.scale
@@ -407,22 +406,21 @@ def test_addmm_updates_rotated_storage_in_place(
 @pytest.mark.parametrize(("beta", "alpha"), [(1, 1), (0.25, 0.25), (-1, -0.5), (0, 0.5)])
 def test_add_updates_rotated_storage_in_place(group_size: int, beta: float, alpha: float) -> None:
     weight, update = _cpu_add_case(group_size=group_size, seed=623)
-    rotated_before = TorchAONVFP4Tensor.dequantize(weight, torch.float32)
+    rotated_before = PiperNVFP4Tensor.dequantize(weight, torch.float32)
     expected_dense = torch.add(
         rotated_before * beta,
         rotate_groups(update.float(), group_size),
         alpha=alpha,
     )
-    expected = TorchAONVFP4Tensor.to_nvfp4(
+    expected = PiperNVFP4Tensor.from_hp(
         expected_dense,
         block_size=weight.block_size,
-        per_tensor_scale=per_tensor_amax_to_scale(expected_dense.abs().amax()).clamp_min(
-            torch.finfo(torch.float32).tiny
-        ),
+        per_tensor_scale=nvfp4_layout.per_tensor_amax_to_scale(
+            expected_dense.abs().amax()
+        ).clamp_min(torch.finfo(torch.float32).tiny),
         act_per_tensor_scale=weight.act_per_tensor_scale,
         is_swizzled_scales=weight.is_swizzled_scales,
-        use_triton_kernel=False,
-        act_quant_kwargs=weight.act_quant_kwargs,
+        act_quant=weight.act_quant,
     )
     qdata = weight.qdata
     scale = weight.scale
@@ -650,22 +648,23 @@ def test_constructor_rejects_non_matrix_weight() -> None:
 def _cuda_case(
     dynamic: bool,
     group_size: int,
-) -> tuple[torch.Tensor, TorchAONVFP4Tensor, ConvRotNVFP4Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ConvRotNVFP4Tensor, torch.Tensor]:
     input = torch.randn(257, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
     logical_weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
     rotated_input = rotate_groups(input, group_size)
-    rotated_weight = rotate_groups(logical_weight, group_size)
-    activation_scale = None if dynamic else per_tensor_amax_to_scale(rotated_input.abs().amax())
-    torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
-        rotated_weight,
-        per_tensor_scale=per_tensor_amax_to_scale(rotated_weight.abs().amax()),
+    activation_scale = (
+        None if dynamic else nvfp4_layout.per_tensor_amax_to_scale(rotated_input.abs().amax())
+    )
+    weight = ConvRotNVFP4Tensor.from_hp(
+        logical_weight,
+        group_size=group_size,
+        compute_per_tensor_scale=True,
         act_per_tensor_scale=activation_scale,
         is_swizzled_scales=True,
-        act_quant_kwargs=_quantization(dynamic),
+        act_quant=_act_quant(dynamic),
     )
-    weight = ConvRotNVFP4Tensor.from_torchao(torchao_weight, group_size=group_size)
     bias = torch.randn(128, device="cuda", dtype=torch.bfloat16)
-    return input, torchao_weight, weight, bias
+    return input, weight, bias
 
 
 @pytest.mark.gpu
@@ -677,7 +676,7 @@ def test_cuda_linear_matches_materialized_rotation(
     dynamic: bool, group_size: int, dtype: torch.dtype
 ) -> None:
     torch.manual_seed(612 + group_size + dynamic)
-    activation, _torchao_weight, weight, bias = _cuda_case(dynamic, group_size)
+    activation, weight, bias = _cuda_case(dynamic, group_size)
     activation = activation.to(dtype)
     weight = weight.to(dtype)
     rotated_input = rotate_groups(activation.float(), group_size)
@@ -719,7 +718,7 @@ def test_cuda_linear_supports_mixed_precision_bias(
     compiled: bool,
 ) -> None:
     torch.manual_seed(616)
-    activation, _torchao_weight, weight, original_bias = _cuda_case(False, 64)
+    activation, weight, original_bias = _cuda_case(False, 64)
     bias = original_bias.to(bias_dtype)
 
     def projection(value: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
@@ -741,18 +740,17 @@ def test_cuda_linear_supports_mixed_precision_bias(
 @pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
 def test_cuda_high_first_linear_matches_low_first() -> None:
     torch.manual_seed(615)
-    activation, _torchao_weight, low, bias = _cuda_case(False, 64)
+    activation, low, bias = _cuda_case(False, 64)
     high = ConvRotNVFP4Tensor(
         ((low.qdata & 0x0F) << 4) | (low.qdata >> 4),
         low.scale,
         low.block_size,
-        low.orig_dtype,
+        low.dtype,
         low.group_size,
         low.per_tensor_scale,
         low.act_per_tensor_scale,
         low.is_swizzled_scales,
-        low.use_triton_kernel,
-        low.act_quant_kwargs,
+        low.act_quant,
         high_first=True,
     )
 
@@ -767,7 +765,7 @@ def test_cuda_high_first_linear_matches_low_first() -> None:
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_cuda_compile_preserves_semantic_linear(dynamic: bool) -> None:
     torch.manual_seed(613 + dynamic)
-    activation, _torchao_weight, weight, bias = _cuda_case(dynamic, 16)
+    activation, weight, bias = _cuda_case(dynamic, 16)
 
     def projection(value: torch.Tensor) -> torch.Tensor:
         return F.linear(value, weight, bias)
@@ -802,7 +800,7 @@ def test_cuda_autocast_normalizes_semantic_linear(
         group_size=16,
         compute_per_tensor_scale=True,
         is_swizzled_scales=True,
-        act_quant_kwargs=_quantization(True),
+        act_quant=_act_quant(True),
     )
     bias = torch.randn(128, device="cuda", dtype=torch.float32) * 0.01
 

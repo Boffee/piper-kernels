@@ -12,7 +12,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
 from piper_kernels import compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -36,12 +35,7 @@ def _weight(format_name, source, *, high_first=False, dynamic=True):
         compute_per_tensor_scale=True,
         is_swizzled_scales=True,
         act_per_tensor_scale=None if dynamic else torch.tensor(0.002, device=source.device),
-        act_quant_kwargs=QuantizeTensorToNVFP4Kwargs(
-            block_size=16,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=dynamic,
-        ),
+        act_quant="dynamic" if dynamic else "static",
         **({"group_size": 64} if cls is ConvRotNVFP4Tensor else {}),
     )
     if high_first:

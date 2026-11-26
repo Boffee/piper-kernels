@@ -3,8 +3,6 @@
 import pytest
 import torch
 from _accelerators import blackwell_cuda_available
-from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as TorchAONVFP4Tensor
-from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
@@ -100,7 +98,7 @@ def test_merge_retains_update_smaller_than_bfloat16_ulp(device):
     base = weight.dequantize(torch.float32)
     previous_scale = weight.per_tensor_scale.clone()
     update = torch.ones_like(base, dtype=torch.bfloat16)
-    expected_scale = per_tensor_amax_to_scale((base + 2**-10).abs().amax())
+    expected_scale = _layout.per_tensor_amax_to_scale((base + 2**-10).abs().amax())
 
     weight.add_(update, alpha=2**-10)
 
@@ -145,10 +143,10 @@ def test_update_matches_quantized_dense_reference(device, operation, group_size,
     weight = _weight(group_size, dtype=dtype, device=device)
     operands = _operands(weight, operation, strided=True)
     merged = _merged(weight, operands, operation, 0.375, 0.25)
-    global_scale = per_tensor_amax_to_scale(merged.float().abs().amax()).clamp_min(
+    global_scale = _layout.per_tensor_amax_to_scale(merged.float().abs().amax()).clamp_min(
         _layout.MIN_WEIGHT_GLOBAL_SCALE
     )
-    expected = TorchAONVFP4Tensor.to_nvfp4(
+    expected = PiperNVFP4Tensor.from_hp(
         merged.float(),
         per_tensor_scale=global_scale,
         is_swizzled_scales=True,
@@ -295,9 +293,9 @@ def test_partial_tiles_and_negative_coefficients(operation, group_size, rows, fe
     weight = _weight(group_size, rows=rows, features=features, swizzled=swizzled)
     operands = _operands(weight, operation, rank=3, strided=True)
     merged = _merged(weight, operands, operation, -0.5, -1)
-    expected = TorchAONVFP4Tensor.to_nvfp4(
+    expected = PiperNVFP4Tensor.from_hp(
         merged.float(),
-        per_tensor_scale=per_tensor_amax_to_scale(merged.abs().amax()),
+        per_tensor_scale=_layout.per_tensor_amax_to_scale(merged.abs().amax()),
         is_swizzled_scales=swizzled,
     )
 

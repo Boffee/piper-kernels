@@ -6,7 +6,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
-from torchao.utils import TorchAOBaseTensor
 
 from piper_kernels._validation import validate_finite_float
 from piper_kernels.stochastic_quantization import signed_seed
@@ -173,7 +172,7 @@ def run_add_(
     return weight
 
 
-def register_update_ops(cls: type[TorchAOBaseTensor], *, format_name: str) -> None:
+def register_update_ops(cls: type[QuantizedWeight], *, format_name: str) -> None:
     """Register ``aten.addmm_.default`` and ``aten.add_.Tensor`` to delegate to methods."""
 
     def _addmm_dispatch(

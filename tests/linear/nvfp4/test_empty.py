@@ -4,7 +4,6 @@ import pytest
 import torch
 from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
 from piper_kernels import compile_options
 from piper_kernels.linear.nvfp4 import _ops, reference
@@ -55,19 +54,13 @@ def test_empty_cuda_linear_matches_dense(dtype, dynamic, group_size, compiled, p
     torch._dynamo.reset()
     source = torch.ones(128, 256, device="cuda", dtype=dtype)
     scale = None if dynamic else torch.tensor(0.25, device="cuda")
-    quantization = QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=dynamic,
-    )
     factory = ConvRotNVFP4Tensor if group_size else PiperNVFP4Tensor
     weight = factory.from_hp(
         source.bfloat16(),
         compute_per_tensor_scale=True,
         act_per_tensor_scale=scale,
         is_swizzled_scales=True,
-        act_quant_kwargs=quantization,
+        act_quant="dynamic" if dynamic else "static",
         **({"group_size": group_size} if group_size else {}),
     ).to(dtype=dtype)
     bias = torch.ones(128, device="cuda", dtype=torch.float32)

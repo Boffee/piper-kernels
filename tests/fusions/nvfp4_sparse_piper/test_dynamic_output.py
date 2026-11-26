@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 import torch
 from _accelerators import exact_sm120_available
-from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor, per_tensor_amax_to_scale
 
 from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
     _sparse_piper_attention_from_quantized_op,
@@ -13,6 +12,7 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
 from piper_kernels.fusions.nvfp4_sparse_piper import output
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_ops
 from piper_kernels.linear.nvfp4 import _ops
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 from .._accuracy import assert_fusion_output_close
 from .test_output import _arguments
@@ -41,13 +41,10 @@ def test_dynamic_output_reuses_storage_and_replays(
     attention_args[11][1].add_(3)
     attention_args.extend(arguments[12:16])
     dense_weight = torch.randn((output_features, 256), device="cuda", dtype=torch.bfloat16)
-    weight = NVFP4Tensor.to_nvfp4(
+    weight = PiperNVFP4Tensor.from_hp(
         dense_weight,
-        per_tensor_scale=(
-            per_tensor_amax_to_scale(dense_weight.abs().amax()) if weight_global_scale else None
-        ),
+        compute_per_tensor_scale=weight_global_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
     )
     # Exercise both nibble orders without multiplying the whole test matrix.
     high_first = dtype is torch.float16

@@ -7,13 +7,6 @@ import torch
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    QuantizeTensorToNVFP4Kwargs,
-    per_tensor_amax_to_scale,
-)
 
 from piper_kernels import compile_options
 from piper_kernels.linear.convrot.nvfp4 import (
@@ -308,15 +301,6 @@ def test_compile_options_install_idempotent_pass() -> None:
     assert compile_options(options) == options
 
 
-def _quantization(dynamic: bool) -> QuantizeTensorToNVFP4Kwargs:
-    return QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=dynamic,
-    )
-
-
 @pytest.mark.gpu
 @pytest.mark.parametrize(("dynamic", "group_size"), [(False, 16), (True, 64)])
 @pytest.mark.skipif(
@@ -327,20 +311,23 @@ def test_cuda_compile_shares_three_projections(dynamic: bool, group_size: int) -
     torch.manual_seed(621 + group_size + dynamic)
     input = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
     rotated_input = rotate_groups(input, group_size)
-    activation_scale = None if dynamic else per_tensor_amax_to_scale(rotated_input.abs().amax())
+    activation_scale = (
+        None if dynamic else (rotated_input.abs().amax().to(torch.float32) / (448.0 * 6.0))
+    )
     weights = []
     biases = []
     for _ in range(3):
         dense_weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
-        rotated_weight = rotate_groups(dense_weight, group_size)
-        torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
-            rotated_weight,
-            per_tensor_scale=per_tensor_amax_to_scale(rotated_weight.abs().amax()),
-            act_per_tensor_scale=activation_scale,
-            is_swizzled_scales=True,
-            act_quant_kwargs=_quantization(dynamic),
+        weights.append(
+            ConvRotNVFP4Tensor.from_hp(
+                dense_weight,
+                compute_per_tensor_scale=True,
+                act_per_tensor_scale=activation_scale,
+                is_swizzled_scales=True,
+                act_quant="dynamic" if dynamic else "static",
+                group_size=group_size,
+            )
         )
-        weights.append(ConvRotNVFP4Tensor.from_torchao(torchao_weight, group_size=group_size))
         biases.append(torch.randn(128, device="cuda", dtype=torch.bfloat16))
 
     def projections(value: torch.Tensor) -> tuple[torch.Tensor, ...]:

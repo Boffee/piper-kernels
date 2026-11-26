@@ -5,9 +5,6 @@ import torch
 from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 from torch.utils._python_dispatch import TorchDispatchMode
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
 
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels.linear.convrot.nvfp4 import triton as convrot_nvfp4
@@ -16,6 +13,7 @@ from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.weights.convrot import triton as convrot_backend
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import triton as convrot_nvfp4_primitives
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 
@@ -328,7 +326,7 @@ def _dequantize_prepared_nvfp4(
     if high_first:
         qdata = nvfp4_layout.swap_packed_pairs(qdata)
     return (
-        TorchAONVFP4Tensor(qdata, scale, 16, torch.float32, is_swizzled_scales=True).dequantize(
+        PiperNVFP4Tensor(qdata, scale, 16, torch.float32, is_swizzled_scales=True).dequantize(
             torch.float32
         )
         * per_tensor_scale

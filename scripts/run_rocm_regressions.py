@@ -106,7 +106,6 @@ def _check_environment() -> None:
         "torch": torch.__version__,
         "hip": torch.version.hip,
         "triton": triton.__version__,
-        "torchao": version("torchao"),
         "pytest": version("pytest"),
         "gpu": torch.cuda.get_device_name(),
         "architecture": target.architecture,

@@ -74,7 +74,7 @@ def test_unsupported_device_does_not_allocate_inputs_or_models(monkeypatch):
     unexpected.assert_not_called()
 
 
-@pytest.mark.parametrize("dependency", ["torchao", "triton"])
+@pytest.mark.parametrize("dependency", ["triton"])
 def test_all_family_discovery_reports_missing_optional_dependencies(dependency):
     script = """
 import sys

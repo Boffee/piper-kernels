@@ -16,13 +16,6 @@ from _compile_capture import FunctionalTargetCapturePass, TargetCapturePass
 from torch._dynamo.utils import ReinplaceCounters
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    QuantizeTensorToNVFP4Kwargs,
-    per_tensor_amax_to_scale,
-)
 
 from piper_kernels import (
     SparsePiperAttention,
@@ -43,7 +36,6 @@ from piper_kernels.fusions.nvfp4_sparse_piper._output_compile import (
 )
 from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
-from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
@@ -59,18 +51,21 @@ _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 _GROUP_SIZES = [pytest.param(None, id="nvfp4"), pytest.param(64, id="convrot64")]
 
 
+def _amax_to_scale(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.float().abs().amax() / (448.0 * 6.0)
+
+
 def _convert_weight(weight: torch.Tensor, group_size: int) -> ConvRotNVFP4Tensor:
-    assert isinstance(weight, TorchAONVFP4Tensor)
+    assert isinstance(weight, PiperNVFP4Tensor)
     dense = weight.dequantize(torch.bfloat16)
-    rotated = rotate_groups(dense, group_size)
-    converted = TorchAONVFP4Tensor.to_nvfp4(
-        rotated,
-        per_tensor_scale=per_tensor_amax_to_scale(rotated.abs().amax()),
+    return ConvRotNVFP4Tensor.from_hp(
+        dense,
+        group_size=group_size,
+        compute_per_tensor_scale=True,
         act_per_tensor_scale=weight.act_per_tensor_scale,
         is_swizzled_scales=True,
-        act_quant_kwargs=weight.act_quant_kwargs,
+        act_quant=weight.act_quant,
     )
-    return ConvRotNVFP4Tensor.from_torchao(converted, group_size=group_size)
 
 
 class _SparseAttentionConfig(TypedDict, total=False):
@@ -124,13 +119,8 @@ class _SparseProjectionAttention(torch.nn.Module):
             device="cuda",
             dtype=torch.bfloat16,
         )
-        base_scale = per_tensor_amax_to_scale(calibration.abs().amax())
-        quantization = QuantizeTensorToNVFP4Kwargs(
-            block_size=16,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=dynamic,
-        )
+        base_scale = _amax_to_scale(calibration)
+        act_quant = "dynamic" if dynamic else "static"
         projections = []
         for index in range(3):
             dense = torch.randn(
@@ -138,12 +128,12 @@ class _SparseProjectionAttention(torch.nn.Module):
                 device="cuda",
                 dtype=torch.bfloat16,
             )
-            torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+            weight: torch.Tensor = PiperNVFP4Tensor.from_hp(
                 dense,
-                per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
+                compute_per_tensor_scale=True,
                 act_per_tensor_scale=(None if dynamic else base_scale * (1.0 + index * 0.01)),
                 is_swizzled_scales=True,
-                act_quant_kwargs=quantization,
+                act_quant=act_quant,
             )
             projection = torch.nn.Linear(
                 self.input_features,
@@ -152,7 +142,6 @@ class _SparseProjectionAttention(torch.nn.Module):
                 device="cuda",
                 dtype=torch.bfloat16,
             )
-            weight: torch.Tensor = PiperNVFP4Tensor.from_torchao(torchao_weight)
             if group_size is not None:
                 weight = _convert_weight(weight, group_size)
             projection.weight = torch.nn.Parameter(weight, requires_grad=False)
@@ -255,24 +244,18 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
             device="cuda",
             dtype=torch.bfloat16,
         )
-        activation_scale = per_tensor_amax_to_scale(calibration.abs().amax())
-        quantization = QuantizeTensorToNVFP4Kwargs(
-            block_size=16,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=output_dynamic,
-        )
+        activation_scale = _amax_to_scale(calibration)
         dense = torch.randn(
             (self.output_features, self.heads * self.head_dim),
             device="cuda",
             dtype=torch.bfloat16,
         )
-        torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+        weight: torch.Tensor = PiperNVFP4Tensor.from_hp(
             dense,
-            per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
+            compute_per_tensor_scale=True,
             act_per_tensor_scale=None if output_dynamic else activation_scale,
             is_swizzled_scales=True,
-            act_quant_kwargs=quantization,
+            act_quant="dynamic" if output_dynamic else "static",
         )
         self.output = torch.nn.Linear(
             self.heads * self.head_dim,
@@ -281,7 +264,6 @@ class _SparseProjectionAttentionOutput(_SparseProjectionAttention):
             device="cuda",
             dtype=torch.bfloat16,
         )
-        weight: torch.Tensor = PiperNVFP4Tensor.from_torchao(torchao_weight)
         if self.group_size is not None:
             weight = _convert_weight(weight, self.group_size)
         self.output.weight = torch.nn.Parameter(weight, requires_grad=False)
@@ -348,18 +330,18 @@ class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentio
     def __init__(self, **config: Unpack[_SparseOutputConfig]) -> None:
         super().__init__(**config)
         query_weight = self.query.weight
-        assert isinstance(query_weight, TorchAONVFP4Tensor)
+        assert isinstance(query_weight, PiperNVFP4Tensor)
         dense = torch.randn(
             (self.heads * self.head_dim, self.input_features),
             device="cuda",
             dtype=torch.bfloat16,
         )
-        torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+        weight: torch.Tensor = PiperNVFP4Tensor.from_hp(
             dense,
-            per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
+            compute_per_tensor_scale=True,
             act_per_tensor_scale=query_weight.act_per_tensor_scale,
             is_swizzled_scales=True,
-            act_quant_kwargs=query_weight.act_quant_kwargs,
+            act_quant=query_weight.act_quant,
         )
         self.gate = torch.nn.Linear(
             self.input_features,
@@ -368,7 +350,6 @@ class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentio
             device="cuda",
             dtype=torch.bfloat16,
         )
-        weight: torch.Tensor = PiperNVFP4Tensor.from_torchao(torchao_weight)
         if self.group_size is not None:
             weight = _convert_weight(weight, self.group_size)
         self.gate.weight = torch.nn.Parameter(weight, requires_grad=False)
@@ -394,7 +375,7 @@ class _ProjectedGateCoarseSparseAttentionOutput(_BoundedSparseProjectionAttentio
 
 
 def _nvfp4_storage(weight: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    assert isinstance(weight, TorchAONVFP4Tensor)
+    assert isinstance(weight, PiperNVFP4Tensor)
     return weight.qdata, weight.scale, weight.per_tensor_scale
 
 
@@ -403,12 +384,11 @@ def _prepare_nvfp4_input(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
     assert isinstance(weight, (PiperNVFP4Tensor, ConvRotNVFP4Tensor))
-    quantization = weight.act_quant_kwargs
-    assert quantization is not None
+    assert weight.act_quant is not None
     return nvfp4_ops.prepare_input(
         hidden_states,
         weight.act_per_tensor_scale,
-        quantization.use_dynamic_per_tensor_scale,
+        weight.act_quant == "dynamic",
         high_first=weight.high_first,
         group_size=weight.group_size if isinstance(weight, ConvRotNVFP4Tensor) else None,
     )
@@ -498,7 +478,7 @@ def _run_explicit_attention_output(
         )
     output_weight = model.output.weight
     if isinstance(output_weight, ConvRotNVFP4Tensor):
-        assert output_weight.act_quant_kwargs is not None
+        assert output_weight.act_quant is not None
         return convrot_nvfp4_ops.linear(
             attention.flatten(2),
             output_weight.qdata,
@@ -506,17 +486,16 @@ def _run_explicit_attention_output(
             output_weight.per_tensor_scale,
             output_weight.act_per_tensor_scale,
             model.output.bias,
-            output_weight.act_quant_kwargs.use_dynamic_per_tensor_scale,
+            output_weight.act_quant == "dynamic",
             output_weight.group_size,
             output_weight.high_first,
         )
     assert isinstance(output_weight, PiperNVFP4Tensor)
-    quantization = output_weight.act_quant_kwargs
-    assert quantization is not None
+    assert output_weight.act_quant is not None
     output_qdata, output_scale, output_per_tensor_scale = nvfp4_ops.prepare_input(
         attention.flatten(2),
         output_weight.act_per_tensor_scale,
-        quantization.use_dynamic_per_tensor_scale,
+        output_weight.act_quant == "dynamic",
         None,
         output_weight.high_first,
     )
@@ -1368,24 +1347,17 @@ class _SparseNvfp4ResidualBlock(torch.nn.Module):
         group_size: int | None,
     ) -> torch.nn.Linear:
         calibration = torch.full((1, 16, in_features), 3.0, device="cuda", dtype=torch.bfloat16)
-        quantization = QuantizeTensorToNVFP4Kwargs(
-            block_size=16,
-            is_swizzled_scales=True,
-            use_triton_kernel=False,
-            use_dynamic_per_tensor_scale=False,
-        )
         dense = torch.randn((out_features, in_features), device="cuda", dtype=torch.bfloat16)
-        torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+        weight: torch.Tensor = PiperNVFP4Tensor.from_hp(
             dense,
-            per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
-            act_per_tensor_scale=per_tensor_amax_to_scale(calibration.abs().amax()),
+            compute_per_tensor_scale=True,
+            act_per_tensor_scale=_amax_to_scale(calibration),
             is_swizzled_scales=True,
-            act_quant_kwargs=quantization,
+            act_quant="static",
         )
         layer = torch.nn.Linear(
             in_features, out_features, bias=False, device="cuda", dtype=torch.bfloat16
         )
-        weight: torch.Tensor = PiperNVFP4Tensor.from_torchao(torchao_weight)
         if group_size is not None:
             weight = _convert_weight(weight, group_size)
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)

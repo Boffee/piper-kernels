@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 import torch
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.nvfp4 import _layout
-from piper_kernels.weights.nvfp4._quantization import quantize_nvfp4
+from piper_kernels.weights.nvfp4._quantization import dequantize_nvfp4, quantize_nvfp4
 
 
 def prepare_input(
@@ -41,7 +37,7 @@ def prepare_input(
             global_scale,
         )
     global_scale = (
-        per_tensor_amax_to_scale(flattened.abs().amax())
+        _layout.per_tensor_amax_to_scale(flattened.abs().amax())
         if dynamic_activation_scale
         else activation_per_tensor_scale
     )
@@ -67,18 +63,12 @@ def linear_prepared(
     if input_qdata.shape[0] == 0:
         return input_qdata.new_empty((0, weight_qdata.shape[0]), dtype=logical_dtype)
 
-    def dequantize(qdata: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return TorchAONVFP4Tensor(
-            qdata,
-            scale,
-            _layout.BLOCK_SIZE,
-            torch.float32,
-            is_swizzled_scales=True,
-        ).dequantize(torch.float32)
-
     # Both operands have the same nibble ordering, so their dot product also
     # agrees when each adjacent pair is swapped in both dequantized tensors.
-    result = dequantize(input_qdata, input_scale) @ dequantize(weight_qdata, weight_scale).T
+    result = (
+        dequantize_nvfp4(input_qdata, input_scale, swizzled=True)
+        @ dequantize_nvfp4(weight_qdata, weight_scale, swizzled=True).T
+    )
     global_scale = input_per_tensor_scale
     if weight_per_tensor_scale is not None:
         global_scale = global_scale * weight_per_tensor_scale
@@ -133,14 +123,7 @@ def linear_w4a16(
         return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
     active = rotate_groups(input.float(), group_size) if group_size else input.float()
     flattened = active.reshape(-1, active.shape[-1])
-    packed_weight = _layout.swap_packed_pairs(weight_qdata) if high_first else weight_qdata
-    weight = TorchAONVFP4Tensor(
-        packed_weight,
-        weight_scale,
-        _layout.BLOCK_SIZE,
-        torch.float32,
-        is_swizzled_scales=True,
-    ).dequantize(torch.float32)
+    weight = dequantize_nvfp4(weight_qdata, weight_scale, swizzled=True, high_first=high_first)
     if weight_per_tensor_scale is not None:
         gs = weight_per_tensor_scale.to(device=weight.device, dtype=torch.float32)
         apply_early = gs.abs() < 1.0
