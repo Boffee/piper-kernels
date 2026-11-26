@@ -521,9 +521,30 @@ def test_trellis_sharding_boundary_rejections_and_meta():
         row_widths=full.row_widths,
     )
     with pytest.raises(ValueError, match="shorter than row_widths requires"):
-        shard_quantized_weight(truncated, dim=0, start=0, length=2)
+        shard_quantized_weight(truncated, dim=0, start=6, length=2)
+    with pytest.raises(ValueError, match="shorter than row_widths requires"):
+        shard_quantized_weight(truncated, dim=1, start=0, length=128)
     with pytest.raises(NotImplementedError, match="transposed"):
         shard_quantized_weight(full.t(), dim=0, start=0, length=2)
+
+    out_of_range = _trellis_weight(
+        rows=4,
+        features=256,
+        block_size=64,
+        group_size=64,
+        variable_rows=True,
+        widths=(1, 2, 1, 2),
+    )
+    assert shard_quantized_weight(out_of_range, dim=0, start=1, length=2).shape == (2, 256)
+    assert shard_quantized_weight(out_of_range, dim=1, start=64, length=128).shape == (4, 128)
+    assert out_of_range.row_widths is not None
+    assert trellis_row_shard_byte_range(
+        out_of_range.row_widths, blocks_per_row=4, start=1, length=2
+    ) == ByteRange(4, 12)
+    with pytest.raises(ValueError, match="variable-row widths"):
+        trellis_row_shard_byte_range(
+            out_of_range.row_widths, blocks_per_row=4, start=1, length=2, block_size=64
+        )
 
     noncontig_var = _trellis_weight(
         rows=8,

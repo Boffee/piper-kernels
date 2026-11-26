@@ -63,7 +63,12 @@ def _validate_trellis_row_widths(
         raise NotImplementedError(
             "ConvRot Trellis variable-row byte ranges require materialized row_widths"
         )
-    widths_cpu = row_widths.detach().to(device="cpu", dtype=torch.int64)
+    source_widths = (
+        row_widths[: start + length]
+        if size is None and start is not None and length is not None
+        else row_widths
+    )
+    widths_cpu = source_widths.detach().to(device="cpu", dtype=torch.int64)
     if size is not None:
         min_bytes = (MIN_BITS_PER_WEIGHT * size + 7) // 8
         max_bytes = (MAX_BITS_PER_WEIGHT * size) // 8
@@ -205,14 +210,15 @@ def _gather_variable_row_blocks(
     width_sum = int(widths_cpu.sum().item())
     total_required = width_sum * blocks_per_row
     total_out_bytes = width_sum * block_length
+    if total_out_bytes == 0:
+        return bitstreams.new_empty((0,))
     if block_start == 0 and block_length == blocks_per_row:
         return bitstreams.narrow(0, 0, total_required).clone(memory_format=torch.contiguous_format)
-    min_width = int(widths_cpu.min().item())
-    max_width = int(widths_cpu.max().item())
-    if min_width == max_width:
+    first_width = int(widths_cpu[0].item())
+    if bool((widths_cpu == first_width).all()):
         return (
             bitstreams.narrow(0, 0, total_required)
-            .view(rows, blocks_per_row, min_width)
+            .view(rows, blocks_per_row, first_width)
             .narrow(1, block_start, block_length)
             .clone(memory_format=torch.contiguous_format)
             .reshape(-1)
@@ -309,20 +315,25 @@ def _trellis_shard(
         return type(weight).__tensor_unflatten__(tensors, metadata, None, None)
 
     blocks_per_row = int(weight.block_scales.shape[1])
-    widths_cpu = _validate_trellis_row_widths(weight.row_widths, block_size=weight.block_size)
-    total_required = int(widths_cpu.sum().item()) * blocks_per_row
-    if total_required > weight.bitstreams.numel():
-        raise ValueError(
-            "ConvRot Trellis variable-row bitstreams is shorter than row_widths requires: "
-            f"need {total_required} bytes, got {weight.bitstreams.numel()}"
-        )
     if dim == 0:
+        widths_cpu = _validate_trellis_row_widths(
+            weight.row_widths,
+            block_size=None,
+            start=start,
+            length=length,
+        )
         byte_range = _row_shard_byte_range_from_widths(
             widths_cpu,
             blocks_per_row=blocks_per_row,
             start=start,
             length=length,
         )
+        required_end = byte_range.offset + byte_range.length
+        if required_end > weight.bitstreams.numel():
+            raise ValueError(
+                "ConvRot Trellis variable-row bitstreams is shorter than row_widths requires: "
+                f"need {required_end} bytes, got {weight.bitstreams.numel()}"
+            )
         bitstreams = weight.bitstreams.narrow(0, byte_range.offset, byte_range.length).clone(
             memory_format=torch.contiguous_format
         )
@@ -330,6 +341,13 @@ def _trellis_shard(
         scale = weight.scale.narrow(0, start, length)
         row_widths = weight.row_widths.narrow(0, start, length)
     else:
+        widths_cpu = _validate_trellis_row_widths(weight.row_widths, block_size=None)
+        total_required = int(widths_cpu.sum().item()) * blocks_per_row
+        if total_required > weight.bitstreams.numel():
+            raise ValueError(
+                "ConvRot Trellis variable-row bitstreams is shorter than row_widths requires: "
+                f"need {total_required} bytes, got {weight.bitstreams.numel()}"
+            )
         bitstreams = _gather_variable_row_blocks(
             weight.bitstreams,
             widths_cpu,
