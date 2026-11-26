@@ -42,6 +42,34 @@ def test_missing_implementation_retains_fallback(monkeypatch):
     assert _backend.select_backend(AcceleratorTarget("cuda", "sm120")) is None
 
 
+@pytest.mark.parametrize(
+    ("backend", "architecture", "expected"),
+    [
+        ("cuda", "sm75", None),
+        ("cuda", "sm80", "nvidia"),
+        ("cuda", "sm86", "nvidia"),
+        ("cuda", "sm89", "nvidia"),
+        ("cuda", "sm90", None),
+        ("cuda", "sm100", None),
+        ("cuda", "sm120", "nvidia"),
+        ("hip", "gfx942", None),
+        ("hip", "gfx1100", None),
+        ("hip", "gfx1151", None),
+        ("hip", "gfx1200", "amd"),
+        ("hip", "gfx1201", "amd"),
+        ("cpu", None, None),
+    ],
+)
+def test_prefill_backend_target_gating(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    architecture: str | None,
+    expected: str | None,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert _backend.prefill_backend(AcceleratorTarget(backend, architecture)) == expected
+
+
 def test_fake_execution_does_not_select_or_launch_backend(monkeypatch):
     assert piper_attention is not None
     forbid_device_probes(monkeypatch, "fake execution must not inspect hardware")

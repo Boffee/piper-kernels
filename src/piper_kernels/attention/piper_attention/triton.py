@@ -1,4 +1,4 @@
-"""Portable GQA-grouped Split-KV Triton decode kernels for chunked Piper KV pools."""
+"""GPU Split-KV decode and quantized chunked prefill Triton kernels for Piper KV pools."""
 
 # Triton's JIT launcher accepts compile-time options not represented in its
 # Python call signature.
@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 import triton
@@ -14,13 +15,17 @@ import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.attention.kernels.piper.triton import pack_amd_wmma_token
+from piper_kernels.attention.kernels.piper.triton import (
+    advance_tile_max_safe,
+    max_propagate_nan,
+    pack_amd_wmma_token,
+)
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
 
-from . import _backend
-from ._quantization import _div16_attrs
+from . import _backend, _quantization
+from ._quantization import _div16_attrs, compile_pointer_attrs
 
 _CENTER_CHUNK = 1024
 _VALUE_TILE_TOKENS = 64
@@ -33,6 +38,7 @@ _MAX_DECODE_SPLITS = 32
 _TARGET_ACTIVE_CTAS = 64
 _SPLIT_NUM_STAGES = 1
 _REDUCE_NUM_WARPS = 4
+_PREFILL_MIN_SEQ_Q = 64
 
 
 def _split_num_warps(head_dim: int) -> int:
@@ -47,36 +53,6 @@ _TL_VALUE_TILE_TOKENS = tl.constexpr(_VALUE_TILE_TOKENS)
 _TL_KEY_SCALES_GROUPED = tl.constexpr(_KEY_SCALES_GROUPED)
 _LOG2_E = tl.constexpr(1.4426950408889634)
 _LN2 = tl.constexpr(0.6931471805599453)
-
-
-@triton.jit
-def _is_nan(x):
-    return x != x  # noqa: PLR0124
-
-
-@triton.jit
-def _max_propagate_nan(a, b):
-    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
-
-
-@triton.jit
-def _two_term_softmax_step(m_prev, bias_prev, m_cur, bias_cur):
-    """Advance two-term base-2 winner state (m, bias) with exact NaN/same-bias handling."""
-    has_nan = _is_nan(m_cur + bias_cur)
-    m_clean = tl.where(has_nan, float("nan"), m_cur)
-    has_cur = ((m_clean != -float("inf")) & (bias_cur != -float("inf"))) | has_nan
-    has_prev = m_prev != -float("inf")
-    bias_diff = tl.where(bias_cur == bias_prev, 0.0, bias_cur - bias_prev)
-    raw_delta = (m_clean - m_prev) + bias_diff
-    delta = tl.where(has_cur, tl.where(has_prev, raw_delta, float("inf")), -float("inf"))
-    cur_wins = (delta > 0.0) | has_nan
-    m_next = tl.where(cur_wins, m_clean, m_prev)
-    bias_next = tl.where(cur_wins, bias_cur, bias_prev)
-    decay = tl.math.exp2(-tl.abs(delta))
-    old_weight = tl.where(has_prev, tl.where(cur_wins, decay, 1.0), 0.0)
-    cur_weight = tl.where(has_cur, tl.where(cur_wins, 1.0, decay), 0.0)
-    safe_m_cur = tl.where(has_cur, m_clean, 0.0)
-    return m_next, bias_next, old_weight, cur_weight, has_cur, has_nan, safe_m_cur
 
 
 @triton.jit
@@ -273,9 +249,9 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
                         k_scale = tl.load(ks_base + rows)
                         scores = qk * (k_scale[None, :] * scaled_log2)
 
-                    m_block = tl.reduce(scores, 1, _max_propagate_nan)
-                    m_i, bias_i, old_weight, cur_weight, has_block, _, safe_m_block = (
-                        _two_term_softmax_step(m_i, bias_i, m_block, chunk_bias)
+                    m_block = tl.reduce(scores, 1, max_propagate_nan)
+                    m_i, bias_i, old_weight, cur_weight, has_block, safe_m_block = (
+                        advance_tile_max_safe(m_i, bias_i, m_block, chunk_bias)
                     )
                     chunk_has_block = chunk_has_block | has_block
                     p = tl.where(
@@ -470,7 +446,7 @@ def _piper_decode_tail_split_kernel(  # noqa: PLR0915
                 valid_mask = valid_n[None, :]
 
             masked_scores = tl.where(valid_mask, scores, -float("inf"))
-            m_block = tl.reduce(masked_scores, 1, _max_propagate_nan)
+            m_block = tl.reduce(masked_scores, 1, max_propagate_nan)
             has_block = m_block != -float("inf")  # pyright: ignore[reportOperatorIssue]
             has_prev = m_i != -float("inf")
             m_new = tl.maximum(m_i, m_block, propagate_nan=tl.PropagateNan.ALL)
@@ -574,11 +550,12 @@ def _piper_decode_splitkv_reduce_kernel(
         s64 = split_idx.to(tl.int64)
         m_s = tl.load(partial_lse_ptr + pl_offset + s64)
         b_s = tl.load(partial_bias_ptr + pl_offset + s64)
-        m_win, bias_win, old_w, cur_w, has_s, has_nan_s, _ = _two_term_softmax_step(
+        m_win, bias_win, old_w, cur_w, has_s, safe_m_s = advance_tile_max_safe(
             m_win, bias_win, m_s, b_s
         )
 
         out_s = tl.load(po_base + s64 * stride_pop + offsets_d)
+        has_nan_s = safe_m_s != safe_m_s  # noqa: PLR0124
         safe_out_s = tl.where(has_nan_s, float("nan"), tl.where(has_s, out_s, 0.0))
         old_num = denom * old_w
         denom = old_num + cur_w
@@ -598,6 +575,405 @@ def _piper_decode_splitkv_reduce_kernel(
     out_ptrs = output_ptr + b64 * stride_ob + qh64 * stride_oh + qi64 * stride_os + offsets_d
     tl.store(out_ptrs, final_out.to(output_ptr.dtype.element_ty))
     tl.store(lse_ptr + b64 * stride_lb + qh64 * stride_lh + qi64, final_lse)
+
+
+@triton.jit
+def _merge_two_attention_waves_kernel(
+    out_a_ptr,
+    lse_a_ptr,
+    out_b_ptr,
+    lse_b_ptr,
+    head_dim: tl.constexpr,
+):
+    """Merge contiguous attention wave ``B`` into wave ``A`` in-place via normalized LSE weights."""
+    row = tl.program_id(0).to(tl.int64)
+    la = tl.load(lse_a_ptr + row)
+    lb = tl.load(lse_b_ptr + row)
+    nan_a = la != la  # noqa: PLR0124
+    nan_b = lb != lb  # noqa: PLR0124
+    has_nan = nan_a | nan_b
+    valid_a = (la != -float("inf")) & (~nan_a)
+    valid_b = (lb != -float("inf")) & (~nan_b)
+    only_a = valid_a & (~valid_b) & (~has_nan)
+    if not only_a:
+        offsets_d = tl.arange(0, head_dim)
+        out_a_ptrs = out_a_ptr + row * head_dim + offsets_d
+        out_b_ptrs = out_b_ptr + row * head_dim + offsets_d
+        only_b = valid_b & (~valid_a) & (~has_nan)
+        both_valid = valid_a & valid_b
+        if has_nan:
+            nan_vec = tl.full((head_dim,), float("nan"), dtype=tl.float32)
+            tl.store(out_a_ptrs, nan_vec.to(out_a_ptr.dtype.element_ty))
+            tl.store(lse_a_ptr + row, float("nan"))
+        elif only_b:
+            ob = tl.load(out_b_ptrs)
+            tl.store(out_a_ptrs, ob.to(out_a_ptr.dtype.element_ty))
+            tl.store(lse_a_ptr + row, lb)
+        elif both_valid:
+            max_l = tl.maximum(la, lb)
+            wa = tl.math.exp(la - max_l)
+            wb = tl.math.exp(lb - max_l)
+            denom = wa + wb
+            na = wa / denom
+            nb = wb / denom
+            oa = tl.load(out_a_ptrs).to(tl.float32)
+            ob = tl.load(out_b_ptrs).to(tl.float32)
+            merged_out = oa * na + ob * nb
+            merged_lse = max_l + tl.math.log(denom)
+            tl.store(out_a_ptrs, merged_out.to(out_a_ptr.dtype.element_ty))
+            tl.store(lse_a_ptr + row, merged_lse)
+        else:
+            zero_vec = tl.zeros((head_dim,), dtype=tl.float32)
+            tl.store(out_a_ptrs, zero_vec.to(out_a_ptr.dtype.element_ty))
+            tl.store(lse_a_ptr + row, -float("inf"))
+
+
+def _merge_two_attention_waves(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+) -> None:
+    total_rows = out_a.shape[0] * out_a.shape[1] * out_a.shape[2]
+    if total_rows == 0:
+        return
+    head_dim = out_a.shape[3]
+    with device_context(out_a.device):
+        _merge_two_attention_waves_kernel[(total_rows,)](
+            out_a,
+            lse_a,
+            out_b,
+            lse_b,
+            head_dim=head_dim,
+            num_warps=_REDUCE_NUM_WARPS,
+        )
+
+
+def _validate_prefill_backend(
+    prefill_backend: Literal["amd", "nvidia"],
+    *,
+    grouped_qk: bool,
+    pack_wmma: bool,
+) -> None:
+    if prefill_backend not in ("amd", "nvidia"):
+        raise ValueError(f"prefill_backend must be 'amd' or 'nvidia', got {prefill_backend!r}")
+    if pack_wmma != (prefill_backend == "amd"):
+        raise ValueError(
+            f"pack_wmma ({pack_wmma}) must match prefill_backend ({prefill_backend!r})"
+        )
+    if prefill_backend == "amd" and not grouped_qk:
+        raise ValueError("AMD chunked prefill requires grouped_qk=True")
+
+
+def _pool_slot_strides(
+    key_int8: torch.Tensor,
+    key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    value_int8: torch.Tensor,
+    value_scale: torch.Tensor,
+    value_mean: torch.Tensor,
+    chunk_to_slot: torch.Tensor | None,
+    num_chunks: torch.Tensor,
+    *,
+    batch: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    bool,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+]:
+    """Return signed pool views, slot-map flag/cap, and zeroed slot/batch strides."""
+    num_slots = key_int8.shape[0]
+    has_chunk_map = chunk_to_slot is not None
+    max_chunks = num_slots if chunk_to_slot is None else chunk_to_slot.shape[1]
+    cs_tensor = chunk_to_slot if chunk_to_slot is not None else num_chunks
+    key_i8_s = key_int8.view(torch.int8)
+    val_i8_s = value_int8.view(torch.int8)
+    return (
+        key_i8_s,
+        val_i8_s,
+        cs_tensor,
+        has_chunk_map,
+        max_chunks,
+        0 if num_slots <= 1 else key_i8_s.stride(0),
+        0 if num_slots <= 1 else key_scale.stride(0),
+        0 if num_slots <= 1 else key_center.stride(0),
+        0 if num_slots <= 1 else val_i8_s.stride(0),
+        0 if num_slots <= 1 else value_scale.stride(0),
+        0 if num_slots <= 1 else value_mean.stride(0),
+        0 if (not has_chunk_map or batch <= 1) else cs_tensor.stride(0),
+        1 if not has_chunk_map else cs_tensor.stride(1),
+    )
+
+
+def _launch_frozen_pool_prefill(
+    query_int8: torch.Tensor,
+    query_scale: torch.Tensor,
+    key_int8: torch.Tensor,
+    key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    value_int8: torch.Tensor,
+    value_scale: torch.Tensor,
+    value_mean: torch.Tensor,
+    chunk_to_slot: torch.Tensor | None,
+    num_chunks: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    seq_q: int,
+    grouped_qk: bool,
+    prefill_backend: Literal["amd", "nvidia"],
+    target: AcceleratorTarget | None,
+) -> None:
+    """Assemble pool views and strides once and dispatch the backend frozen-pool kernel."""
+    batch, q_heads, _, head_dim = output.shape
+    num_slots, kv_heads, _, _ = key_int8.shape
+    query_storage = query_int8.shape[2]
+    (
+        key_i8_s,
+        val_i8_s,
+        cs_tensor,
+        has_chunk_map,
+        max_chunks,
+        stride_ki_s,
+        stride_ks_s,
+        stride_kc_s,
+        stride_vi_s,
+        stride_vs_s,
+        stride_vm_s,
+        stride_cs_b,
+        stride_cs_c,
+    ) = _pool_slot_strides(
+        key_int8,
+        key_scale,
+        key_center,
+        value_int8,
+        value_scale,
+        value_mean,
+        chunk_to_slot,
+        num_chunks,
+        batch=batch,
+    )
+    common_args: tuple[object, ...] = (
+        query_int8,
+        query_scale,
+        key_i8_s,
+        key_scale,
+        key_center,
+        val_i8_s,
+        value_scale,
+        value_mean,
+        cs_tensor,
+        num_chunks,
+        output,
+        lse,
+        seq_q,
+        query_storage,
+        q_heads,
+        num_slots,
+        max_chunks,
+        stride_ki_s,
+        stride_ks_s,
+        stride_kc_s,
+        stride_vi_s,
+        stride_vs_s,
+        stride_vm_s,
+        stride_cs_b,
+        stride_cs_c,
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        lse.stride(0),
+        lse.stride(1),
+    )
+    gqa_group = q_heads // kv_heads
+    if prefill_backend == "amd":
+        from ._amd import gluon as amd_gluon  # noqa: PLC0415
+
+        amd_gluon.launch_frozen_pool_kernel(
+            common_args,
+            device=query_int8.device,
+            batch=batch,
+            q_heads=q_heads,
+            seq_q=seq_q,
+            query_storage=query_storage,
+            gqa_group=gqa_group,
+            head_dim=head_dim,
+            has_chunk_map=has_chunk_map,
+        )
+    else:
+        from ._nvidia import triton as nvidia_triton  # noqa: PLC0415
+
+        nvidia_triton.launch_prefill_kernel(
+            common_args,
+            device=query_int8.device,
+            batch=batch,
+            q_heads=q_heads,
+            seq_q=seq_q,
+            gqa_group=gqa_group,
+            head_dim=head_dim,
+            grouped_qk=grouped_qk,
+            has_chunk_map=has_chunk_map,
+            is_tail=False,
+            is_causal=False,
+            target=target,
+        )
+
+
+def _run_chunked_prefill(
+    query: torch.Tensor,
+    key_int8: torch.Tensor,
+    key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    value_int8: torch.Tensor,
+    value_scale: torch.Tensor,
+    value_mean: torch.Tensor,
+    chunk_to_slot: torch.Tensor | None,
+    num_chunks: torch.Tensor,
+    *,
+    tail_key: torch.Tensor | None,
+    tail_value: torch.Tensor | None,
+    tail_len: torch.Tensor | None,
+    scale: float,
+    is_causal: bool,
+    grouped_qk: bool,
+    pack_wmma: bool,
+    prefill_backend: Literal["amd", "nvidia"],
+    target: AcceleratorTarget | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run quantized chunked prefill over finalized pool slots plus optional live tail."""
+    batch, q_heads, seq_q, head_dim = query.shape
+    num_slots = key_int8.shape[0]
+    max_chunks = num_slots if chunk_to_slot is None else chunk_to_slot.shape[1]
+    tail_cap = 0 if tail_key is None else tail_key.shape[2]
+    has_chunks = max_chunks > 0 and num_slots > 0
+    has_tail = tail_cap > 0
+
+    output = torch.empty((batch, q_heads, seq_q, head_dim), device=query.device, dtype=query.dtype)
+    lse = torch.empty((batch, q_heads, seq_q), device=query.device, dtype=torch.float32)
+    if batch == 0:
+        return output, lse
+    if not has_chunks and not has_tail:
+        output.zero_()
+        lse.fill_(-float("inf"))
+        return output, lse
+
+    storage_q = triton.cdiv(seq_q, 64) * 64
+    if prefill_backend == "amd":
+        from piper_kernels.attention.kernels.piper._amd import (  # noqa: PLC0415
+            quantization as amd_quantization,
+        )
+
+        query_int8, query_scale = amd_quantization.prepare_query(
+            query, scale, storage_sequence_length=storage_q
+        )
+    else:
+        with device_context(query.device):
+            query_int8, query_scale = qk_quantization.prepare_query(
+                query, scale, grouped=grouped_qk, storage_query_length=storage_q
+            )
+
+    if has_chunks:
+        _launch_frozen_pool_prefill(
+            query_int8,
+            query_scale,
+            key_int8,
+            key_scale,
+            key_center,
+            value_int8,
+            value_scale,
+            value_mean,
+            chunk_to_slot,
+            num_chunks,
+            output,
+            lse,
+            seq_q=seq_q,
+            grouped_qk=grouped_qk,
+            prefill_backend=prefill_backend,
+            target=target,
+        )
+
+    if has_tail:
+        assert tail_key is not None
+        assert tail_value is not None
+        assert tail_len is not None
+        tail_storage = triton.cdiv(tail_cap, 64) * 64
+        tail_k_int8, tail_k_scale, tail_k_center = _quantization.prepare_chunk_centered_key(
+            tail_key,
+            grouped=grouped_qk,
+            storage_key_length=tail_storage,
+            scale_storage_length=tail_storage,
+            key_lengths=tail_len,
+        )
+        tail_v_int8, tail_v_scale_or_mult, tail_v_log_scale, tail_v_mean = (
+            _quantization.prepare_chunk_centered_value(
+                tail_value,
+                storage_key_length=tail_storage,
+                store_log_scale=pack_wmma,
+                scale_storage_length=tail_storage,
+                pack_wmma=pack_wmma,
+                log_scale_dtype=torch.float32,
+                tile_layout=True,
+                scale_by_p_range=pack_wmma,
+                key_lengths=tail_len,
+            )
+        )
+        out_tail = torch.empty_like(output) if has_chunks else output
+        lse_tail = torch.empty_like(lse) if has_chunks else lse
+        if prefill_backend == "amd":
+            from ._amd import gluon as amd_gluon  # noqa: PLC0415
+
+            amd_gluon.launch_tail_prefill(
+                query_int8,
+                query_scale,
+                tail_k_int8,
+                tail_k_scale,
+                tail_k_center,
+                tail_v_int8,
+                tail_v_scale_or_mult,
+                tail_v_log_scale,
+                tail_v_mean,
+                tail_len,
+                out_tail,
+                lse_tail,
+                seq_q=seq_q,
+                tail_cap=tail_cap,
+                is_causal=is_causal,
+            )
+        else:
+            from ._nvidia import triton as nvidia_triton  # noqa: PLC0415
+
+            nvidia_triton.launch_tail_prefill(
+                query_int8,
+                query_scale,
+                tail_k_int8,
+                tail_k_scale,
+                tail_k_center,
+                tail_v_int8,
+                tail_v_scale_or_mult,
+                tail_v_mean,
+                tail_len,
+                out_tail,
+                lse_tail,
+                seq_q=seq_q,
+                tail_cap=tail_cap,
+                is_causal=is_causal,
+                grouped_qk=grouped_qk,
+                target=target,
+            )
+        if has_chunks:
+            _merge_two_attention_waves(output, lse, out_tail, lse_tail)
+
+    return output, lse
 
 
 def _select_split_counts(
@@ -649,9 +1025,34 @@ def piper_attention_decode_triton(
     grouped_qk: bool,
     pack_wmma: bool,
     active_chunks_hint: int,
+    prefill_backend: Literal["amd", "nvidia"] | None = None,
+    target: AcceleratorTarget | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Execute GQA-grouped Split-KV decode and deterministic LSE reduction on GPU."""
+    """Execute GQA-grouped Split-KV decode or quantized chunked prefill on GPU."""
+    if prefill_backend is not None:
+        _validate_prefill_backend(prefill_backend, grouped_qk=grouped_qk, pack_wmma=pack_wmma)
     batch, q_heads, seq_q, head_dim = query.shape
+    if seq_q >= _PREFILL_MIN_SEQ_Q and prefill_backend is not None:
+        return _run_chunked_prefill(
+            query,
+            key_int8,
+            key_scale,
+            key_center,
+            value_int8,
+            value_scale,
+            value_mean,
+            chunk_to_slot,
+            num_chunks,
+            tail_key=tail_key,
+            tail_value=tail_value,
+            tail_len=tail_len,
+            scale=scale,
+            is_causal=is_causal,
+            grouped_qk=grouped_qk,
+            pack_wmma=pack_wmma,
+            prefill_backend=prefill_backend,
+            target=target,
+        )
     num_slots, kv_heads, _, _ = key_int8.shape
     gqa_group = q_heads // kv_heads
 
@@ -696,19 +1097,31 @@ def piper_attention_decode_triton(
 
     with device_context(query.device):
         if int8_splits > 0:
-            has_chunk_map = chunk_to_slot is not None
-            cs_tensor = chunk_to_slot if chunk_to_slot is not None else num_chunks
-            key_i8_s = key_int8.view(torch.int8)
-            val_i8_s = value_int8.view(torch.int8)
-
-            stride_ki_s = 0 if num_slots <= 1 else key_i8_s.stride(0)
-            stride_ks_s = 0 if num_slots <= 1 else key_scale.stride(0)
-            stride_kc_s = 0 if num_slots <= 1 else key_center.stride(0)
-            stride_vi_s = 0 if num_slots <= 1 else val_i8_s.stride(0)
-            stride_vs_s = 0 if num_slots <= 1 else value_scale.stride(0)
-            stride_vm_s = 0 if num_slots <= 1 else value_mean.stride(0)
-            stride_cs_b = 0 if (not has_chunk_map or batch <= 1) else cs_tensor.stride(0)
-            stride_cs_c = 1 if not has_chunk_map else cs_tensor.stride(1)
+            (
+                key_i8_s,
+                val_i8_s,
+                cs_tensor,
+                has_chunk_map,
+                _,
+                stride_ki_s,
+                stride_ks_s,
+                stride_kc_s,
+                stride_vi_s,
+                stride_vs_s,
+                stride_vm_s,
+                stride_cs_b,
+                stride_cs_c,
+            ) = _pool_slot_strides(
+                key_int8,
+                key_scale,
+                key_center,
+                value_int8,
+                value_scale,
+                value_mean,
+                chunk_to_slot,
+                num_chunks,
+                batch=batch,
+            )
 
             _piper_decode_frozen_split_kernel[(batch * kv_heads * q_tiles, int8_splits)](
                 query,
@@ -1034,7 +1447,79 @@ def compile_kv_decode_kernels(
     )
 
 
+def compile_kv_prefill_kernels(
+    target: object,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 128,
+    has_chunk_map: bool = True,
+    is_causal: bool = True,
+    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
+) -> tuple[object, ...]:
+    """Offline-compile two-wave merge and native chunked prefill kernels for ``target``."""
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"dtype must be float16 or bfloat16, got {dtype}")
+    if head_dim not in (64, 128):
+        raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
+
+    from triton.compiler import ASTSource  # noqa: PLC0415 - compile-only dependency
+
+    triton_dtype = "bf16" if dtype is torch.bfloat16 else "fp16"
+    compiler = triton.compile if compile_fn is None else compile_fn
+    merge_constants: dict[str, object] = {"head_dim": head_dim}
+    merge_sig = {
+        "out_a_ptr": f"*{triton_dtype}",
+        "lse_a_ptr": "*fp32",
+        "out_b_ptr": f"*{triton_dtype}",
+        "lse_b_ptr": "*fp32",
+    }
+    merge_attrs = compile_pointer_attrs(_merge_two_attention_waves_kernel.arg_names, merge_sig)
+    merge_compiled = compiler(
+        ASTSource(
+            _merge_two_attention_waves_kernel,
+            merge_sig,
+            constexprs=merge_constants,
+            attrs=merge_attrs,
+        ),
+        target,
+        {"num_warps": _REDUCE_NUM_WARPS},
+    )
+
+    accel = AcceleratorTarget.from_compiler_target(target)
+    backend = _backend.prefill_backend(accel)
+    if backend == "amd":
+        from ._amd import gluon as amd_gluon  # noqa: PLC0415
+
+        return (
+            merge_compiled,
+            *amd_gluon.compile_amd_prefill_kernels(
+                target,
+                dtype=dtype,
+                head_dim=head_dim,
+                has_chunk_map=has_chunk_map,
+                is_causal=is_causal,
+                compile_fn=compile_fn,
+            ),
+        )
+    if backend == "nvidia":
+        from ._nvidia import triton as nvidia_triton  # noqa: PLC0415
+
+        return (
+            merge_compiled,
+            *nvidia_triton.compile_nvidia_prefill_kernels(
+                target,
+                dtype=dtype,
+                head_dim=head_dim,
+                has_chunk_map=has_chunk_map,
+                is_causal=is_causal,
+                compile_fn=compile_fn,
+            ),
+        )
+    return (merge_compiled,)
+
+
 __all__ = [
     "compile_kv_decode_kernels",
+    "compile_kv_prefill_kernels",
     "piper_attention_decode_triton",
 ]
