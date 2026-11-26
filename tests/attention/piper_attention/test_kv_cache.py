@@ -20,8 +20,10 @@ from _accelerators import (
 )
 from torch._dynamo.testing import CompileCounterWithBackend
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.autograd import forward_ad
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.nn import functional as fn
+from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels import (
@@ -1079,6 +1081,70 @@ def test_freeze_rejects_inference_pool_outside_inference_mode() -> None:
     assert _pool_versions(normal_pool) == versions_before
     _assert_pools_exact(normal_pool, snap)
     torch.testing.assert_close(mixed_inf_value_mean, inf_snap, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("use_inference_mode", [False, True])
+def test_freeze_torch_function_mode_swap_cannot_bypass_validation(
+    use_inference_mode: bool,
+) -> None:
+    base = PiperKVChunkPool.empty(2, 2, 64, device="cpu", kv_dtype=torch.uint8)
+    arena = torch.empty(2 * 2 * KV_CHUNK_TOKENS * 64 + 256 * 1024, dtype=torch.uint8)
+    pool_arena = PiperKVChunkPool.from_tensors(
+        arena[: 2 * 2 * KV_CHUNK_TOKENS * 64].view(2, 2, KV_CHUNK_TOKENS, 64),
+        base.key_scale,
+        base.key_center,
+        base.value_int8,
+        base.value_scale,
+        base.value_mean,
+    )
+    _fill_pool_sentinels(pool_arena)
+    snap = _clone_pool(pool_arena)
+    versions_before = _pool_versions(pool_arena)
+
+    k_ok = torch.randn((1, 2, KV_CHUNK_TOKENS, 64), dtype=torch.bfloat16)
+    v_ok = torch.randn_like(k_ok)
+    slots_ok = torch.tensor([0], dtype=torch.int32)
+    overlap_k = (
+        arena[: 1 * 2 * KV_CHUNK_TOKENS * 64 * 2]
+        .view(torch.bfloat16)
+        .view(1, 2, KV_CHUNK_TOKENS, 64)
+    )
+
+    class _SwapKeyMode(TorchFunctionMode):
+        def __init__(self, replacement_key: torch.Tensor) -> None:
+            self.replacement_key = replacement_key
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            if func is torch.ops.piper_kernels.piper_kv_freeze_.default:
+                args = (self.replacement_key, *args[1:])
+            return func(*args, **(kwargs or {}))
+
+    ctx = torch.inference_mode() if use_inference_mode else torch.no_grad()
+    with ctx:
+        with _SwapKeyMode(k_ok.float()), pytest.raises(ValueError, match="float16 or bfloat16"):
+            freeze_kv_chunks_(k_ok, v_ok, pool_arena, slots_ok)
+        with (
+            _SwapKeyMode(overlap_k),
+            pytest.raises(ValueError, match="must not overlap key_int8"),
+        ):
+            freeze_kv_chunks_(k_ok, v_ok, pool_arena, slots_ok)
+        if not use_inference_mode:
+            with forward_ad.dual_level():
+                k_dual = forward_ad.make_dual(k_ok, torch.ones_like(k_ok))
+                with pytest.raises(RuntimeError, match="inference-only"):
+                    freeze_kv_chunks_(k_dual, v_ok, pool_arena, slots_ok)
+                with _SwapKeyMode(k_dual), pytest.raises(RuntimeError, match="inference-only"):
+                    freeze_kv_chunks_(k_ok, v_ok, pool_arena, slots_ok)
+    if not use_inference_mode:
+        with (
+            _SwapKeyMode(k_ok.clone().requires_grad_(True)),
+            pytest.raises(RuntimeError, match="inference-only"),
+        ):
+            freeze_kv_chunks_(k_ok, v_ok, pool_arena, slots_ok)
+
+    if not use_inference_mode:
+        assert _pool_versions(pool_arena) == versions_before
+    _assert_pools_exact(pool_arena, snap)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

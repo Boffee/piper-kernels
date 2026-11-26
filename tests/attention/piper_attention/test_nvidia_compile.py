@@ -207,6 +207,7 @@ def test_nvidia_value_preparation_accepts_runtime_head_count(architecture, head_
 _KV_COMPILE_TARGETS = (
     GPUTarget("cuda", 75, 32),
     GPUTarget("cuda", 80, 32),
+    GPUTarget("cuda", 86, 32),
     GPUTarget("cuda", 89, 32),
     GPUTarget("cuda", 120, 32),
     GPUTarget("hip", "gfx942", 64),
@@ -421,4 +422,75 @@ def test_kv_tail_quantize_prefill_compile_zero_spills(
         lambda compile_fn: _quantization.compile_kv_tail_quantize_kernels(
             target, dtype=dtype, head_dim=head_dim, compile_fn=compile_fn
         ),
+    )
+
+
+def test_kv_freeze_and_decode_gfx1200_smoke() -> None:
+    tgt = GPUTarget("hip", "gfx1200", 32)
+    _assert_zero_spill_kernels(
+        tgt,
+        2,
+        lambda compile_fn: _quantization.compile_kv_freeze_kernels(
+            tgt, dtype=torch.bfloat16, head_dim=128, compile_fn=compile_fn
+        ),
+        check_sgpr_spills=False,
+    )
+    _assert_zero_spill_kernels(
+        tgt,
+        3,
+        lambda compile_fn: compile_kv_decode_kernels(
+            tgt, dtype=torch.bfloat16, head_dim=128, compile_fn=compile_fn
+        ),
+    )
+
+
+_WIDE_POOL_DECODE_TARGETS = (
+    *[t for t in _KV_COMPILE_TARGETS if t.backend == "cuda"],
+    GPUTarget("hip", "gfx1201", 32),
+)
+
+
+@pytest.mark.parametrize("target", _KV_PREFILL_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_wide_pool_prefill_compile_zero_spills(
+    monkeypatch: pytest.MonkeyPatch,
+    target: GPUTarget,
+    head_dim: int,
+) -> None:
+    if target.backend == "cuda":
+        monkeypatch.setattr(
+            triton.knobs.runtime, "add_stages_inspection_hook", _MixedInt8StageHook(None)
+        )
+    _assert_zero_spill_kernels(
+        target,
+        3,
+        lambda compile_fn: compile_kv_prefill_kernels(
+            target,
+            dtype=torch.bfloat16,
+            head_dim=head_dim,
+            wide_pool=True,
+            compile_fn=compile_fn,
+        ),
+        check_sgpr_spills=True,
+    )
+
+
+@pytest.mark.parametrize("target", _WIDE_POOL_DECODE_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_wide_pool_decode_compile_zero_spills(
+    target: GPUTarget,
+    head_dim: int,
+) -> None:
+    # Wide i64 pool strides trigger a benign 4-SGPR-to-VGPR spill on gfx1201 D=128 (0 VGPR/scratch).
+    _assert_zero_spill_kernels(
+        target,
+        3,
+        lambda compile_fn: compile_kv_decode_kernels(
+            target,
+            dtype=torch.bfloat16,
+            head_dim=head_dim,
+            wide_pool=True,
+            compile_fn=compile_fn,
+        ),
+        check_sgpr_spills=not (target.backend == "hip" and head_dim == 128),
     )

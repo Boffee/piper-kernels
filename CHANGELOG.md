@@ -24,6 +24,20 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- `piper_attention`, `freeze_kv_chunks_`, and `piper_attention_decode`: guarded causal
+  masked `+inf` `k_bias` tiles in NVIDIA Triton and AMD Gluon chunked prefill so
+  masked-out future key tiles cannot poison active rows with `(-inf) + (+inf) = NaN`,
+  fixed normalized two-wave FP32 LSE merging when one wave has `+inf` LSE and the
+  other is finite (preserving `NaN` when both waves are `+inf`), and parenthesized
+  `(query_scale * key_scale)` on SM8x `grouped_qk=False` score scaling in both dense
+  attention and chunked prefill. Tightened `freeze_kv_chunks_` and
+  `piper_attention_decode` boundary validation with operand-`id`-keyed single-use
+  tokens (preventing `TorchFunctionMode`/`TorchDispatchMode` bypass while preserving
+  `meta`/zero-pool/non-overlapping contracts under `torch.compile`) and expanded
+  offline zero-spill compile coverage to `sm86`, `gfx1200`, and wide-pool `i64` slot
+  strides. Verified live on SM120 and CPU and offline across
+  `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and `gfx1200`/`gfx1201`; live `sm75`/`sm8x`,
+  RDNA4/ROCm, and Windows remain unexercised locally.
 - `moe_ffn` and `MoEWeights`: flattened M1 and Split-K CUDA launch grids to support
   `top_k > 65,535`, gated `convrot_trellis` GPU dispatch on SM75+ and supported AMD
   targets (falling back to the portable reference on pre-SM75 CUDA), and aligned

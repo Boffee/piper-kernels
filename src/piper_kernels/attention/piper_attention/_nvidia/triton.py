@@ -201,36 +201,43 @@ def _compute_chunk_k_bias(
 
 
 @triton.jit
-def _restore_chunk_value_mean(
+def _fold_chunk_value_mean(
     numerator,
     chunk_denom,
-    value_mean_ptr,
-    kv_batch_head,
-    chunk_idx,
-    key_chunks,
+    value_mean_base,
     offsets_d,
     offsets_vd,
     split_pv_head_dim: tl.constexpr,
     head_dim: tl.constexpr,
+    guard_zero: tl.constexpr,
 ):
     """Fold one K1024 chunk's softmax mass times its V mean into the FP32 numerator."""
-    chunk_weight_codes = chunk_denom * _P_UINT8_RANGE
-    value_mean_base = (
-        value_mean_ptr + (kv_batch_head.to(tl.int64) * key_chunks + chunk_idx) * head_dim
-    )
+    chunk_weight_codes = (chunk_denom * _P_UINT8_RANGE)[:, None]
     if split_pv_head_dim:
         half_head_dim: tl.constexpr = head_dim // 2
         accumulator_low, accumulator_high = numerator
         value_mean_low = tl.load(value_mean_base + offsets_vd)
+        delta_low = chunk_weight_codes * value_mean_low[None, :]
+        if guard_zero:
+            zero_guard = (chunk_denom > 0.0)[:, None]
+            accumulator_low = accumulator_low + tl.where(zero_guard, delta_low, 0.0)
+        else:
+            accumulator_low = accumulator_low + delta_low
         value_mean_high = tl.load(value_mean_base + half_head_dim + offsets_vd)
-        accumulator_low += chunk_weight_codes[:, None] * value_mean_low[None, :]
-        accumulator_high += chunk_weight_codes[:, None] * value_mean_high[None, :]
+        delta_high = chunk_weight_codes * value_mean_high[None, :]
+        if guard_zero:
+            zero_guard = (chunk_denom > 0.0)[:, None]
+            accumulator_high = accumulator_high + tl.where(zero_guard, delta_high, 0.0)
+        else:
+            accumulator_high = accumulator_high + delta_high
         return (accumulator_low, accumulator_high)
     else:
-        accumulator = numerator
         value_mean = tl.load(value_mean_base + offsets_d)
-        accumulator += chunk_weight_codes[:, None] * value_mean[None, :]
-        return accumulator
+        delta = chunk_weight_codes * value_mean[None, :]
+        if guard_zero:
+            zero_guard = (chunk_denom > 0.0)[:, None]
+            delta = tl.where(zero_guard, delta, 0.0)
+        return numerator + delta
 
 
 @triton.jit
@@ -318,7 +325,7 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             mask=current_n < key_length,
             other=0.0,
         )
-        scores = integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
+        scores = integer_scores.to(tl.float32) * (query_scale[:, None] * key_scale[None, :])
 
     if mask_keys:
         if is_causal:
@@ -672,17 +679,18 @@ def _attention_chunk(
             loop_licm=loop_licm,
             padded_kv=padded_kv,
         )
-    numerator = _restore_chunk_value_mean(
+    value_mean_base = (
+        value_mean_ptr + (kv_batch_head.to(tl.int64) * key_chunks + chunk_idx) * head_dim
+    )
+    numerator = _fold_chunk_value_mean(
         numerator,
         chunk_denom,
-        value_mean_ptr,
-        kv_batch_head,
-        chunk_idx,
-        key_chunks,
+        value_mean_base,
         offsets_d,
         offsets_vd,
         split_pv_head_dim=split_pv_head_dim,
         head_dim=head_dim,
+        guard_zero=tl.constexpr(False),
     )
     return numerator, denominator, running_max, running_bias
 
@@ -1703,8 +1711,8 @@ def _piper_chunked_prefill_kernel(  # noqa: PLR0912, PLR0915
                     scores = integer_scores.to(tl.float32) * (query_scale * key_scale)[:, None]
                 else:
                     key_scale = tl.load(ks_chunk_ptr + current_n)
-                    scores = (
-                        integer_scores.to(tl.float32) * query_scale[:, None] * key_scale[None, :]
+                    scores = integer_scores.to(tl.float32) * (
+                        query_scale[:, None] * key_scale[None, :]
                     )
                 if is_tail:
                     global_n = chunk * 1024 + current_n
@@ -1725,12 +1733,22 @@ def _piper_chunked_prefill_kernel(  # noqa: PLR0912, PLR0915
                 block_max = tl.where(
                     chunk_active, tl.reduce(shifted_scores, 1, max_propagate_nan), -float("inf")
                 )
+                tile_k_bias = (
+                    tl.where(
+                        valid_queries
+                        & (chunk * 1024 + start_n - global_query_start <= output_rows),
+                        k_bias,
+                        0.0,
+                    )
+                    if (is_tail and is_causal)
+                    else k_bias
+                )
                 next_max, next_bias, old_weight, current_weight, has_block, safe_block_max = (
                     advance_tile_max_safe(
                         running_max,
                         running_bias,
                         block_max,
-                        k_bias,
+                        tile_k_bias,
                         valid_queries,
                     )
                 )
@@ -1782,18 +1800,16 @@ def _piper_chunked_prefill_kernel(  # noqa: PLR0912, PLR0915
                 running_max = next_max
                 running_bias = next_bias
 
-            chunk_active_mean = (chunk_denom > 0.0)[:, None]
-            scale_eff = (chunk_denom * _P_UINT8_RANGE)[:, None]
-            if split_pv_head_dim:
-                acc_lo, acc_hi = numerator
-                vm_lo = tl.load(vm_chunk_ptr + offsets_vd)
-                vm_hi = tl.load(vm_chunk_ptr + half_head_dim + offsets_vd)
-                acc_lo += tl.where(chunk_active_mean, scale_eff * vm_lo[None, :], 0.0)
-                acc_hi += tl.where(chunk_active_mean, scale_eff * vm_hi[None, :], 0.0)
-                numerator = (acc_lo, acc_hi)
-            else:
-                vm = tl.load(vm_chunk_ptr + offsets_d)
-                numerator += tl.where(chunk_active_mean, scale_eff * vm[None, :], 0.0)
+            numerator = _fold_chunk_value_mean(
+                numerator,
+                chunk_denom,
+                vm_chunk_ptr,
+                offsets_d,
+                offsets_vd,
+                split_pv_head_dim=split_pv_head_dim,
+                head_dim=head_dim,
+                guard_zero=tl.constexpr(True),
+            )
 
     has_any = running_max != -float("inf")
     safe_denom = tl.where(has_any & (denominator != 0.0), denominator, 1.0)
@@ -1942,13 +1958,12 @@ def compile_nvidia_prefill_kernels(
     head_dim: int = 128,
     has_chunk_map: bool = True,
     is_causal: bool = True,
+    wide_pool: bool = False,
     compile_fn=None,
 ) -> tuple[object, object]:
     """Offline-compile unified NVIDIA frozen-pool and offset-causal tail prefill kernels."""
-    from triton.compiler import ASTSource  # noqa: PLC0415
-
     accel = AcceleratorTarget.from_compiler_target(target)
-    triton_dtype = "bf16" if dtype is torch.bfloat16 else "fp16"
+    triton_dtype = _quantization.validate_kv_compile_args(dtype, head_dim)
     grouped_qk = _policy.groups_qk_scales(accel)
     compiler = triton.compile if compile_fn is None else compile_fn
 
@@ -1967,35 +1982,14 @@ def compile_nvidia_prefill_kernels(
             "block_m": block_m,
             "loop_num_stages": 1,
         }
-        sig = {
-            name: "i32" for name in _piper_chunked_prefill_kernel.arg_names if name not in constants
-        }
-        sig.update(
-            query_ptr="*i8",
-            query_scale_ptr="*fp32",
-            key_int8_ptr="*i8",
-            key_scale_ptr="*fp32",
-            key_center_ptr="*fp32",
-            value_int8_ptr="*i8",
-            value_scale_ptr="*fp32",
-            value_mean_ptr="*fp32",
-            chunk_to_slot_ptr="*i32",
-            num_chunks_ptr="*i32",
-            output_ptr=f"*{triton_dtype}",
-            lse_ptr="*fp32",
+        wide = wide_pool and not tail_mode
+        source = _quantization.build_kernel_source(
+            _piper_chunked_prefill_kernel,
+            constants=constants,
+            overrides=_quantization.frozen_pool_pointer_signature(triton_dtype, wide_pool=wide),
+            pointer_range_32=not wide,
         )
-        return compiler(
-            ASTSource(
-                _piper_chunked_prefill_kernel,
-                sig,
-                constexprs=constants,
-                attrs=_quantization.compile_pointer_attrs(
-                    _piper_chunked_prefill_kernel.arg_names, sig
-                ),
-            ),
-            target,
-            {"num_warps": num_warps, "num_stages": 1},
-        )
+        return compiler(source, target, {"num_warps": num_warps, "num_stages": 1})
 
     return (
         _compile_variant(tail_mode=False, causal_mode=False, chunk_map=has_chunk_map),
