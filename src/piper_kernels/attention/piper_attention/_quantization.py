@@ -80,7 +80,7 @@ def _quantize_key_k1024_body(
     head_dim: tl.constexpr,
 ):
     chunk_start = in_chunk * _TL_CENTER_CHUNK
-    valid_count = tl.minimum(_TL_CENTER_CHUNK, key_length - chunk_start)
+    valid_count = tl.maximum(tl.minimum(_TL_CENTER_CHUNK, key_length - chunk_start), 0)
     active_tiles = tl.cdiv(valid_count, _TL_BLOCK_N)
     offsets_tile = tl.arange(0, _TL_BLOCK_N)
     offsets_d = tl.arange(0, head_dim)
@@ -178,8 +178,10 @@ def _quantize_key_k1024_kernel(
     scatter_slots: tl.constexpr,
     heads,  # noqa: ARG001 - Triton launch signature
     head_dim: tl.constexpr,
+    has_key_lengths: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
     """Compute one K1024 chunk's rotated mean and center/quantize its keys in one CTA."""
+    tl.static_assert(not (scatter_slots and has_key_lengths))
     chunk = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
     batch = tl.program_id(2).to(tl.int64)
@@ -203,6 +205,11 @@ def _quantize_key_k1024_kernel(
                 head_dim=head_dim,
             )
     else:
+        active_key_length = (
+            tl.minimum(tl.maximum(tl.load(slot_ids_ptr + batch), 0), key_length)
+            if has_key_lengths
+            else key_length
+        )
         _quantize_key_k1024_body(
             key_ptr + batch * stride_kb + head * stride_kh,
             output_ptr + batch * stride_ob + head * stride_oh,
@@ -210,7 +217,7 @@ def _quantize_key_k1024_kernel(
             center_ptr + batch * stride_cb + head * stride_ch,
             chunk,
             chunk,
-            key_length,
+            active_key_length,
             storage_key_length,
             scale_groups,
             stride_kn,
@@ -242,7 +249,7 @@ def _quantize_value_k1024_body(
     head_dim: tl.constexpr,
 ):
     chunk_start = in_chunk * _TL_CENTER_CHUNK
-    valid_count = tl.minimum(_TL_CENTER_CHUNK, key_length - chunk_start)
+    valid_count = tl.maximum(tl.minimum(_TL_CENTER_CHUNK, key_length - chunk_start), 0)
     active_tiles = tl.cdiv(valid_count, _TL_BLOCK_N)
     offsets_tile = tl.arange(0, _TL_BLOCK_N)
     offsets_d = tl.arange(0, head_dim)
@@ -345,8 +352,10 @@ def _quantize_value_k1024_kernel(
     scatter_slots: tl.constexpr,
     heads,  # noqa: ARG001 - Triton launch signature
     head_dim: tl.constexpr,
+    has_key_lengths: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
     """Center and quantize one V1024 chunk per CTA without partial workspace."""
+    tl.static_assert(not (scatter_slots and has_key_lengths))
     chunk = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
     batch = tl.program_id(2).to(tl.int64)
@@ -377,6 +386,11 @@ def _quantize_value_k1024_kernel(
             )
     else:
         meta_offset = batch * stride_mb + head * stride_mh
+        active_key_length = (
+            tl.minimum(tl.maximum(tl.load(slot_ids_ptr + batch), 0), key_length)
+            if has_key_lengths
+            else key_length
+        )
         _quantize_value_k1024_body(
             value_ptr + batch * stride_vb + head * stride_vh,
             output_ptr + batch * stride_ob + head * stride_oh,
@@ -385,7 +399,7 @@ def _quantize_value_k1024_kernel(
             value_mean_ptr + batch * stride_cb + head * stride_ch,
             chunk,
             chunk,
-            key_length,
+            active_key_length,
             storage_key_length,
             meta_storage_length,
             stride_vn,
@@ -406,6 +420,7 @@ def prepare_chunk_centered_key(
     storage_key_length: int,
     scale_storage_length: int | None = None,
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    key_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize K1024-centered keys and return (key_int8, key_scale, key_center)."""
     batch, heads, key_length, head_dim = key.shape
@@ -426,35 +441,54 @@ def prepare_chunk_centered_key(
         )
     else:
         key_int8, key_scale, key_center = out
+    stride_kb = 0 if batch <= 1 else key.stride(0)
+    stride_kh = 0 if heads <= 1 else key.stride(1)
+    stride_ob = 0 if batch <= 1 else key_int8.stride(0)
+    stride_oh = 0 if heads <= 1 else key_int8.stride(1)
+    stride_sb = 0 if batch <= 1 else key_scale.stride(0)
+    stride_sh = 0 if heads <= 1 else key_scale.stride(1)
+    stride_cb = 0 if batch <= 1 else key_center.stride(0)
+    stride_ch = 0 if heads <= 1 else key_center.stride(1)
     with device_context(key.device):
         _quantize_key_k1024_kernel[(chunk_count, heads, batch)](
             key,
             key_int8,
             key_scale,
             key_center,
-            key_int8,
+            key_int8 if key_lengths is None else key_lengths,
             key_length,
             storage_key_length,
             key_scale.shape[2],
             chunk_count,
             0,
-            key.stride(0),
-            key.stride(1),
+            stride_kb,
+            stride_kh,
             key.stride(2),
-            key_int8.stride(0),
-            key_int8.stride(1),
+            stride_ob,
+            stride_oh,
             key_int8.stride(2),
-            key_scale.stride(0),
-            key_scale.stride(1),
-            key_center.stride(0),
-            key_center.stride(1),
+            stride_sb,
+            stride_sh,
+            stride_cb,
+            stride_ch,
             grouped_qk=grouped,
             scatter_slots=False,
             heads=heads,
             head_dim=head_dim,
+            has_key_lengths=key_lengths is not None,
             num_warps=4,
         )
     return key_int8, key_scale, key_center
+
+
+def _value_quantize_num_warps(
+    head_dim: int,
+    *,
+    tile_layout: bool,
+    pack_wmma: bool,
+    has_key_lengths: bool,
+) -> int:
+    return 8 if (head_dim == 128 and tile_layout and not pack_wmma and has_key_lengths) else 4
 
 
 def prepare_chunk_centered_value(
@@ -465,14 +499,18 @@ def prepare_chunk_centered_value(
     scale_storage_length: int | None = None,
     pack_wmma: bool = False,
     log_scale_dtype: torch.dtype = torch.float16,
+    tile_layout: bool | None = None,
+    scale_by_p_range: bool = True,
+    key_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize V1024-centered values in one pass without sequence-wide reductions."""
     batch, heads, key_length, head_dim = value.shape
     chunk_count = int(triton.cdiv(key_length, CENTER_CHUNK))
     meta_length = key_length if scale_storage_length is None else scale_storage_length
+    use_tile_layout = pack_wmma if tile_layout is None else tile_layout
     value_shape = (
         (batch, heads, storage_key_length // _BLOCK_N, head_dim, _BLOCK_N)
-        if pack_wmma
+        if use_tile_layout
         else (batch, heads, head_dim, storage_key_length)
     )
     value_int8 = torch.empty(value_shape, device=value.device, dtype=torch.int8)
@@ -487,8 +525,16 @@ def prepare_chunk_centered_value(
     value_mean = torch.empty(
         (batch, heads, chunk_count, head_dim), device=value.device, dtype=torch.float32
     )
-    stride_od = head_dim * _BLOCK_N if pack_wmma else value_int8.stride(2)
-    stride_ok = 1 if pack_wmma else value_int8.stride(3)
+    stride_od = head_dim * _BLOCK_N if use_tile_layout else value_int8.stride(2)
+    stride_ok = 1 if use_tile_layout else value_int8.stride(3)
+    stride_vb = 0 if batch <= 1 else value.stride(0)
+    stride_vh = 0 if heads <= 1 else value.stride(1)
+    stride_ob = 0 if batch <= 1 else value_int8.stride(0)
+    stride_oh = 0 if heads <= 1 else value_int8.stride(1)
+    stride_mb = 0 if batch <= 1 else value_scale_multiplier.stride(0)
+    stride_mh = 0 if heads <= 1 else value_scale_multiplier.stride(1)
+    stride_cb = 0 if batch <= 1 else value_mean.stride(0)
+    stride_ch = 0 if heads <= 1 else value_mean.stride(1)
     with device_context(value.device):
         _quantize_value_k1024_kernel[(chunk_count, heads, batch)](
             value,
@@ -496,30 +542,36 @@ def prepare_chunk_centered_value(
             value_scale_multiplier,
             value_log_scale,
             value_mean,
-            value_int8,
+            value_int8 if key_lengths is None else key_lengths,
             key_length,
             storage_key_length,
             meta_length,
             0,
-            value.stride(0),
-            value.stride(1),
+            stride_vb,
+            stride_vh,
             value.stride(2),
-            value_int8.stride(0),
-            value_int8.stride(1),
+            stride_ob,
+            stride_oh,
             stride_od,
             stride_ok,
-            value_scale_multiplier.stride(0),
-            value_scale_multiplier.stride(1),
-            value_mean.stride(0),
-            value_mean.stride(1),
+            stride_mb,
+            stride_mh,
+            stride_cb,
+            stride_ch,
             store_log_scale=store_log_scale,
-            scale_by_p_range=True,
+            scale_by_p_range=scale_by_p_range,
             pack_wmma=pack_wmma,
-            tile_layout=pack_wmma,
+            tile_layout=use_tile_layout,
             scatter_slots=False,
             heads=heads,
             head_dim=head_dim,
-            num_warps=4,
+            has_key_lengths=key_lengths is not None,
+            num_warps=_value_quantize_num_warps(
+                head_dim,
+                tile_layout=use_tile_layout,
+                pack_wmma=pack_wmma,
+                has_key_lengths=key_lengths is not None,
+            ),
         )
     return value_int8, value_scale_multiplier, value_log_scale, value_mean
 
@@ -632,14 +684,57 @@ def _div16_attrs(
     }
 
 
-def compile_kv_freeze_kernels(
+def compile_pointer_attrs(
+    arg_names: list[str],
+    signature: dict[str, str],
+    *,
+    div16_names: frozenset[str] = frozenset(),
+) -> dict[tuple[int, ...], list[list[object]]]:
+    """Attach live contiguous pointer divisibility/range attrs and selected stride attrs."""
+    attrs: dict[tuple[int, ...], list[list[object]]] = {}
+    for idx, name in enumerate(arg_names):
+        ty = signature.get(name)
+        if isinstance(ty, str) and ty.startswith("*"):
+            attrs[(idx,)] = [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+        elif name in div16_names:
+            attrs[(idx,)] = [["tt.divisibility", 16]]
+    return attrs
+
+
+_KEY_DIV16_BASE = frozenset(
+    {
+        "output_ptr",
+        "scale_ptr",
+        "center_ptr",
+        "stride_ob",
+        "stride_oh",
+        "stride_on",
+        "stride_ch",
+    }
+)
+_VALUE_DIV16_BASE = frozenset(
+    {
+        "output_ptr",
+        "scale_multiplier_ptr",
+        "log_scale_ptr",
+        "value_mean_ptr",
+        "stride_ob",
+        "stride_oh",
+        "stride_mh",
+        "stride_ch",
+    }
+)
+
+
+def _compile_quantize_pair(
     target: object,
     *,
-    dtype: torch.dtype = torch.bfloat16,
-    head_dim: int = 128,
+    dtype: torch.dtype,
+    head_dim: int,
+    scatter_slots: bool,
+    has_key_lengths: bool,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, object]:
-    """Offline-compile K1024 and V1024 slot-scatter freeze kernels for ``target``."""
     if dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"dtype must be float16 or bfloat16, got {dtype}")
     if head_dim not in (64, 128):
@@ -649,15 +744,15 @@ def compile_kv_freeze_kernels(
 
     from . import _backend  # noqa: PLC0415 - avoid backend/triton import cycle
 
-    _, grouped_qk, pack_wmma = _backend.kv_chunk_layout(
-        AcceleratorTarget.from_compiler_target(target)
-    )
+    accel = AcceleratorTarget.from_compiler_target(target)
+    _, grouped_qk, pack_wmma = _backend.kv_chunk_layout(accel)
     triton_dtype = "bf16" if dtype is torch.bfloat16 else "fp16"
 
     key_constants: dict[str, object] = {
         "grouped_qk": grouped_qk,
-        "scatter_slots": True,
+        "scatter_slots": scatter_slots,
         "head_dim": head_dim,
+        "has_key_lengths": has_key_lengths,
     }
     key_signature: dict[str, str] = {
         name: "i32" for name in _quantize_key_k1024_kernel.arg_names if name not in key_constants
@@ -669,30 +764,28 @@ def compile_kv_freeze_kernels(
         center_ptr="*fp32",
         slot_ids_ptr="*i32",
     )
-    key_attrs = _div16_attrs(
-        _quantize_key_k1024_kernel.arg_names,
-        frozenset(
-            {
-                "output_ptr",
-                "scale_ptr",
-                "center_ptr",
-                "stride_ob",
-                "stride_oh",
-                "stride_on",
-                "stride_sh",
-                "stride_ch",
-            }
-        ),
+    key_attrs = (
+        _div16_attrs(_quantize_key_k1024_kernel.arg_names, _KEY_DIV16_BASE | {"stride_sh"})
+        if scatter_slots
+        else compile_pointer_attrs(
+            _quantize_key_k1024_kernel.arg_names,
+            key_signature,
+            div16_names=_KEY_DIV16_BASE | {"stride_cb", "stride_kb", "stride_kh", "stride_kn"},
+        )
     )
 
+    store_log_scale = pack_wmma if not scatter_slots else False
+    scale_by_p_range = pack_wmma if not scatter_slots else False
+    use_tile_layout = True
     value_constants: dict[str, object] = {
         "stride_ok": 1,
-        "store_log_scale": False,
-        "scale_by_p_range": False,
+        "store_log_scale": store_log_scale,
+        "scale_by_p_range": scale_by_p_range,
         "pack_wmma": pack_wmma,
-        "tile_layout": True,
-        "scatter_slots": True,
+        "tile_layout": use_tile_layout,
+        "scatter_slots": scatter_slots,
         "head_dim": head_dim,
+        "has_key_lengths": has_key_lengths,
     }
     value_signature: dict[str, str] = {
         name: "i32"
@@ -707,23 +800,26 @@ def compile_kv_freeze_kernels(
         value_mean_ptr="*fp32",
         slot_ids_ptr="*i32",
     )
-    value_attrs = _div16_attrs(
-        _quantize_value_k1024_kernel.arg_names,
-        frozenset(
-            {
-                "output_ptr",
-                "scale_multiplier_ptr",
-                "log_scale_ptr",
-                "value_mean_ptr",
-                "stride_ob",
-                "stride_oh",
-                "stride_mh",
-                "stride_ch",
-            }
-        ),
+    value_attrs = (
+        _div16_attrs(_quantize_value_k1024_kernel.arg_names, _VALUE_DIV16_BASE)
+        if scatter_slots
+        else compile_pointer_attrs(
+            _quantize_value_k1024_kernel.arg_names,
+            value_signature,
+            div16_names=_VALUE_DIV16_BASE
+            | {"stride_mb", "stride_cb", "stride_vb", "stride_vh", "stride_vn"},
+        )
     )
 
-    options: dict[str, object] = {"num_warps": 4}
+    key_options: dict[str, object] = {"num_warps": 4}
+    value_options: dict[str, object] = {
+        "num_warps": _value_quantize_num_warps(
+            head_dim,
+            tile_layout=use_tile_layout,
+            pack_wmma=pack_wmma,
+            has_key_lengths=has_key_lengths,
+        )
+    }
     compiler = triton.compile if compile_fn is None else compile_fn
     return (
         compiler(
@@ -734,7 +830,7 @@ def compile_kv_freeze_kernels(
                 attrs=key_attrs,
             ),
             target,
-            options,
+            key_options,
         ),
         compiler(
             ASTSource(
@@ -744,6 +840,42 @@ def compile_kv_freeze_kernels(
                 attrs=value_attrs,
             ),
             target,
-            options,
+            value_options,
         ),
+    )
+
+
+def compile_kv_freeze_kernels(
+    target: object,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 128,
+    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
+) -> tuple[object, object]:
+    """Offline-compile K1024 and V1024 slot-scatter freeze kernels for ``target``."""
+    return _compile_quantize_pair(
+        target,
+        dtype=dtype,
+        head_dim=head_dim,
+        scatter_slots=True,
+        has_key_lengths=False,
+        compile_fn=compile_fn,
+    )
+
+
+def compile_kv_tail_quantize_kernels(
+    target: object,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 128,
+    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
+) -> tuple[object, object]:
+    """Offline-compile K1024 and V1024 ragged tail quantization kernels for ``target``."""
+    return _compile_quantize_pair(
+        target,
+        dtype=dtype,
+        head_dim=head_dim,
+        scatter_slots=False,
+        has_key_lengths=True,
+        compile_fn=compile_fn,
     )

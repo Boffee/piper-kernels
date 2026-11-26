@@ -8,7 +8,7 @@ slow correctness paths, not exact PyTorch SDPA replacements.
 | Operator | Use when | Q/K/V layout | Input dtype |
 |---|---|---|---|
 | `piper_attention` | Every query attends all keys, or causal attention is needed | `[batch, heads, sequence, features]` | FP16, BF16 |
-| `piper_attention_decode` | Decoding or MTP verification against a frozen `PiperKVChunkPool` plus live tail | Query `[batch, q_heads, seq_q, features]`; chunked pool + `[batch, kv_heads, tail_cap, features]` | FP16, BF16 |
+| `piper_attention_decode` | Decoding, MTP verification, or offset-causal chunked prefill against a frozen `PiperKVChunkPool` plus live tail | Query `[batch, q_heads, seq_q, features]`; chunked pool + `[batch, kv_heads, tail_cap, features]` | FP16, BF16 |
 | `SparsePiperAttention` | The model supplies a block layout and per-head sparse budgets | `[batch, sequence, heads, features]` | FP16, BF16, FP32 |
 | `sage_attention_2pp` | You specifically want the canonical SageAttention2++ 8+8 algorithm | `[batch, heads, sequence, features]` | FP16, BF16 |
 
@@ -214,14 +214,25 @@ Pool and operator contract:
   `slot_ids` within a single call must be distinct. `freeze_kv_chunks_` is inference-only
   (enforcing `InferenceMode` if any pool buffer is an inference tensor) and supports CUDA
   Graph capture and `torch.compile(fullgraph=True, dynamic=True)`.
-- **Grouped Split-KV decode & LSE wave merge:** `piper_attention_decode` keeps queries
-  and softmax probabilities in FP32 while dequantizing frozen INT8 K/V slots, so
-  outputs approximate FP32 SDPA rather than being bitwise identical to quantized-Q/P
-  `piper_attention` prefill. It executes native Triton Split-KV kernels on supported
-  GPUs (NVIDIA SM70+ and AMD ROCm; offline zero-spill compile verified across SM75,
-  SM80, SM89, SM120, `gfx942`, `gfx1100`, `gfx1151`, and `gfx1201`) and the portable
-  FP32-accumulation reference elsewhere, with `torch.compile(fullgraph=True, dynamic=True)`
-  and CUDA Graph capture support. It decodes `query` (`[batch, q_heads, seq_q, head_dim]`
+- **Grouped Split-KV decode, chunked prefill & LSE wave merge:** `piper_attention_decode`
+  automatically selects the kernel path by `seq_q` and GPU target:
+  - For `seq_q < 64` (decode and speculative verification), CPU reference, or GPUs without
+    native quantized tensor-core Piper support (e.g., SM75, SM90, SM100, `gfx942`,
+    `gfx1100`, `gfx1151`), it keeps queries and softmax probabilities in FP32 while
+    dequantizing frozen INT8 K/V slots (approximating FP32 SDPA rather than INT8-Q/UINT8-P
+    `piper_attention` prefill), running native Triton Split-KV kernels on GPU (NVIDIA
+    SM70+ and AMD ROCm) and the portable FP32-accumulation reference elsewhere.
+  - For `seq_q >= 64` (multi-turn / long-prompt chunked prefill) on NVIDIA SM8x/SM12x and
+    AMD RDNA4 (`gfx1200`/`gfx1201`), it routes directly into quantized INT8-Q/UINT8-P
+    tensor-core prefill over finalized `PiperKVChunkPool` slots plus an optional
+    K1024/V1024 chunk-centered live tail (supporting arbitrary non-64-aligned causal offsets
+    `active_tail - seq_q`, zero-copy pool reads, and two-wave FP32 LSE merging).
+  Both paths share the same operator API, zero host readbacks,
+  `torch.compile(fullgraph=True, dynamic=True)`, and CUDA Graph capture support. At
+  `seq_q >= 64`, quantized Q/P prefill approximates FP32 SDPA within INT8/UINT8 Piper
+  quantization error rather than matching FP32-Q/P Split-KV bitwise, and K1024/V1024 tail
+  centering shares per-chunk statistics across causal queries within each 1024-token tail
+  chunk. It attends `query` (`[batch, q_heads, seq_q, head_dim]`
   in `float16`/`bfloat16`,
   `q_heads` a multiple of `pool.kv_heads`, `seq_q >= 1`) against active slots addressed
   through `chunk_to_slot` (`[batch, max_chunks]` `int32` or `None` for direct
@@ -233,17 +244,19 @@ Pool and operator contract:
   `scale` defaults to `head_dim**-0.5` and, when supplied, must be finite and positive.
   With `is_causal=True` (default) and a live tail, frozen chunks remain visible prior to
   the live tail while tail tokens obey `token_idx <= active_tail - seq_q + q_pos`
-  (including `seq_q == 1` and `seq_q > active_tail`); with `is_causal=False`, all active
+  (including `seq_q == 1`, non-64-aligned offsets, and `seq_q > active_tail`); with
+  `is_causal=False`, all active
   tail tokens up to `tail_len` are visible to every query token (`is_causal` is a no-op
   without a tail). Pass `return_lse=True` to receive `(output, lse)` with FP32
   natural-log `lse` (`[batch, q_heads, seq_q]`; `0.0` output and `-inf` LSE when zero
   valid tokens exist). As numerical preconditions, inputs should keep the rotated FP32
   dot product `q · k_center` finite (overflowing products yield `+inf` chunk bias and
-  `NaN`/`+inf` LSE) and keep active value buffers (`tail_value[:, :, :active_tail]` and
-  active pool value tensors) finite (non-finite active `V` entries can propagate IEEE
-  `0.0 * NaN` in causal or multi-split attention, matching dense SDPA). Native GPU kernels
-  use `active_chunks_hint` (non-negative int; `0`
-  derives splits from `max_chunks`) for launch parallelism only. Combine multi-wave
+  `NaN`/`+inf` LSE) and keep `query`, active tail keys (`tail_key[:, :, :active_tail]`),
+  and active value buffers (`tail_value[:, :, :active_tail]` and active pool value tensors)
+  finite (non-finite active entries can poison quantization scales/means or trigger IEEE
+  `0.0 * NaN`). Split-KV decode
+  kernels use `active_chunks_hint` (non-negative int; `0` derives splits from
+  `max_chunks`) for launch parallelism only. Combine multi-wave
   results with `merge_attention_lse(outputs, lses)`: it accepts strided `outputs`
   sharing dtype in `{float16, bfloat16, float32, float64}` and matching-device `lses`
   whose per-wave dtypes may vary independently within that set, returns `merged_out` in

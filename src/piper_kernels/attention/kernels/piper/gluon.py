@@ -5,6 +5,7 @@
 # pyright: reportArgumentType=false, reportAssignmentType=false, reportCallIssue=false
 # pyright: reportIndexIssue=false
 
+import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -33,6 +34,36 @@ def advance_tile_max(running_max, running_bias, block_max, k_bias):
     old_weight = gl.where(tile_wins, decay, 1.0)
     current_weight = gl.where(tile_wins, 1.0, decay)
     return next_max, next_bias, old_weight, current_weight
+
+
+@gluon.jit
+def max_propagate_nan(a, b):
+    """Max reducer that propagates NaNs across lanes."""
+    return gl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@gluon.jit
+def advance_tile_max_safe(running_max, running_bias, block_max, k_bias):
+    """Update winner-frame running maximum with NaN, -inf, and same-bias guards."""
+    has_nan = (block_max + k_bias) != (block_max + k_bias)
+    m_clean = gl.where(has_nan, float("nan"), block_max)
+    has_block = ((m_clean != -float("inf")) & (k_bias != -float("inf"))) | has_nan
+    has_running = running_max != -float("inf")
+    bias_diff = gl.where(k_bias == running_bias, 0.0, k_bias - running_bias)
+    raw_delta = (m_clean - running_max) + bias_diff
+    delta = gl.where(
+        has_block,
+        gl.where(has_running, raw_delta, float("inf")),
+        -float("inf"),
+    )
+    tile_wins = (delta > 0.0) | has_nan
+    next_max = gl.where(tile_wins, m_clean, running_max)
+    next_bias = gl.where(tile_wins, k_bias, running_bias)
+    decay = gl.exp2(-gl.abs(delta))
+    old_weight = gl.where(has_running, gl.where(tile_wins, decay, 1.0), 0.0)
+    current_weight = gl.where(has_block, gl.where(tile_wins, 1.0, decay), 0.0)
+    safe_block_max = gl.where(has_block, m_clean, 0.0)
+    return next_max, next_bias, old_weight, current_weight, has_block, safe_block_max
 
 
 @gluon.jit

@@ -2,6 +2,7 @@
 
 import sys
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 
@@ -45,6 +46,15 @@ def kv_chunk_layout(target: AcceleratorTarget) -> tuple[int, bool, bool]:
         grouped_qk = nvidia_policy.groups_qk_scales(target)
         return (16 if grouped_qk else 1024), grouped_qk, False
     return 16, True, False
+
+
+def prefill_backend(target: AcceleratorTarget) -> Literal["amd", "nvidia"] | None:
+    """Return the native quantized-prefill backend name for ``target``, if any."""
+    if nvidia_policy.supports_target(target):
+        return "nvidia"
+    if supports_amd_target(target):
+        return "amd"
+    return None
 
 
 def select_backend(target: AcceleratorTarget) -> AttentionImplementation | None:

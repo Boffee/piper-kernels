@@ -25,7 +25,10 @@ from piper_kernels.attention.piper_attention._nvidia.gluon_async_copy import (
 )
 from piper_kernels.attention.piper_attention._nvidia.policy import select_execution_plan
 from piper_kernels.attention.piper_attention._nvidia.triton import _piper_attention_kernel
-from piper_kernels.attention.piper_attention.triton import compile_kv_decode_kernels
+from piper_kernels.attention.piper_attention.triton import (
+    compile_kv_decode_kernels,
+    compile_kv_prefill_kernels,
+)
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="offline compiler coverage on Linux"
@@ -181,6 +184,7 @@ def test_nvidia_value_preparation_accepts_runtime_head_count(architecture, head_
         "tile_layout": False,
         "scatter_slots": False,
         "head_dim": head_dim,
+        "has_key_lengths": False,
     }
     kernel = _quantization._quantize_value_k1024_kernel
     signature = {name: "i32" for name in kernel.arg_names if name not in constants}
@@ -300,5 +304,121 @@ def test_kv_decode_8_target_compile_zero_spills(
             is_causal=is_causal,
             contiguous_inputs=contiguous_inputs,
             compile_fn=compile_fn,
+        ),
+    )
+
+
+_FALLBACK_PREFILL_TARGETS = (
+    GPUTarget("cuda", 75, 32),
+    GPUTarget("hip", "gfx942", 64),
+    GPUTarget("hip", "gfx1100", 32),
+    GPUTarget("hip", "gfx1151", 32),
+)
+_NVIDIA_PREFILL_TARGETS = (
+    GPUTarget("cuda", 80, 32),
+    GPUTarget("cuda", 86, 32),
+    GPUTarget("cuda", 89, 32),
+    GPUTarget("cuda", 120, 32),
+)
+_KV_PREFILL_TARGETS = (*_NVIDIA_PREFILL_TARGETS, GPUTarget("hip", "gfx1201", 32))
+
+
+@pytest.mark.parametrize("target", _FALLBACK_PREFILL_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_prefill_fallback_targets_merge_zero_spills(
+    target: GPUTarget,
+    dtype: torch.dtype,
+    head_dim: int,
+) -> None:
+    _assert_zero_spill_kernels(
+        target,
+        1,
+        lambda compile_fn: compile_kv_prefill_kernels(
+            target,
+            dtype=dtype,
+            head_dim=head_dim,
+            compile_fn=compile_fn,
+        ),
+        check_sgpr_spills=True,
+    )
+
+
+@pytest.mark.parametrize("target", _NVIDIA_PREFILL_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(("has_chunk_map", "is_causal"), [(False, False), (True, True)])
+def test_kv_prefill_native_cuda_compile_zero_spills(
+    monkeypatch: pytest.MonkeyPatch,
+    target: GPUTarget,
+    dtype: torch.dtype,
+    head_dim: int,
+    has_chunk_map: bool,
+    is_causal: bool,
+) -> None:
+    monkeypatch.setattr(
+        triton.knobs.runtime, "add_stages_inspection_hook", _MixedInt8StageHook(None)
+    )
+    compiled_out: list[object] = []
+
+    def _compile_and_record(
+        compile_fn: Callable[[object, object, dict[str, object]], object] | None,
+    ) -> tuple[object, ...]:
+        res = compile_kv_prefill_kernels(
+            target,
+            dtype=dtype,
+            head_dim=head_dim,
+            has_chunk_map=has_chunk_map,
+            is_causal=is_causal,
+            compile_fn=compile_fn,
+        )
+        compiled_out.extend(res)
+        return res
+
+    _assert_zero_spill_kernels(
+        target,
+        3,
+        _compile_and_record,
+        check_sgpr_spills=True,
+    )
+    for compiled in compiled_out[1:]:
+        ptx = compiled.asm["ptx"]  # type: ignore[attr-defined]
+        assert ".s32.s8.s8.s32" in ptx
+        assert ".s32.u8.s8.s32" in ptx
+        assert "piper_attention_u8s8_dot_marker" not in ptx
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_prefill_amd_dispatch_compile_smoke(
+    dtype: torch.dtype,
+    head_dim: int,
+) -> None:
+    _assert_zero_spill_kernels(
+        GPUTarget("hip", "gfx1201", 32),
+        3,
+        lambda compile_fn: compile_kv_prefill_kernels(
+            GPUTarget("hip", "gfx1201", 32),
+            dtype=dtype,
+            head_dim=head_dim,
+            compile_fn=compile_fn,
+        ),
+        check_sgpr_spills=True,
+    )
+
+
+@pytest.mark.parametrize("target", _KV_PREFILL_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_tail_quantize_prefill_compile_zero_spills(
+    target: GPUTarget,
+    dtype: torch.dtype,
+    head_dim: int,
+) -> None:
+    _assert_zero_spill_kernels(
+        target,
+        2,
+        lambda compile_fn: _quantization.compile_kv_tail_quantize_kernels(
+            target, dtype=dtype, head_dim=head_dim, compile_fn=compile_fn
         ),
     )

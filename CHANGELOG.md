@@ -5,6 +5,23 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Offset-causal chunked prefill in `piper_attention_decode` (`seq_q >= 64` on NVIDIA
+  SM8x/SM12x and AMD RDNA4 `gfx1200`/`gfx1201`), reading finalized `PiperKVChunkPool`
+  slots zero-copy via `chunk_to_slot` plus K1024/V1024 chunk-centered live BF16/FP16
+  tails with arbitrary non-64-aligned causal offsets (`active_tail - seq_q`),
+  `seq_q > active_tail` support, ragged per-batch chunk/tail counts, normalized
+  two-wave FP32 LSE merging, `torch.compile(fullgraph=True, dynamic=True)`, and CUDA
+  Graph capture without new custom ops. At `seq_q >= 64`, quantized INT8-Q/UINT8-P
+  execution replaces FP32-Q/P Split-KV semantics (approximating FP32 SDPA within Piper
+  quantization error and sharing per-1024-token tail centering statistics across causal
+  queries within a chunk). Verified with zero register/stack spills offline across
+  `sm80`, `sm86`, `sm89`, and `sm120`, and zero VGPR/SGPR/scratch spills across
+  attention, wave merge, and tail quantization live and offline on AMD RX 9070 XT
+  (`gfx1201`), with offline `gfx1200` attention smoke coverage. Live NVIDIA hardware
+  execution remains unexercised locally.
+
 ## [0.9.0rc1] - 2026-11-26
 
 ### Added

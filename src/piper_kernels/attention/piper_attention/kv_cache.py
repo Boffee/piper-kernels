@@ -51,6 +51,8 @@ class _KVChunkConfig:
     key_scales: int
     grouped_qk: bool
     pack_wmma: bool
+    prefill_backend: Literal["amd", "nvidia"] | None = None
+    target: AcceleratorTarget | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,8 +134,15 @@ def _resolve_target(target: AcceleratorTarget | torch.device | str | None) -> Ac
 def _resolve_kv_chunk_config(
     target: AcceleratorTarget | torch.device | str | None = None,
 ) -> _KVChunkConfig:
-    key_scales, grouped_qk, pack_wmma = _backend.kv_chunk_layout(_resolve_target(target))
-    return _KVChunkConfig(key_scales=key_scales, grouped_qk=grouped_qk, pack_wmma=pack_wmma)
+    resolved = _resolve_target(target)
+    key_scales, grouped_qk, pack_wmma = _backend.kv_chunk_layout(resolved)
+    return _KVChunkConfig(
+        key_scales=key_scales,
+        grouped_qk=grouped_qk,
+        pack_wmma=pack_wmma,
+        prefill_backend=_backend.prefill_backend(resolved),
+        target=resolved,
+    )
 
 
 def kv_chunk_storage_specs(
@@ -1612,6 +1621,8 @@ def _piper_attention_decode_op(  # noqa: PLR0913, PLR0917
             grouped_qk=config.grouped_qk,
             pack_wmma=config.pack_wmma,
             active_chunks_hint=active_chunks_hint,
+            prefill_backend=config.prefill_backend,
+            target=config.target,
         )
 
     from .reference import piper_attention_decode_reference  # noqa: PLC0415 - lazy CPU fallback
@@ -1820,7 +1831,7 @@ def piper_attention_decode(  # noqa: PLR0913
     return_lse: bool = False,
     active_chunks_hint: int = 0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Decode grouped queries against frozen K1024/V1024 ``pool`` chunks and a live tail.
+    """Attend grouped queries against frozen K1024/V1024 ``pool`` chunks and a live tail.
 
     Args:
         query: Query states of shape ``[batch, q_heads, seq_q, head_dim]`` in
@@ -1840,11 +1851,13 @@ def piper_attention_decode(  # noqa: PLR0913
         tail_len: Optional contiguous 1-D ``int32`` active tail lengths ``[batch]``
             clamped to ``[0, tail_cap]``.
         scale: Positive finite softmax scale; defaults to ``head_dim**-0.5``.
-        is_causal: Defaults to ``True``. For ``seq_q > 1`` speculative verification,
+        is_causal: Defaults to ``True``. For causal decode, speculative
+            verification (``seq_q < 64``), and chunked prefill (``seq_q >= 64``),
             frozen chunks remain visible prior to the live tail while tail attention
-            enforces ``token_idx <= active_tail - seq_q + q_pos``. When ``False``, all
-            active tail tokens up to ``tail_len`` are visible to every query token;
-            ignored when no tail is provided.
+            enforces ``token_idx <= active_tail - seq_q + q_pos`` (supporting
+            ``seq_q == 1``, non-64-aligned offsets, and ``seq_q > active_tail``).
+            When ``False``, all active tail tokens up to ``tail_len`` are visible
+            to every query token; ignored when no tail is provided.
         return_lse: If ``True``, return ``(output, lse)`` with ``float32`` natural-log
             ``lse`` of shape ``[batch, q_heads, seq_q]`` (``-inf`` where a query sees
             zero valid KV tokens while ``output`` is ``0.0``).
@@ -1853,12 +1866,24 @@ def piper_attention_decode(  # noqa: PLR0913
             ``max_chunks``).
 
     Backends & graphs:
-        Executes native GQA-grouped Split-KV Triton kernels on supported GPUs and
-        the portable FP32-accumulation PyTorch reference elsewhere. Inference-only
-        with zero host readbacks; supports ``torch.compile(fullgraph=True, dynamic=True)``
-        and CUDA Graph capture. As a numerical precondition, inputs should keep the
-        FP32 rotated dot product ``q · k_center`` finite (overflowing products yield
-        ``+inf`` bias and ``NaN``/``+inf`` LSE).
+        Shares one operator API, zero host readbacks,
+        ``torch.compile(fullgraph=True, dynamic=True)``, and CUDA Graph capture
+        across paths:
+        - For ``seq_q < 64`` (decode and MTP verification) or fallback targets
+          (e.g. SM75/SM90/SM100, ``gfx942``, ``gfx1100``, ``gfx1151``), executes
+          native GQA-grouped Split-KV Triton kernels on supported GPUs (keeping
+          queries and softmax weights in FP32 while dequantizing pool slots) or
+          the portable FP32-accumulation reference elsewhere.
+        - For ``seq_q >= 64`` on NVIDIA SM8x/SM12x and AMD RDNA4
+          (``gfx1200``/``gfx1201``), routes into INT8-Q/UINT8-P tensor-core
+          prefill over ``pool`` plus K1024/V1024 chunk-centered live tail with
+          normalized FP32 two-wave LSE merging.
+        Numerical differences at ``seq_q >= 64``: quantized Q/P prefill
+        approximates FP32 SDPA within INT8/UINT8 Piper quantization error rather
+        than matching FP32-Q/P Split-KV bitwise; K1024/V1024 tail centering
+        shares local chunk statistics across causal queries within each 1024-token
+        tail chunk; callers should keep rotated dot products ``q · k_center``,
+        ``query``, active ``tail_key``, and active value buffers finite.
     """
     if not isinstance(pool, PiperKVChunkPool):
         raise TypeError(f"pool must be a PiperKVChunkPool, got {type(pool).__name__}")

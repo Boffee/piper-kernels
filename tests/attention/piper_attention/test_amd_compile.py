@@ -35,9 +35,16 @@ def _compile_dense_kernel(
         "is_causal": causal,
         "wide_query_offsets": wide,
         "wide_context_offsets": wide,
+        "lse_ptr": None,
+        "key_lengths_ptr": None,
+        "store_lse": False,
+        "has_key_lengths": False,
+        "offset_causal_from_key_length": False,
     }
     kernel = amd_gluon._dense_piper_kernel
     signature = {name: "i32" for name in kernel.arg_names if name not in constants}
+    signature["lse_ptr"] = "constexpr"
+    signature["key_lengths_ptr"] = "constexpr"
     signature.update(
         dict.fromkeys(
             (
@@ -156,3 +163,61 @@ def test_dense_amd_launch_attributes_unpin_warp_pipeline_loads():
     assert _PINNED_LOAD_BARRIER in pinned.asm["llir"]
     assert _PINNED_LOAD_BARRIER not in unpinned.asm["llir"]
     assert "sched_barrier mask(0x00000001)" not in unpinned.asm["amdgcn"]
+
+
+def _assert_zero_spill_amd_prefill(compiled) -> None:
+    assert compiled.asm["hsaco"]
+    assert compiled.metadata.global_scratch_size == 0
+    amdgcn = compiled.asm["amdgcn"]
+    instructions = [
+        line.replace(" ", "") for line in amdgcn.splitlines() if "v_wmma_i32_16x16x16_iu8" in line
+    ]
+    assert any("0x3e22f983neg_lo:[1,1,0]" in line for line in instructions)
+    assert any("0x3e22f983neg_lo:[1,0,0]" in line for line in instructions)
+    assert all(",0neg_lo:[1,0,0]" not in line for line in instructions)
+    assert all("clamp" not in line for line in instructions)
+    if rocm_fences_only_lds():
+        assert "global_inv" not in amdgcn
+    if torch.version.hip is not None or not amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS:
+        assert "global_load_b64" not in amdgcn
+    vgpr_spills = re.search(r"vgpr_spill[^:]*:\s*(\d+)", amdgcn)
+    sgpr_spills = re.search(r"sgpr_spill[^:]*:\s*(\d+)", amdgcn)
+    priv_size = re.search(r"amdhsa_private_segment_fixed_size\s+(\d+)", amdgcn)
+    assert vgpr_spills is not None
+    assert int(vgpr_spills.group(1)) == 0
+    assert sgpr_spills is not None
+    assert int(sgpr_spills.group(1)) == 0
+    assert priv_size is not None
+    assert int(priv_size.group(1)) == 0
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("has_chunk_map", "is_causal"), [(False, False), (True, True)])
+def test_amd_prefill_compilation_zero_spills(
+    head_dim: int,
+    dtype: torch.dtype,
+    has_chunk_map: bool,
+    is_causal: bool,
+) -> None:
+    frozen, tail = amd_gluon.compile_amd_prefill_kernels(
+        GPUTarget("hip", "gfx1201", 32),
+        dtype=dtype,
+        head_dim=head_dim,
+        has_chunk_map=has_chunk_map,
+        is_causal=is_causal,
+    )
+    _assert_zero_spill_amd_prefill(frozen)
+    _assert_zero_spill_amd_prefill(tail)
+
+
+def test_amd_prefill_gfx1200_smoke() -> None:
+    frozen, tail = amd_gluon.compile_amd_prefill_kernels(
+        GPUTarget("hip", "gfx1200", 32),
+        dtype=torch.bfloat16,
+        head_dim=128,
+        has_chunk_map=True,
+        is_causal=True,
+    )
+    _assert_zero_spill_amd_prefill(frozen)
+    _assert_zero_spill_amd_prefill(tail)

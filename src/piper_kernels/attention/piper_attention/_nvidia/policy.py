@@ -234,6 +234,22 @@ def _sm120_execution_plan(
     )
 
 
+def select_prefill_config(
+    target: AcceleratorTarget,
+    *,
+    head_dim: int,
+    is_tail: bool,
+) -> tuple[int, int, bool]:
+    """Return ``(block_m, num_warps, split_pv_head_dim)`` with zero ptxas spills."""
+    if not is_tail:
+        num_warps = 8 if head_dim == 128 else 4
+        return 64, num_warps, head_dim == 128 or target.is_cuda_capability(12)
+    if head_dim == 128 and not (target.is_cuda_capability(8, 0) or target.is_cuda_capability(12)):
+        return 32, 4, False
+    split_pv = head_dim == 128 or target.is_cuda_capability(12) or target.is_cuda_capability(8, 9)
+    return 64, 8, split_pv
+
+
 def select_execution_plan(
     target: AcceleratorTarget,
     *,

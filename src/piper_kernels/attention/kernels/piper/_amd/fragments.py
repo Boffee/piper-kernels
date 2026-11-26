@@ -340,9 +340,9 @@ def qk_fp32_center_bias(
         word32 = gl.load(words + row_words + d_word)
         d_base = d_word * 4
         for byte in gl.static_range(4):
-            q_val = (word32 >> (byte * 8)).to(gl.int8).to(gl.float32)
+            q_val = (word32 >> (byte * 8)).to(gl.int8).to(gl.float32) * query_scale
             acc = gl.fma(q_val, gl.load(key_center_ptr + d_base + byte), acc)
-    return acc * query_scale
+    return acc
 
 
 @gluon.jit

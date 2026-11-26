@@ -16,6 +16,7 @@ from _accelerators import (
     forbid_device_probes,
     forbid_triton_driver,
     rdna4_available,
+    uint8_int8_mma_available,
 )
 from torch._dynamo.testing import CompileCounterWithBackend
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -2559,3 +2560,1038 @@ def test_decode_multi_tile_gqa(device_name: str, head_dim: int) -> None:
     cos = fn.cosine_similarity(out.float().reshape(-1), sdpa.float().reshape(-1), dim=0)
     assert float(cos) > 0.99
     torch.testing.assert_close(lse, sdpa_lse, atol=5e-2, rtol=2e-2)
+
+
+def _supports_native_prefill_gpu() -> bool:
+    return rdna4_available() or uint8_int8_mma_available()
+
+
+def _assert_prefill_quality(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    sdpa: torch.Tensor,
+    sdpa_lse: torch.Tensor,
+) -> None:
+    for b in range(out.shape[0]):
+        out_b = out[b].float().reshape(-1)
+        sdpa_b = sdpa[b].float().reshape(-1)
+        cos = fn.cosine_similarity(out_b, sdpa_b, dim=0)
+        rel_err = float((out_b - sdpa_b).norm() / (sdpa_b.norm() + 1e-6))
+        assert float(cos) > 0.99
+        assert rel_err < 0.03
+    torch.testing.assert_close(lse, sdpa_lse, atol=1e-1, rtol=3e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+def test_gpu_chunked_prefill_launch_routing() -> None:
+    device = torch.device("cuda")
+    is_rdna4 = rdna4_available()
+    native_prefill = _supports_native_prefill_gpu()
+    pool = _make_strided_pool(3, 2, 128, device=device, kv_dtype=torch.uint8)
+    _populate_test_pool(pool, [0, 1, 2], device=device, dtype=torch.bfloat16, seed=1101)
+    c2s = torch.tensor([[0, 2, 1]], device=device, dtype=torch.int32)
+    nc = torch.tensor([3], device=device, dtype=torch.int32)
+    tk, tv, tl = _make_sentinel_tail(1, 2, 96, 128, [80], device=device, dtype=torch.bfloat16)
+
+    q63 = torch.randn((1, 6, 63, 128), device=device, dtype=torch.bfloat16)
+    _, launches63 = _record_triton_launches(
+        lambda: piper_attention_decode(
+            q63, pool, c2s, nc, tail_key=tk, tail_value=tv, tail_len=tl, return_lse=True
+        )
+    )
+    assert "_piper_decode_frozen_split_kernel" in launches63
+    assert "_piper_decode_tail_split_kernel" in launches63
+    assert "_merge_two_attention_waves_kernel" not in launches63
+
+    for seq_q in (64, 129):
+        q = torch.randn((1, 6, seq_q, 128), device=device, dtype=torch.bfloat16)
+        _, launches = _record_triton_launches(
+            lambda q=q: piper_attention_decode(
+                q, pool, c2s, nc, tail_key=tk, tail_value=tv, tail_len=tl, return_lse=True
+            )
+        )
+        if not native_prefill:
+            assert "_piper_decode_frozen_split_kernel" in launches
+            continue
+        assert "_piper_decode_frozen_split_kernel" not in launches
+        assert "_piper_decode_tail_split_kernel" not in launches
+        assert "_merge_two_attention_waves_kernel" in launches
+        if is_rdna4:
+            assert "_frozen_pool_piper_kernel" in launches
+            assert "_dense_piper_kernel" in launches
+        else:
+            assert "_piper_chunked_prefill_kernel" in launches
+
+    if native_prefill:
+        q129 = torch.randn((1, 6, 129, 128), device=device, dtype=torch.bfloat16)
+        _, f_only = _record_triton_launches(
+            lambda: piper_attention_decode(q129, pool, c2s, nc, return_lse=True)
+        )
+        assert "_merge_two_attention_waves_kernel" not in f_only
+        assert (
+            "_frozen_pool_piper_kernel" if is_rdna4 else "_piper_chunked_prefill_kernel"
+        ) in f_only
+        if is_rdna4:
+            assert "_dense_piper_kernel" not in f_only
+
+        empty_c2s = torch.empty((1, 0), device=device, dtype=torch.int32)
+        empty_nc = torch.zeros_like(nc)
+        _, t_only = _record_triton_launches(
+            lambda: piper_attention_decode(
+                q129,
+                pool,
+                empty_c2s,
+                empty_nc,
+                tail_key=tk,
+                tail_value=tv,
+                tail_len=tl,
+                return_lse=True,
+            )
+        )
+        assert "_merge_two_attention_waves_kernel" not in t_only
+        assert ("_dense_piper_kernel" if is_rdna4 else "_piper_chunked_prefill_kernel") in t_only
+        if is_rdna4:
+            assert "_frozen_pool_piper_kernel" not in t_only
+
+        out_empty, lse_empty = piper_attention_decode(
+            q129, pool, empty_c2s, empty_nc, return_lse=True
+        )
+        assert (out_empty == 0.0).all()
+        assert (lse_empty == -float("inf")).all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("kv_dtype", [torch.int8, torch.uint8])
+def test_gpu_chunked_prefill_non_aligned_causal_and_two_wave_parity(
+    head_dim: int,
+    dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> None:
+    device = torch.device("cuda")
+    num_slots = 6
+    kv_heads = 2
+    q_heads = 6
+    pool = _make_strided_pool(num_slots, kv_heads, head_dim, device=device, kv_dtype=kv_dtype)
+    k_frozen, v_frozen = _populate_test_pool(
+        pool, [0, 1, 2, 3, 4, 5], device=device, dtype=dtype, seed=1201 + head_dim
+    )
+    slot_keys = {i: (k_frozen[i], v_frozen[i]) for i in range(num_slots)}
+
+    # Scenario A: 5 frozen chunks + 380 prefix + seq_q=644 -> tail_len=1024 (holes, BSHD).
+    torch.manual_seed(1202 + head_dim)
+    seq_a = 644
+    q_a = torch.randn((2, seq_a, q_heads, head_dim), device=device, dtype=dtype).transpose(1, 2)
+    c2s_a = torch.tensor([[3, 0, -1, 5, 1, 99, 2], [4, 2, 1, 0, 5, 3, 0]], device=device).int()
+    nc_a = torch.tensor([7, 3], device=device, dtype=torch.int32)
+    tk_a_raw = torch.randn((2, 1040, kv_heads, head_dim), device=device, dtype=dtype)
+    tv_a_raw = torch.randn_like(tk_a_raw)
+    tk_a = tk_a_raw.transpose(1, 2)
+    tv_a = tv_a_raw.transpose(1, 2)
+    tk_a[0, :, 1024:].fill_(float("nan"))
+    tv_a[0, :, 1024:].fill_(float("inf"))
+    tk_a[1, :, 700:].fill_(float("nan"))
+    tv_a[1, :, 700:].fill_(float("inf"))
+    tl_a = torch.tensor([1024, 700], device=device, dtype=torch.int32)
+
+    out_a, lse_a = piper_attention_decode(
+        q_a,
+        pool,
+        c2s_a,
+        nc_a,
+        tail_key=tk_a,
+        tail_value=tv_a,
+        tail_len=tl_a,
+        is_causal=True,
+        return_lse=True,
+    )
+    sdpa_a, sdpa_lse_a = _exact_fp32_attention(
+        q_a,
+        slot_keys,
+        c2s_a,
+        nc_a,
+        num_slots,
+        tail_key=tk_a,
+        tail_value=tv_a,
+        tail_len=tl_a,
+        scale=head_dim**-0.5,
+        is_causal=True,
+    )
+    _assert_prefill_quality(out_a, lse_a, sdpa_a, sdpa_lse_a)
+
+    out_af, lse_af = piper_attention_decode(q_a, pool, c2s_a, nc_a, return_lse=True)
+    out_at, lse_at = piper_attention_decode(
+        q_a,
+        pool,
+        torch.empty((2, 0), device=device, dtype=torch.int32),
+        torch.zeros_like(nc_a),
+        tail_key=tk_a,
+        tail_value=tv_a,
+        tail_len=tl_a,
+        is_causal=True,
+        return_lse=True,
+    )
+    merged_o, merged_l = merge_attention_lse([out_af, out_at], [lse_af, lse_at])
+    merge_atol = 2e-2 if dtype is torch.bfloat16 else 1e-2
+    torch.testing.assert_close(out_a, merged_o, atol=merge_atol, rtol=merge_atol)
+    torch.testing.assert_close(lse_a, merged_l, atol=1e-4, rtol=1e-4)
+
+    # Scenario B: chunk_to_slot=None + multi-chunk tail (tail_len=2380, seq_q=2000).
+    seq_b = 2000
+    q_b = torch.randn((1, q_heads, seq_b, head_dim), device=device, dtype=dtype)
+    nc_b = torch.tensor([3], device=device, dtype=torch.int32)
+    tk_b, tv_b, tl_b = _make_sentinel_tail(
+        1, kv_heads, 2400, head_dim, [2380], device=device, dtype=dtype
+    )
+    for is_causal in (True, False):
+        out_b, lse_b = piper_attention_decode(
+            q_b,
+            pool,
+            None,
+            nc_b,
+            tail_key=tk_b,
+            tail_value=tv_b,
+            tail_len=tl_b,
+            is_causal=is_causal,
+            return_lse=True,
+        )
+        sdpa_b, sdpa_lse_b = _exact_fp32_attention(
+            q_b,
+            slot_keys,
+            None,
+            nc_b,
+            num_slots,
+            tail_key=tk_b,
+            tail_value=tv_b,
+            tail_len=tl_b,
+            scale=head_dim**-0.5,
+            is_causal=is_causal,
+        )
+        _assert_prefill_quality(out_b, lse_b, sdpa_b, sdpa_lse_b)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_gpu_chunked_prefill_boundary_offsets_and_seq_gt_tail(head_dim: int) -> None:
+    device = torch.device("cuda")
+    num_slots = 2
+    kv_heads = 2
+    q_heads = 4
+    pool = _make_strided_pool(num_slots, kv_heads, head_dim, device=device, kv_dtype=torch.uint8)
+    k_frozen, v_frozen = _populate_test_pool(
+        pool, [0, 1], device=device, dtype=torch.bfloat16, seed=1301 + head_dim
+    )
+    slot_keys = {0: (k_frozen[0], v_frozen[0]), 1: (k_frozen[1], v_frozen[1])}
+    c2s = torch.tensor([[0, 1]], device=device, dtype=torch.int32)
+    nc = torch.tensor([2], device=device, dtype=torch.int32)
+
+    torch.manual_seed(1302 + head_dim)
+    for offset in (1, 62, 63, 65, 380, 1025):
+        seq_q = 64
+        tail_len_val = offset + seq_q
+        q = torch.randn((1, q_heads, seq_q, head_dim), device=device, dtype=torch.bfloat16)
+        tk, tv, tl = _make_sentinel_tail(
+            1,
+            kv_heads,
+            tail_len_val + 17,
+            head_dim,
+            [tail_len_val],
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        out, lse = piper_attention_decode(
+            q,
+            pool,
+            c2s,
+            nc,
+            tail_key=tk,
+            tail_value=tv,
+            tail_len=tl,
+            is_causal=True,
+            return_lse=True,
+        )
+        sdpa, sdpa_lse = _exact_fp32_attention(
+            q,
+            slot_keys,
+            c2s,
+            nc,
+            num_slots,
+            tail_key=tk,
+            tail_value=tv,
+            tail_len=tl,
+            scale=head_dim**-0.5,
+            is_causal=True,
+        )
+        _assert_prefill_quality(out, lse, sdpa, sdpa_lse)
+
+    # seq_q > active_tail (seq_q=128, active_tail=30): first 98 queries see zero tail tokens.
+    seq_gt = 128
+    q_gt = torch.randn((1, q_heads, seq_gt, head_dim), device=device, dtype=torch.bfloat16)
+    tk_gt, tv_gt, tl_gt = _make_sentinel_tail(
+        1, kv_heads, 96, head_dim, [30], device=device, dtype=torch.bfloat16
+    )
+    out_tail_only, lse_tail_only = piper_attention_decode(
+        q_gt,
+        pool,
+        torch.empty((1, 0), device=device, dtype=torch.int32),
+        torch.zeros_like(nc),
+        tail_key=tk_gt,
+        tail_value=tv_gt,
+        tail_len=tl_gt,
+        is_causal=True,
+        return_lse=True,
+    )
+    assert (out_tail_only[:, :, :98] == 0.0).all()
+    assert (lse_tail_only[:, :, :98] == -float("inf")).all()
+    sdpa_tail_only, sdpa_lse_tail_only = _exact_fp32_attention(
+        q_gt,
+        {},
+        None,
+        torch.zeros_like(nc),
+        0,
+        tail_key=tk_gt,
+        tail_value=tv_gt,
+        tail_len=tl_gt,
+        scale=head_dim**-0.5,
+        is_causal=True,
+    )
+    _assert_prefill_quality(
+        out_tail_only[:, :, 98:],
+        lse_tail_only[:, :, 98:],
+        sdpa_tail_only[:, :, 98:],
+        sdpa_lse_tail_only[:, :, 98:],
+    )
+
+    out_nc_gt, lse_nc_gt = piper_attention_decode(
+        q_gt,
+        pool,
+        c2s,
+        nc,
+        tail_key=tk_gt,
+        tail_value=tv_gt,
+        tail_len=tl_gt,
+        is_causal=False,
+        return_lse=True,
+    )
+    sdpa_nc_gt, sdpa_lse_nc_gt = _exact_fp32_attention(
+        q_gt,
+        slot_keys,
+        c2s,
+        nc,
+        num_slots,
+        tail_key=tk_gt,
+        tail_value=tv_gt,
+        tail_len=tl_gt,
+        scale=head_dim**-0.5,
+        is_causal=False,
+    )
+    _assert_prefill_quality(out_nc_gt, lse_nc_gt, sdpa_nc_gt, sdpa_lse_nc_gt)
+
+    out_with_pool, lse_with_pool = piper_attention_decode(
+        q_gt,
+        pool,
+        c2s,
+        nc,
+        tail_key=tk_gt,
+        tail_value=tv_gt,
+        tail_len=tl_gt,
+        is_causal=True,
+        return_lse=True,
+    )
+    out_f_only, lse_f_only = piper_attention_decode(q_gt, pool, c2s, nc, return_lse=True)
+    torch.testing.assert_close(out_with_pool[:, :, :98], out_f_only[:, :, :98], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(lse_with_pool[:, :, :98], lse_f_only[:, :, :98], atol=0.0, rtol=0.0)
+    sdpa_gt, sdpa_lse_gt = _exact_fp32_attention(
+        q_gt,
+        slot_keys,
+        c2s,
+        nc,
+        num_slots,
+        tail_key=tk_gt,
+        tail_value=tv_gt,
+        tail_len=tl_gt,
+        scale=head_dim**-0.5,
+        is_causal=True,
+    )
+    _assert_prefill_quality(out_with_pool, lse_with_pool, sdpa_gt, sdpa_lse_gt)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_gpu_chunked_prefill_ragged_batch(head_dim: int) -> None:
+    device = torch.device("cuda")
+    kv_heads = 2
+    q_heads = 4
+    num_slots = 4
+    seq_q = 70
+    pool = _make_strided_pool(num_slots, kv_heads, head_dim, device=device, kv_dtype=torch.uint8)
+    k_frozen, v_frozen = _populate_test_pool(
+        pool, [0, 1, 2, 3], device=device, dtype=torch.bfloat16, seed=1401 + head_dim
+    )
+    slot_keys = {i: (k_frozen[i], v_frozen[i]) for i in range(num_slots)}
+
+    # Row 0: frozen+multi-chunk tail (clamped > tail_cap), Row 1: tail-only, Row 2: frozen-only,
+    # Row 3: empty (negative num_chunks & tail_len clamped to 0).
+    torch.manual_seed(1402 + head_dim)
+    q = torch.randn((4, q_heads, seq_q, head_dim), device=device, dtype=torch.bfloat16)
+    c2s = torch.tensor(
+        [
+            [2, -1, 0, 99],
+            [0, 1, 2, 3],
+            [3, 1, -5, 2],
+            [0, 1, 2, 3],
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    nc = torch.tensor([9, 0, 2, -2], device=device, dtype=torch.int32)
+    tk, tv, tl = _make_sentinel_tail(
+        4, kv_heads, 1100, head_dim, [1500, 50, 0, -3], device=device, dtype=torch.bfloat16
+    )
+    out, lse = piper_attention_decode(
+        q, pool, c2s, nc, tail_key=tk, tail_value=tv, tail_len=tl, is_causal=True, return_lse=True
+    )
+    assert (out[1, :, :20] == 0.0).all()
+    assert (lse[1, :, :20] == -float("inf")).all()
+    assert (out[3] == 0.0).all()
+    assert (lse[3] == -float("inf")).all()
+    sdpa, sdpa_lse = _exact_fp32_attention(
+        q[:3],
+        slot_keys,
+        c2s[:3],
+        nc[:3],
+        num_slots,
+        tail_key=tk[:3],
+        tail_value=tv[:3],
+        tail_len=tl[:3],
+        scale=head_dim**-0.5,
+        is_causal=True,
+    )
+    _assert_prefill_quality(out[:3], lse[:3], sdpa, sdpa_lse)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_gpu_chunked_prefill_ieee754_edges(head_dim: int) -> None:
+    device = torch.device("cuda")
+    q64 = torch.ones((1, 2, 64, head_dim), device=device, dtype=torch.bfloat16)
+    edge_pool = _make_strided_pool(2, 2, head_dim, device=device, kv_dtype=torch.uint8)
+    _populate_test_pool(
+        edge_pool, [0, 1], device=device, dtype=torch.bfloat16, seed=1403 + head_dim
+    )
+    edge_pool.value_scale[0, 0].zero_()
+    c2s_one = torch.tensor([[0]], device=device, dtype=torch.int32)
+    nc_one = torch.tensor([1], device=device, dtype=torch.int32)
+    o_zero_vs, l_zero_vs = piper_attention_decode(q64, edge_pool, c2s_one, nc_one, return_lse=True)
+    assert torch.isfinite(o_zero_vs).all()
+    assert torch.isfinite(l_zero_vs).all()
+    torch.testing.assert_close(
+        o_zero_vs[:, 0].float(),
+        edge_pool.value_mean[0, 0].view(1, 1, head_dim).expand(1, 64, head_dim),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+    # Multi-chunk pool: valid chunk 0 alongside -inf k_bias chunk 1 with poisoned NaN value meta.
+    q_rot = _signed_hadamard_forward(q64.float())[0, 0, 0]
+    neg_inf_kc = torch.where(
+        q_rot == 0.0,
+        0.0,
+        torch.where(q_rot > 0.0, -float("inf"), float("inf")),
+    )
+    edge_pool.key_center[1, 0].copy_(neg_inf_kc)
+    edge_pool.value_scale[1, 0].fill_(float("nan"))
+    edge_pool.value_mean[1, 0].fill_(float("nan"))
+    o_c0_only, l_c0_only = piper_attention_decode(
+        q64,
+        edge_pool,
+        torch.tensor([[0]], device=device, dtype=torch.int32),
+        nc_one,
+        return_lse=True,
+    )
+    tk_g = torch.randn((1, 2, 70, head_dim), device=device, dtype=torch.bfloat16)
+    tv_g = torch.randn_like(tk_g)
+    tl_g = torch.tensor([70], device=device, dtype=torch.int32)
+    o_neg_multi, l_neg_multi = piper_attention_decode(
+        q64,
+        edge_pool,
+        torch.tensor([[0, 1]], device=device, dtype=torch.int32),
+        torch.tensor([2], device=device, dtype=torch.int32),
+        return_lse=True,
+    )
+    torch.testing.assert_close(o_neg_multi[:, 0], o_c0_only[:, 0], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(l_neg_multi[:, 0], l_c0_only[:, 0], atol=1e-4, rtol=1e-4)
+
+    # +inf k_bias from finite 1e20 keys/queries yields constant 1.0 out and +inf LSE, not NaN.
+    pos_pool = _make_strided_pool(1, 1, head_dim, device=device, kv_dtype=torch.uint8)
+    k_big = torch.full((1, 1, KV_CHUNK_TOKENS, head_dim), 1e20, device=device, dtype=torch.bfloat16)
+    v_one = torch.ones_like(k_big)
+    freeze_kv_chunks_(k_big, v_one, pos_pool, torch.tensor([0], device=device, dtype=torch.int32))
+    q_big = torch.full((1, 1, 64, head_dim), 1e20, device=device, dtype=torch.bfloat16)
+    o_pos, l_pos = piper_attention_decode(
+        q_big,
+        pos_pool,
+        torch.tensor([[0]], device=device, dtype=torch.int32),
+        torch.tensor([1], device=device, dtype=torch.int32),
+        return_lse=True,
+    )
+    torch.testing.assert_close(o_pos, torch.ones_like(o_pos), atol=1e-2, rtol=1e-2)
+    assert (l_pos == float("inf")).all()
+
+    # Active NaN in pool key_center propagates cleanly through wave merge.
+    pos_pool.key_center[0, 0, 0] = float("nan")
+    o_nan, l_nan = piper_attention_decode(
+        q_big,
+        pos_pool,
+        torch.tensor([[0]], device=device, dtype=torch.int32),
+        torch.tensor([1], device=device, dtype=torch.int32),
+        tail_key=tk_g[:, :1],
+        tail_value=tv_g[:, :1],
+        tail_len=tl_g,
+        return_lse=True,
+    )
+    assert torch.isnan(o_nan).all()
+    assert torch.isnan(l_nan).all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_gpu_chunked_prefill_zero_key_scale_and_nan_kbias_tail(head_dim: int) -> None:
+    device = torch.device("cuda")
+    pool = _make_strided_pool(1, 1, head_dim, device=device, kv_dtype=torch.uint8)
+    _populate_test_pool(pool, [0], device=device, dtype=torch.bfloat16, seed=1404 + head_dim)
+    c2s = torch.tensor([[0]], device=device, dtype=torch.int32)
+    nc = torch.tensor([1], device=device, dtype=torch.int32)
+    q = torch.randn((1, 1, 64, head_dim), device=device, dtype=torch.bfloat16)
+
+    # Underflowing softmax scale turns query_scale * key_scale to 0.0 -> uniform value_mean.
+    o_tiny, l_tiny = piper_attention_decode(q, pool, c2s, nc, scale=1e-40, return_lse=True)
+    torch.testing.assert_close(
+        o_tiny.float(),
+        pool.value_mean[0, 0].view(1, 1, 1, head_dim).expand_as(o_tiny),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(l_tiny, torch.full_like(l_tiny, math.log(KV_CHUNK_TOKENS)))
+
+    # Explicit zero key_scale must not leave unscaled INT8 dot products in softmax.
+    pool.key_scale.zero_()
+    o_zs, l_zs = piper_attention_decode(q, pool, c2s, nc, return_lse=True)
+    _, l_split = piper_attention_decode(q[:, :, :1], pool, c2s, nc, return_lse=True)
+    torch.testing.assert_close(
+        o_zs.float(),
+        pool.value_mean[0, 0].view(1, 1, 1, head_dim).expand_as(o_zs),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(l_zs[:, :, :1], l_split, atol=1e-3, rtol=1e-3)
+
+    # Finite 2**125 (+inf + -inf) k_bias on 1-tile tail (active_tail=32) must propagate NaN to out.
+    if _supports_native_prefill_gpu():
+        had = _signed_hadamard_forward(torch.eye(head_dim, device=device))
+        qt = torch.zeros((head_dim,), device=device)
+        qt[0], qt[1] = 1.0, 1.0
+        kt = torch.zeros((head_dim,), device=device)
+        kt[0], kt[1] = 2.0**125, -(2.0**125)
+        q_kb = (
+            (qt @ had.T)
+            .to(torch.bfloat16)
+            .view(1, 1, 1, head_dim)
+            .expand(1, 1, 64, head_dim)
+            .clone()
+        )
+        tk_kb = (
+            (kt @ had.T)
+            .to(torch.bfloat16)
+            .view(1, 1, 1, head_dim)
+            .expand(1, 1, 64, head_dim)
+            .clone()
+        )
+        o_kb, l_kb = piper_attention_decode(
+            q_kb,
+            pool,
+            torch.empty((1, 0), device=device, dtype=torch.int32),
+            torch.zeros_like(nc),
+            tail_key=tk_kb,
+            tail_value=torch.ones_like(tk_kb),
+            tail_len=torch.tensor([32], device=device, dtype=torch.int32),
+            is_causal=False,
+            return_lse=True,
+        )
+        assert torch.isnan(o_kb).all()
+        assert torch.isnan(l_kb).all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_gpu_chunked_prefill_small_denom_and_large_key_center(head_dim: int) -> None:
+    device = torch.device("cuda")
+    # Large-variance BF16 values (~2e35) yield legitimate denominator < 1e-30; must not clamp.
+    sd_pool = _make_strided_pool(1, 1, head_dim, device=device, kv_dtype=torch.uint8)
+    q_sd = torch.zeros((1, 1, 64, head_dim), device=device, dtype=torch.bfloat16)
+    v_sd_tail = torch.zeros_like(q_sd)
+    v_sd_tail[:, :, 32:, :] = 2e35
+    empty_c2s = torch.empty((1, 0), device=device, dtype=torch.int32)
+    zero_nc = torch.zeros((1,), device=device, dtype=torch.int32)
+    o_sd_t, l_sd_t = piper_attention_decode(
+        q_sd,
+        sd_pool,
+        empty_c2s,
+        zero_nc,
+        tail_key=q_sd,
+        tail_value=v_sd_tail,
+        tail_len=torch.tensor([64], device=device, dtype=torch.int32),
+        is_causal=False,
+        return_lse=True,
+    )
+    torch.testing.assert_close(
+        o_sd_t.float(),
+        torch.full_like(o_sd_t, 1e35, dtype=torch.float32),
+        atol=0.0,
+        rtol=5e-2,
+    )
+    torch.testing.assert_close(l_sd_t, torch.full_like(l_sd_t, math.log(64)), atol=5e-2, rtol=1e-2)
+
+    k_sd_full = torch.zeros((1, 1, KV_CHUNK_TOKENS, head_dim), device=device, dtype=torch.bfloat16)
+    v_sd_full = torch.zeros_like(k_sd_full)
+    v_sd_full[:, :, KV_CHUNK_TOKENS // 2 :, :] = 2e35
+    freeze_kv_chunks_(k_sd_full, v_sd_full, sd_pool, torch.tensor([0], device=device).int())
+    o_sd_f, l_sd_f = piper_attention_decode(
+        q_sd,
+        sd_pool,
+        torch.tensor([[0]], device=device, dtype=torch.int32),
+        torch.tensor([1], device=device, dtype=torch.int32),
+        is_causal=False,
+        return_lse=True,
+    )
+    torch.testing.assert_close(
+        o_sd_f.float(),
+        torch.full_like(o_sd_f, 1e35, dtype=torch.float32),
+        atol=0.0,
+        rtol=5e-2,
+    )
+    torch.testing.assert_close(
+        l_sd_f,
+        torch.full_like(l_sd_f, math.log(KV_CHUNK_TOKENS)),
+        atol=5e-2,
+        rtol=1e-2,
+    )
+
+    # Large finite key_center (~1e36) with unit query must apply query_scale before center dot sum.
+    q_big_c = torch.zeros((1, 1, 64, head_dim), device=device, dtype=torch.bfloat16)
+    q_big_c[:, :, :, 0] = 1.0
+    tk_big_c = torch.zeros((1, 1, 1, head_dim), device=device, dtype=torch.bfloat16)
+    tk_big_c[:, :, 0, 0] = 1e36
+    tv_big_c = torch.ones_like(tk_big_c)
+    tl_big_c = torch.tensor([1], device=device, dtype=torch.int32)
+    expected_lse_big = 1e36 / math.sqrt(head_dim)
+    o_bc, l_bc = piper_attention_decode(
+        q_big_c,
+        sd_pool,
+        empty_c2s,
+        zero_nc,
+        tail_key=tk_big_c,
+        tail_value=tv_big_c,
+        tail_len=tl_big_c,
+        is_causal=False,
+        return_lse=True,
+    )
+    assert torch.isfinite(o_bc).all()
+    assert torch.isfinite(l_bc).all()
+    torch.testing.assert_close(o_bc, torch.ones_like(o_bc), atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(
+        l_bc,
+        torch.full_like(l_bc, expected_lse_big),
+        atol=0.0,
+        rtol=5e-2,
+    )
+
+    freeze_kv_chunks_(
+        k_sd_full,
+        torch.ones_like(k_sd_full),
+        sd_pool,
+        torch.tensor([0], device=device, dtype=torch.int32),
+    )
+    o_bc_mix, l_bc_mix = piper_attention_decode(
+        q_big_c,
+        sd_pool,
+        torch.tensor([[0]], device=device, dtype=torch.int32),
+        torch.tensor([1], device=device, dtype=torch.int32),
+        tail_key=tk_big_c,
+        tail_value=tv_big_c,
+        tail_len=tl_big_c,
+        is_causal=False,
+        return_lse=True,
+    )
+    assert torch.isfinite(o_bc_mix).all()
+    assert torch.isfinite(l_bc_mix).all()
+    torch.testing.assert_close(o_bc_mix, torch.ones_like(o_bc_mix), atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(
+        l_bc_mix,
+        torch.full_like(l_bc_mix, expected_lse_big),
+        atol=0.0,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+def test_gpu_chunked_prefill_layouts_scales_and_empty_edges() -> None:
+    device = torch.device("cuda")
+    # Non-contiguous chunk_to_slot, custom scale, and MQA (kv_heads=1, q_heads=4).
+    pool_mqa = _make_strided_pool(3, 1, 128, device=device, kv_dtype=torch.uint8)
+    k_mqa, v_mqa = _populate_test_pool(
+        pool_mqa, [0, 1, 2], device=device, dtype=torch.bfloat16, seed=1410
+    )
+    slots_mqa = {i: (k_mqa[i], v_mqa[i]) for i in range(3)}
+    q_mqa = torch.randn((2, 4, 68, 128), device=device, dtype=torch.bfloat16)
+    c2s_mqa = torch.tensor([[2, 9, 0, 8], [1, 7, 2, 6]], device=device, dtype=torch.int32)[:, ::2]
+    assert not c2s_mqa.is_contiguous()
+    nc_mqa = torch.tensor([2, 2], device=device, dtype=torch.int32)
+    tk_mqa, tv_mqa, tl_mqa = _make_sentinel_tail(
+        2, 1, 100, 128, [80, 90], device=device, dtype=torch.bfloat16
+    )
+    out_mqa, lse_mqa = piper_attention_decode(
+        q_mqa,
+        pool_mqa,
+        c2s_mqa,
+        nc_mqa,
+        tail_key=tk_mqa,
+        tail_value=tv_mqa,
+        tail_len=tl_mqa,
+        scale=0.07,
+        is_causal=True,
+        return_lse=True,
+        active_chunks_hint=1,
+    )
+    sdpa_mqa, sdpa_lse_mqa = _exact_fp32_attention(
+        q_mqa,
+        slots_mqa,
+        c2s_mqa,
+        nc_mqa,
+        3,
+        tail_key=tk_mqa,
+        tail_value=tv_mqa,
+        tail_len=tl_mqa,
+        scale=0.07,
+        is_causal=True,
+    )
+    _assert_prefill_quality(out_mqa, lse_mqa, sdpa_mqa, sdpa_lse_mqa)
+    out_nolse = piper_attention_decode(
+        q_mqa,
+        pool_mqa,
+        c2s_mqa,
+        nc_mqa,
+        tail_key=tk_mqa,
+        tail_value=tv_mqa,
+        tail_len=tl_mqa,
+        scale=0.07,
+        is_causal=True,
+        return_lse=False,
+    )
+    assert isinstance(out_nolse, torch.Tensor)
+    torch.testing.assert_close(out_nolse, out_mqa, atol=1e-2, rtol=1e-2)
+
+    # MHA with odd head count (kv_heads=q_heads=3, head_dim=64 -> mask_heads=True on AMD).
+    pool_mha = _make_strided_pool(2, 3, 64, device=device, kv_dtype=torch.uint8)
+    k_mha, v_mha = _populate_test_pool(
+        pool_mha, [0, 1], device=device, dtype=torch.bfloat16, seed=1411
+    )
+    q_mha = torch.randn((1, 3, 65, 64), device=device, dtype=torch.bfloat16)
+    c2s_mha = torch.tensor([[1, 0]], device=device, dtype=torch.int32)
+    nc_mha = torch.tensor([2], device=device, dtype=torch.int32)
+    tk_mha, tv_mha, tl_mha = _make_sentinel_tail(
+        1, 3, 96, 64, [80], device=device, dtype=torch.bfloat16
+    )
+    out_mha, lse_mha = piper_attention_decode(
+        q_mha,
+        pool_mha,
+        c2s_mha,
+        nc_mha,
+        tail_key=tk_mha,
+        tail_value=tv_mha,
+        tail_len=tl_mha,
+        return_lse=True,
+    )
+    sdpa_mha, sdpa_lse_mha = _exact_fp32_attention(
+        q_mha,
+        {0: (k_mha[0], v_mha[0]), 1: (k_mha[1], v_mha[1])},
+        c2s_mha,
+        nc_mha,
+        2,
+        tail_key=tk_mha,
+        tail_value=tv_mha,
+        tail_len=tl_mha,
+        scale=64**-0.5,
+        is_causal=True,
+    )
+    _assert_prefill_quality(out_mha, lse_mha, sdpa_mha, sdpa_lse_mha)
+
+    # batch==0 and tail_cap==0 empty edges at seq_q=64.
+    q_b0 = torch.empty((0, 3, 64, 64), device=device, dtype=torch.bfloat16)
+    o_b0, l_b0 = piper_attention_decode(
+        q_b0,
+        pool_mha,
+        torch.empty((0, 2), device=device, dtype=torch.int32),
+        torch.empty((0,), device=device, dtype=torch.int32),
+        return_lse=True,
+    )
+    assert o_b0.shape == q_b0.shape
+    assert l_b0.shape == (0, 3, 64)
+    o_t0, l_t0 = piper_attention_decode(
+        q_mha[:, :, :64],
+        pool_mha,
+        torch.empty((1, 0), device=device, dtype=torch.int32),
+        torch.zeros((1,), device=device, dtype=torch.int32),
+        tail_key=torch.empty((1, 3, 0, 64), device=device, dtype=torch.bfloat16),
+        tail_value=torch.empty((1, 3, 0, 64), device=device, dtype=torch.bfloat16),
+        tail_len=torch.zeros((1,), device=device, dtype=torch.int32),
+        return_lse=True,
+    )
+    assert (o_t0 == 0.0).all()
+    assert (l_t0 == -float("inf")).all()
+
+    # Exported piper_attention_decode_triton validates prefill flags across seq_q.
+    from piper_kernels.attention.piper_attention.triton import (  # noqa: PLC0415 - lazy GPU import
+        piper_attention_decode_triton,
+    )
+
+    for q_bad in (q_mha[:, :, :1], q_mha):
+        with pytest.raises(ValueError, match="prefill_backend"):
+            piper_attention_decode_triton(
+                q_bad,
+                pool_mha.key_int8,
+                pool_mha.key_scale,
+                pool_mha.key_center,
+                pool_mha.value_int8,
+                pool_mha.value_scale,
+                pool_mha.value_mean,
+                c2s_mha,
+                nc_mha,
+                tail_key=None,
+                tail_value=None,
+                tail_len=None,
+                scale=64**-0.5,
+                is_causal=True,
+                grouped_qk=True,
+                pack_wmma=True,
+                active_chunks_hint=0,
+                prefill_backend="bogus",  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValueError, match="pack_wmma"):
+            piper_attention_decode_triton(
+                q_bad,
+                pool_mha.key_int8,
+                pool_mha.key_scale,
+                pool_mha.key_center,
+                pool_mha.value_int8,
+                pool_mha.value_scale,
+                pool_mha.value_mean,
+                c2s_mha,
+                nc_mha,
+                tail_key=None,
+                tail_value=None,
+                tail_len=None,
+                scale=64**-0.5,
+                is_causal=True,
+                grouped_qk=True,
+                pack_wmma=False,
+                active_chunks_hint=0,
+                prefill_backend="amd",
+            )
+        with pytest.raises(ValueError, match="grouped_qk"):
+            piper_attention_decode_triton(
+                q_bad,
+                pool_mha.key_int8,
+                pool_mha.key_scale,
+                pool_mha.key_center,
+                pool_mha.value_int8,
+                pool_mha.value_scale,
+                pool_mha.value_mean,
+                c2s_mha,
+                nc_mha,
+                tail_key=None,
+                tail_value=None,
+                tail_len=None,
+                scale=64**-0.5,
+                is_causal=True,
+                grouped_qk=False,
+                pack_wmma=True,
+                active_chunks_hint=0,
+                prefill_backend="amd",
+            )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_gpu_chunked_prefill_torch_compile_dynamic(head_dim: int) -> None:
+    device = torch.device("cuda")
+    kv_heads = 2
+    q_heads = 6
+    num_slots = 7
+    pool = _make_strided_pool(num_slots, kv_heads, head_dim, device=device, kv_dtype=torch.uint8)
+    k_frozen, v_frozen = _populate_test_pool(
+        pool, list(range(num_slots)), device=device, dtype=torch.bfloat16, seed=1501 + head_dim
+    )
+    slot_keys = {i: (k_frozen[i], v_frozen[i]) for i in range(num_slots)}
+
+    def _step(
+        q_in: torch.Tensor,
+        c2s_in: torch.Tensor,
+        nc_in: torch.Tensor,
+        tk_in: torch.Tensor,
+        tv_in: torch.Tensor,
+        tl_in: torch.Tensor,
+        *pool_tensors: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dyn_pool = PiperKVChunkPool.from_tensors(*pool_tensors)
+        return piper_attention_decode(
+            q_in,
+            dyn_pool,
+            c2s_in,
+            nc_in,
+            tail_key=tk_in,
+            tail_value=tv_in,
+            tail_len=tl_in,
+            return_lse=True,
+            active_chunks_hint=c2s_in.shape[1],
+        )
+
+    torch._dynamo.reset()
+    counter = CompileCounterWithBackend("inductor")
+    compiled = torch.compile(_step, backend=counter, fullgraph=True, dynamic=True)
+
+    with torch.inference_mode():
+        for seq_q, tail_cap, tl_val in ((5, 97, 81), (65, 113, 81), (130, 161, 145)):
+            q = torch.randn((3, q_heads, seq_q, head_dim), device=device, dtype=torch.bfloat16)
+            c2s = torch.tensor(
+                [[1, 3, -1, 5], [4, 0, 2, 6], [6, -1, 2, 1]], device=device, dtype=torch.int32
+            )
+            nc = torch.tensor([4, 3, 2], device=device, dtype=torch.int32)
+            tk, tv, tl = _make_sentinel_tail(
+                3,
+                kv_heads,
+                tail_cap,
+                head_dim,
+                [tl_val, tl_val - 7, tl_val - 19],
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            (out_c, lse_c), launches = _record_triton_launches(
+                lambda q=q, c2s=c2s, nc=nc, tk=tk, tv=tv, tl=tl: compiled(
+                    q,
+                    c2s,
+                    nc,
+                    tk,
+                    tv,
+                    tl,
+                    pool.key_int8,
+                    pool.key_scale,
+                    pool.key_center,
+                    pool.value_int8,
+                    pool.value_scale,
+                    pool.value_mean,
+                )
+            )
+            if seq_q < 64:
+                assert "_piper_decode_frozen_split_kernel" in launches
+            elif _supports_native_prefill_gpu():
+                assert "_piper_decode_frozen_split_kernel" not in launches
+                assert "_merge_two_attention_waves_kernel" in launches
+            out_e, lse_e = piper_attention_decode(
+                q, pool, c2s, nc, tail_key=tk, tail_value=tv, tail_len=tl, return_lse=True
+            )
+            torch.testing.assert_close(out_c, out_e, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(lse_c, lse_e, atol=1e-4, rtol=1e-4)
+            sdpa, sdpa_lse = _exact_fp32_attention(
+                q,
+                slot_keys,
+                c2s,
+                nc,
+                num_slots,
+                tail_key=tk,
+                tail_value=tv,
+                tail_len=tl,
+                scale=head_dim**-0.5,
+                is_causal=True,
+            )
+            _assert_prefill_quality(out_c, lse_c, sdpa, sdpa_lse)
+    assert counter.frame_count == 1
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_gpu_chunked_prefill_cudagraph_replay(head_dim: int) -> None:
+    device = torch.device("cuda")
+    kv_heads = 2
+    q_heads = 6
+    num_slots = 5
+    pool = _make_strided_pool(num_slots, kv_heads, head_dim, device=device, kv_dtype=torch.uint8)
+    _populate_test_pool(
+        pool, [0, 1, 2, 3, 4], device=device, dtype=torch.bfloat16, seed=1502 + head_dim
+    )
+    q_buf = torch.randn((2, q_heads, 129, head_dim), device=device, dtype=torch.bfloat16)
+    c2s_buf = torch.tensor([[0, 2, -1], [4, 1, 3]], device=device, dtype=torch.int32)
+    nc_buf = torch.tensor([2, 3], device=device, dtype=torch.int32)
+    tk_buf = torch.randn((2, kv_heads, 160, head_dim), device=device, dtype=torch.bfloat16)
+    tv_buf = torch.randn_like(tk_buf)
+    tl_buf = torch.tensor([140, 132], device=device, dtype=torch.int32)
+
+    for _ in range(2):
+        piper_attention_decode(
+            q_buf, pool, c2s_buf, nc_buf, tail_key=tk_buf, tail_value=tv_buf, tail_len=tl_buf
+        )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_buf, lse_buf = piper_attention_decode(
+            q_buf,
+            pool,
+            c2s_buf,
+            nc_buf,
+            tail_key=tk_buf,
+            tail_value=tv_buf,
+            tail_len=tl_buf,
+            return_lse=True,
+        )
+
+    q_buf.copy_(torch.randn_like(q_buf))
+    c2s_buf.copy_(torch.tensor([[4, 3, -1], [1, 0, 2]], device=device, dtype=torch.int32))
+    nc_buf.copy_(torch.tensor([2, 3], device=device, dtype=torch.int32))
+    tk_buf.copy_(torch.randn_like(tk_buf))
+    tv_buf.copy_(torch.randn_like(tv_buf))
+    tl_buf.copy_(torch.tensor([155, 130], device=device, dtype=torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    eager_o, eager_l = piper_attention_decode(
+        q_buf,
+        pool,
+        c2s_buf,
+        nc_buf,
+        tail_key=tk_buf,
+        tail_value=tv_buf,
+        tail_len=tl_buf,
+        return_lse=True,
+    )
+    torch.testing.assert_close(out_buf, eager_o, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(lse_buf, eager_l, atol=0.0, rtol=0.0)
+
+    c2s_buf[0].fill_(-1)
+    nc_buf[0] = 0
+    tl_buf[0] = 0
+    graph.replay()
+    torch.cuda.synchronize()
+    assert (out_buf[0] == 0.0).all()
+    assert (lse_buf[0] == -float("inf")).all()
