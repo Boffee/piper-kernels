@@ -51,14 +51,39 @@ def _decode_e4m3(code):
 
 
 @triton.jit
-def _decode_states_to_q_fp32(states, scale_codes):
-    """Decode 16-bit trellis states and raw E4M3 scale codes to quantized INT8 values in FP32."""
+def _decode_states_lcg_numerators(states):
+    """Compute signed LCG byte-sum numerators from 16-bit trellis states."""
     x = states * _LCG_MULTIPLIER + _LCG_INCREMENT
     numerators = ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)).to(tl.int32)
-    numerators -= _CODE_OFFSET
+    return numerators - _CODE_OFFSET
+
+
+@triton.jit
+def _decode_states_to_q_fp32(states, scale_codes):
+    """Decode 16-bit trellis states and raw E4M3 scale codes to quantized INT8 values in FP32."""
+    numerators = _decode_states_lcg_numerators(states)
     multipliers = _decode_e4m3(scale_codes.to(tl.uint32)) * _CODE_RECIPROCAL
     scaled = numerators.to(tl.float32) * multipliers[:, None]
     return libdevice.rint(tl.clamp(scaled, -127.0, 127.0))
+
+
+@triton.jit
+def _uniform_row_start_bits(step_bits, num_wide_steps, clamped_steps, denom):
+    """Compute uniform per-step start bit offsets for one block."""
+    return step_bits * clamped_steps + (clamped_steps + 1) * num_wide_steps // denom
+
+
+@triton.jit
+def _variable_row_start_bits(width, clamped_steps, denom):
+    """Compute per-row variable-width start bit offsets and total stream bits."""
+    row_bits = width * 8
+    row_step_bits = row_bits // denom
+    row_wide_steps = row_bits - row_step_bits * denom
+    start_bits = (
+        row_step_bits[:, None] * clamped_steps[None, :]
+        + row_wide_steps[:, None] * (clamped_steps[None, :] + 1) // denom
+    )
+    return start_bits, row_bits[:, None]
 
 
 @triton.jit
@@ -147,14 +172,7 @@ def _decode_variable_addresses(
         base = within_slot
         # Bound loads to bitstreams even if caller-owned row_widths are malformed.
         remaining_bytes = tl.maximum(bitstreams_bytes.to(tl.int64) - base, 0)
-    row_bits = width * 8
-    row_step_bits = row_bits // denom
-    row_wide_steps = row_bits - row_step_bits * denom
-    start_bits = (
-        row_step_bits[:, None] * clamped_steps[None, :]
-        + row_wide_steps[:, None] * (clamped_steps[None, :] + 1) // denom
-    )
-    stream_bits = row_bits[:, None]
+    start_bits, stream_bits = _variable_row_start_bits(width, clamped_steps, denom)
     block_ptr_1d = bitstreams + base
     stream_bytes = tl.minimum(width.to(tl.int64), remaining_bytes).to(tl.int32)
     return block_ptr_1d, start_bits, stream_bits, stream_bytes
@@ -222,7 +240,7 @@ def _decode_int8_blocks(
         )
         stream_bytes_2d = stream_bytes[:, None]
     else:
-        offsets = step_bits * clamped_steps + (clamped_steps + 1) * num_wide_steps // denom
+        offsets = _uniform_row_start_bits(step_bits, num_wide_steps, clamped_steps, denom)
         block_ptr_1d = bitstreams + blocks.to(tl.int64) * bytes_per_block
         start_bits = tl.broadcast_to(offsets[None, :], (tile_blocks, tile_steps))
         stream_bits = block_bits

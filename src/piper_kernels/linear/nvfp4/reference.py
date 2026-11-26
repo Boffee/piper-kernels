@@ -65,16 +65,17 @@ def linear_prepared(
 
     # Both operands have the same nibble ordering, so their dot product also
     # agrees when each adjacent pair is swapped in both dequantized tensors.
-    result = (
-        dequantize_nvfp4(input_qdata, input_scale, swizzled=True)
-        @ dequantize_nvfp4(weight_qdata, weight_scale, swizzled=True).T
-    )
-    global_scale = input_per_tensor_scale
-    if weight_per_tensor_scale is not None:
-        global_scale = global_scale * weight_per_tensor_scale
-    result.mul_(global_scale)
-    if bias is not None:
-        result.add_(bias.float())
+    with torch.amp.autocast(input_qdata.device.type, enabled=False):
+        result = (
+            dequantize_nvfp4(input_qdata, input_scale, swizzled=True)
+            @ dequantize_nvfp4(weight_qdata, weight_scale, swizzled=True).T
+        )
+        global_scale = input_per_tensor_scale
+        if weight_per_tensor_scale is not None:
+            global_scale = global_scale * weight_per_tensor_scale
+        result.mul_(global_scale)
+        if bias is not None:
+            result.add_(bias.float())
     return result.to(logical_dtype)
 
 
@@ -121,19 +122,20 @@ def linear_w4a16(
     """Dequantize swizzled NVFP4 weights and apply a floating activation, optionally rotated."""
     if input.numel() == 0 or weight_qdata.shape[0] == 0:
         return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))
-    active = rotate_groups(input.float(), group_size) if group_size else input.float()
-    flattened = active.reshape(-1, active.shape[-1])
-    weight = dequantize_nvfp4(weight_qdata, weight_scale, swizzled=True, high_first=high_first)
-    if weight_per_tensor_scale is not None:
-        gs = weight_per_tensor_scale.to(device=weight.device, dtype=torch.float32)
-        apply_early = gs.abs() < 1.0
-        pre_scale = torch.where(apply_early, gs, torch.ones_like(gs))
-        post_scale = torch.where(apply_early, torch.ones_like(gs), gs)
-        result = ((flattened * pre_scale) @ weight.T) * post_scale
-    else:
-        result = flattened @ weight.T
-    if bias is not None:
-        result.add_(bias.float())
+    with torch.amp.autocast(input.device.type, enabled=False):
+        active = rotate_groups(input.float(), group_size) if group_size else input.float()
+        flattened = active.reshape(-1, active.shape[-1])
+        weight = dequantize_nvfp4(weight_qdata, weight_scale, swizzled=True, high_first=high_first)
+        if weight_per_tensor_scale is not None:
+            gs = weight_per_tensor_scale.to(device=weight.device, dtype=torch.float32)
+            apply_early = gs.abs() < 1.0
+            pre_scale = torch.where(apply_early, gs, torch.ones_like(gs))
+            post_scale = torch.where(apply_early, torch.ones_like(gs), gs)
+            result = ((flattened * pre_scale) @ weight.T) * post_scale
+        else:
+            result = flattened @ weight.T
+        if bias is not None:
+            result.add_(bias.float())
     return result.to(input.dtype).reshape(*input.shape[:-1], weight_qdata.shape[0])
 
 

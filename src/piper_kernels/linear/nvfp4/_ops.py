@@ -157,6 +157,8 @@ def _linear_fake(
     _high_first: bool = False,
     weight_only: bool = False,
 ) -> torch.Tensor:
+    if input.ndim == 0:
+        raise ValueError("NVFP4 linear input must be a non-scalar strided floating tensor")
     if weight_only and (activation_per_tensor_scale is not None or dynamic_activation_scale):
         raise ValueError("NVFP4 linear weight-only execution does not accept activation scales")
     return input.new_empty((*input.shape[:-1], weight_qdata.shape[0]))

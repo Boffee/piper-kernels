@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import math
 from dataclasses import dataclass
 from typing import Literal
@@ -20,6 +19,7 @@ from piper_kernels.trellis._layout import (
 from piper_kernels.weights.convrot._rotation import rotate_groups, validate_group_size
 
 from . import _ops
+from .reference import _autocast_disabled
 
 type MoEWeightFormat = Literal[
     "nvfp4_w4a16",
@@ -35,12 +35,6 @@ _SUPPORTED_WEIGHT_FORMATS = (
     "convrot_int8",
     "convrot_trellis",
 )
-
-
-def _autocast_disabled(device: torch.device) -> contextlib.AbstractContextManager[object]:
-    if device.type in ("cpu", "cuda"):
-        return torch.amp.autocast(device_type=device.type, enabled=False)
-    return contextlib.nullcontext()
 
 
 def _normalize_nvfp4_global_scale(
@@ -93,26 +87,7 @@ class MoEWeights:
             raise ValueError(
                 f"MoE logical_dtype must be float16, bfloat16, or float32, got {self.logical_dtype}"
             )
-        _ops._validate_weight_storage(
-            self.up_gate_qdata,
-            self.up_gate_scale,
-            self.down_qdata,
-            self.down_scale,
-            self.up_gate_global_scale,
-            self.down_global_scale,
-            group_size=self.group_size,
-            activation_fn=self.activation_fn,
-            gate_first=self.gate_first,
-            high_first=self.high_first,
-            up_gate_block_scales=self.up_gate_block_scales,
-            down_block_scales=self.down_block_scales,
-            up_gate_row_widths=self.up_gate_row_widths,
-            down_row_widths=self.down_row_widths,
-            up_gate_slot_offsets=self.up_gate_slot_offsets,
-            down_slot_offsets=self.down_slot_offsets,
-            up_gate_block_size=self.up_gate_block_size,
-            down_block_size=self.down_block_size,
-        )
+        _ops._validate_weight_storage(self)
 
     @property
     def weight_format(self) -> MoEWeightFormat:
@@ -127,23 +102,23 @@ class MoEWeights:
     def num_slots(self) -> int:
         """Return the number of resident expert slots wrapped by this storage."""
         if self.down_block_scales is not None:
-            return int(self.down_block_scales.shape[0])
-        return int(self.down_qdata.shape[0])
+            return self.down_block_scales.shape[0]
+        return self.down_qdata.shape[0]
 
     @property
     def hidden_size(self) -> int:
         """Return the logical model hidden width ``H``."""
         if self.down_block_scales is not None:
-            return int(self.down_block_scales.shape[1])
-        return int(self.down_qdata.shape[1])
+            return self.down_block_scales.shape[1]
+        return self.down_qdata.shape[1]
 
     @property
     def intermediate_size(self) -> int:
         """Return the per-expert FFN intermediate width ``I``."""
         if self.down_block_scales is not None:
-            return int(self.down_block_scales.shape[2]) * self.down_block_size
+            return self.down_block_scales.shape[2] * self.down_block_size
         factor = 2 if self.up_gate_qdata.dtype is torch.uint8 else 1
-        return int(self.down_qdata.shape[2]) * factor
+        return self.down_qdata.shape[2] * factor
 
     @property
     def device(self) -> torch.device:
@@ -744,13 +719,6 @@ def moe_ffn(
         raise TypeError("MoE accumulate must be a bool")
     if accumulate and out is None:
         raise ValueError("accumulate=True requires a caller-owned out tensor")
-    if (
-        out is not None
-        and not torch.compiler.is_compiling()
-        and detect_fake_mode() is None
-        and (out.is_neg() or out.is_conj())
-    ):
-        raise ValueError("MoE out tensor must not use negated or conjugated views")
     if input.dtype is not weights.logical_dtype:
         raise ValueError(
             f"MoE input dtype {input.dtype} must match weight logical_dtype {weights.logical_dtype}"
@@ -767,43 +735,10 @@ def moe_ffn(
             raise TypeError("MoE active_slots_hint must be an integer or None")
         if active_slots_hint <= 0:
             raise ValueError("MoE active_slots_hint must be positive")
-        hint = int(active_slots_hint)
+        hint = active_slots_hint
 
-    if out is None:
-        return _ops.moe_ffn(
-            input,
-            topk_ids,
-            topk_weights,
-            weights.up_gate_qdata,
-            weights.up_gate_scale,
-            weights.down_qdata,
-            weights.down_scale,
-            weights.up_gate_global_scale,
-            weights.down_global_scale,
-            expert_to_slot,
-            prepared_data,
-            prepared_scale,
-            group_size=weights.group_size,
-            activation_fn=weights.activation_fn,
-            gate_first=weights.gate_first,
-            high_first=weights.high_first,
-            active_slots_hint=hint,
-            up_gate_block_scales=weights.up_gate_block_scales,
-            down_block_scales=weights.down_block_scales,
-            up_gate_row_widths=weights.up_gate_row_widths,
-            down_row_widths=weights.down_row_widths,
-            up_gate_slot_offsets=weights.up_gate_slot_offsets,
-            down_slot_offsets=weights.down_slot_offsets,
-            up_gate_block_size=weights.up_gate_block_size,
-            down_block_size=weights.down_block_size,
-        )
-    # InferenceMode skips the Autograd key; validate concrete out calls before ADInplaceOrView.
-    if (
-        not torch.compiler.is_compiling()
-        and detect_fake_mode() is None
-        and torch.is_inference_mode_enabled()
-    ):
-        _ops._validate_before_mutating(
+    return _ops.dispatch_moe_ffn(
+        _ops._MoEOperands(
             input,
             topk_ids,
             topk_weights,
@@ -817,51 +752,22 @@ def moe_ffn(
             prepared_data,
             prepared_scale,
             out,
-            accumulate=accumulate,
-            group_size=weights.group_size,
-            activation_fn=weights.activation_fn,
-            gate_first=weights.gate_first,
-            high_first=weights.high_first,
-            active_slots_hint=hint,
-            up_gate_block_scales=weights.up_gate_block_scales,
-            down_block_scales=weights.down_block_scales,
-            up_gate_row_widths=weights.up_gate_row_widths,
-            down_row_widths=weights.down_row_widths,
-            up_gate_slot_offsets=weights.up_gate_slot_offsets,
-            down_slot_offsets=weights.down_slot_offsets,
-            up_gate_block_size=weights.up_gate_block_size,
-            down_block_size=weights.down_block_size,
+            accumulate,
+            weights.group_size,
+            weights.activation_fn,
+            weights.gate_first,
+            weights.high_first,
+            hint,
+            weights.up_gate_block_scales,
+            weights.down_block_scales,
+            weights.up_gate_row_widths,
+            weights.down_row_widths,
+            weights.up_gate_slot_offsets,
+            weights.down_slot_offsets,
+            weights.up_gate_block_size,
+            weights.down_block_size,
         )
-    _ops.moe_ffn_(
-        input,
-        topk_ids,
-        topk_weights,
-        weights.up_gate_qdata,
-        weights.up_gate_scale,
-        weights.down_qdata,
-        weights.down_scale,
-        out,
-        weights.up_gate_global_scale,
-        weights.down_global_scale,
-        expert_to_slot,
-        prepared_data,
-        prepared_scale,
-        accumulate=accumulate,
-        group_size=weights.group_size,
-        activation_fn=weights.activation_fn,
-        gate_first=weights.gate_first,
-        high_first=weights.high_first,
-        active_slots_hint=hint,
-        up_gate_block_scales=weights.up_gate_block_scales,
-        down_block_scales=weights.down_block_scales,
-        up_gate_row_widths=weights.up_gate_row_widths,
-        down_row_widths=weights.down_row_widths,
-        up_gate_slot_offsets=weights.up_gate_slot_offsets,
-        down_slot_offsets=weights.down_slot_offsets,
-        up_gate_block_size=weights.up_gate_block_size,
-        down_block_size=weights.down_block_size,
     )
-    return out
 
 
 __all__ = [

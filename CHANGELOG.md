@@ -22,6 +22,21 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   (`gfx1201`), with offline `gfx1200` attention smoke coverage. Live NVIDIA hardware
   execution remains unexercised locally.
 
+### Fixed
+
+- `moe_ffn` and `MoEWeights`: flattened M1 and Split-K CUDA launch grids to support
+  `top_k > 65,535`, gated `convrot_trellis` GPU dispatch on SM75+ and supported AMD
+  targets (falling back to the portable reference on pre-SM75 CUDA), and aligned
+  `gfx1200` with `gfx1201` on RDNA4. Rejected eager `moe_ffn(..., out=out)` calls
+  (including `device="meta"` and `torch.inference_mode()`) now validate once without
+  bumping `out._version`, and `MoEWeights` preserves `torch.SymInt` shapes and
+  `active_slots_hint` under `torch.compile(dynamic=True)`.
+- Linear and Trellis weight boundaries: validated `ConvRotInt8Tensor.from_trellis`
+  inputs before allocating storage, preserved autocast precision/range and rejected
+  scalar `meta` inputs in NVFP4 W4A16 linear, rejected non-contiguous 3-D `out`
+  buffers before empty-output setup, and fixed non-foldable 3-D activation views on
+  CUDA.
+
 ## [0.9.0rc1] - 2026-11-26
 
 ### Added

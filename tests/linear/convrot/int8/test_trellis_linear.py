@@ -8,7 +8,9 @@ import sys
 
 import pytest
 import torch
+import triton
 from _compile_capture import TargetCapturePass
+from _nvidia_resources import capture_cuda_spill_stores
 from torch._dynamo.testing import CompileCounterWithBackend
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
@@ -48,9 +50,11 @@ _PRIMARY_ISA_TARGETS = [
 ]
 
 _SECONDARY_ISA_TARGETS = [
+    pytest.param(GPUTarget("cuda", 86, 32), id="cuda-86"),
     pytest.param(GPUTarget("cuda", 89, 32), id="cuda-89"),
     _hip_target_param("gfx1100", 32),
     _hip_target_param("gfx1151", 32),
+    _hip_target_param("gfx1200", 32),
 ]
 
 
@@ -614,9 +618,18 @@ def test_copy_and_pin_contracts() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _assert_zero_spills(target: GPUTarget, kernels: dict[str, object]) -> None:
+def _compile_and_assert_zero_spills(
+    target: GPUTarget,
+    *,
+    expect_splitk: bool,
+    **kwargs: object,
+) -> dict[str, triton.compiler.CompiledKernel]:
+    spills_by_hash, compile_fn = capture_cuda_spill_stores()
+    kernels = compile_trellis_kernels(target, compile_fn=compile_fn, **kwargs)  # type: ignore[arg-type]
+    assert "gemv" in kernels
+    assert ("reduce" in kernels) is expect_splitk
     for name, compiled in kernels.items():
-        asm = compiled.asm  # type: ignore[attr-defined]
+        asm = compiled.asm
         if target.backend == "hip":
             hsaco = asm["hsaco"]
             amdgcn = asm["amdgcn"]
@@ -625,11 +638,10 @@ def _assert_zero_spills(target: GPUTarget, kernels: dict[str, object]) -> None:
             assert match is not None, f"missing .vgpr_spill_count in {target.arch} {name}"
             assert int(match.group(1)) == 0, f"{target.arch} {name} spilled {match.group(1)} VGPRs"
         else:
-            ptx = asm["ptx"]
-            assert ptx
-            assert not re.search(r"\.local\s+\.align\s+\d+\s+\.b8\s+\w+\[\d+\]", ptx), (
-                f"sm{target.arch} {name} allocated .local stack frame in PTX"
-            )
+            assert asm["ptx"]
+            spills = spills_by_hash[compiled.hash]
+            assert spills == 0, f"sm{target.arch} {name} spilled {spills} bytes"
+    return kernels
 
 
 @pytest.mark.parametrize("target", _PRIMARY_ISA_TARGETS)
@@ -663,8 +675,9 @@ def test_trellis_gemv_compiles_without_spills_primary_targets(
     bias_dtype: torch.dtype | None,
     expect_splitk: bool,
 ) -> None:
-    kernels = compile_trellis_kernels(
+    _compile_and_assert_zero_spills(
         target,
+        expect_splitk=expect_splitk,
         rows=rows,
         out_features=out_features,
         input_features=input_features,
@@ -674,15 +687,13 @@ def test_trellis_gemv_compiles_without_spills_primary_targets(
         variable_rows=variable_rows,
         num_sms=64,
     )
-    assert "gemv" in kernels
-    assert ("reduce" in kernels) is expect_splitk
-    _assert_zero_spills(target, kernels)
 
 
 @pytest.mark.parametrize("target", _SECONDARY_ISA_TARGETS)
 def test_trellis_gemv_compiles_without_spills_secondary_targets(target: GPUTarget) -> None:
-    kernels = compile_trellis_kernels(
+    _compile_and_assert_zero_spills(
         target,
+        expect_splitk=True,
         rows=8,
         out_features=64,
         input_features=65408,  # 292 * 224
@@ -692,9 +703,6 @@ def test_trellis_gemv_compiles_without_spills_secondary_targets(target: GPUTarge
         variable_rows=True,
         num_sms=64,
     )
-    assert "gemv" in kernels
-    assert "reduce" in kernels
-    _assert_zero_spills(target, kernels)
 
 
 # ---------------------------------------------------------------------------

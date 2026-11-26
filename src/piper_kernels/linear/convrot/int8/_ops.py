@@ -4,8 +4,6 @@ Fake implementations describe shared tensor contracts without selecting hardware
 Runtime bodies resolve implementations again, including after compiler rewrites.
 """
 
-import math
-
 import torch
 
 from piper_kernels._input_activations import input_activation_width
@@ -29,15 +27,9 @@ def linear(
 ) -> torch.Tensor:
     """Dispatch the stable linear operation to a supported implementation."""
     if block_scales is not None:
-        out_features, blocks_per_row = block_scales.shape
-        leading_shape = input.shape[:-1]
-        rows = math.prod(leading_shape)
-        if input.device.type == "meta" or rows == 0 or out_features == 0:
-            return input.new_empty((*leading_shape, out_features))
-        if blocks_per_row == 0:
-            if bias is None:
-                return input.new_zeros((*leading_shape, out_features))
-            return bias.to(input.dtype).expand(*leading_shape, out_features).clone()
+        out_features = block_scales.shape[0]
+        if input.device.type == "meta":
+            return input.new_empty((*input.shape[:-1], out_features))
         if runtime.supports_device(input.device):
             from . import trellis_triton  # noqa: PLC0415
 

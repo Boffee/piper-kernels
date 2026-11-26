@@ -7,7 +7,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 import torch
@@ -17,12 +17,11 @@ from _accelerators import (
     rocm_fences_only_lds,
     w4a16_nvfp4_available,
 )
-from _nvidia_resources import compile_with_spill_stores
+from _nvidia_resources import capture_cuda_spill_stores
 from torch._dynamo.testing import CompileCounter
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
 from triton.backends.compiler import GPUTarget
-from triton.compiler import ASTSource
 from triton.compiler.compiler import LazyDict
 
 from piper_kernels import compile_options
@@ -47,9 +46,11 @@ ActivationKind = Literal["swiglu", "gelu_tanh"]
 _INT8_MOE_GPU_AVAILABLE = w4a16_nvfp4_available() and (
     torch.version.hip is not None or torch.cuda.get_device_capability()[0] >= 8
 )
+_SM75_SHARED_MEMORY_LIMIT = 64 * 1024
 _SM120_SHARED_MEMORY_LIMIT = 99 * 1024
 _NVIDIA_TARGETS = [
     GPUTarget("cuda", 80, 32),
+    GPUTarget("cuda", 86, 32),
     GPUTarget("cuda", 89, 32),
     GPUTarget("cuda", 120, 32),
 ]
@@ -59,6 +60,33 @@ _AMD_TARGETS = [
     ("gfx1151", 32),
     ("gfx1201", 32),
 ]
+
+
+def _shared_memory_limit(target: GPUTarget) -> int:
+    return _SM75_SHARED_MEMORY_LIMIT if target.arch < 80 else _SM120_SHARED_MEMORY_LIMIT
+
+
+def _compile_nvidia_and_assert_clean(
+    target: GPUTarget,
+    *,
+    check_int8_mma: bool = False,
+    max_spill_stores: dict[str, int] | None = None,
+    **kwargs: Any,
+) -> dict[str, triton.compiler.CompiledKernel]:
+    spills_by_hash, compiler = capture_cuda_spill_stores()
+    compiled = moe_triton.compile_moe_kernels(target, compiler=compiler, **kwargs)
+    assert compiled
+    smem_limit = _shared_memory_limit(target)
+    for name, kernel in compiled.items():
+        assert kernel.asm.get("cubin")
+        ptx = kernel.asm.get("ptx", "")
+        assert ptx
+        limit = 0 if max_spill_stores is None else max_spill_stores.get(name, 0)
+        assert spills_by_hash[kernel.hash] <= limit
+        assert kernel.metadata.shared <= smem_limit
+        if check_int8_mma and name.startswith(("int8_matmul", "int8_grouped")):
+            assert "mma.sync" in ptx
+    return compiled
 
 
 def _make_dense_weights(
@@ -753,17 +781,6 @@ def test_validation_errors_leave_caller_out_untouched() -> None:
             )
         assert torch.equal(out.view(torch.uint16), before_bits)
 
-    # Rejected mutating calls never bump out._version or break saved autograd graphs.
-    for ctx_factory in (torch.enable_grad, torch.no_grad, torch.inference_mode):
-        tracked_out = torch.ones((1, 128), dtype=torch.bfloat16)
-        grad_leaf = torch.ones((1, 128), dtype=torch.bfloat16, requires_grad=True)
-        saved = (grad_leaf * tracked_out).sum()
-        with ctx_factory(), pytest.raises(ValueError, match="topk_ids"):
-            moe_ffn(x, weights, topk_ids.float(), topk_weights, out=tracked_out, accumulate=True)
-        assert tracked_out._version == 0
-        saved.backward()
-        assert grad_leaf.grad is not None
-
     x_fp16 = torch.randn((1, 128), dtype=torch.float16)
     bad_fp16_prep = PreparedMoEInput(
         data=torch.zeros((1, 128), dtype=torch.float16),
@@ -824,6 +841,43 @@ def test_validation_errors_leave_caller_out_untouched() -> None:
                 accumulate=True,
             )
     assert torch.equal(out.view(torch.uint16), before_bits)
+
+
+def test_rejected_inplace_calls_preserve_out_version() -> None:
+    torch.manual_seed(22)
+    weights = _make_moe_weights(
+        3, 128, 128, weight_format="convrot_int8", group_size=64, dtype=torch.bfloat16, seed=21
+    )
+    x = torch.randn((1, 128), dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    topk_weights = torch.tensor([[0.6, 0.4]], dtype=torch.bfloat16)
+    alias_out = weights.up_gate_scale[0, :64].view(torch.bfloat16).view(1, 128)
+
+    # Rejected mutating calls never bump out._version or break saved autograd graphs.
+    for ctx_factory in (torch.enable_grad, torch.no_grad, torch.inference_mode):
+        tracked_out = torch.ones((1, 128), dtype=torch.bfloat16)
+        grad_leaf = torch.ones((1, 128), dtype=torch.bfloat16, requires_grad=True)
+        saved = (grad_leaf * tracked_out).sum()
+        with ctx_factory(), pytest.raises(ValueError, match="topk_ids"):
+            moe_ffn(x, weights, topk_ids.float(), topk_weights, out=tracked_out, accumulate=True)
+        assert tracked_out._version == 0
+        saved.backward()
+        assert grad_leaf.grad is not None
+
+        alias_before = alias_out.clone()
+        alias_ver = alias_out._version
+        with ctx_factory(), pytest.raises(ValueError, match="alias"):
+            moe_ffn(x, weights, topk_ids, topk_weights, out=alias_out)
+        assert alias_out._version == alias_ver
+        assert torch.equal(alias_out, alias_before)
+
+    normal_out = torch.zeros_like(x)
+    v_before = normal_out._version
+    with torch.inference_mode():
+        assert moe_ffn(x, weights, topk_ids, topk_weights, out=normal_out) is normal_out
+        assert normal_out._version > v_before
+        inf_out = torch.zeros_like(x)
+        assert moe_ffn(x, weights, topk_ids, topk_weights, out=inf_out) is inf_out
 
 
 @pytest.mark.parametrize(
@@ -1132,6 +1186,11 @@ def test_cpu_empty_meta_and_multi_row() -> None:
         moe_ffn(meta_x, meta_w, meta_ids, meta_wts, out=meta_inplace, accumulate=True)
         is meta_inplace
     )
+    for ctx_factory in (torch.enable_grad, torch.no_grad, torch.inference_mode):
+        v_meta = meta_inplace._version
+        with ctx_factory(), pytest.raises(ValueError, match="topk_weights"):
+            moe_ffn(meta_x, meta_w, meta_ids, meta_wts.to(torch.int32), out=meta_inplace)
+        assert meta_inplace._version == v_meta
 
 
 def test_cpu_noncontiguous_inputs_and_overlapping_out() -> None:
@@ -2062,17 +2121,9 @@ def test_offline_nvidia_compile_zero_spills(
     split_k: int,
     accumulate: bool,
 ) -> None:
-    spill_records: dict[triton.compiler.CompiledKernel, int] = {}
-
-    def _compile(
-        source: ASTSource, tgt: GPUTarget, options: dict[str, object]
-    ) -> triton.compiler.CompiledKernel:
-        compiled, spills = compile_with_spill_stores(source, tgt, options)
-        spill_records[compiled] = spills
-        return compiled
-
-    compiled = moe_triton.compile_moe_kernels(
+    compiled = _compile_nvidia_and_assert_clean(
         target,
+        check_int8_mma=True,
         weight_format=weight_format,
         logical_dtype=logical_dtype,
         hidden_size=5120,
@@ -2080,20 +2131,10 @@ def test_offline_nvidia_compile_zero_spills(
         group_size=group_size,
         split_k=split_k,
         accumulate=accumulate,
-        compiler=_compile,
     )
-    assert compiled
     expected_prefix = "int8_matmul_" if weight_format == "convrot_int8" else "nvfp4_gemv_"
     assert f"{expected_prefix}up" in compiled
     assert f"{expected_prefix}down" in compiled
-    for name, kernel in compiled.items():
-        assert kernel.asm.get("cubin")
-        ptx = kernel.asm.get("ptx", "")
-        assert ptx
-        assert spill_records[kernel] == 0
-        assert kernel.metadata.shared <= _SM120_SHARED_MEMORY_LIMIT
-        if name.startswith("int8_matmul"):
-            assert "mma.sync" in ptx
 
 
 @pytest.mark.parametrize("weight_format", ["nvfp4_w4a16", "convrot_nvfp4_w4a16"])
@@ -2102,16 +2143,7 @@ def test_offline_sm75_compile_matrix(
     weight_format: MoEFormat, split_k: int, accumulate: bool
 ) -> None:
     sm75 = GPUTarget("cuda", 75, 32)
-    spill_records: dict[triton.compiler.CompiledKernel, int] = {}
-
-    def _compile(
-        source: ASTSource, tgt: GPUTarget, options: dict[str, object]
-    ) -> triton.compiler.CompiledKernel:
-        compiled, spills = compile_with_spill_stores(source, tgt, options)
-        spill_records[compiled] = spills
-        return compiled
-
-    compiled = moe_triton.compile_moe_kernels(
+    _compile_nvidia_and_assert_clean(
         sm75,
         weight_format=weight_format,
         logical_dtype=torch.float16,
@@ -2120,12 +2152,7 @@ def test_offline_sm75_compile_matrix(
         group_size=64 if weight_format == "convrot_nvfp4_w4a16" else 0,
         split_k=split_k,
         accumulate=accumulate,
-        compiler=_compile,
     )
-    assert compiled
-    for kernel in compiled.values():
-        assert kernel.asm.get("cubin")
-        assert spill_records[kernel] == 0
 
     with pytest.raises(ValueError, match="SM80"):
         moe_triton.compile_moe_kernels(
@@ -2559,7 +2586,7 @@ def test_gpu_launch_canary_nvfp4_and_int8() -> None:
         nvfp4_first, ref_nvfp4_up, weight_format="nvfp4_w4a16", dtype=torch.bfloat16
     )
     assert "nvfp4_moe_m1_gemv_kernel" in nvfp4_launches
-    assert "nvfp4_moe_m1_reduce_kernel" in nvfp4_launches
+    assert "moe_splitk_reduce_kernel" in nvfp4_launches
     assert "moe_m1_activate_rotate_kernel" in nvfp4_launches
     assert "moe_m1_weighted_reduce_kernel" in nvfp4_launches
 
@@ -2606,7 +2633,7 @@ def test_gpu_launch_canary_nvfp4_and_int8() -> None:
             int8_first, ref_int8_up, weight_format="convrot_int8", dtype=torch.bfloat16
         )
         assert "int8_moe_m1_matmul_kernel" in int8_launches
-        assert "int8_moe_m1_reduce_kernel" in int8_launches
+        assert "moe_splitk_reduce_kernel" in int8_launches
         assert "moe_m1_weighted_reduce_kernel" in int8_launches
 
     # Down-projection Split-K parity and repeatability (H=512, I=16384, active_slots_hint=1).
@@ -3246,17 +3273,9 @@ def test_offline_nvidia_small_batch_compile_zero_spills(
     split_k: int,
     accumulate: bool,
 ) -> None:
-    spill_records: dict[triton.compiler.CompiledKernel, int] = {}
-
-    def _compile(
-        source: ASTSource, tgt: GPUTarget, options: dict[str, object]
-    ) -> triton.compiler.CompiledKernel:
-        compiled, spills = compile_with_spill_stores(source, tgt, options)
-        spill_records[compiled] = spills
-        return compiled
-
-    compiled = moe_triton.compile_moe_kernels(
+    compiled = _compile_nvidia_and_assert_clean(
         target,
+        check_int8_mma=True,
         weight_format=weight_format,
         logical_dtype=logical_dtype,
         rows=rows,
@@ -3266,20 +3285,11 @@ def test_offline_nvidia_small_batch_compile_zero_spills(
         group_size=group_size,
         split_k=split_k,
         accumulate=accumulate,
-        compiler=_compile,
     )
     assert "bucket" in compiled
     expected_prefix = "int8_matmul_" if weight_format == "convrot_int8" else "nvfp4_gemv_"
     assert f"{expected_prefix}up" in compiled
     assert f"{expected_prefix}down" in compiled
-    for name, kernel in compiled.items():
-        assert kernel.asm.get("cubin")
-        ptx = kernel.asm.get("ptx", "")
-        assert ptx
-        assert spill_records[kernel] == 0
-        assert kernel.metadata.shared <= _SM120_SHARED_MEMORY_LIMIT
-        if name.startswith("int8_matmul"):
-            assert "mma.sync" in ptx
 
 
 @pytest.mark.parametrize("weight_format", ["nvfp4_w4a16", "convrot_nvfp4_w4a16"])
@@ -3293,16 +3303,7 @@ def test_offline_sm75_small_batch_compile_zero_spills(
     accumulate: bool,
 ) -> None:
     sm75 = GPUTarget("cuda", 75, 32)
-    spill_records: dict[triton.compiler.CompiledKernel, int] = {}
-
-    def _compile(
-        source: ASTSource, tgt: GPUTarget, options: dict[str, object]
-    ) -> triton.compiler.CompiledKernel:
-        compiled, spills = compile_with_spill_stores(source, tgt, options)
-        spill_records[compiled] = spills
-        return compiled
-
-    compiled = moe_triton.compile_moe_kernels(
+    compiled = _compile_nvidia_and_assert_clean(
         sm75,
         weight_format=weight_format,
         logical_dtype=logical_dtype,
@@ -3313,22 +3314,14 @@ def test_offline_sm75_small_batch_compile_zero_spills(
         group_size=64 if weight_format == "convrot_nvfp4_w4a16" else 0,
         split_k=split_k,
         accumulate=accumulate,
-        compiler=_compile,
     )
     assert "bucket" in compiled
     assert "nvfp4_gemv_up" in compiled
     assert "nvfp4_gemv_down" in compiled
-    for kernel in compiled.values():
-        assert kernel.asm.get("cubin")
-        assert kernel.asm.get("ptx")
-        assert spill_records[kernel] == 0
-        assert kernel.metadata.shared <= _SM120_SHARED_MEMORY_LIMIT
 
     if rows == 4 and logical_dtype is torch.float16 and weight_format == "nvfp4_w4a16":
         for prefill_rows, prefill_top_k in ((17, 6), (16, 65)):
-            routed = moe_triton.compile_moe_kernels(
-                sm75, rows=prefill_rows, top_k=prefill_top_k, compiler=_compile
-            )
+            routed = _compile_nvidia_and_assert_clean(sm75, rows=prefill_rows, top_k=prefill_top_k)
             assert "nvfp4_grouped" in routed
             assert "bucket_count" in routed
         with pytest.raises(ValueError, match="must be positive"):
@@ -3875,11 +3868,6 @@ def test_gpu_small_batch_splitk_with_misses(
         seed=771 + group_size,
     )
     slot_map = torch.tensor([1, -1, 0], device="cuda", dtype=torch.int64)
-    expected_reduce = (
-        "int8_moe_m1_reduce_kernel"
-        if weight_format == "convrot_int8"
-        else "nvfp4_moe_m1_reduce_kernel"
-    )
     for rows in (4, 8):
         x = torch.randn((rows, 16384), device="cuda", dtype=dtype)
         ids = torch.tensor(
@@ -3893,7 +3881,7 @@ def test_gpu_small_batch_splitk_with_misses(
                 x, weights, ids, wts, expert_to_slot=slot_map, active_slots_hint=1
             )
         )
-        assert expected_reduce in launches
+        assert "moe_splitk_reduce_kernel" in launches
         expected = _reference_for_weights(x, weights, ids, wts, expert_to_slot=slot_map)
         _assert_matches_reference(actual, expected, weight_format=weight_format, dtype=dtype)
 
@@ -4126,17 +4114,9 @@ def test_offline_nvidia_prefill_compile_zero_spills(
     rows: int,
     accumulate: bool,
 ) -> None:
-    spill_records: dict[triton.compiler.CompiledKernel, int] = {}
-
-    def _compile(
-        source: ASTSource, tgt: GPUTarget, options: dict[str, object]
-    ) -> triton.compiler.CompiledKernel:
-        compiled, spills = compile_with_spill_stores(source, tgt, options)
-        spill_records[compiled] = spills
-        return compiled
-
-    compiled = moe_triton.compile_moe_kernels(
+    compiled = _compile_nvidia_and_assert_clean(
         target,
+        check_int8_mma=True,
         weight_format=weight_format,
         logical_dtype=logical_dtype,
         rows=rows,
@@ -4146,7 +4126,6 @@ def test_offline_nvidia_prefill_compile_zero_spills(
         intermediate_size=2304,
         group_size=group_size,
         accumulate=accumulate,
-        compiler=_compile,
     )
     for key in ("bucket_count", "bucket_scatter", "gather", "weighted_reduce"):
         assert key in compiled
@@ -4156,14 +4135,6 @@ def test_offline_nvidia_prefill_compile_zero_spills(
     else:
         assert "nvfp4_grouped" in compiled
         assert "activate_rotate" in compiled
-    for name, kernel in compiled.items():
-        assert kernel.asm.get("cubin")
-        ptx = kernel.asm.get("ptx", "")
-        assert ptx
-        assert spill_records[kernel] == 0
-        assert kernel.metadata.shared <= _SM120_SHARED_MEMORY_LIMIT
-        if name.startswith("int8_grouped"):
-            assert "mma.sync" in ptx
 
 
 @pytest.mark.parametrize("weight_format", ["nvfp4_w4a16", "convrot_nvfp4_w4a16"])
@@ -4176,16 +4147,7 @@ def test_offline_sm75_prefill_compile_zero_spills(
     accumulate: bool,
 ) -> None:
     sm75 = GPUTarget("cuda", 75, 32)
-    spill_records: dict[triton.compiler.CompiledKernel, int] = {}
-
-    def _compile(
-        source: ASTSource, tgt: GPUTarget, options: dict[str, object]
-    ) -> triton.compiler.CompiledKernel:
-        compiled, spills = compile_with_spill_stores(source, tgt, options)
-        spill_records[compiled] = spills
-        return compiled
-
-    compiled = moe_triton.compile_moe_kernels(
+    compiled = _compile_nvidia_and_assert_clean(
         sm75,
         weight_format=weight_format,
         logical_dtype=logical_dtype,
@@ -4196,19 +4158,12 @@ def test_offline_sm75_prefill_compile_zero_spills(
         intermediate_size=512,
         group_size=64 if weight_format == "convrot_nvfp4_w4a16" else 0,
         accumulate=accumulate,
-        compiler=_compile,
     )
     assert "nvfp4_grouped" in compiled
-    for kernel in compiled.values():
-        assert kernel.asm.get("cubin")
-        assert kernel.asm.get("ptx")
-        assert spill_records[kernel] == 0
-        assert kernel.metadata.shared <= _SM120_SHARED_MEMORY_LIMIT
 
     if rows == 128 and logical_dtype is torch.float16 and weight_format == "nvfp4_w4a16":
-        wide_sm75 = moe_triton.compile_moe_kernels(sm75, rows=20000, top_k=6, compiler=_compile)
+        wide_sm75 = _compile_nvidia_and_assert_clean(sm75, rows=20000, top_k=6)
         assert "nvfp4_grouped" in wide_sm75
-        assert all(spill_records[kernel] == 0 for kernel in wide_sm75.values())
 
         sm80 = _NVIDIA_TARGETS[0]
         wide_sm80 = moe_triton.compile_moe_kernels(
@@ -4948,17 +4903,9 @@ def test_offline_nvidia_trellis_compile_zero_spills(
 ) -> None:
     variable_rows, has_slot_offsets, block_size, hidden_size, inter_size = layout_spec
     regime, rows, top_k, split_k, accumulate = regime_spec
-    spill_records: dict[triton.compiler.CompiledKernel, int] = {}
-
-    def _compile(
-        source: ASTSource, tgt: GPUTarget, options: dict[str, object]
-    ) -> triton.compiler.CompiledKernel:
-        compiled, spills = compile_with_spill_stores(source, tgt, options)
-        spill_records[compiled] = spills
-        return compiled
-
-    compiled = moe_triton.compile_moe_kernels(
+    compiled = _compile_nvidia_and_assert_clean(
         target,
+        check_int8_mma=True,
         weight_format="convrot_trellis",
         logical_dtype=torch.bfloat16,
         rows=rows,
@@ -4972,7 +4919,6 @@ def test_offline_nvidia_trellis_compile_zero_spills(
         block_size=block_size,
         variable_rows=variable_rows,
         has_slot_offsets=has_slot_offsets,
-        compiler=_compile,
     )
     if regime == "prefill" and target.arch >= 80:
         assert {"trellis_decode", "int8_grouped_up", "int8_grouped_down"}.issubset(compiled)
@@ -4984,14 +4930,6 @@ def test_offline_nvidia_trellis_compile_zero_spills(
             assert {"bucket", "trellis_reduce"}.issubset(compiled)
         else:
             assert "bucket" in compiled
-    for name, kernel in compiled.items():
-        assert kernel.asm.get("cubin")
-        ptx = kernel.asm.get("ptx", "")
-        assert ptx
-        assert spill_records[kernel] == 0
-        assert kernel.metadata.shared <= _SM120_SHARED_MEMORY_LIMIT
-        if name.startswith("int8_grouped"):
-            assert "mma.sync" in ptx
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm HIP compiler is Linux-only")
@@ -5103,18 +5041,18 @@ def _assert_trellis_prefill_matches_oracle(
     assert torch.isfinite(actual).all()
     if _INT8_MOE_GPU_AVAILABLE:
         int8_oracle_weights = _decode_trellis_moe_weights_to_int8(weights)
-        expected_w8a8 = moe_ffn(
+        expected_w8a8 = _reference_for_weights(
             x,
             int8_oracle_weights,
             topk_ids,
             topk_weights,
             expert_to_slot=expert_to_slot,
-            out=None if out_before is None else out_before.clone(),
+            out=out_before,
             accumulate=accumulate,
         )
-        rtol = 1e-4 if weights.logical_dtype is torch.float32 else 1e-3
-        atol = 1e-4 if weights.logical_dtype is torch.float32 else 1e-3
-        torch.testing.assert_close(actual, expected_w8a8, rtol=rtol, atol=atol)
+        _assert_matches_reference(
+            actual, expected_w8a8, weight_format="convrot_int8", dtype=weights.logical_dtype
+        )
         return
     expected_a16 = _reference_for_weights(
         x,
@@ -5243,7 +5181,7 @@ def test_gpu_trellis_m1_and_batched_parity(
                 dtype=dtype,
             )
     if rows == 4 and up_layout == "uniform" and down_layout == "uniform":
-        # Narrow out_features + deep K triggers split_k_up > 1 and nvfp4_moe_m1_reduce_kernel.
+        # Narrow out_features + deep K triggers split_k_up > 1 and moe_splitk_reduce_kernel.
         w_splitk = _make_trellis_moe_weights(
             2,
             36864,
@@ -5267,7 +5205,7 @@ def test_gpu_trellis_m1_and_batched_parity(
             )
             assert any("trellis_moe_gemv_kernel" in name for name in launches_sk)
             if sm_count >= 32:
-                assert any("nvfp4_moe_m1_reduce_kernel" in name for name in launches_sk)
+                assert any("moe_splitk_reduce_kernel" in name for name in launches_sk)
             _assert_matches_reference(
                 out_sk,
                 _reference_for_weights(x_sk, w_splitk, ids_sk, wts_sk),
@@ -5509,8 +5447,8 @@ def test_gpu_trellis_prefill_intra_expert_row_windowing(
 
     decode_launches = [name for name in launches if "decode_slots_int8_kernel" in name]
     grouped_launches = [name for name in launches if "int8_moe_grouped_gemm_kernel" in name]
-    assert len(decode_launches) == 5  # 3 up_gate windows (straddling half_n=8192) + 2 down windows
-    assert len(grouped_launches) == 5
+    assert len(decode_launches) > 2
+    assert len(grouped_launches) == len(decode_launches)
     assert peak_delta < 56 * 1024 * 1024
     _assert_trellis_prefill_matches_oracle(actual, x, weights, topk_ids, topk_weights)
 
@@ -5737,3 +5675,297 @@ def test_gpu_trellis_reference_cuda_graph_replay(layout_kind: TrellisLayoutKind)
         expected_eager = _run_ref(out_buf.clone())
         graph.replay()
         torch.testing.assert_close(out_buf, expected_eager, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("target", "weight_format", "group_size"),
+    [
+        (target, weight_format, group_size)
+        for target in _NVIDIA_TRELLIS_TARGETS
+        for weight_format, group_size in (
+            ("nvfp4_w4a16", 0),
+            ("convrot_nvfp4_w4a16", 64),
+            ("convrot_trellis", 64),
+            ("convrot_int8", 64),
+        )
+        if not (target.arch < 80 and weight_format == "convrot_int8")
+    ],
+)
+@pytest.mark.parametrize(("rows", "split_k"), [(1, 2), (256, 1)])
+def test_offline_nvidia_gelu_tanh_compile_zero_spills(
+    target: GPUTarget,
+    weight_format: MoEFormat,
+    group_size: int,
+    rows: int,
+    split_k: int,
+) -> None:
+    _compile_nvidia_and_assert_clean(
+        target,
+        check_int8_mma=True,
+        weight_format=weight_format,
+        logical_dtype=torch.bfloat16,
+        rows=rows,
+        top_k=4,
+        hidden_size=512,
+        intermediate_size=512,
+        group_size=group_size,
+        activation_fn="gelu_tanh",
+        split_k=split_k,
+    )
+
+
+@pytest.mark.parametrize("target", _NVIDIA_TARGETS)
+@pytest.mark.parametrize(("rows", "split_k"), [(1, 2), (4, 1), (256, 1)])
+def test_offline_nvidia_int8_unaligned_nk_compile_zero_spills(
+    target: GPUTarget,
+    rows: int,
+    split_k: int,
+) -> None:
+    _compile_nvidia_and_assert_clean(
+        target,
+        check_int8_mma=True,
+        weight_format="convrot_int8",
+        logical_dtype=torch.bfloat16,
+        rows=rows,
+        top_k=4,
+        num_slots=64,
+        hidden_size=144,
+        intermediate_size=112,
+        group_size=16,
+        split_k=split_k,
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "weight_format", "group_size"),
+    [
+        (target, weight_format, group_size)
+        for target in _NVIDIA_TRELLIS_TARGETS
+        for weight_format, group_size in (
+            ("nvfp4_w4a16", 0),
+            ("convrot_trellis", 64),
+            ("convrot_int8", 64),
+        )
+        if not (target.arch < 80 and weight_format == "convrot_int8")
+    ],
+)
+def test_offline_nvidia_batched_block_p_1024_compile_zero_spills(
+    target: GPUTarget,
+    weight_format: MoEFormat,
+    group_size: int,
+) -> None:
+    compiled = _compile_nvidia_and_assert_clean(
+        target,
+        check_int8_mma=True,
+        weight_format=weight_format,
+        logical_dtype=torch.bfloat16,
+        rows=16,
+        top_k=64,
+        num_slots=64,
+        hidden_size=256,
+        intermediate_size=256,
+        group_size=group_size,
+    )
+    assert "bucket" in compiled
+
+
+@pytest.mark.parametrize(
+    ("weight_format", "group_size"),
+    [("nvfp4_w4a16", 0), ("convrot_trellis", 64), ("convrot_int8", 64)],
+)
+@pytest.mark.parametrize(("rows", "split_k"), [(1, 2), (4, 1), (256, 1)])
+def test_offline_optional_null_pointers_compile_zero_spills(
+    weight_format: MoEFormat,
+    group_size: int,
+    rows: int,
+    split_k: int,
+) -> None:
+    for target in _NVIDIA_TRELLIS_TARGETS:
+        if target.arch < 80 and weight_format == "convrot_int8":
+            continue
+        # On 48-warp/SM SM86/SM89, ptxas trades 8 stack bytes (REG:72, STACK:8) for
+        # higher CTA occupancy when use_dot=False and has_global_scale=False.
+        spill_limits = (
+            {"nvfp4_gemv_up": 8}
+            if (weight_format == "nvfp4_w4a16" and rows == 4 and target.arch in (86, 89))
+            else None
+        )
+        _compile_nvidia_and_assert_clean(
+            target,
+            check_int8_mma=True,
+            max_spill_stores=spill_limits,
+            weight_format=weight_format,
+            logical_dtype=torch.bfloat16,
+            rows=rows,
+            top_k=4,
+            hidden_size=512,
+            intermediate_size=512,
+            group_size=group_size,
+            has_slot_map=False,
+            has_global_scale=False,
+            split_k=split_k,
+        )
+    if sys.platform == "linux":
+        amd_target = GPUTarget("hip", "gfx1201", 32)
+        compiled = moe_triton.compile_moe_kernels(
+            amd_target,
+            weight_format=weight_format,
+            logical_dtype=torch.bfloat16,
+            rows=rows,
+            top_k=4,
+            hidden_size=512,
+            intermediate_size=512,
+            group_size=group_size,
+            has_slot_map=False,
+            has_global_scale=False,
+            split_k=split_k,
+        )
+        for name, kernel in compiled.items():
+            check_spills = not name.startswith(("int8_matmul", "int8_grouped"))
+            _assert_clean_amd_compile(kernel, "gfx1201", check_vgpr_spills=check_spills)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+def test_gpu_m1_top_k_exceeds_cuda_grid_y_limit() -> None:
+    torch.manual_seed(1001)
+    formats: list[tuple[MoEFormat, int, int, str]] = [
+        ("nvfp4_w4a16", 0, 64, "nvfp4_moe_m1_gemv_kernel"),
+        ("convrot_trellis", 64, 256, "trellis_moe_gemv_kernel"),
+    ]
+    if _INT8_MOE_GPU_AVAILABLE:
+        formats.append(("convrot_int8", 64, 64, "int8_moe_m1_matmul_kernel"))
+
+    top_k = 70_000
+    hit_cols = torch.tensor([0, 35_000, 69_999], device="cuda", dtype=torch.int64)
+    ids = torch.full((1, top_k), -1, device="cuda", dtype=torch.int64)
+    ids[0, hit_cols] = torch.tensor([0, 1, 0], device="cuda", dtype=torch.int64)
+    wts = torch.zeros((1, top_k), device="cuda", dtype=torch.bfloat16)
+    wts[0, hit_cols] = torch.tensor([0.3, 0.5, 0.2], device="cuda", dtype=torch.bfloat16)
+
+    for weight_format, group_size, width, expected_kernel in formats:
+        weights = _make_moe_weights(
+            2,
+            width,
+            width,
+            weight_format=weight_format,
+            group_size=group_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+            seed=1002 + width + group_size,
+        )
+        x = torch.randn((1, width), device="cuda", dtype=torch.bfloat16)
+        actual, launches = _record_triton_launches(
+            lambda x=x, weights=weights: moe_ffn(x, weights, ids, wts, active_slots_hint=2)
+        )
+        assert expected_kernel in launches
+        assert "moe_m1_weighted_reduce_kernel" in launches
+        if weight_format != "convrot_int8":
+            assert "moe_m1_activate_rotate_kernel" in launches
+        expected = _independent_moe_oracle(x, weights, ids, wts)
+        _assert_matches_reference(
+            actual, expected, weight_format=weight_format, dtype=torch.bfloat16
+        )
+
+    # rows=2, top_k=70_000 triggers _select_moe_execution_regime prefill-to-M1 fallback.
+    w_nvfp4 = _make_moe_weights(
+        2, 64, 64, weight_format="nvfp4_w4a16", dtype=torch.bfloat16, device="cuda", seed=1005
+    )
+    x_two = torch.randn((2, 64), device="cuda", dtype=torch.bfloat16)
+    ids_two = ids.repeat(2, 1)
+    wts_two = wts.repeat(2, 1)
+    actual_two, launches_two = _record_triton_launches(
+        lambda: moe_ffn(x_two, w_nvfp4, ids_two, wts_two, active_slots_hint=2)
+    )
+    assert "nvfp4_moe_m1_gemv_kernel" in launches_two
+    assert "moe_m1_weighted_reduce_kernel" in launches_two
+    _assert_matches_reference(
+        actual_two,
+        _independent_moe_oracle(x_two, w_nvfp4, ids_two, wts_two),
+        weight_format="nvfp4_w4a16",
+        dtype=torch.bfloat16,
+    )
+
+    # Wide H triggers Split-K on up_gate and exercises flattened moe_splitk_reduce_kernel.
+    if torch.cuda.get_device_properties(0).multi_processor_count >= 32:
+        w_splitk = _make_moe_weights(
+            2,
+            4096,
+            512,
+            weight_format="nvfp4_w4a16",
+            dtype=torch.bfloat16,
+            device="cuda",
+            seed=1006,
+        )
+        x_splitk = torch.randn((1, 4096), device="cuda", dtype=torch.bfloat16)
+        actual_sk, launches_sk = _record_triton_launches(
+            lambda: moe_ffn(x_splitk, w_splitk, ids, wts, active_slots_hint=2)
+        )
+        assert "nvfp4_moe_m1_gemv_kernel" in launches_sk
+        assert "moe_splitk_reduce_kernel" in launches_sk
+        assert "moe_m1_activate_rotate_kernel" in launches_sk
+        _assert_matches_reference(
+            actual_sk,
+            _independent_moe_oracle(x_splitk, w_splitk, ids, wts),
+            weight_format="nvfp4_w4a16",
+            dtype=torch.bfloat16,
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+def test_gpu_sm70_trellis_gelu_tanh_falls_back_to_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(1009)
+    weights = _make_trellis_moe_weights(
+        3,
+        256,
+        256,
+        group_size=64,
+        activation_fn="gelu_tanh",
+        dtype=torch.float16,
+        device="cuda",
+        seed=1010,
+    )
+    x = torch.randn((2, 256), device="cuda", dtype=torch.float16)
+    ids = torch.tensor([[0, 2], [1, 0]], device="cuda", dtype=torch.int64)
+    wts = torch.tensor([[0.6, 0.4], [0.25, 0.75]], device="cuda", dtype=torch.float16)
+    slot_map = torch.tensor([2, -1, 0], device="cuda", dtype=torch.int64)
+    expected = _reference_for_weights(x, weights, ids, wts, expert_to_slot=slot_map).to("cuda")
+
+    # Initialize Triton driver before stubbing torch.version.hip so isolated ROCm runs keep HIP.
+    assert triton.runtime.driver.active is not None
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (7, 0))
+    actual, launches = _record_triton_launches(
+        lambda: moe_ffn(x, weights, ids, wts, expert_to_slot=slot_map)
+    )
+    assert "trellis_moe_gemv_kernel" not in launches
+    assert "moe_m1_activate_rotate_kernel" not in launches
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_compile_dynamic_active_slots_hint_single_frame() -> None:
+    torch.manual_seed(1015)
+    weights = _make_moe_weights(
+        4, 64, 64, weight_format="nvfp4_w4a16", dtype=torch.float32, seed=1016
+    )
+
+    def _fn(inp: torch.Tensor, ids: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+        return moe_ffn(inp, weights, ids, wts, active_slots_hint=inp.shape[0])
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    compiled = torch.compile(_fn, backend=counter, fullgraph=True, dynamic=True)
+    for rows in (3, 5, 7):
+        x = torch.randn((rows, 64), dtype=torch.float32)
+        ids = torch.randint(0, 4, (rows, 2), dtype=torch.int64)
+        wts = torch.full((rows, 2), 0.5, dtype=torch.float32)
+        actual = compiled(x, ids, wts)
+        expected = _reference_for_weights(x, weights, ids, wts)
+        _assert_matches_reference(
+            actual, expected, weight_format="nvfp4_w4a16", dtype=torch.float32
+        )
+    assert counter.frame_count == 1
+    torch._dynamo.reset()

@@ -153,6 +153,35 @@ except ModuleNotFoundError as error:
     _mean_backend = None
 
 
+def _prepare_output_view(
+    out: torch.Tensor | None,
+    *,
+    rows: int,
+    width: int,
+    expected_shape: tuple[int, ...],
+    logical_dtype: torch.dtype,
+    device: torch.device,
+    label: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if out is None:
+        output = torch.empty((rows, width), device=device, dtype=logical_dtype)
+        return output, output.reshape(expected_shape)
+    if out.shape != expected_shape or out.dtype is not logical_dtype or out.device != device:
+        raise ValueError(
+            f"{label} must match expected shape {expected_shape}, dtype {logical_dtype}, "
+            f"and device {device}"
+        )
+    if out.ndim == 0 or out.stride(-1) != 1:
+        raise ValueError("prepared INT8 GEMM output must be column-contiguous")
+    try:
+        output = out.view(rows, width)
+    except RuntimeError as error:
+        raise ValueError(f"{label} must be viewable as a 2-D row-strided matrix") from error
+    if output.stride(1) != 1:
+        raise ValueError("prepared INT8 GEMM output must be column-contiguous")
+    return output, out
+
+
 class LinearBackend:
     """Shared host orchestration bound to one accelerator policy and kernel launcher.
 
@@ -203,6 +232,9 @@ class LinearBackend:
         """Rotate and quantize an input, optionally into caller-owned storage."""
         input_2d = input.reshape(-1, input.shape[-1]).contiguous()
         m = input_2d.shape[0]
+        leading_shape = input.shape[:-1]
+        expected_q_shape = (*leading_shape, in_features)
+        expected_s_shape = tuple(leading_shape)
         if out is None:
             input_qdata = torch.empty(
                 (m, in_features),
@@ -211,13 +243,31 @@ class LinearBackend:
             )
             row_scales = torch.empty(m, device=input.device, dtype=torch.float32)
             result = (
-                input_qdata.reshape(*input.shape[:-1], in_features),
-                row_scales.reshape(input.shape[:-1]),
+                input_qdata.reshape(expected_q_shape),
+                row_scales.reshape(expected_s_shape),
             )
         else:
             result = out
-        input_qdata = result[0].reshape(m, in_features)
-        row_scales = result[1].reshape(m)
+            q_out, s_out = result
+            if (
+                q_out.shape != expected_q_shape
+                or q_out.dtype is not torch.int8
+                or q_out.device != input.device
+                or s_out.shape != expected_s_shape
+                or s_out.dtype is not torch.float32
+                or s_out.device != input.device
+            ):
+                raise ValueError(
+                    "prepared INT8 input buffers must match expected shapes "
+                    f"{expected_q_shape} (int8) and {expected_s_shape} (float32) "
+                    f"on device {input.device}"
+                )
+            if not q_out.is_contiguous() or not s_out.is_contiguous():
+                raise ValueError("prepared INT8 input buffers must be contiguous")
+            input_qdata = q_out.view(m, in_features)
+            row_scales = s_out.view(m)
+        if m == 0:
+            return result
         if execution_plan.fuse_rotation_quantization:
             self.kernels.fused_rotate_quantize_input(
                 input_2d,
@@ -283,22 +333,19 @@ class LinearBackend:
             if second_weight.shape != weight_qdata.shape:
                 raise ValueError("paired INT8 projections must have matching weight shapes")
         output_features = n * (2 if paired else 1)
-        if out is None:
-            output = torch.empty(
-                (m, output_features),
-                device=input_qdata.device,
-                dtype=logical_dtype,
-            )
-            result = output.reshape(*leading_shape, output_features)
-        else:
-            result = out
-        input_qdata_2d = input_qdata.reshape(m, k)
-        input_scale_1d = input_scale.reshape(m)
-        output = result.reshape(m, output_features)
-        if output.stride(1) != 1:
-            raise ValueError("prepared INT8 GEMM output must be column-contiguous")
+        output, result = _prepare_output_view(
+            out,
+            rows=m,
+            width=output_features,
+            expected_shape=(*leading_shape, output_features),
+            logical_dtype=logical_dtype,
+            device=input_qdata.device,
+            label="prepared INT8 GEMM output",
+        )
         if not m or not n:
             return result
+        input_qdata_2d = input_qdata.reshape(m, k)
+        input_scale_1d = input_scale.reshape(m)
         self.kernels.launch_prepared_linear(
             input_qdata_2d,
             input_scale_1d,
@@ -493,29 +540,15 @@ class LinearBackend:
         second_weight, second_scale, second_bias = second_projection
         if second_weight.shape != weight_qdata.shape:
             raise ValueError("paired INT8 projections must have matching weight shapes")
-        expected_shape = (*leading_shape, n)
-        if out is None:
-            output = torch.empty((m, n), device=input_qdata.device, dtype=logical_dtype)
-            result = output.reshape(expected_shape)
-        else:
-            if (
-                out.shape != expected_shape
-                or out.dtype is not logical_dtype
-                or out.device != input_qdata.device
-            ):
-                raise ValueError(
-                    "prepared INT8 SwiGLU output must match expected shape "
-                    f"{expected_shape}, dtype {logical_dtype}, and device {input_qdata.device}"
-                )
-            if out.ndim == 0 or out.stride(-1) != 1:
-                raise ValueError("prepared INT8 GEMM output must be column-contiguous")
-            result = out
-            try:
-                output = result.view(m, n)
-            except RuntimeError as error:
-                raise ValueError(
-                    "prepared INT8 SwiGLU output must be viewable as a 2-D row-strided matrix"
-                ) from error
+        output, result = _prepare_output_view(
+            out,
+            rows=m,
+            width=n,
+            expected_shape=(*leading_shape, n),
+            logical_dtype=logical_dtype,
+            device=input_qdata.device,
+            label="prepared INT8 SwiGLU output",
+        )
         if not m or not n:
             return result
         target = AcceleratorTarget.from_device(input_qdata.device) if target is None else target

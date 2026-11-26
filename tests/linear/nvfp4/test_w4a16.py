@@ -10,6 +10,7 @@ import pytest
 import torch
 import triton
 from _accelerators import mock_cuda_target, w4a16_nvfp4_available
+from _nvidia_resources import capture_cuda_spill_stores
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn import functional as F  # noqa: N812
@@ -37,6 +38,8 @@ _PRIMARY_ISA_TARGETS = [
 ]
 
 _ADDITIONAL_CUDA_TARGETS = [
+    GPUTarget("cuda", 75, 32),
+    GPUTarget("cuda", 86, 32),
     GPUTarget("cuda", 89, 32),
     GPUTarget("cuda", 120, 32),
 ]
@@ -569,11 +572,14 @@ def test_attention_output_pass_skips_weight_only_linear(
 def _assert_clean_offline_compile(
     compiled: triton.compiler.CompiledKernel,
     target: GPUTarget,
+    *,
+    cuda_spill_stores: int | None = None,
 ) -> None:
     assert compiled.metadata.global_scratch_size == 0
     if target.backend == "cuda":
         assert compiled.asm.get("ptx")
         assert compiled.asm.get("cubin")
+        assert cuda_spill_stores == 0, f"sm{target.arch} spilled {cuda_spill_stores} bytes"
         return
     assert compiled.asm.get("hsaco")
     amdgcn = compiled.asm.get("amdgcn", "")
@@ -583,6 +589,26 @@ def _assert_clean_offline_compile(
         assert int(vgpr_spills.group(1)) == 0
     if priv_size is not None:
         assert int(priv_size.group(1)) == 0
+
+
+def _compile_w4a16_and_assert_clean(
+    target: GPUTarget,
+    **kwargs: object,
+) -> dict[str, triton.compiler.CompiledKernel]:
+    spills_by_hash, compile_fn = capture_cuda_spill_stores()
+    compiled_kernels = nvfp4_triton.compile_w4a16_kernels(
+        target,
+        compile_fn=compile_fn,
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert compiled_kernels
+    for kernel in compiled_kernels.values():
+        _assert_clean_offline_compile(
+            kernel,
+            target,
+            cuda_spill_stores=spills_by_hash[kernel.hash] if target.backend == "cuda" else None,
+        )
+    return compiled_kernels
 
 
 @pytest.mark.parametrize("target", _PRIMARY_ISA_TARGETS)
@@ -603,6 +629,8 @@ def _assert_clean_offline_compile(
         (4, 5120, 5120, torch.float32, torch.float32, False, True, 0),
         (8, 5120, 5120, torch.float16, torch.float16, False, True, 16),
         (16, 5120, 5120, torch.bfloat16, torch.bfloat16, True, True, 0),
+        (16, 5120, 5120, torch.float32, torch.float32, False, False, 0),
+        (16, 5120, 5120, torch.float16, torch.float16, False, True, 16),
         (64, 5120, 5120, torch.float16, torch.float16, True, False, 0),
         (64, 5120, 5120, torch.float16, torch.float32, False, True, 0),
     ],
@@ -618,7 +646,7 @@ def test_w4a16_workloads_compile_without_vgpr_spills(
     two_level: bool,
     group_size: int,
 ) -> None:
-    compiled = nvfp4_triton.compile_w4a16_kernels(
+    compiled = _compile_w4a16_and_assert_clean(
         target,
         rows=rows,
         out_features=out_features,
@@ -629,13 +657,10 @@ def test_w4a16_workloads_compile_without_vgpr_spills(
         high_first=high_first,
         has_weight_per_tensor_scale=two_level,
     )
-    assert compiled
     if rows > 16:
         assert "dequant" in compiled
     else:
         assert "gemv" in compiled
-    for kernel in compiled.values():
-        _assert_clean_offline_compile(kernel, target)
 
 
 @pytest.mark.parametrize("target", _ADDITIONAL_CUDA_TARGETS)
@@ -648,11 +673,15 @@ def test_w4a16_workloads_compile_without_vgpr_spills(
         "bias_dtype",
         "high_first",
         "two_level",
+        "group_size",
     ),
     [
-        (1, 1024, 5120, torch.float16, torch.float16, False, True),
-        (16, 5120, 5120, torch.float16, torch.float32, False, True),
-        (64, 5120, 5120, torch.bfloat16, None, True, True),
+        (1, 1024, 5120, torch.float16, torch.float16, False, True, 0),
+        (16, 5120, 5120, torch.bfloat16, torch.float32, False, True, 0),
+        (16, 5120, 5120, torch.float16, torch.float32, False, True, 0),
+        (16, 5120, 5120, torch.float32, None, False, False, 0),
+        (16, 5120, 5120, torch.float16, torch.float16, False, True, 16),
+        (64, 5120, 5120, torch.bfloat16, None, True, True, 0),
     ],
 )
 def test_w4a16_workloads_compile_for_additional_cuda_arches(
@@ -664,20 +693,19 @@ def test_w4a16_workloads_compile_for_additional_cuda_arches(
     bias_dtype: torch.dtype | None,
     high_first: bool,
     two_level: bool,
+    group_size: int,
 ) -> None:
-    compiled = nvfp4_triton.compile_w4a16_kernels(
+    _compile_w4a16_and_assert_clean(
         target,
         rows=rows,
         out_features=out_features,
         input_features=input_features,
         input_dtype=input_dtype,
         bias_dtype=bias_dtype,
+        group_size=group_size,
         high_first=high_first,
         has_weight_per_tensor_scale=two_level,
     )
-    assert compiled
-    for kernel in compiled.values():
-        _assert_clean_offline_compile(kernel, target)
 
 
 @pytest.mark.gpu
@@ -1047,3 +1075,66 @@ def test_gpu_w4a16_preserves_zero_and_tiny_global_scales(rows: int) -> None:
         ).cuda()
         assert float(actual_fp16.abs().min()) > 0.0
         torch.testing.assert_close(actual_fp16, expected_fp16, rtol=1e-2, atol=1e-5)
+
+
+def test_meta_nvfp4_linear_rejects_scalar_input() -> None:
+    q = torch.empty(16, 8, dtype=torch.uint8, device="meta")
+    s = torch.empty(32, 16, dtype=torch.float8_e4m3fn, device="meta")
+    x0 = torch.empty((), dtype=torch.bfloat16, device="meta")
+
+    with pytest.raises(ValueError, match="non-scalar"):
+        torch.ops.piper_kernels.nvfp4_linear.default(x0, q, s, None, None, None, False, False, True)
+    with pytest.raises(ValueError, match="non-scalar"):
+        torch.ops.piper_kernels.convrot_nvfp4_linear.default(
+            x0, q, s, None, None, None, False, 16, False, True
+        )
+
+
+def test_reference_w4a16_preserves_precision_under_autocast() -> None:
+    pattern = (
+        torch.tensor(
+            [1, 1, 1, -1, 1, 1, 1, -1, 1, 1, 1, -1, -1, -1, -1, 1],
+            dtype=torch.float16,
+        )
+        * 20000.0
+    )
+    x = pattern.expand(4, 16).contiguous()
+    qdata = torch.full((16, 8), 0x22, dtype=torch.uint8)
+    scale = torch.ones((32, 16), dtype=torch.float8_e4m3fn)
+    per_tensor_scale = torch.tensor(1.0 / 16.0, dtype=torch.float32)
+
+    expected = nvfp4_reference.linear_w4a16(x, qdata, scale, per_tensor_scale, None, group_size=16)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = nvfp4_reference.linear_w4a16(
+            x, qdata, scale, per_tensor_scale, None, group_size=16
+        )
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+def test_gpu_w4a16_convrot_fp16_under_autocast_preserves_range() -> None:
+    pattern = (
+        torch.tensor(
+            [1, 1, 1, -1, 1, 1, 1, -1, 1, 1, 1, -1, -1, -1, -1, 1],
+            dtype=torch.float16,
+        )
+        * 20000.0
+    )
+    x = pattern.expand(17, 16).contiguous().cuda()
+    qdata = torch.full((16, 8), 0x22, dtype=torch.uint8, device="cuda")
+    scale = torch.ones((32, 16), dtype=torch.float8_e4m3fn, device="cuda")
+    per_tensor_scale = torch.tensor(1.0 / 16.0, dtype=torch.float32, device="cuda")
+    weight = ConvRotNVFP4Tensor(
+        qdata, scale, 16, torch.float16, 16, per_tensor_scale, None, True, None
+    )
+
+    with torch.autocast("cuda", dtype=torch.float16):
+        actual = F.linear(x, weight)
+    expected = nvfp4_reference.linear_w4a16(
+        x.cpu(), qdata.cpu(), scale.cpu(), per_tensor_scale.cpu(), None, group_size=16
+    ).cuda()
+    assert actual.dtype is torch.float16
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)

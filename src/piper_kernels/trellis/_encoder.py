@@ -35,17 +35,15 @@ from piper_kernels._triton.runtime import device_context
 
 from ._gluon_forward import FP16_SCALE, run_viterbi
 from ._layout import (
-    CODE_OFFSET,
     CODE_RECIPROCAL,
-    LCG_INCREMENT,
-    LCG_MULTIPLIER,
     STATE_BITS,
     TrellisLayout,
 )
 from ._reference import decode_states
+from .triton import _decode_states_lcg_numerators
 
 _MIN_SCALE = 1e-8
-_FP8_NORMAL_FLOOR = 2.0**-9
+_FP8_MIN_POSITIVE = 2.0**-9
 _COARSE_STATE_BITS = 12
 _OVERLAP_WINDOW = 32
 _FP8_SEARCH_RADIUS = 1
@@ -56,9 +54,6 @@ _MAX_CHUNK_WEIGHTS = 1 << 24
 _MAX_LDLQ_CHUNK_ROWS = 4096
 _MAX_LDLQ_CHUNK_WEIGHTS = 1 << 27
 
-_LCG_MULTIPLIER = tl.constexpr(LCG_MULTIPLIER)
-_LCG_INCREMENT = tl.constexpr(LCG_INCREMENT)
-_CODE_OFFSET = tl.constexpr(CODE_OFFSET)
 _CODE_RECIPROCAL = tl.constexpr(CODE_RECIPROCAL)
 _MIN_SCALE_TL = tl.constexpr(_MIN_SCALE)
 
@@ -79,7 +74,7 @@ def _round_fp8(x: torch.Tensor) -> torch.Tensor:
 def _compute_fp8_window(center: torch.Tensor, radius: int) -> torch.Tensor:
     """Positive E4M3 values within ``radius`` grid steps of ``_round_fp8(center)``."""
     grid = _build_fp8_values(center.device)
-    nearest = _round_fp8(center).clamp(min=float(grid[0]))
+    nearest = _round_fp8(center).clamp(min=_FP8_MIN_POSITIVE)
     index = torch.searchsorted(grid, nearest.contiguous())
     offsets = torch.arange(-radius, radius + 1, device=center.device)
     positions = (index.unsqueeze(-1) + offsets).clamp(0, grid.numel() - 1)
@@ -196,10 +191,7 @@ def _refit_fp8_kernel(
     mask = t < block_size
     w = tl.load(w_ptr + bid * block_size + t, mask=mask, other=0.0).to(tl.float32)
     st = tl.load(states_ptr + bid * block_size + t, mask=mask, other=0).to(tl.uint32)
-    x = st * _LCG_MULTIPLIER + _LCG_INCREMENT
-    n = (
-        ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)).to(tl.int32) - _CODE_OFFSET
-    ).to(tl.float32)
+    n = _decode_states_lcg_numerators(st).to(tl.float32)
     p2 = tl.load(p2_ptr + bid).to(tl.float32)
     w_scaled = w / p2
 
@@ -207,7 +199,7 @@ def _refit_fp8_kernel(
     best_scale = tl.load(window_ptr + bid * num_cands + (num_cands // 2))
     for c in range(num_cands):
         sc = tl.load(window_ptr + bid * num_cands + c)
-        q = tl.minimum(tl.maximum(libdevice.nearbyint(n * (sc * _CODE_RECIPROCAL)), -127.0), 127.0)
+        q = tl.minimum(tl.maximum(libdevice.rint(n * (sc * _CODE_RECIPROCAL)), -127.0), 127.0)
         d = tl.where(mask, w_scaled - q, 0.0)
         err = tl.sum(d * d, axis=0)
         better = err < best_err
@@ -240,7 +232,7 @@ def _estimate_initial_scales(
     multipliers = torch.tensor(_ROW_MULTIPLIERS, dtype=torch.float32, device=device)
     sc_all = (s_c0[:, None] * multipliers[None, :]).contiguous()
     sc_blk = sc_all.repeat_interleave(blocks_per_row, dim=0)
-    ratio = (best_s[:, None] / sc_blk).clamp(min=_FP8_NORMAL_FLOOR)
+    ratio = (best_s[:, None] / sc_blk).clamp(min=_FP8_MIN_POSITIVE)
     eff_s = (_round_fp8(ratio) * sc_blk).contiguous()
 
     blk_errs = torch.empty(num_blocks, len(_ROW_MULTIPLIERS), dtype=torch.float32, device=device)
@@ -261,7 +253,7 @@ def _estimate_initial_scales(
     best_m = blk_errs.view(rows, blocks_per_row, len(_ROW_MULTIPLIERS)).double().sum(1).argmin(-1)
     row_scale = sc_all.gather(1, best_m[:, None]).squeeze(1)
     p2 = row_scale.repeat_interleave(blocks_per_row)
-    block_scale = _round_fp8((best_s / p2).clamp(min=_FP8_NORMAL_FLOOR))
+    block_scale = _round_fp8((best_s / p2).clamp(min=_FP8_MIN_POSITIVE))
     return row_scale, p2, block_scale
 
 
@@ -373,7 +365,7 @@ def _encode_rows_ldlq(
                 tile_t=tile_t,
                 num_warps=4,
             )
-        block_scale = _round_fp8((best_s / row_scale).clamp(min=_FP8_NORMAL_FLOOR))
+        block_scale = _round_fp8((best_s / row_scale).clamp(min=_FP8_MIN_POSITIVE))
         states, final_scale = _search_and_refit_blocks(w_block, row_scale, block_scale, layout)
         bitstreams[:, block_idx, :] = pack_states(states, layout)
         final_scale_fp8 = final_scale.to(torch.float8_e4m3fn)

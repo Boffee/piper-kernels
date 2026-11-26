@@ -108,6 +108,8 @@ def _linear_fake(
     weight_only: bool = False,
 ) -> torch.Tensor:
     validate_group_size(group_size)
+    if input.ndim == 0:
+        raise ValueError("ConvRot NVFP4 linear input must be a non-scalar strided floating tensor")
     if weight_only and (activation_per_tensor_scale is not None or dynamic_activation_scale):
         raise ValueError(
             "ConvRot NVFP4 linear weight-only execution does not accept activation scales"

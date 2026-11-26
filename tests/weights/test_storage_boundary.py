@@ -7,7 +7,11 @@ from typing import Any
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import (
+    exact_sm120_available,
+    trellis_encoder_available,
+    w4a16_nvfp4_available,
+)
 from torch import nn
 from torch.nn import functional as F  # noqa: N812
 
@@ -449,28 +453,42 @@ def test_nvfp4_from_quantized_contract() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU")
 def test_storage_boundary_round_trip_and_offload_cuda() -> None:
     torch.manual_seed(29)
-    dense_trellis = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) * 0.2
-    trellis_from_hp = ConvRotTrellisTensor.from_hp(
-        dense_trellis, group_size=64, bits_per_weight=4.0
-    )
-    trellis_storage = TrellisStorage.from_hp(dense_trellis, group_size=64, bits_per_weight=4.0)
-    trellis_from_store = ConvRotTrellisTensor.from_trellis_storage(trellis_storage, group_size=64)
-    torch.testing.assert_close(
-        trellis_from_hp.dequantize(), trellis_from_store.dequantize(), rtol=0, atol=0
-    )
-
     linear_weights: list[QuantizedWeight] = [
         _make_int8_2d(device="cuda", static_act=True),
-        _make_nvfp4_2d(device="cuda", act_quant=None, high_first=True),
-        _make_nvfp4_2d(device="cuda", act_quant="static", high_first=True),
-        _make_nvfp4_2d(device="cuda", act_quant="dynamic"),
-        _make_nvfp4_2d(convrot=True, device="cuda", act_quant=None, high_first=True),
-        _make_nvfp4_2d(convrot=True, device="cuda", act_quant="dynamic"),
-        trellis_from_hp,
+        _make_trellis_uniform().to("cuda"),
+        _make_trellis_variable_row().to("cuda"),
     ]
+    if trellis_encoder_available():
+        dense_trellis = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) * 0.2
+        trellis_from_hp = ConvRotTrellisTensor.from_hp(
+            dense_trellis, group_size=64, bits_per_weight=4.0
+        )
+        trellis_storage = TrellisStorage.from_hp(dense_trellis, group_size=64, bits_per_weight=4.0)
+        trellis_from_store = ConvRotTrellisTensor.from_trellis_storage(
+            trellis_storage, group_size=64
+        )
+        torch.testing.assert_close(
+            trellis_from_hp.dequantize(), trellis_from_store.dequantize(), rtol=0, atol=0
+        )
+        linear_weights.append(trellis_from_hp)
+    if w4a16_nvfp4_available():
+        linear_weights.extend(
+            [
+                _make_nvfp4_2d(device="cuda", act_quant=None, high_first=True),
+                _make_nvfp4_2d(convrot=True, device="cuda", act_quant=None, high_first=True),
+            ]
+        )
+    if exact_sm120_available():
+        linear_weights.extend(
+            [
+                _make_nvfp4_2d(device="cuda", act_quant="static", high_first=True),
+                _make_nvfp4_2d(device="cuda", act_quant="dynamic"),
+                _make_nvfp4_2d(convrot=True, device="cuda", act_quant="dynamic"),
+            ]
+        )
     for weight in linear_weights:
         rebuilt = _assert_zero_copy_storage_round_trip(weight)
         tensors, metadata = weight.as_storage()
@@ -545,24 +563,40 @@ def test_nonfoldable_3d_activation_views_cpu(builder: Callable[[], QuantizedWeig
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm GPU")
 @pytest.mark.parametrize(
-    "builder",
+    ("requirement", "builder"),
     [
-        lambda: _make_int8_2d(device="cuda", static_act=False),
-        lambda: _make_nvfp4_2d(device="cuda", act_quant=None, high_first=True),
-        lambda: _make_nvfp4_2d(device="cuda", act_quant="static", high_first=True),
-        lambda: _make_nvfp4_2d(device="cuda", act_quant="dynamic"),
-        lambda: _make_nvfp4_2d(convrot=True, device="cuda", act_quant=None, high_first=True),
-        lambda: _make_nvfp4_2d(convrot=True, device="cuda", act_quant="dynamic"),
-        lambda: ConvRotTrellisTensor.from_hp(
-            torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) * 0.2,
-            group_size=64,
-            bits_per_weight=4.0,
+        ("cuda", lambda: _make_int8_2d(device="cuda", static_act=False)),
+        ("cuda", lambda: _make_trellis_uniform().to("cuda")),
+        ("cuda", lambda: _make_trellis_variable_row().to("cuda")),
+        ("w4a16", lambda: _make_nvfp4_2d(device="cuda", act_quant=None, high_first=True)),
+        ("sm120", lambda: _make_nvfp4_2d(device="cuda", act_quant="static", high_first=True)),
+        ("sm120", lambda: _make_nvfp4_2d(device="cuda", act_quant="dynamic")),
+        (
+            "w4a16",
+            lambda: _make_nvfp4_2d(convrot=True, device="cuda", act_quant=None, high_first=True),
+        ),
+        ("sm120", lambda: _make_nvfp4_2d(convrot=True, device="cuda", act_quant="dynamic")),
+        (
+            "trellis_encode",
+            lambda: ConvRotTrellisTensor.from_hp(
+                torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) * 0.2,
+                group_size=64,
+                bits_per_weight=4.0,
+            ),
         ),
     ],
 )
-def test_nonfoldable_3d_activation_views_cuda(builder: Callable[[], QuantizedWeight]) -> None:
+def test_nonfoldable_3d_activation_views_cuda(
+    requirement: str, builder: Callable[[], QuantizedWeight]
+) -> None:
+    if requirement == "sm120" and not exact_sm120_available():
+        pytest.skip("requires exact NVIDIA SM120")
+    if requirement == "w4a16" and not w4a16_nvfp4_available():
+        pytest.skip("requires W4A16 NVFP4 support")
+    if requirement == "trellis_encode" and not trellis_encoder_available():
+        pytest.skip("requires NVIDIA SM80+ Trellis encoding support")
     torch.manual_seed(31)
     _assert_nonfoldable_3d_views_match(builder(), compiled=True)
 

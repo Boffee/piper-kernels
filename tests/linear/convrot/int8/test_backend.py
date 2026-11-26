@@ -687,3 +687,86 @@ def test_validated_operations_call_the_selected_implementation(monkeypatch, oper
                 rounding_seed=2**64 - 1,
             )
             execute.assert_called_once_with(qdata, scale, mat1, mat2, 16, 3.0, 2.0, -1)
+
+
+def test_backend_rejects_noncontiguous_3d_out_and_skips_empty_preparation() -> None:
+    fake_kernels = SimpleNamespace(
+        fused_rotate_quantize_input=Mock(),
+        quantize_input=Mock(),
+        launch_prepared_linear=Mock(),
+    )
+    implementation = _backend.LinearBackend(nvidia.policy, fake_kernels)  # type: ignore[arg-type]
+    target = AcceleratorTarget("cuda", "sm120")
+    weight = torch.empty(8, 32, dtype=torch.int8)
+    plan = implementation.default_execution_plan(weight, target=target, rows=6)
+
+    bad_3d_out = torch.empty(2, 4, 8)[:, 1:, :]
+    assert not bad_3d_out.is_contiguous()
+    for bad_out, pattern in (
+        (torch.empty(3, 2, 8), "expected shape"),
+        (torch.empty((2, 3, 8), dtype=torch.float16), "expected shape"),
+        (torch.empty((2, 3, 8), device="meta"), "expected shape"),
+        (torch.empty((8, 6)).t().view(2, 3, 8), "column-contiguous"),
+        (bad_3d_out, "2-D row-strided matrix"),
+    ):
+        with pytest.raises(ValueError, match=pattern):
+            implementation.execute_prepared_linear(
+                torch.empty((2, 3, 32), dtype=torch.int8),
+                torch.empty(2, 3),
+                weight,
+                torch.empty(8, 1),
+                None,
+                torch.float32,
+                plan,
+                out=bad_out,
+                target=target,
+            )
+    fake_kernels.launch_prepared_linear.assert_not_called()
+
+    bad_prep_q = torch.empty((2, 4, 32), dtype=torch.int8)[:, 1:, :]
+    for bad_prep, pattern in (
+        ((torch.empty((3, 2, 32), dtype=torch.int8), torch.empty(3, 2)), "expected shapes"),
+        ((torch.empty((2, 3, 32), dtype=torch.float16), torch.empty(2, 3)), "expected shapes"),
+        (
+            (torch.empty((2, 3, 32), dtype=torch.int8), torch.empty((2, 3), device="meta")),
+            "expected shapes",
+        ),
+        ((bad_prep_q, torch.empty(2, 3)), "contiguous"),
+    ):
+        with pytest.raises(ValueError, match=pattern):
+            implementation.prepare_input_with_plan(
+                torch.empty(2, 3, 32),
+                32,
+                16,
+                activation_fn=None,
+                execution_plan=plan,
+                target=target,
+                out=bad_prep,
+            )
+    fake_kernels.fused_rotate_quantize_input.assert_not_called()
+
+    empty_q, empty_s = implementation.prepare_input_with_plan(
+        torch.empty(0, 32),
+        32,
+        16,
+        activation_fn=None,
+        execution_plan=plan,
+        target=target,
+    )
+    assert empty_q.shape == (0, 32)
+    assert empty_s.shape == (0,)
+    provided = (torch.empty((0, 32), dtype=torch.int8), torch.empty(0))
+    assert (
+        implementation.prepare_input_with_plan(
+            torch.empty(0, 32),
+            32,
+            16,
+            activation_fn=None,
+            execution_plan=plan,
+            target=target,
+            out=provided,
+        )
+        is provided
+    )
+    fake_kernels.fused_rotate_quantize_input.assert_not_called()
+    fake_kernels.quantize_input.assert_not_called()

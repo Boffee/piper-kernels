@@ -20,13 +20,22 @@ import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
+from piper_kernels._triton.primitives import (
+    TRITON_FLOAT_POINTER_TYPES,
+    TritonCompileFn,
+    default_triton_compile,
+    splitk_tile_bounds,
+)
 from piper_kernels._triton.runtime import device_context
+from piper_kernels.linear._dispatch import empty_linear_output
 from piper_kernels.linear._splitk import device_sm_count, select_split_k
 from piper_kernels.trellis._layout import TrellisLayout, validate_block_size
 from piper_kernels.trellis.triton import (
     _bit_window_params,
     _decode_states_to_q_fp32,
     _load_cyclic_states,
+    _uniform_row_start_bits,
+    _variable_row_start_bits,
     compute_row_offsets,
     decode_int8_out,
     decode_variable_rows_int8_out,
@@ -40,11 +49,6 @@ _SCRATCH_DECODE_MAX_BYTES = 32 * 1024 * 1024
 _REDUCE_BLOCK_N = 256
 _SPLITK_MIN_WEIGHT_BYTES = 2 * 1024 * 1024
 _SPLITK_MAX = 8
-_TRITON_FLOAT_POINTER_TYPES = {
-    torch.float16: "*fp16",
-    torch.bfloat16: "*bf16",
-    torch.float32: "*fp32",
-}
 
 
 @triton.jit
@@ -83,9 +87,7 @@ def _gemv_accumulate_k_blocks(
     variable_rows: tl.constexpr,
 ):
     """Run the unified uniform/variable K-block accumulation loop for one CTA split."""
-    blocks_per_split = (blocks_per_row + split_k - 1) // split_k
-    b_start = pid_k * blocks_per_split
-    b_end = tl.minimum(b_start + blocks_per_split, blocks_per_row)
+    b_start, b_end = splitk_tile_bounds(blocks_per_row, pid_k, split_k)
     row_blk_base = row_index.to(tl.int64) * blocks_per_row
     bpb64 = bytes_per_block.to(tl.int64)
 
@@ -179,9 +181,10 @@ def trellis_gemv_splitk_kernel(
     has_bias: tl.constexpr,
 ):
     """Fused in-register Trellis -> A16 Split-K GEMV over one output row per CTA."""
-    pid_n = tl.program_id(0)
+    pid_mn = tl.program_id(0)
+    pid_n = pid_mn % out_features
+    pid_m = pid_mn // out_features
     pid_k = tl.program_id(1)
-    pid_m = tl.program_id(2)
 
     row_index = pid_n + tl.arange(0, 1)
     row_mask = row_index < out_features
@@ -199,34 +202,28 @@ def trellis_gemv_splitk_kernel(
         width = tl.load(row_widths_ptr + row_index, mask=row_mask, other=0).to(tl.int32)
         row_offset = tl.load(row_offsets_ptr + row_index, mask=row_mask, other=0).to(tl.int64)
         row_base_bytes = row_offset * blocks_per_row
-        row_bits = width * 8
-        row_step_bits = row_bits // denom
-        row_wide_steps = row_bits - row_step_bits * denom
-        start_bits = (
-            row_step_bits[:, None] * clamped_steps[None, :]
-            + row_wide_steps[:, None] * (clamped_steps[None, :] + 1) // denom
-        )
-        byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift = _bit_window_params(
-            start_bits, row_bits[:, None]
-        )
         width64 = width.to(tl.int64)
-        u_b0_mask = elem_mask
-        u_b1_mask = elem_mask
-        u_m0 = elem_mask
-        u_m1 = elem_mask
-        u_m2 = elem_mask
     else:
-        offsets = step_bits * clamped_steps + (clamped_steps + 1) * num_wide_steps // denom
-        byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift = _bit_window_params(
-            offsets[None, :], block_bits
-        )
+        width = tl.full((1,), 0, tl.int32)
         row_base_bytes = tl.full((1,), 0, tl.int64)
         width64 = tl.full((1,), 0, tl.int64)
+    if variable_rows:
+        start_bits, stream_bits = _variable_row_start_bits(width, clamped_steps, denom)
+        u_b0_mask = row_mask
+        u_b1_mask = row_mask
+    else:
+        start_bits = _uniform_row_start_bits(step_bits, num_wide_steps, clamped_steps, denom)[
+            None, :
+        ]
+        stream_bits = block_bits
         u_b0_mask = row_mask & (bytes_per_block > 0)
         u_b1_mask = row_mask & (bytes_per_block > 1)
-        u_m0 = elem_mask & (byte < bytes_per_block)
-        u_m1 = elem_mask & ((byte + 1) < bytes_per_block)
-        u_m2 = elem_mask & ((byte + 2) < bytes_per_block)
+    byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift = _bit_window_params(
+        start_bits, stream_bits
+    )
+    u_m0 = elem_mask if variable_rows else (elem_mask & (byte < bytes_per_block))
+    u_m1 = elem_mask if variable_rows else (elem_mask & ((byte + 1) < bytes_per_block))
+    u_m2 = elem_mask if variable_rows else (elem_mask & ((byte + 2) < bytes_per_block))
 
     acc = _gemv_accumulate_k_blocks(
         x_rot_ptr,
@@ -329,7 +326,7 @@ def _select_gemv_config(
     block_m = 1 if rows == 1 else (2 if rows == 2 else (4 if rows <= 4 else _GEMV_MAX_ROWS))
     num_warps = 1
     if rows > _GEMV_MAX_ROWS:
-        # Large-M fallback (e.g. SM75 without W8A8) already fills SMs on M x N.
+        # Large-M fallback (devices without an optimized W8A8 backend) already fills SMs on M x N.
         return (block_m, num_warps, 1)
     output_tiles = out_features * triton.cdiv(rows, block_m)
     split_k = select_split_k(
@@ -346,22 +343,6 @@ def _select_gemv_config(
     return (block_m, num_warps, split_k)
 
 
-def _empty_linear_output(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    out_features: int,
-    in_features: int,
-    bias: torch.Tensor | None,
-) -> torch.Tensor | None:
-    leading_shape = input.shape[:-1]
-    if math.prod(leading_shape) == 0 or out_features == 0:
-        return input.new_empty((*leading_shape, out_features))
-    if in_features == 0:
-        if bias is None:
-            return input.new_zeros((*leading_shape, out_features))
-        return bias.to(input.dtype).expand(*leading_shape, out_features).clone()
-    return None
-
-
 def linear_a16(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     bitstreams: torch.Tensor,
@@ -375,7 +356,7 @@ def linear_a16(
     """Execute ConvRot Trellis linear via fused in-register A16 Split-K GEMV."""
     out_features, blocks_per_row = block_scales.shape
     in_features = blocks_per_row * block_size
-    empty = _empty_linear_output(input, out_features, in_features, bias)
+    empty = empty_linear_output(input, out_features, in_features, bias)
     if empty is not None:
         return empty
     leading_shape = input.shape[:-1]
@@ -415,7 +396,7 @@ def linear_a16(
         if is_splitk
         else output
     )
-    grid = (out_features, split_k, triton.cdiv(rows, block_m))
+    grid = (out_features * triton.cdiv(rows, block_m), split_k)
     with device_context(input.device):
         row_offsets = compute_row_offsets(row_widths) if row_widths is not None else None
         trellis_gemv_splitk_kernel[grid](
@@ -479,7 +460,7 @@ def _linear_w8a8(
     """Execute prefill ConvRot Trellis linear via bounded N-chunked scratch decode + W8A8."""
     out_features, blocks_per_row = block_scales.shape
     in_features = blocks_per_row * block_size
-    empty = _empty_linear_output(input, out_features, in_features, bias)
+    empty = empty_linear_output(input, out_features, in_features, bias)
     if empty is not None:
         return empty
     leading_shape = input.shape[:-1]
@@ -490,8 +471,9 @@ def _linear_w8a8(
     input_qdata, input_scale = int8_backend.prepare_input(input_2d, group_size)
 
     raw_chunk_rows = max(1, _SCRATCH_DECODE_MAX_BYTES // in_features)
-    if raw_chunk_rows < out_features and raw_chunk_rows >= 128:
-        chunk_rows = (raw_chunk_rows // 128) * 128
+    chunk_align = 256 if raw_chunk_rows >= 256 else 128
+    if raw_chunk_rows < out_features and raw_chunk_rows >= chunk_align:
+        chunk_rows = (raw_chunk_rows // chunk_align) * chunk_align
     else:
         chunk_rows = min(out_features, raw_chunk_rows)
     q_scratch = torch.empty((chunk_rows, in_features), device=input.device, dtype=torch.int8)
@@ -590,6 +572,7 @@ def compile_trellis_kernels(
     variable_rows: bool = False,
     bytes_per_block: int | None = None,
     num_sms: int = 64,
+    compile_fn: TritonCompileFn = default_triton_compile,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     """Compile the production Trellis A16 GEMV (and Split-K reduce) kernels for a target."""
     if rows <= 0 or out_features <= 0 or input_features <= 0 or num_sms <= 0:
@@ -599,15 +582,15 @@ def compile_trellis_kernels(
         raise ValueError(
             f"input_features {input_features} must be divisible by block_size {block_size}"
         )
-    if input_dtype not in _TRITON_FLOAT_POINTER_TYPES:
+    if input_dtype not in TRITON_FLOAT_POINTER_TYPES:
         raise ValueError(f"Unsupported Trellis input dtype: {input_dtype}")
-    if bias_dtype is not None and bias_dtype not in _TRITON_FLOAT_POINTER_TYPES:
+    if bias_dtype is not None and bias_dtype not in TRITON_FLOAT_POINTER_TYPES:
         raise ValueError(f"Unsupported Trellis bias dtype: {bias_dtype}")
 
-    out_ty = _TRITON_FLOAT_POINTER_TYPES[input_dtype]
+    out_ty = TRITON_FLOAT_POINTER_TYPES[input_dtype]
     has_bias = bias_dtype is not None
     bias_signature = (
-        {} if bias_dtype is None else {"bias_ptr": _TRITON_FLOAT_POINTER_TYPES[bias_dtype]}
+        {} if bias_dtype is None else {"bias_ptr": TRITON_FLOAT_POINTER_TYPES[bias_dtype]}
     )
     bias_constexpr: dict[str, object] = {"bias_ptr": None} if bias_dtype is None else {}
     blocks_per_row = input_features // block_size
@@ -666,14 +649,14 @@ def compile_trellis_kernels(
         gemv_constexprs["row_offsets_ptr"] = None
 
     compiled: dict[str, triton.compiler.CompiledKernel] = {
-        "gemv": triton.compile(
+        "gemv": compile_fn(
             ASTSource(trellis_gemv_splitk_kernel, gemv_signature, constexprs=gemv_constexprs),
-            target=target,
-            options={"num_warps": num_warps},
+            target,
+            {"num_warps": num_warps},
         )
     }
     if is_splitk:
-        compiled["reduce"] = triton.compile(
+        compiled["reduce"] = compile_fn(
             ASTSource(
                 trellis_splitk_reduce_kernel,
                 {
@@ -691,8 +674,8 @@ def compile_trellis_kernels(
                     "has_bias": has_bias,
                 },
             ),
-            target=target,
-            options={"num_warps": 4},
+            target,
+            {"num_warps": 4},
         )
     return compiled
 

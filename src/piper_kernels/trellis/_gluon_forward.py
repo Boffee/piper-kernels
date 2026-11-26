@@ -858,6 +858,8 @@ def _run_walk(
         max_ctas = max(1, _BACKPOINTER_BYTES // (rows_per_cta * trace_steps * cap))
         waves = max(1, max_ctas // wave_ctas)
         batch_ctas = min(total_ctas, waves * wave_ctas)
+        if batch_ctas < total_ctas and batch_ctas >= 4:
+            batch_ctas = (batch_ctas // 4) * 4
 
         slot_states = torch.empty(total_slots, trace_steps, dtype=torch.int64, device=device)
         bp_storage = torch.empty(

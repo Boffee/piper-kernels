@@ -449,6 +449,31 @@ def _compile_amd_splitk_kernels(
     return {"splitk_matmul": matmul_compiled, "splitk_reduce": reduce_compiled}
 
 
+def _assert_amd_splitk_zero_spills(
+    architecture: str,
+    compiled: dict[str, triton.compiler.CompiledKernel],
+) -> None:
+    # gfx1201 splitk_matmul inherits pre-existing 647-909 VGPR spills from the
+    # shared (16, 64, 256) WMMA schedule, which is tracked outside Phase 1 cleanup.
+    checked = (
+        ("splitk_reduce",) if architecture == "gfx1201" else ("splitk_matmul", "splitk_reduce")
+    )
+    for name in checked:
+        amdgcn = compiled[name].asm["amdgcn"]
+        vgpr_spills = re.search(r"\.vgpr_spill_count:\s*(\d+)", amdgcn)
+        assert vgpr_spills is not None, f"missing .vgpr_spill_count in {architecture} {name}"
+        assert int(vgpr_spills.group(1)) == 0, (
+            f"{architecture} {name} spilled {vgpr_spills.group(1)} VGPRs"
+        )
+        priv_size = re.search(r"\.private_segment_fixed_size:\s*(\d+)", amdgcn)
+        assert priv_size is not None, (
+            f"missing .private_segment_fixed_size in {architecture} {name}"
+        )
+        assert int(priv_size.group(1)) == 0, (
+            f"{architecture} {name} reserved private_segment {priv_size.group(1)}"
+        )
+
+
 @pytest.mark.parametrize(
     ("architecture", "warp_size"),
     [("gfx942", 64), ("gfx1100", 32), ("gfx1151", 32), ("gfx1201", 32)],
@@ -486,6 +511,7 @@ def test_amd_splitk_kernels_compile_to_matrix_instructions(
     expected_isa = "v_mfma_i32" if architecture == "gfx942" else "v_wmma_i32"
     amdgcn = compiled["splitk_matmul"].asm["amdgcn"]
     assert expected_isa in amdgcn
+    _assert_amd_splitk_zero_spills(architecture, compiled)
     if architecture == "gfx1201" and rocm_fences_only_lds():
         assert "global_inv" not in amdgcn
 
@@ -501,6 +527,7 @@ def test_gfx1201_seeded_splitk_kernel_compiles() -> None:
     )
     assert set(compiled) == {"splitk_matmul", "splitk_reduce"}
     assert "v_wmma_i32" in compiled["splitk_matmul"].asm["amdgcn"]
+    _assert_amd_splitk_zero_spills("gfx1201", compiled)
 
 
 @pytest.mark.parametrize(

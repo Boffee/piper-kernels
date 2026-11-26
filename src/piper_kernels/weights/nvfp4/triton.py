@@ -49,7 +49,7 @@ def _decode_fp4(packed, logical_offsets):
 
 
 @triton.jit
-def swizzled_scale_offsets(rows, scale_columns, column_blocks: tl.constexpr):
+def swizzled_scale_offsets(rows, scale_columns, column_blocks):
     row_block = rows // 128
     row_inner = rows % 128
     column_block = scale_columns // 4

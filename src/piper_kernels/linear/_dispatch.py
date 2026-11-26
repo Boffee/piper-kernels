@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -74,8 +75,26 @@ def apply_linear_autocast(
     )
 
 
+def empty_linear_output(
+    input: torch.Tensor,  # noqa: A002 - match linear terminology
+    out_features: int,
+    reduction_units: int,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Return an empty or zero-reduction output tensor when a linear projection has no MAC work."""
+    leading_shape = input.shape[:-1]
+    if math.prod(leading_shape) == 0 or out_features == 0:
+        return input.new_empty((*leading_shape, out_features))
+    if reduction_units == 0:
+        if bias is None:
+            return input.new_zeros((*leading_shape, out_features))
+        return bias.to(input.dtype).expand(*leading_shape, out_features).clone()
+    return None
+
+
 __all__ = [
     "apply_linear_autocast",
     "bind_linear_arguments",
+    "empty_linear_output",
     "linear_autocast_dtype",
 ]
