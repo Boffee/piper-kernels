@@ -398,7 +398,7 @@ def test_gluon_kernel_matches_triton_recurrence(
     assert torch.isfinite(gluon).all()
     # Both kernels share the recurrence; FP32 operation order can move a value
     # across one final output rounding boundary.
-    torch.testing.assert_close(gluon, stock, atol=2**-8, rtol=0.0)
+    torch.testing.assert_close(gluon, stock, atol=2**-8, rtol=torch.finfo(dtype).eps)
 
 
 def test_gluon_ragged_lengths_reuse_one_specialization() -> None:

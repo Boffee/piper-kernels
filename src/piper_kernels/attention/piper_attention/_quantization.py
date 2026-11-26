@@ -25,7 +25,8 @@ Numerical boundaries:
 # Python call signature.
 # pyright: reportCallIssue=false
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 import torch
 import triton
@@ -689,16 +690,98 @@ def compile_pointer_attrs(
     signature: dict[str, str],
     *,
     div16_names: frozenset[str] = frozenset(),
+    all_strides_div16: bool = False,
+    pointer_range_32: bool = True,
 ) -> dict[tuple[int, ...], list[list[object]]]:
-    """Attach live contiguous pointer divisibility/range attrs and selected stride attrs."""
+    """Attach live pointer divisibility/range attrs and selected stride attrs."""
+    ptr_attrs: list[list[object]] = [["tt.divisibility", 16]]
+    if pointer_range_32:
+        ptr_attrs.append(["tt.pointer_range", 32])
     attrs: dict[tuple[int, ...], list[list[object]]] = {}
     for idx, name in enumerate(arg_names):
         ty = signature.get(name)
         if isinstance(ty, str) and ty.startswith("*"):
-            attrs[(idx,)] = [["tt.divisibility", 16], ["tt.pointer_range", 32]]
-        elif name in div16_names:
+            attrs[(idx,)] = list(ptr_attrs)
+        elif ty is not None and (
+            name in div16_names or (all_strides_div16 and name.startswith("stride_"))
+        ):
             attrs[(idx,)] = [["tt.divisibility", 16]]
     return attrs
+
+
+POOL_SLOT_STRIDE_NAMES: tuple[str, ...] = (
+    "stride_ki_s",
+    "stride_ks_s",
+    "stride_kc_s",
+    "stride_vi_s",
+    "stride_vs_s",
+    "stride_vm_s",
+)
+
+
+def validate_kv_compile_args(dtype: torch.dtype, head_dim: int) -> str:
+    """Validate offline KV compile dtype/head_dim and return the Triton pointer dtype stem."""
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"dtype must be float16 or bfloat16, got {dtype}")
+    if head_dim not in (64, 128):
+        raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
+    return "bf16" if dtype is torch.bfloat16 else "fp16"
+
+
+def frozen_pool_pointer_signature(triton_dtype: str, *, wide_pool: bool = False) -> dict[str, str]:
+    """Return the shared frozen-pool prefill pointer signature (plus i64 slot strides)."""
+    sig = {
+        "query_ptr": "*i8",
+        "query_scale_ptr": "*fp32",
+        "key_int8_ptr": "*i8",
+        "key_scale_ptr": "*fp32",
+        "key_center_ptr": "*fp32",
+        "value_int8_ptr": "*i8",
+        "value_scale_ptr": "*fp32",
+        "value_mean_ptr": "*fp32",
+        "chunk_to_slot_ptr": "*i32",
+        "num_chunks_ptr": "*i32",
+        "output_ptr": f"*{triton_dtype}",
+        "lse_ptr": "*fp32",
+    }
+    if wide_pool:
+        sig.update(dict.fromkeys(POOL_SLOT_STRIDE_NAMES, "i64"))
+    return sig
+
+
+def build_kernel_source(
+    kernel: Any,
+    *,
+    constants: dict[str, object],
+    overrides: dict[str, str],
+    attrs: Mapping[tuple[int, ...], object] | None = None,
+    gluon: bool = False,
+    div16_names: frozenset[str] = frozenset(),
+    all_strides_div16: bool = False,
+    pointer_range_32: bool = True,
+) -> object:
+    """Construct a Triton ASTSource or GluonASTSource with i32 defaults and pointer attrs."""
+    arg_names: list[str] = list(kernel.arg_names)
+    sig: dict[str, str] = {name: "i32" for name in arg_names if name not in constants}
+    sig.update(overrides)
+    resolved_attrs: Any = (
+        compile_pointer_attrs(
+            arg_names,
+            sig,
+            div16_names=div16_names,
+            all_strides_div16=all_strides_div16,
+            pointer_range_32=pointer_range_32,
+        )
+        if attrs is None
+        else attrs
+    )
+    if gluon:
+        from triton.experimental.gluon._runtime import GluonASTSource  # noqa: PLC0415
+
+        return GluonASTSource(kernel, sig, constexprs=constants, attrs=resolved_attrs)
+    from triton.compiler import ASTSource  # noqa: PLC0415
+
+    return ASTSource(kernel, sig, constexprs=constants, attrs=resolved_attrs)
 
 
 _KEY_DIV16_BASE = frozenset(
@@ -735,18 +818,12 @@ def _compile_quantize_pair(
     has_key_lengths: bool,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, object]:
-    if dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"dtype must be float16 or bfloat16, got {dtype}")
-    if head_dim not in (64, 128):
-        raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
-
-    from triton.compiler import ASTSource  # noqa: PLC0415 - compile-only dependency
+    triton_dtype = validate_kv_compile_args(dtype, head_dim)
 
     from . import _backend  # noqa: PLC0415 - avoid backend/triton import cycle
 
     accel = AcceleratorTarget.from_compiler_target(target)
     _, grouped_qk, pack_wmma = _backend.kv_chunk_layout(accel)
-    triton_dtype = "bf16" if dtype is torch.bfloat16 else "fp16"
 
     key_constants: dict[str, object] = {
         "grouped_qk": grouped_qk,
@@ -754,28 +831,27 @@ def _compile_quantize_pair(
         "head_dim": head_dim,
         "has_key_lengths": has_key_lengths,
     }
-    key_signature: dict[str, str] = {
-        name: "i32" for name in _quantize_key_k1024_kernel.arg_names if name not in key_constants
+    key_overrides = {
+        "key_ptr": f"*{triton_dtype}",
+        "output_ptr": "*i8",
+        "scale_ptr": "*fp32",
+        "center_ptr": "*fp32",
+        "slot_ids_ptr": "*i32",
     }
-    key_signature.update(
-        key_ptr=f"*{triton_dtype}",
-        output_ptr="*i8",
-        scale_ptr="*fp32",
-        center_ptr="*fp32",
-        slot_ids_ptr="*i32",
-    )
-    key_attrs = (
-        _div16_attrs(_quantize_key_k1024_kernel.arg_names, _KEY_DIV16_BASE | {"stride_sh"})
-        if scatter_slots
-        else compile_pointer_attrs(
-            _quantize_key_k1024_kernel.arg_names,
-            key_signature,
-            div16_names=_KEY_DIV16_BASE | {"stride_cb", "stride_kb", "stride_kh", "stride_kn"},
-        )
+    key_source = build_kernel_source(
+        _quantize_key_k1024_kernel,
+        constants=key_constants,
+        overrides=key_overrides,
+        attrs=(
+            _div16_attrs(_quantize_key_k1024_kernel.arg_names, _KEY_DIV16_BASE | {"stride_sh"})
+            if scatter_slots
+            else None
+        ),
+        div16_names=_KEY_DIV16_BASE | {"stride_cb", "stride_kb", "stride_kh", "stride_kn"},
     )
 
-    store_log_scale = pack_wmma if not scatter_slots else False
-    scale_by_p_range = pack_wmma if not scatter_slots else False
+    store_log_scale = pack_wmma and not scatter_slots
+    scale_by_p_range = pack_wmma and not scatter_slots
     use_tile_layout = True
     value_constants: dict[str, object] = {
         "stride_ok": 1,
@@ -787,31 +863,27 @@ def _compile_quantize_pair(
         "head_dim": head_dim,
         "has_key_lengths": has_key_lengths,
     }
-    value_signature: dict[str, str] = {
-        name: "i32"
-        for name in _quantize_value_k1024_kernel.arg_names
-        if name not in value_constants
+    value_overrides = {
+        "value_ptr": f"*{triton_dtype}",
+        "output_ptr": "*i8",
+        "scale_multiplier_ptr": "*fp32",
+        "log_scale_ptr": "*fp32",
+        "value_mean_ptr": "*fp32",
+        "slot_ids_ptr": "*i32",
     }
-    value_signature.update(
-        value_ptr=f"*{triton_dtype}",
-        output_ptr="*i8",
-        scale_multiplier_ptr="*fp32",
-        log_scale_ptr="*fp32",
-        value_mean_ptr="*fp32",
-        slot_ids_ptr="*i32",
-    )
-    value_attrs = (
-        _div16_attrs(_quantize_value_k1024_kernel.arg_names, _VALUE_DIV16_BASE)
-        if scatter_slots
-        else compile_pointer_attrs(
-            _quantize_value_k1024_kernel.arg_names,
-            value_signature,
-            div16_names=_VALUE_DIV16_BASE
-            | {"stride_mb", "stride_cb", "stride_vb", "stride_vh", "stride_vn"},
-        )
+    value_source = build_kernel_source(
+        _quantize_value_k1024_kernel,
+        constants=value_constants,
+        overrides=value_overrides,
+        attrs=(
+            _div16_attrs(_quantize_value_k1024_kernel.arg_names, _VALUE_DIV16_BASE)
+            if scatter_slots
+            else None
+        ),
+        div16_names=_VALUE_DIV16_BASE
+        | {"stride_mb", "stride_cb", "stride_vb", "stride_vh", "stride_vn"},
     )
 
-    key_options: dict[str, object] = {"num_warps": 4}
     value_options: dict[str, object] = {
         "num_warps": _value_quantize_num_warps(
             head_dim,
@@ -822,26 +894,8 @@ def _compile_quantize_pair(
     }
     compiler = triton.compile if compile_fn is None else compile_fn
     return (
-        compiler(
-            ASTSource(
-                _quantize_key_k1024_kernel,
-                key_signature,
-                constexprs=key_constants,
-                attrs=key_attrs,
-            ),
-            target,
-            key_options,
-        ),
-        compiler(
-            ASTSource(
-                _quantize_value_k1024_kernel,
-                value_signature,
-                constexprs=value_constants,
-                attrs=value_attrs,
-            ),
-            target,
-            value_options,
-        ),
+        compiler(key_source, target, {"num_warps": 4}),
+        compiler(value_source, target, value_options),
     )
 
 

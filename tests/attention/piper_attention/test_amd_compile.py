@@ -212,12 +212,14 @@ def test_amd_prefill_compilation_zero_spills(
 
 
 def test_amd_prefill_gfx1200_smoke() -> None:
-    frozen, tail = amd_gluon.compile_amd_prefill_kernels(
-        GPUTarget("hip", "gfx1200", 32),
-        dtype=torch.bfloat16,
-        head_dim=128,
-        has_chunk_map=True,
-        is_causal=True,
-    )
-    _assert_zero_spill_amd_prefill(frozen)
-    _assert_zero_spill_amd_prefill(tail)
+    for wide_pool in (False, True):
+        frozen, tail = amd_gluon.compile_amd_prefill_kernels(
+            GPUTarget("hip", "gfx1200", 32),
+            dtype=torch.bfloat16,
+            head_dim=128,
+            has_chunk_map=True,
+            is_causal=True,
+            wide_pool=wide_pool,
+        )
+        _assert_zero_spill_amd_prefill(frozen)
+        _assert_zero_spill_amd_prefill(tail)

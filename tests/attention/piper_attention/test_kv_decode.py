@@ -3059,6 +3059,164 @@ def test_gpu_chunked_prefill_ieee754_edges(head_dim: int) -> None:
     assert torch.isnan(o_nan).all()
     assert torch.isnan(l_nan).all()
 
+    # Zero key_scale with huge softmax scale must associate (query_scale * key_scale) before
+    # multiplying integer QK scores so +/-inf * 0.0 never produces NaN (e.g. SM8x grouped_qk=False).
+    zero_k_pool = _make_strided_pool(1, 1, head_dim, device=device, kv_dtype=torch.uint8)
+    v_two = torch.full((1, 1, KV_CHUNK_TOKENS, head_dim), 2.0, device=device, dtype=torch.bfloat16)
+    freeze_kv_chunks_(
+        torch.zeros_like(v_two),
+        v_two,
+        zero_k_pool,
+        torch.tensor([0], device=device, dtype=torch.int32),
+    )
+    zero_k_pool.key_int8.view(torch.int8).fill_(127)
+    zero_k_pool.key_scale.zero_()
+    zero_k_pool.key_center.zero_()
+    q_ones = torch.ones((1, 1, 64, head_dim), device=device, dtype=torch.bfloat16)
+    expected_lse = math.log(KV_CHUNK_TOKENS)
+    for q_slice in (q_ones, q_ones[:, :, :1]):
+        o_zero_ks, l_zero_ks = piper_attention_decode(
+            q_slice,
+            zero_k_pool,
+            torch.tensor([[0]], device=device, dtype=torch.int32),
+            nc_one,
+            scale=1e36,
+            return_lse=True,
+        )
+        assert torch.isfinite(o_zero_ks).all()
+        assert torch.isfinite(l_zero_ks).all()
+        torch.testing.assert_close(o_zero_ks, torch.full_like(o_zero_ks, 2.0), atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            l_zero_ks, torch.full_like(l_zero_ks, expected_lse), atol=1e-4, rtol=1e-4
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_gpu_chunked_prefill_masked_pos_inf_kbias_and_two_wave_pos_inf(head_dim: int) -> None:
+    device = torch.device("cuda")
+    pool = _make_strided_pool(2, 1, head_dim, device=device, kv_dtype=torch.uint8)
+    empty_c2s = torch.empty((1, 0), device=device, dtype=torch.int32)
+    zero_nc = torch.zeros((1,), device=device, dtype=torch.int32)
+
+    # 1. Causal non-64-aligned tail with +inf k_bias: query rows masked out of trailing tile 1
+    #    must remain finite instead of letting (-inf) + (+inf) poison valid outputs/LSE.
+    q_big = torch.full((1, 1, 64, head_dim), 1e20, device=device, dtype=torch.bfloat16)
+    tk_big = torch.full((1, 1, 100, head_dim), 1e20, device=device, dtype=torch.bfloat16)
+    tv_one = torch.ones_like(tk_big)
+    tl_100 = torch.tensor([100], device=device, dtype=torch.int32)
+    o_causal_tail, l_causal_tail = piper_attention_decode(
+        q_big,
+        pool,
+        empty_c2s,
+        zero_nc,
+        tail_key=tk_big,
+        tail_value=tv_one,
+        tail_len=tl_100,
+        is_causal=True,
+        return_lse=True,
+    )
+    assert torch.isfinite(o_causal_tail).all()
+    torch.testing.assert_close(o_causal_tail, torch.ones_like(o_causal_tail), atol=1e-2, rtol=1e-2)
+    assert (l_causal_tail == float("inf")).all()
+
+    # 2. Causal seq_q > active_tail mixing a finite frozen chunk with a +inf k_bias live tail:
+    #    early query rows (rows 0..31) see zero tail tokens and must match the frozen chunk only.
+    _populate_test_pool(pool, [0], device=device, dtype=torch.bfloat16, seed=1499 + head_dim)
+    c2s_0 = torch.tensor([[0]], device=device, dtype=torch.int32)
+    nc_1 = torch.tensor([1], device=device, dtype=torch.int32)
+    o_frozen_only, l_frozen_only = piper_attention_decode(q_big, pool, c2s_0, nc_1, return_lse=True)
+    tl_32 = torch.tensor([32], device=device, dtype=torch.int32)
+    o_mix_seq_gt, l_mix_seq_gt = piper_attention_decode(
+        q_big,
+        pool,
+        c2s_0,
+        nc_1,
+        tail_key=tk_big[:, :, :32],
+        tail_value=tv_one[:, :, :32],
+        tail_len=tl_32,
+        is_causal=True,
+        return_lse=True,
+    )
+    torch.testing.assert_close(
+        o_mix_seq_gt[:, :, :32], o_frozen_only[:, :, :32], atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        l_mix_seq_gt[:, :, :32], l_frozen_only[:, :, :32], atol=1e-4, rtol=1e-4
+    )
+    torch.testing.assert_close(
+        o_mix_seq_gt[:, :, 32:], torch.ones_like(o_mix_seq_gt[:, :, 32:]), atol=1e-2, rtol=1e-2
+    )
+    assert (l_mix_seq_gt[:, :, 32:] == float("inf")).all()
+
+    # 3. Two-wave merge: +inf LSE in exactly one wave dominates a finite opposite wave, whereas
+    #    +inf in both waves stays indeterminate NaN (matching Split-KV and reference semantics).
+    k_pos = torch.full((1, 1, KV_CHUNK_TOKENS, head_dim), 1e34, device=device, dtype=torch.bfloat16)
+    v_pos = torch.ones_like(k_pos)
+    freeze_kv_chunks_(k_pos, v_pos, pool, torch.tensor([1], device=device, dtype=torch.int32))
+    c2s_1 = torch.tensor([[1]], device=device, dtype=torch.int32)
+    q_med = torch.full((1, 1, 64, head_dim), 1e6, device=device, dtype=torch.bfloat16)
+    torch.manual_seed(1511 + head_dim)
+    tk_fin = torch.randn((1, 1, 64, head_dim), device=device, dtype=torch.bfloat16)
+    tv_fin = torch.zeros_like(tk_fin)
+    tl_64 = torch.tensor([64], device=device, dtype=torch.int32)
+    o_a_split, l_a_split = piper_attention_decode(
+        q_med[:, :, :1],
+        pool,
+        c2s_1,
+        nc_1,
+        tail_key=tk_fin,
+        tail_value=tv_fin,
+        tail_len=tl_64,
+        is_causal=True,
+        return_lse=True,
+    )
+    o_a_prefill, l_a_prefill = piper_attention_decode(
+        q_med,
+        pool,
+        c2s_1,
+        nc_1,
+        tail_key=tk_fin,
+        tail_value=tv_fin,
+        tail_len=tl_64,
+        is_causal=True,
+        return_lse=True,
+    )
+    torch.testing.assert_close(o_a_prefill, o_a_split.expand_as(o_a_prefill), atol=1e-2, rtol=1e-2)
+    assert (l_a_split == float("inf")).all()
+    assert (l_a_prefill == float("inf")).all()
+
+    # Finite frozen wave (chunk 0) + +inf tail wave -> tail wave wins with 1.0 out and +inf LSE.
+    o_b_prefill, l_b_prefill = piper_attention_decode(
+        q_big,
+        pool,
+        c2s_0,
+        nc_1,
+        tail_key=tk_big[:, :, :64],
+        tail_value=tv_one[:, :, :64],
+        tail_len=tl_64,
+        is_causal=False,
+        return_lse=True,
+    )
+    torch.testing.assert_close(o_b_prefill, torch.ones_like(o_b_prefill), atol=1e-2, rtol=1e-2)
+    assert (l_b_prefill == float("inf")).all()
+
+    # Both waves +inf LSE -> indeterminate NaN.
+    o_both_inf, l_both_inf = piper_attention_decode(
+        q_big,
+        pool,
+        c2s_1,
+        nc_1,
+        tail_key=tk_big[:, :, :64],
+        tail_value=tv_one[:, :, :64],
+        tail_len=tl_64,
+        is_causal=False,
+        return_lse=True,
+    )
+    assert torch.isnan(o_both_inf).all()
+    assert torch.isnan(l_both_inf).all()
+
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")

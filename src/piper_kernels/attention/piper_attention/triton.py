@@ -25,7 +25,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 
 from . import _backend, _quantization
-from ._quantization import _div16_attrs, compile_pointer_attrs
+from ._quantization import _div16_attrs
 
 _CENTER_CHUNK = 1024
 _VALUE_TILE_TOKENS = 64
@@ -591,21 +591,23 @@ def _merge_two_attention_waves_kernel(
     lb = tl.load(lse_b_ptr + row)
     nan_a = la != la  # noqa: PLR0124
     nan_b = lb != lb  # noqa: PLR0124
-    has_nan = nan_a | nan_b
+    pos_inf_a = la == float("inf")
+    pos_inf_b = lb == float("inf")
+    has_nan = nan_a | nan_b | (pos_inf_a & pos_inf_b)
     valid_a = (la != -float("inf")) & (~nan_a)
     valid_b = (lb != -float("inf")) & (~nan_b)
-    only_a = valid_a & (~valid_b) & (~has_nan)
-    if not only_a:
+    a_wins = valid_a & ((~valid_b) | (pos_inf_a & (~pos_inf_b))) & (~has_nan)
+    if not a_wins:
         offsets_d = tl.arange(0, head_dim)
         out_a_ptrs = out_a_ptr + row * head_dim + offsets_d
         out_b_ptrs = out_b_ptr + row * head_dim + offsets_d
-        only_b = valid_b & (~valid_a) & (~has_nan)
-        both_valid = valid_a & valid_b
+        b_wins = valid_b & ((~valid_a) | (pos_inf_b & (~pos_inf_a))) & (~has_nan)
+        both_valid = valid_a & valid_b & (~pos_inf_a) & (~pos_inf_b)
         if has_nan:
             nan_vec = tl.full((head_dim,), float("nan"), dtype=tl.float32)
             tl.store(out_a_ptrs, nan_vec.to(out_a_ptr.dtype.element_ty))
             tl.store(lse_a_ptr + row, float("nan"))
-        elif only_b:
+        elif b_wins:
             ob = tl.load(out_b_ptrs)
             tl.store(out_a_ptrs, ob.to(out_a_ptr.dtype.element_ty))
             tl.store(lse_a_ptr + row, lb)
@@ -1245,21 +1247,6 @@ def piper_attention_decode_triton(
     return output, lse
 
 
-def _live_contiguous_attrs(
-    arg_names: list[str],
-    signature: dict[str, str],
-) -> dict[tuple[int, ...], object]:
-    return {
-        (idx,): (
-            [["tt.divisibility", 16], ["tt.pointer_range", 32]]
-            if name.endswith("_ptr")
-            else [["tt.divisibility", 16]]
-        )
-        for idx, name in enumerate(arg_names)
-        if name in signature and (name.endswith("_ptr") or name.startswith("stride_"))
-    }
-
-
 def compile_kv_decode_kernels(
     target: object,
     *,
@@ -1268,144 +1255,125 @@ def compile_kv_decode_kernels(
     has_chunk_map: bool = True,
     is_causal: bool = True,
     contiguous_inputs: bool = True,
+    wide_pool: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, object, object]:
     """Compile frozen-split, tail-split, and reduce decode kernels offline."""
-    if dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"dtype must be float16 or bfloat16, got {dtype}")
-    if head_dim not in (64, 128):
-        raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
-
-    from triton.compiler import ASTSource  # noqa: PLC0415 - compile-only dependency
-
+    triton_dtype = _quantization.validate_kv_compile_args(dtype, head_dim)
     _, grouped_qk, pack_wmma = _backend.kv_chunk_layout(
         AcceleratorTarget.from_compiler_target(target)
     )
-    triton_dtype = "bf16" if dtype is torch.bfloat16 else "fp16"
 
-    frozen_constants: dict[str, object] = {
-        "has_chunk_map": has_chunk_map,
-        "grouped_qk": grouped_qk,
-        "pack_wmma": pack_wmma,
-        "head_dim": head_dim,
-        "block_qh": _BLOCK_QH,
+    frozen_overrides: dict[str, str] = {
+        "query_ptr": f"*{triton_dtype}",
+        "key_int8_ptr": "*i8",
+        "key_scale_ptr": "*fp32",
+        "key_center_ptr": "*fp32",
+        "value_int8_ptr": "*i8",
+        "value_scale_ptr": "*fp32",
+        "value_mean_ptr": "*fp32",
+        "chunk_to_slot_ptr": "*i32",
+        "num_chunks_ptr": "*i32",
+        "partial_out_ptr": "*fp32",
+        "partial_lse_ptr": "*fp32",
+        "partial_bias_ptr": "*fp32",
+        "scale": "fp32",
     }
-    frozen_signature: dict[str, str] = {
-        name: "i32"
-        for name in _piper_decode_frozen_split_kernel.arg_names
-        if name not in frozen_constants
-    }
-    frozen_signature.update(
-        query_ptr=f"*{triton_dtype}",
-        key_int8_ptr="*i8",
-        key_scale_ptr="*fp32",
-        key_center_ptr="*fp32",
-        value_int8_ptr="*i8",
-        value_scale_ptr="*fp32",
-        value_mean_ptr="*fp32",
-        chunk_to_slot_ptr="*i32",
-        num_chunks_ptr="*i32",
-        partial_out_ptr="*fp32",
-        partial_lse_ptr="*fp32",
-        partial_bias_ptr="*fp32",
-        scale="fp32",
+    if wide_pool:
+        frozen_overrides.update(dict.fromkeys(_quantization.POOL_SLOT_STRIDE_NAMES, "i64"))
+    frozen_noncontig = frozenset(
+        {
+            "key_int8_ptr",
+            "key_scale_ptr",
+            "key_center_ptr",
+            "value_int8_ptr",
+            "value_scale_ptr",
+            "value_mean_ptr",
+            "partial_out_ptr",
+            "stride_ki_s",
+            "stride_vi_s",
+            "stride_pob",
+            "stride_poh",
+            "stride_pos",
+            "stride_pop",
+        }
     )
-    frozen_attrs = (
-        _live_contiguous_attrs(_piper_decode_frozen_split_kernel.arg_names, frozen_signature)
-        if contiguous_inputs
-        else _div16_attrs(
-            _piper_decode_frozen_split_kernel.arg_names,
-            frozenset(
-                {
-                    "key_int8_ptr",
-                    "key_scale_ptr",
-                    "key_center_ptr",
-                    "value_int8_ptr",
-                    "value_scale_ptr",
-                    "value_mean_ptr",
-                    "partial_out_ptr",
-                    "stride_ki_s",
-                    "stride_vi_s",
-                    "stride_pob",
-                    "stride_poh",
-                    "stride_pos",
-                    "stride_pop",
-                }
-            ),
-        )
-    )
-
-    tail_constants: dict[str, object] = {
-        "is_causal": is_causal,
-        "head_dim": head_dim,
-        "block_qh": _BLOCK_QH,
-    }
-    tail_signature: dict[str, str] = {
-        name: "i32"
-        for name in _piper_decode_tail_split_kernel.arg_names
-        if name not in tail_constants
-    }
-    tail_signature.update(
-        query_ptr=f"*{triton_dtype}",
-        tail_key_ptr=f"*{triton_dtype}",
-        tail_value_ptr=f"*{triton_dtype}",
-        tail_len_ptr="*i32",
-        partial_out_ptr="*fp32",
-        partial_lse_ptr="*fp32",
-        partial_bias_ptr="*fp32",
-        scale="fp32",
-    )
-    tail_attrs = (
-        _live_contiguous_attrs(_piper_decode_tail_split_kernel.arg_names, tail_signature)
-        if contiguous_inputs
-        else _div16_attrs(
-            _piper_decode_tail_split_kernel.arg_names,
-            frozenset(
-                {
-                    "partial_out_ptr",
-                    "stride_pob",
-                    "stride_poh",
-                    "stride_pos",
-                    "stride_pop",
-                }
-            ),
-        )
+    frozen_source = _quantization.build_kernel_source(
+        _piper_decode_frozen_split_kernel,
+        constants={
+            "has_chunk_map": has_chunk_map,
+            "grouped_qk": grouped_qk,
+            "pack_wmma": pack_wmma,
+            "head_dim": head_dim,
+            "block_qh": _BLOCK_QH,
+        },
+        overrides=frozen_overrides,
+        attrs=(
+            None
+            if contiguous_inputs
+            else _div16_attrs(_piper_decode_frozen_split_kernel.arg_names, frozen_noncontig)
+        ),
+        all_strides_div16=True,
+        pointer_range_32=not wide_pool,
     )
 
-    reduce_constants: dict[str, object] = {
-        "head_dim": head_dim,
-    }
-    reduce_signature: dict[str, str] = {
-        name: "i32"
-        for name in _piper_decode_splitkv_reduce_kernel.arg_names
-        if name not in reduce_constants
-    }
-    reduce_signature.update(
-        partial_out_ptr="*fp32",
-        partial_lse_ptr="*fp32",
-        partial_bias_ptr="*fp32",
-        output_ptr=f"*{triton_dtype}",
-        lse_ptr="*fp32",
+    tail_noncontig = frozenset(
+        {"partial_out_ptr", "stride_pob", "stride_poh", "stride_pos", "stride_pop"}
     )
-    reduce_attrs = (
-        _live_contiguous_attrs(_piper_decode_splitkv_reduce_kernel.arg_names, reduce_signature)
-        if contiguous_inputs
-        else _div16_attrs(
-            _piper_decode_splitkv_reduce_kernel.arg_names,
-            frozenset(
-                {
-                    "partial_out_ptr",
-                    "output_ptr",
-                    "stride_pob",
-                    "stride_poh",
-                    "stride_pos",
-                    "stride_pop",
-                    "stride_ob",
-                    "stride_oh",
-                    "stride_os",
-                }
-            ),
-        )
+    tail_source = _quantization.build_kernel_source(
+        _piper_decode_tail_split_kernel,
+        constants={
+            "is_causal": is_causal,
+            "head_dim": head_dim,
+            "block_qh": _BLOCK_QH,
+        },
+        overrides={
+            "query_ptr": f"*{triton_dtype}",
+            "tail_key_ptr": f"*{triton_dtype}",
+            "tail_value_ptr": f"*{triton_dtype}",
+            "tail_len_ptr": "*i32",
+            "partial_out_ptr": "*fp32",
+            "partial_lse_ptr": "*fp32",
+            "partial_bias_ptr": "*fp32",
+            "scale": "fp32",
+        },
+        attrs=(
+            None
+            if contiguous_inputs
+            else _div16_attrs(_piper_decode_tail_split_kernel.arg_names, tail_noncontig)
+        ),
+        all_strides_div16=True,
+    )
+
+    reduce_noncontig = frozenset(
+        {
+            "partial_out_ptr",
+            "output_ptr",
+            "stride_pob",
+            "stride_poh",
+            "stride_pos",
+            "stride_pop",
+            "stride_ob",
+            "stride_oh",
+            "stride_os",
+        }
+    )
+    reduce_source = _quantization.build_kernel_source(
+        _piper_decode_splitkv_reduce_kernel,
+        constants={"head_dim": head_dim},
+        overrides={
+            "partial_out_ptr": "*fp32",
+            "partial_lse_ptr": "*fp32",
+            "partial_bias_ptr": "*fp32",
+            "output_ptr": f"*{triton_dtype}",
+            "lse_ptr": "*fp32",
+        },
+        attrs=(
+            None
+            if contiguous_inputs
+            else _div16_attrs(_piper_decode_splitkv_reduce_kernel.arg_names, reduce_noncontig)
+        ),
+        all_strides_div16=True,
     )
 
     compiler = triton.compile if compile_fn is None else compile_fn
@@ -1414,36 +1382,9 @@ def compile_kv_decode_kernels(
         "num_stages": _SPLIT_NUM_STAGES,
     }
     return (
-        compiler(
-            ASTSource(
-                _piper_decode_frozen_split_kernel,
-                frozen_signature,
-                constexprs=frozen_constants,
-                attrs=frozen_attrs,
-            ),
-            target,
-            split_options,
-        ),
-        compiler(
-            ASTSource(
-                _piper_decode_tail_split_kernel,
-                tail_signature,
-                constexprs=tail_constants,
-                attrs=tail_attrs,
-            ),
-            target,
-            split_options,
-        ),
-        compiler(
-            ASTSource(
-                _piper_decode_splitkv_reduce_kernel,
-                reduce_signature,
-                constexprs=reduce_constants,
-                attrs=reduce_attrs,
-            ),
-            target,
-            {"num_warps": _REDUCE_NUM_WARPS},
-        ),
+        compiler(frozen_source, target, split_options),
+        compiler(tail_source, target, split_options),
+        compiler(reduce_source, target, {"num_warps": _REDUCE_NUM_WARPS}),
     )
 
 
@@ -1454,36 +1395,23 @@ def compile_kv_prefill_kernels(
     head_dim: int = 128,
     has_chunk_map: bool = True,
     is_causal: bool = True,
+    wide_pool: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, ...]:
     """Offline-compile two-wave merge and native chunked prefill kernels for ``target``."""
-    if dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"dtype must be float16 or bfloat16, got {dtype}")
-    if head_dim not in (64, 128):
-        raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
-
-    from triton.compiler import ASTSource  # noqa: PLC0415 - compile-only dependency
-
-    triton_dtype = "bf16" if dtype is torch.bfloat16 else "fp16"
+    triton_dtype = _quantization.validate_kv_compile_args(dtype, head_dim)
     compiler = triton.compile if compile_fn is None else compile_fn
-    merge_constants: dict[str, object] = {"head_dim": head_dim}
-    merge_sig = {
-        "out_a_ptr": f"*{triton_dtype}",
-        "lse_a_ptr": "*fp32",
-        "out_b_ptr": f"*{triton_dtype}",
-        "lse_b_ptr": "*fp32",
-    }
-    merge_attrs = compile_pointer_attrs(_merge_two_attention_waves_kernel.arg_names, merge_sig)
-    merge_compiled = compiler(
-        ASTSource(
-            _merge_two_attention_waves_kernel,
-            merge_sig,
-            constexprs=merge_constants,
-            attrs=merge_attrs,
-        ),
-        target,
-        {"num_warps": _REDUCE_NUM_WARPS},
+    merge_source = _quantization.build_kernel_source(
+        _merge_two_attention_waves_kernel,
+        constants={"head_dim": head_dim},
+        overrides={
+            "out_a_ptr": f"*{triton_dtype}",
+            "lse_a_ptr": "*fp32",
+            "out_b_ptr": f"*{triton_dtype}",
+            "lse_b_ptr": "*fp32",
+        },
     )
+    merge_compiled = compiler(merge_source, target, {"num_warps": _REDUCE_NUM_WARPS})
 
     accel = AcceleratorTarget.from_compiler_target(target)
     backend = _backend.prefill_backend(accel)
@@ -1498,6 +1426,7 @@ def compile_kv_prefill_kernels(
                 head_dim=head_dim,
                 has_chunk_map=has_chunk_map,
                 is_causal=is_causal,
+                wide_pool=wide_pool,
                 compile_fn=compile_fn,
             ),
         )
@@ -1512,6 +1441,7 @@ def compile_kv_prefill_kernels(
                 head_dim=head_dim,
                 has_chunk_map=has_chunk_map,
                 is_causal=is_causal,
+                wide_pool=wide_pool,
                 compile_fn=compile_fn,
             ),
         )

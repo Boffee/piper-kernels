@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal, NoReturn, overload
@@ -64,10 +64,47 @@ class _SlotBufferSpan:
     num_slots: _SymInt
 
 
-_VALIDATED_CONFIG: ContextVar[_KVChunkConfig | None] = ContextVar(
-    "piper_kv_freeze_validated_config", default=None
+_VALIDATED_FREEZE: ContextVar[tuple[tuple[int, ...], _KVChunkConfig] | None] = ContextVar(
+    "piper_kv_freeze_validated_state", default=None
+)
+_DECODE_AUTOGRAD_CHECKED: ContextVar[tuple[int, ...] | None] = ContextVar(
+    "piper_kv_decode_autograd_checked", default=None
 )
 _INT64_MAX = (1 << 63) - 1
+
+
+def _require_tensor(value: object, *, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(value).__name__}")
+    return value
+
+
+def _require_tensors(
+    pairs: tuple[tuple[str, object], ...],
+    *,
+    allow_none: bool = False,
+) -> None:
+    for name, value in pairs:
+        if allow_none and value is None:
+            continue
+        if not isinstance(value, torch.Tensor):
+            suffix = " or None" if allow_none else ""
+            raise TypeError(f"{name} must be a torch.Tensor{suffix}, got {type(value).__name__}")
+
+
+@contextlib.contextmanager
+def _prevalidated_freeze(
+    tensors: tuple[torch.Tensor, ...],
+    config: _KVChunkConfig | None,
+) -> Iterator[None]:
+    if config is None:
+        yield
+        return
+    token = _VALIDATED_FREEZE.set((tuple(id(tensor) for tensor in tensors), config))
+    try:
+        yield
+    finally:
+        _VALIDATED_FREEZE.reset(token)
 
 
 def _describe_invalid_value(value: object) -> str:
@@ -655,9 +692,7 @@ def _validate_pool_tensors(
         ("value_scale", value_scale),
         ("value_mean", value_mean),
     )
-    for name, tensor in tensors:
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
+    _require_tensors(tensors)
     device = key_int8.device
     for name, tensor in tensors[1:]:
         if tensor.device != device:
@@ -855,23 +890,22 @@ def _validate_strided_tensor(
     ndim_desc: str | None = None,
     last_dim_contiguous: bool = False,
 ) -> torch.Tensor:
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
-    if tensor.device != device:
-        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
-    valid_dtype = tensor.dtype in dtype if isinstance(dtype, tuple) else tensor.dtype is dtype
+    checked = _require_tensor(tensor, name=name)
+    if checked.device != device:
+        raise ValueError(f"{name} must be on {device}, got {checked.device}")
+    valid_dtype = checked.dtype in dtype if isinstance(dtype, tuple) else checked.dtype is dtype
     if not valid_dtype:
-        raise ValueError(f"{name} must use {dtype_label}, got {tensor.dtype}")
-    if tensor.layout is not torch.strided:
+        raise ValueError(f"{name} must use {dtype_label}, got {checked.dtype}")
+    if checked.layout is not torch.strided:
         raise ValueError(f"{name} must use strided layout")
-    if tensor.is_neg() or tensor.is_conj():
+    if checked.is_neg() or checked.is_conj():
         raise ValueError(f"{name} must not use negated or conjugated views")
-    if ndim is not None and tensor.ndim != ndim:
+    if ndim is not None and checked.ndim != ndim:
         desc = f"{ndim} dims" if ndim_desc is None else ndim_desc
-        raise ValueError(f"{name} must have {desc}, got {tuple(tensor.shape)}")
-    if last_dim_contiguous and tensor.stride(-1) != 1:
+        raise ValueError(f"{name} must have {desc}, got {tuple(checked.shape)}")
+    if last_dim_contiguous and checked.stride(-1) != 1:
         raise ValueError(f"{name} head dimension must be contiguous")
-    return tensor
+    return checked
 
 
 def _validate_freeze_kv_input(
@@ -965,9 +999,7 @@ def _validate_freeze_before_mutating(
                     "is not allowed."
                 )
 
-    for name, tensor in (("key", key), ("value", value), ("slot_ids", slot_ids)):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
+    _require_tensors((("key", key), ("value", value), ("slot_ids", slot_ids)))
     if key.ndim != 4:
         raise ValueError(
             f"key must have shape [num_new, kv_heads, {KV_CHUNK_TOKENS}, head_dim], "
@@ -986,10 +1018,11 @@ def _validate_freeze_before_mutating(
         raise ValueError(f"key ({key.dtype}) and value ({value.dtype}) must share a dtype")
     _validate_int32_1d(slot_ids, name="slot_ids", device=device, length=num_new)
 
-    for read_name, read_tensor in (("key", key), ("value", value), ("slot_ids", slot_ids)):
-        for pool_name, pool_tensor in zip(_POOL_FIELD_NAMES, pool_tensors, strict=True):
-            if _input_overlaps_pool_tensor(read_tensor, pool_tensor):
-                raise ValueError(f"{read_name} must not overlap {pool_name} in storage")
+    if not torch.compiler.is_compiling():
+        for read_name, read_tensor in (("key", key), ("value", value), ("slot_ids", slot_ids)):
+            for pool_name, pool_tensor in zip(_POOL_FIELD_NAMES, pool_tensors, strict=True):
+                if _input_overlaps_pool_tensor(read_tensor, pool_tensor):
+                    raise ValueError(f"{read_name} must not overlap {pool_name} in storage")
 
     return _resolve_checked_config(device, key_scales) if check_target else None
 
@@ -1027,11 +1060,13 @@ def _piper_kv_freeze_op(
         value_mean,
         slot_ids,
     )
-    _reject_autograd(*tensors)
-    config = _VALIDATED_CONFIG.get()
-    if config is not None:
-        _VALIDATED_CONFIG.set(None)
+    cached = _VALIDATED_FREEZE.get()
+    if cached is not None:
+        _VALIDATED_FREEZE.set(None)
+    if cached is not None and cached[0] == tuple(id(tensor) for tensor in tensors):
+        config = cached[1]
     else:
+        _reject_autograd(*tensors)
         config = _validate_freeze_before_mutating(
             *tensors,
             check_target=not _is_fake_or_compiling(tensors),
@@ -1131,12 +1166,8 @@ def _piper_kv_freeze_autograd(
         if _is_fake_or_compiling(tensors)
         else _validate_freeze_before_mutating(*tensors, check_target=True)
     )
-    token = _VALIDATED_CONFIG.set(config)
-    try:
-        with torch._C._AutoDispatchBelowAutograd():
-            torch.ops.piper_kernels.piper_kv_freeze_.default(*tensors)
-    finally:
-        _VALIDATED_CONFIG.reset(token)
+    with _prevalidated_freeze(tensors, config), torch._C._AutoDispatchBelowAutograd():
+        torch.ops.piper_kernels.piper_kv_freeze_.default(*tensors)
 
 
 def freeze_kv_chunks_(
@@ -1168,9 +1199,7 @@ def freeze_kv_chunks_(
     """
     if not isinstance(pool, PiperKVChunkPool):
         raise TypeError(f"pool must be a PiperKVChunkPool, got {type(pool).__name__}")
-    for arg_name, arg_tensor in (("key", key), ("value", value), ("slot_ids", slot_ids)):
-        if not isinstance(arg_tensor, torch.Tensor):
-            raise TypeError(f"{arg_name} must be a torch.Tensor, got {type(arg_tensor).__name__}")
+    _require_tensors((("key", key), ("value", value), ("slot_ids", slot_ids)))
     tensors = (
         key,
         value,
@@ -1185,57 +1214,10 @@ def freeze_kv_chunks_(
     # InferenceMode skips the Autograd key; validate concrete calls before ADInplaceOrView.
     if not _is_fake_or_compiling(tensors) and torch.is_inference_mode_enabled():
         config = _validate_freeze_before_mutating(*tensors, check_target=True)
-        token = _VALIDATED_CONFIG.set(config)
-        try:
+        with _prevalidated_freeze(tensors, config):
             torch.ops.piper_kernels.piper_kv_freeze_.default(*tensors)
-        finally:
-            _VALIDATED_CONFIG.reset(token)
         return
     torch.ops.piper_kernels.piper_kv_freeze_.default(*tensors)
-
-
-def _validate_lse_wave_pair(
-    idx: int,
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    *,
-    ref_shape: tuple[int, ...],
-    ref_lse_shape: tuple[int, ...],
-    ref_dtype: torch.dtype,
-    ref_device: torch.device,
-) -> None:
-    if not isinstance(lse, torch.Tensor):
-        raise TypeError(f"lses[{idx}] must be a torch.Tensor, got {type(lse).__name__}")
-    if idx > 0:
-        if not isinstance(out, torch.Tensor):
-            raise TypeError(f"outputs[{idx}] must be a torch.Tensor, got {type(out).__name__}")
-        if out.device != ref_device:
-            raise ValueError(
-                f"outputs[{idx}] and lses[{idx}] must share device {ref_device}, "
-                f"got {out.device} and {lse.device}"
-            )
-        if out.layout is not torch.strided:
-            raise ValueError(f"outputs[{idx}] must use strided layout")
-        if out.dtype is not ref_dtype:
-            raise ValueError(
-                f"outputs[{idx}] dtype ({out.dtype}) must match outputs[0] ({ref_dtype})"
-            )
-        if tuple(out.shape) != ref_shape:
-            raise ValueError(f"outputs[{idx}] shape {tuple(out.shape)} must match {ref_shape}")
-    if lse.device != ref_device:
-        raise ValueError(
-            f"outputs[{idx}] and lses[{idx}] must share device {ref_device}, "
-            f"got {ref_device} and {lse.device}"
-        )
-    if lse.layout is not torch.strided:
-        raise ValueError(f"lses[{idx}] must use strided layout")
-    if lse.dtype not in _SUPPORTED_LSE_DTYPES:
-        raise ValueError(
-            f"lses[{idx}] must use a supported floating dtype "
-            f"(float16, bfloat16, float32, or float64), got {lse.dtype}"
-        )
-    if tuple(lse.shape) != ref_lse_shape:
-        raise ValueError(f"lses[{idx}] shape {tuple(lse.shape)} must match {ref_lse_shape}")
 
 
 def _validate_lse_waves(
@@ -1256,33 +1238,46 @@ def _validate_lse_waves(
             f"outputs and lses must have equal lengths, got {len(outputs)} and {len(lses)}"
         )
 
-    ref_out = outputs[0]
-    if not isinstance(ref_out, torch.Tensor):
-        raise TypeError(f"outputs[0] must be a torch.Tensor, got {type(ref_out).__name__}")
+    ref_out = _require_tensor(outputs[0], name="outputs[0]")
     if ref_out.ndim < 1:
         raise ValueError(f"outputs[0] must have at least 1 dim, got {tuple(ref_out.shape)}")
-    if ref_out.layout is not torch.strided:
-        raise ValueError("outputs[0] must use strided layout")
-    if ref_out.dtype not in _SUPPORTED_LSE_DTYPES:
-        raise ValueError(
-            f"outputs[0] must use a supported floating dtype "
-            f"(float16, bfloat16, float32, or float64), got {ref_out.dtype}"
-        )
     ref_shape = tuple(ref_out.shape)
     ref_lse_shape = ref_shape[:-1]
     ref_dtype = ref_out.dtype
     ref_device = ref_out.device
 
     for idx, (out, lse) in enumerate(zip(outputs, lses, strict=True)):
-        _validate_lse_wave_pair(
-            idx,
-            out,
-            lse,
-            ref_shape=ref_shape,
-            ref_lse_shape=ref_lse_shape,
-            ref_dtype=ref_dtype,
-            ref_device=ref_device,
+        checked_out = _require_tensor(out, name=f"outputs[{idx}]")
+        checked_lse = _require_tensor(lse, name=f"lses[{idx}]")
+        expected_out_dtype: torch.dtype | tuple[torch.dtype, ...] = (
+            _SUPPORTED_LSE_DTYPES if idx == 0 else ref_dtype
         )
+        for label, tensor, expected_shape, expected_dtype in (
+            (f"outputs[{idx}]", checked_out, ref_shape, expected_out_dtype),
+            (f"lses[{idx}]", checked_lse, ref_lse_shape, _SUPPORTED_LSE_DTYPES),
+        ):
+            if tensor.device != ref_device:
+                raise ValueError(
+                    f"outputs[{idx}] and lses[{idx}] must share device {ref_device}, "
+                    f"got {checked_out.device} and {checked_lse.device}"
+                )
+            if tensor.layout is not torch.strided:
+                raise ValueError(f"{label} must use strided layout")
+            if (
+                tensor.dtype not in expected_dtype
+                if isinstance(expected_dtype, tuple)
+                else tensor.dtype is not expected_dtype
+            ):
+                if isinstance(expected_dtype, tuple):
+                    raise ValueError(
+                        f"{label} must use a supported floating dtype "
+                        f"(float16, bfloat16, float32, or float64), got {tensor.dtype}"
+                    )
+                raise ValueError(
+                    f"{label} dtype ({tensor.dtype}) must match outputs[0] ({ref_dtype})"
+                )
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(f"{label} shape {tuple(tensor.shape)} must match {expected_shape}")
     return ref_shape, ref_dtype, ref_device
 
 
@@ -1469,8 +1464,7 @@ def _validate_decode_tail(
         raise ValueError(
             f"tail_value length ({tail_value.shape[2]}) must match tail_key ({tail_key.shape[2]})"
         )
-    if not isinstance(tail_len, torch.Tensor):
-        raise TypeError(f"tail_len must be a torch.Tensor, got {type(tail_len).__name__}")
+    _require_tensor(tail_len, name="tail_len")
     _validate_int32_1d(tail_len, name="tail_len", device=device, length=batch)
 
 
@@ -1505,8 +1499,7 @@ def _validate_decode_inputs(  # noqa: PLR0913, PLR0917
     device = key_int8.device
     batch = _validate_decode_query(query, device=device, kv_heads=kv_heads, head_dim=head_dim)
 
-    if not isinstance(num_chunks, torch.Tensor):
-        raise TypeError(f"num_chunks must be a torch.Tensor, got {type(num_chunks).__name__}")
+    _require_tensor(num_chunks, name="num_chunks")
     _validate_int32_1d(num_chunks, name="num_chunks", device=device, length=batch)
     _validate_chunk_to_slot(chunk_to_slot, device=device, batch=batch)
     _validate_decode_tail(
@@ -1574,7 +1567,11 @@ def _piper_attention_decode_op(  # noqa: PLR0913, PLR0917
         tail_len,
     )
     non_null_tensors = tuple(t for t in all_tensors if t is not None)
-    _reject_autograd(*non_null_tensors, operator="piper_attention_decode")
+    checked_ids = _DECODE_AUTOGRAD_CHECKED.get()
+    if checked_ids is not None:
+        _DECODE_AUTOGRAD_CHECKED.set(None)
+    if checked_ids != tuple(id(t) for t in non_null_tensors):
+        _reject_autograd(*non_null_tensors, operator="piper_attention_decode")
     config, resolved_scale = _validate_decode_inputs(
         query,
         key_int8,
@@ -1722,23 +1719,9 @@ def _piper_attention_decode_autograd(  # noqa: PLR0913, PLR0917
     is_causal: bool = True,
     active_chunks_hint: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _reject_autograd(
-        query,
-        key_int8,
-        key_scale,
-        key_center,
-        value_int8,
-        value_scale,
-        value_mean,
-        chunk_to_slot,
-        num_chunks,
-        tail_key,
-        tail_value,
-        tail_len,
-        operator="piper_attention_decode",
-    )
-    with torch._C._AutoDispatchBelowAutograd():
-        return torch.ops.piper_kernels.piper_attention_decode.default(
+    non_null_tensors = tuple(
+        t
+        for t in (
             query,
             key_int8,
             key_scale,
@@ -1751,10 +1734,32 @@ def _piper_attention_decode_autograd(  # noqa: PLR0913, PLR0917
             tail_key,
             tail_value,
             tail_len,
-            scale,
-            is_causal,
-            active_chunks_hint,
         )
+        if t is not None
+    )
+    _reject_autograd(*non_null_tensors, operator="piper_attention_decode")
+    token = _DECODE_AUTOGRAD_CHECKED.set(tuple(id(t) for t in non_null_tensors))
+    try:
+        with torch._C._AutoDispatchBelowAutograd():
+            return torch.ops.piper_kernels.piper_attention_decode.default(
+                query,
+                key_int8,
+                key_scale,
+                key_center,
+                value_int8,
+                value_scale,
+                value_mean,
+                chunk_to_slot,
+                num_chunks,
+                tail_key,
+                tail_value,
+                tail_len,
+                scale,
+                is_causal,
+                active_chunks_hint,
+            )
+    finally:
+        _DECODE_AUTOGRAD_CHECKED.reset(token)
 
 
 def _reject_neg_or_conj_views(*_args: object, **_kwargs: object) -> NoReturn:
@@ -1896,18 +1901,16 @@ def piper_attention_decode(  # noqa: PLR0913
         maximum=_INT64_MAX,
         allow_symint=True,
     )
-    if not isinstance(query, torch.Tensor):
-        raise TypeError(f"query must be a torch.Tensor, got {type(query).__name__}")
-    if not isinstance(num_chunks, torch.Tensor):
-        raise TypeError(f"num_chunks must be a torch.Tensor, got {type(num_chunks).__name__}")
-    for arg_name, arg in (
-        ("chunk_to_slot", chunk_to_slot),
-        ("tail_key", tail_key),
-        ("tail_value", tail_value),
-        ("tail_len", tail_len),
-    ):
-        if arg is not None and not isinstance(arg, torch.Tensor):
-            raise TypeError(f"{arg_name} must be a torch.Tensor or None, got {type(arg).__name__}")
+    _require_tensors((("query", query), ("num_chunks", num_chunks)))
+    _require_tensors(
+        (
+            ("chunk_to_slot", chunk_to_slot),
+            ("tail_key", tail_key),
+            ("tail_value", tail_value),
+            ("tail_len", tail_len),
+        ),
+        allow_none=True,
+    )
 
     resolved_scale: float | None = (
         None
