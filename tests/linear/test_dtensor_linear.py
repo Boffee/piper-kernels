@@ -16,6 +16,7 @@ from torch.nn import functional as F  # noqa: N812
 from piper_kernels import compile_options
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 from piper_kernels.weights.sharding import shard_quantized_weight
 
@@ -23,6 +24,8 @@ _FORMATS = {
     "int8": (ConvRotInt8Tensor, compile_options),
     "nvfp4": (PiperNVFP4Tensor, compile_options),
     "convrot_nvfp4": (ConvRotNVFP4Tensor, compile_options),
+    "trellis_uniform": (ConvRotTrellisTensor, compile_options),
+    "trellis_variable": (ConvRotTrellisTensor, compile_options),
 }
 
 
@@ -30,6 +33,47 @@ def _weight(format_name, source, *, high_first=False, dynamic=True):
     cls, _ = _FORMATS[format_name]
     if cls is ConvRotInt8Tensor:
         return cls.from_hp(source, group_size=64)
+    if cls is ConvRotTrellisTensor:
+        rows, features = source.shape
+        block_size = 64
+        blocks_per_row = features // block_size
+        generator = torch.Generator().manual_seed(404)
+        block_scales = (torch.rand(rows, blocks_per_row, generator=generator) * 0.5 + 0.5).to(
+            dtype=torch.float8_e4m3fn, device=source.device
+        )
+        scale = (torch.rand(rows, 1, generator=generator) * 0.02 + 0.005).to(source.device)
+        if format_name == "trellis_variable":
+            widths = (16, 24, 32, 48)
+            row_widths = torch.tensor(
+                [widths[idx % len(widths)] for idx in range(rows)],
+                dtype=torch.uint8,
+                device=source.device,
+            )
+            bitstreams = torch.randint(
+                0,
+                256,
+                (blocks_per_row * int(row_widths.sum().item()),),
+                dtype=torch.uint8,
+                generator=generator,
+            ).to(source.device)
+        else:
+            row_widths = None
+            bitstreams = torch.randint(
+                0,
+                256,
+                (rows, blocks_per_row, 32),
+                dtype=torch.uint8,
+                generator=generator,
+            ).to(source.device)
+        return ConvRotTrellisTensor.from_quantized(
+            bitstreams,
+            block_scales,
+            scale,
+            block_size=block_size,
+            group_size=64,
+            logical_dtype=source.dtype,
+            row_widths=row_widths,
+        )
     result = cls.from_hp(
         source,
         compute_per_tensor_scale=True,
@@ -210,7 +254,11 @@ def _two_rank_linear(rank, store_path, device_type):
     try:
         mesh = DeviceMesh(device_type, [0, 1])
         cpu_mesh = DeviceMesh("cpu", [0, 1])
-        formats = tuple(_FORMATS) if device_type == "cuda" else ("int8",)
+        formats = (
+            tuple(_FORMATS)
+            if device_type == "cuda"
+            else ("int8", "trellis_uniform", "trellis_variable")
+        )
         cases = product(formats, (Replicate(), Shard(0), Shard(1)), (False, True), (False, True))
         for format_name, placement, with_bias, compiled in cases:
             label = (
@@ -261,7 +309,8 @@ def test_two_rank_replicated_and_sharded_linear(tmp_path, device_type):
         (format_name, case)
         for format_name in _FORMATS
         for case in ("plain", "bias", "mixed_bias", "batched", "high_first", "static")
-        if format_name != "int8" or case not in ("high_first", "static")
+        if (format_name not in ("int8", "trellis_uniform", "trellis_variable"))
+        or case not in ("high_first", "static")
     ],
 )
 def test_cuda_dtensor_linear_matches_local_quantized_weight(

@@ -22,7 +22,6 @@ from piper_kernels.linear.convrot.int8.trellis_triton import linear as triton_tr
 from piper_kernels.trellis import TrellisHessian, TrellisLayout, TrellisStorage, resolve_layout
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
-from piper_kernels.weights.sharding import shard_quantized_weight
 
 _gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 _nvidia = pytest.mark.skipif(
@@ -524,7 +523,7 @@ def test_trellis_swiglu_ffn_compile_skips_int8_fx_passes(device: str) -> None:
     assert piper_targets == [torch.ops.piper_kernels.convrot_int8_linear.default] * 3
 
 
-def test_copy_pin_and_sharding_contracts() -> None:
+def test_copy_and_pin_contracts() -> None:
     dst = _make_weight(
         7,
         256,
@@ -563,14 +562,12 @@ def test_copy_pin_and_sharding_contracts() -> None:
     assert dst.is_pinned() is False
     assert dst_var.is_pinned() is False
 
-    # Unsupported copies and sharding rejections
+    # Unsupported copies
     dense = torch.zeros(7, 256, dtype=torch.bfloat16)
     with pytest.raises(NotImplementedError):
         dst.copy_(dense)
     with pytest.raises(NotImplementedError):
         dense.copy_(dst)
-    with pytest.raises(NotImplementedError, match="does not support shard_quantized_weight"):
-        shard_quantized_weight(dst, dim=0, start=0, length=2)
 
     snap_bs = dst.bitstreams.clone()
     snap_sc = dst.block_scales.view(torch.uint8).clone()

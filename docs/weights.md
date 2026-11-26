@@ -419,8 +419,8 @@ int8_weight.copy_from_trellis_(storage.bitstreams, storage.block_scales, storage
 arguments directly via `ConvRotTrellisTensor.from_hp(...)`, and supports
 `dequantize()`, transposed `mm`/`addmm`/`matmul`, and CPU execution; small
 batches keep high-precision activations while larger batches use dynamic INT8
-activation quantization on supported W8A8 backends (`F.embedding`, sharding,
-FSDP2, and in-place weight updates are unsupported on `ConvRotTrellisTensor`).
+activation quantization on supported W8A8 backends (`F.embedding`, FSDP2,
+and in-place weight updates are unsupported on `ConvRotTrellisTensor`).
 
 A checkpoint stores `(bitstreams, block_scales, scale, block_size, group_size)`.
 `TrellisStorage.from_hp` also accepts an exact `bytes_per_block` instead of
@@ -443,17 +443,29 @@ support in-place `ConvRotInt8Tensor` refills via `copy_from_trellis_`; see
 ## Shard a quantized weight
 
 `shard_quantized_weight` copies a contiguous untransposed 2-D shard with its own
-packed storage (repacking NVFP4 padding):
+packed storage across `ConvRotInt8Tensor`, `PiperNVFP4Tensor`, `ConvRotNVFP4Tensor`,
+and `ConvRotTrellisTensor` (both uniform and variable-row `row_widths`, repacking
+NVFP4 padding and variable-row `dim=1` bitstreams without dequantizing):
 
 ```python
-from piper_kernels.weights.sharding import shard_quantized_weight
+from piper_kernels.weights.sharding import (
+    shard_quantized_weight,
+    trellis_row_shard_byte_range,
+)
 
 row_shard = shard_quantized_weight(int8_weight, dim=0, start=0, length=64)
+byte_span = trellis_row_shard_byte_range(
+    row_widths, blocks_per_row=in_features // block_size, start=0, length=64
+)
 ```
 
-`dim=0` splits output rows at any nonempty interval; `dim=1` aligns both `start`
-and `length` to ConvRot groups and 16-value NVFP4 blocks. NVFP4 accepts
-flat/canonical and ordinary/swizzled scales, though execution requires its
+`dim=0` splits output rows at any nonempty interval (`trellis_row_shard_byte_range`
+returns `ByteRange(offset, length)` inside 1-D variable-row `bitstreams` from
+`row_widths` alone, enabling zero-materialization Direct I/O `Shard(0)` reads; pass
+`block_size` to also validate 2–6 bpw width bounds). `dim=1` aligns both `start`
+and `length` to ConvRot groups, 16-value NVFP4 blocks, and Trellis `block_size`.
+Variable-row Trellis requires materialized `row_widths` (not `device="meta"`).
+NVFP4 accepts flat/canonical and ordinary/swizzled scales, though execution requires its
 supported layout. Direct narrow/slice
 views and DTensor redistribution are unsupported. For DTensor, install the local
 shard **before** `parallelize_module`:

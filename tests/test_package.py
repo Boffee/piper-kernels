@@ -41,7 +41,7 @@ from piper_kernels import (
 )
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.nvfp4 import convrot_nvfp4_linear
-from piper_kernels.weights import QuantizedWeight
+from piper_kernels.weights import QuantizedWeight, sharding
 from piper_kernels.weights.convrot import SUPPORTED_GROUP_SIZES
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
@@ -438,3 +438,11 @@ def test_public_packages_import() -> None:
 def test_weights_public_exports() -> None:
     assert piper_kernels.weights.__all__ == ["QuantizedWeight"]
     assert piper_kernels.weights.QuantizedWeight is QuantizedWeight
+    assert sharding.__all__ == [
+        "ByteRange",
+        "shard_quantized_weight",
+        "trellis_row_shard_byte_range",
+    ]
+    assert hasattr(sharding, "ByteRange")
+    assert hasattr(sharding, "shard_quantized_weight")
+    assert hasattr(sharding, "trellis_row_shard_byte_range")
