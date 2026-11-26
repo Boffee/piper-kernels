@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import exact_sm120_available, trellis_encoder_available
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
 
@@ -581,8 +581,10 @@ def test_trellis_sharding_boundary_rejections_and_meta():
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("creation_device", ["cpu", "cuda"])
 def test_cuda_trellis_linear_composition(mode, compiled, creation_device):
-    if not exact_sm120_available():
-        pytest.skip("requires an SM120 CUDA device")
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA or ROCm device")
+    if mode == "uniform_hp" and not trellis_encoder_available():
+        pytest.skip("requires an SM80+ NVIDIA GPU for Trellis encoding")
     if mode == "uniform_hp":
         torch.manual_seed(131)
         source = torch.randn(384, 512, device="cuda", dtype=torch.bfloat16) * 0.05
@@ -637,8 +639,8 @@ def test_cuda_trellis_linear_composition(mode, compiled, creation_device):
 
 @pytest.mark.gpu
 def test_cuda_variable_row_trellis_multichunk_dim1_shard():
-    if not exact_sm120_available():
-        pytest.skip("requires an SM120 CUDA device")
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA or ROCm device")
     # 1024 rows * 64 blocks (halved from 128) * avg 36 bytes = 2.36 MiB > 2 MiB gather chunk.
     full = _trellis_weight(
         rows=1024,

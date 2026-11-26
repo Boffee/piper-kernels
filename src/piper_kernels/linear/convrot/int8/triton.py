@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from piper_kernels._residual.triton import add_residual
+from piper_kernels._triton.primitives import splitk_tile_bounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget, rdna4_int8_accumulator_seed
 from piper_kernels.linear._splitk import device_sm_count, select_split_k
@@ -710,11 +711,7 @@ def int8_matmul_splitk_kernel(
     offs_m = pid_m * block_m + tl.arange(0, block_m)
     offs_n = pid_n * block_n + tl.arange(0, block_n)
 
-    total_k_tiles = tl.cdiv(k, block_k)
-    base_tiles = total_k_tiles // split_k
-    remainder_tiles = total_k_tiles % split_k
-    k_start = pid_k * base_tiles + tl.minimum(pid_k, remainder_tiles)
-    k_end = k_start + base_tiles + tl.where(pid_k < remainder_tiles, 1, 0)
+    k_start, k_end = splitk_tile_bounds(tl.cdiv(k, block_k), pid_k, split_k)
 
     acc = _accumulate_int8_tile(
         input_ptr,

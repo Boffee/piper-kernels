@@ -13,7 +13,14 @@ from triton.compiler import ASTSource
 
 from piper_kernels import _input_activations as input_activations
 from piper_kernels._input_activations import triton as triton_input_activations
+from piper_kernels._triton.primitives import (
+    TRITON_FLOAT_POINTER_TYPES,
+    TritonCompileFn,
+    default_triton_compile,
+    splitk_tile_bounds,
+)
 from piper_kernels._triton.runtime import device_context
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear import _bias
 from piper_kernels.linear._splitk import device_sm_count, select_split_k
 from piper_kernels.linear.nvfp4._storage import prepare_activation_storage
@@ -932,11 +939,7 @@ def w4a16_gemv_splitk_kernel(
     pre_scale, post_scale = _split_global_scale(global_scale)
     epilogue_scale = post_scale if pre_scale_in_gemv else global_scale
 
-    total_k_tiles = tl.cdiv(input_features, block_k)
-    base_tiles = total_k_tiles // split_k
-    remainder_tiles = total_k_tiles % split_k
-    k_tile_start = pid_k * base_tiles + tl.minimum(pid_k, remainder_tiles)
-    k_tile_end = k_tile_start + base_tiles + tl.where(pid_k < remainder_tiles, 1, 0)
+    k_tile_start, k_tile_end = splitk_tile_bounds(tl.cdiv(input_features, block_k), pid_k, split_k)
 
     acc = (
         tl.zeros((block_n,), dtype=tl.float32)
@@ -1123,22 +1126,18 @@ def _select_w4a16_split_k(
     )
 
 
-_TRITON_FLOAT_POINTER_TYPES = {
-    torch.float16: "*fp16",
-    torch.bfloat16: "*bf16",
-    torch.float32: "*fp32",
-}
-
-
 def _select_w4a16_gemv_config_for_sms(
     num_sms: int,
     rows: int,
     input_dtype: torch.dtype,
     out_features: int,
     input_features: int,
+    *,
+    target: AcceleratorTarget | None = None,
 ) -> tuple[int, int, int, int, bool, int]:
     """Select ``(block_m, block_n, block_k, num_warps, use_dot, split_k)``."""
     weight_bytes = out_features * (input_features // 2)
+    no_dot = target is not None and target.is_nvidia_cuda and not target.cuda_capability_at_least(8)
     if rows == 1:
         if (
             triton.cdiv(out_features, _W4A16_GEMV_BLOCK_N) <= num_sms
@@ -1153,7 +1152,7 @@ def _select_w4a16_gemv_config_for_sms(
             block_k=_W4A16_GEMV_BLOCK_K,
         )
         return (1, _W4A16_GEMV_BLOCK_N, _W4A16_GEMV_BLOCK_K, 4, False, split_k)
-    if rows <= 4 or input_dtype is torch.float32:
+    if rows <= 4 or input_dtype is torch.float32 or no_dot:
         block_m = 4 if rows <= 4 else (8 if rows <= 8 else _W4A16_GEMV_MAX_ROWS)
         split_k = _select_w4a16_split_k(
             num_sms,
@@ -1170,7 +1169,16 @@ def _select_w4a16_gemv_config_for_sms(
         block_n=_W4A16_DOT_BLOCK_N,
         block_k=_W4A16_DOT_BLOCK_K,
     )
-    return (_W4A16_GEMV_MAX_ROWS, _W4A16_DOT_BLOCK_N, _W4A16_DOT_BLOCK_K, 4, True, split_k)
+    # 8 warps eliminates pre-existing 40-76 B num_warps=4 ptxas spills on SM86/SM89/SM120.
+    dot_num_warps = 8 if (target is not None and target.is_nvidia_cuda) else 4
+    return (
+        _W4A16_GEMV_MAX_ROWS,
+        _W4A16_DOT_BLOCK_N,
+        _W4A16_DOT_BLOCK_K,
+        dot_num_warps,
+        True,
+        split_k,
+    )
 
 
 def _select_w4a16_gemv_config(
@@ -1179,46 +1187,63 @@ def _select_w4a16_gemv_config(
     input_dtype: torch.dtype,
     out_features: int,
     input_features: int,
+    *,
+    target: AcceleratorTarget | None = None,
 ) -> tuple[int, int, int, int, bool, int]:
+    resolved_target = AcceleratorTarget.from_device(device) if target is None else target
     return _select_w4a16_gemv_config_for_sms(
         device_sm_count(device),
         rows,
         input_dtype,
         out_features,
         input_features,
+        target=resolved_target,
     )
+
+
+def _optional_ptr_binding(
+    name: str, ptr_type: str | None
+) -> tuple[dict[str, str], dict[str, object]]:
+    return ({name: ptr_type}, {}) if ptr_type is not None else ({}, {name: None})
 
 
 def _compile_w4a16_reduce_kernel(
     target: GPUTarget,
     *,
-    bias_ty: str,
+    bias_ty: str | None,
     out_ty: str,
     has_weight_per_tensor_scale: bool,
     has_bias: bool,
     post_scale_only: bool = False,
+    compile_fn: TritonCompileFn = default_triton_compile,
 ) -> triton.compiler.CompiledKernel:
-    return triton.compile(
+    scale_sig, scale_const = _optional_ptr_binding(
+        "weight_per_tensor_scale_ptr", "*fp32" if has_weight_per_tensor_scale else None
+    )
+    bias_sig, bias_const = _optional_ptr_binding("bias_ptr", bias_ty if has_bias else None)
+    return compile_fn(
         ASTSource(
             w4a16_splitk_reduce_kernel,
             {
                 "partial_ptr": "*fp32",
-                "weight_per_tensor_scale_ptr": "*fp32",
-                "bias_ptr": bias_ty,
+                **scale_sig,
+                **bias_sig,
                 "output_ptr": out_ty,
                 "rows": "i32",
                 "out_features": "i32",
                 "split_k": "i32",
             },
             constexprs={
+                **scale_const,
+                **bias_const,
                 "block_n": _W4A16_REDUCE_BLOCK_N,
                 "has_weight_per_tensor_scale": has_weight_per_tensor_scale,
                 "has_bias": has_bias,
                 "post_scale_only": post_scale_only,
             },
         ),
-        target=target,
-        options={"num_warps": 4},
+        target,
+        {"num_warps": 4},
     )
 
 
@@ -1234,13 +1259,14 @@ def compile_w4a16_kernels(
     high_first: bool = False,
     has_weight_per_tensor_scale: bool = True,
     num_sms: int = 64,
+    compile_fn: TritonCompileFn = default_triton_compile,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     """Compile the production W4A16 Triton kernels selected for one workload."""
     if rows <= 0 or out_features <= 0 or input_features <= 0 or num_sms <= 0:
         raise ValueError("Workload dimensions and SM count must be positive integers")
-    if input_dtype not in _TRITON_FLOAT_POINTER_TYPES:
+    if input_dtype not in TRITON_FLOAT_POINTER_TYPES:
         raise ValueError(f"Unsupported W4A16 input dtype: {input_dtype}")
-    if bias_dtype is not None and bias_dtype not in _TRITON_FLOAT_POINTER_TYPES:
+    if bias_dtype is not None and bias_dtype not in TRITON_FLOAT_POINTER_TYPES:
         raise ValueError(f"Unsupported W4A16 bias dtype: {bias_dtype}")
     if group_size != 0:
         validate_group_size(group_size)
@@ -1248,19 +1274,25 @@ def compile_w4a16_kernels(
     active_dtype = (
         torch.float32 if (group_size > 0 and input_dtype is torch.float16) else input_dtype
     )
-    active_ty = _TRITON_FLOAT_POINTER_TYPES[active_dtype]
-    out_ty = _TRITON_FLOAT_POINTER_TYPES[input_dtype]
+    active_ty = TRITON_FLOAT_POINTER_TYPES[active_dtype]
+    out_ty = TRITON_FLOAT_POINTER_TYPES[input_dtype]
     has_bias = bias_dtype is not None
-    bias_ty = out_ty if bias_dtype is None else _TRITON_FLOAT_POINTER_TYPES[bias_dtype]
+    bias_ty = None if bias_dtype is None else TRITON_FLOAT_POINTER_TYPES[bias_dtype]
+    target_info = AcceleratorTarget.from_compiler_target(target)
     if rows > _W4A16_GEMV_MAX_ROWS:
+        sm75_bf16 = (
+            target_info.is_nvidia_cuda
+            and not target_info.cuda_capability_at_least(8)
+            and active_dtype is torch.bfloat16
+        )
         compiled_large: dict[str, triton.compiler.CompiledKernel] = {
-            "dequant": triton.compile(
+            "dequant": compile_fn(
                 ASTSource(
                     dequantize_nvfp4_swizzled_kernel,
                     {
                         "weight_ptr": "*u8",
                         "weight_scale_ptr": "*u8",
-                        "output_ptr": active_ty,
+                        "output_ptr": "*fp32" if sm75_bf16 else active_ty,
                         "out_features": "i32",
                         "input_features": "i32",
                         "scale_column_blocks": "i32",
@@ -1271,8 +1303,8 @@ def compile_w4a16_kernels(
                         "high_first": high_first,
                     },
                 ),
-                target=target,
-                options={"num_warps": 4},
+                target,
+                {"num_warps": 4},
             )
         }
         if has_weight_per_tensor_scale or has_bias or active_dtype is not input_dtype:
@@ -1282,24 +1314,34 @@ def compile_w4a16_kernels(
                 out_ty=out_ty,
                 has_weight_per_tensor_scale=has_weight_per_tensor_scale,
                 has_bias=has_bias,
-                post_scale_only=active_dtype is not torch.float16,
+                post_scale_only=has_weight_per_tensor_scale and active_dtype is not torch.float16,
+                compile_fn=compile_fn,
             )
         return compiled_large
 
     block_m, block_n, block_k, num_warps, use_dot, split_k = _select_w4a16_gemv_config_for_sms(
-        num_sms, rows, active_dtype, out_features, input_features
+        num_sms,
+        rows,
+        active_dtype,
+        out_features,
+        input_features,
+        target=target_info,
     )
     is_splitk = split_k > 1
+    scale_sig, scale_const = _optional_ptr_binding(
+        "weight_per_tensor_scale_ptr", "*fp32" if has_weight_per_tensor_scale else None
+    )
+    bias_sig, bias_const = _optional_ptr_binding("bias_ptr", bias_ty if has_bias else None)
     compiled: dict[str, triton.compiler.CompiledKernel] = {
-        "gemv": triton.compile(
+        "gemv": compile_fn(
             ASTSource(
                 w4a16_gemv_splitk_kernel,
                 {
                     "input_ptr": active_ty,
                     "weight_ptr": "*u8",
                     "weight_scale_ptr": "*u8",
-                    "weight_per_tensor_scale_ptr": "*fp32",
-                    "bias_ptr": bias_ty,
+                    **scale_sig,
+                    **bias_sig,
                     "output_ptr": "*fp32" if is_splitk else out_ty,
                     "rows": "i32",
                     "out_features": "i32",
@@ -1308,6 +1350,8 @@ def compile_w4a16_kernels(
                     "split_k": "i32",
                 },
                 constexprs={
+                    **scale_const,
+                    **bias_const,
                     "block_m": block_m,
                     "block_n": block_n,
                     "block_k": block_k,
@@ -1318,8 +1362,8 @@ def compile_w4a16_kernels(
                     "use_dot": use_dot,
                 },
             ),
-            target=target,
-            options={"num_warps": num_warps},
+            target,
+            {"num_warps": num_warps},
         )
     }
     if is_splitk:
@@ -1329,7 +1373,10 @@ def compile_w4a16_kernels(
             out_ty=out_ty,
             has_weight_per_tensor_scale=has_weight_per_tensor_scale,
             has_bias=has_bias,
-            post_scale_only=not (use_dot and active_dtype is torch.float16),
+            post_scale_only=(
+                has_weight_per_tensor_scale and not (use_dot and active_dtype is torch.float16)
+            ),
+            compile_fn=compile_fn,
         )
     return compiled
 
@@ -1372,6 +1419,83 @@ def _dequantize_nvfp4_swizzled(
     return output
 
 
+def _linear_w4a16_large_m(
+    active_2d: torch.Tensor,
+    input_dtype: torch.dtype,
+    input_shape: torch.Size,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_per_tensor_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    high_first: bool,
+    target_info: AcceleratorTarget,
+) -> torch.Tensor:
+    rows, out_features = active_2d.shape[0], weight_qdata.shape[0]
+    sm75_bf16 = (
+        target_info.is_nvidia_cuda
+        and not target_info.cuda_capability_at_least(8)
+        and active_2d.dtype is torch.bfloat16
+    )
+    dequant_weight = _dequantize_nvfp4_swizzled(
+        weight_qdata,
+        weight_scale,
+        high_first=high_first,
+        output_dtype=torch.float32 if sm75_bf16 else active_2d.dtype,
+    )
+    with torch.amp.autocast(active_2d.device.type, enabled=False):
+        weight_t = dequant_weight.T
+        if weight_per_tensor_scale is None and bias is None and active_2d.dtype is input_dtype:
+            product = (
+                torch.mm(active_2d.float(), weight_t).to(input_dtype)
+                if sm75_bf16
+                else torch.mm(active_2d, weight_t)
+            )
+            return product.reshape(*input_shape[:-1], out_features)
+        output = torch.empty((rows, out_features), device=active_2d.device, dtype=input_dtype)
+        post_scale_only = (
+            weight_per_tensor_scale is not None and active_2d.dtype is not torch.float16
+        )
+        pre_scale = None
+        if post_scale_only:
+            assert weight_per_tensor_scale is not None
+            gs_f32 = weight_per_tensor_scale.to(device=active_2d.device, dtype=torch.float32)
+            pre_scale = torch.where(gs_f32.abs() < 1.0, gs_f32, torch.ones_like(gs_f32))
+        chunk_rows = min(
+            rows,
+            max(1, _W4A16_FP32_WORKSPACE_BYTES // (out_features * 4)),
+            _W4A16_MAX_REDUCE_ROWS,
+        )
+        with device_context(active_2d.device):
+            for start in range(0, rows, chunk_rows):
+                end = min(start + chunk_rows, rows)
+                active_chunk = active_2d[start:end]
+                if pre_scale is not None:
+                    active_chunk = (active_chunk.float() * pre_scale).to(active_2d.dtype)
+                if active_2d.dtype is torch.float32 or sm75_bf16:
+                    partial = torch.mm(
+                        active_chunk.float() if sm75_bf16 else active_chunk, weight_t
+                    )
+                else:
+                    partial = torch.mm(active_chunk, weight_t, out_dtype=torch.float32)
+                chunk_len = end - start
+                reduce_grid = (triton.cdiv(out_features, _W4A16_REDUCE_BLOCK_N), chunk_len)
+                w4a16_splitk_reduce_kernel[reduce_grid](
+                    partial,
+                    weight_per_tensor_scale,
+                    bias,
+                    output[start:end],
+                    chunk_len,
+                    out_features,
+                    1,
+                    block_n=_W4A16_REDUCE_BLOCK_N,
+                    has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
+                    has_bias=bias is not None,
+                    post_scale_only=post_scale_only,
+                    num_warps=4,
+                )
+    return output.reshape(*input_shape[:-1], out_features)
+
+
 def _linear_w4a16(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     weight_qdata: torch.Tensor,
@@ -1403,58 +1527,19 @@ def _linear_w4a16(
     else:
         active_2d = input_2d
 
+    target_info = AcceleratorTarget.from_device(input.device)
     if rows > _W4A16_GEMV_MAX_ROWS:
-        dequant_weight = _dequantize_nvfp4_swizzled(
+        return _linear_w4a16_large_m(
+            active_2d,
+            input.dtype,
+            input.shape,
             weight_qdata,
             weight_scale,
-            high_first=high_first,
-            output_dtype=active_2d.dtype,
+            weight_per_tensor_scale,
+            bias,
+            high_first,
+            target_info,
         )
-        if weight_per_tensor_scale is None and bias is None and active_2d.dtype is input.dtype:
-            return torch.mm(active_2d, dequant_weight.T).reshape(*input.shape[:-1], out_features)
-        output = torch.empty((rows, out_features), device=input.device, dtype=input.dtype)
-        post_scale_only = (
-            weight_per_tensor_scale is not None and active_2d.dtype is not torch.float16
-        )
-        if post_scale_only:
-            assert weight_per_tensor_scale is not None
-            gs_f32 = weight_per_tensor_scale.to(device=active_2d.device, dtype=torch.float32)
-            pre_scale = torch.where(gs_f32.abs() < 1.0, gs_f32, torch.ones_like(gs_f32))
-        else:
-            pre_scale = None
-        chunk_rows = min(
-            rows,
-            max(1, _W4A16_FP32_WORKSPACE_BYTES // (out_features * 4)),
-            _W4A16_MAX_REDUCE_ROWS,
-        )
-        with device_context(input.device):
-            for start in range(0, rows, chunk_rows):
-                end = min(start + chunk_rows, rows)
-                active_chunk = active_2d[start:end]
-                if pre_scale is not None:
-                    active_chunk = (active_chunk.float() * pre_scale).to(active_2d.dtype)
-                partial = (
-                    torch.mm(active_chunk, dequant_weight.T)
-                    if active_2d.dtype is torch.float32
-                    else torch.mm(active_chunk, dequant_weight.T, out_dtype=torch.float32)
-                )
-                chunk_len = end - start
-                reduce_grid = (triton.cdiv(out_features, _W4A16_REDUCE_BLOCK_N), chunk_len)
-                w4a16_splitk_reduce_kernel[reduce_grid](
-                    partial,
-                    weight_per_tensor_scale,
-                    bias,
-                    output[start:end],
-                    chunk_len,
-                    out_features,
-                    1,
-                    block_n=_W4A16_REDUCE_BLOCK_N,
-                    has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
-                    has_bias=bias is not None,
-                    post_scale_only=post_scale_only,
-                    num_warps=4,
-                )
-        return output.reshape(*input.shape[:-1], out_features)
 
     output = torch.empty((rows, out_features), device=input.device, dtype=input.dtype)
     block_m, block_n, block_k, num_warps, use_dot, split_k = _select_w4a16_gemv_config(
@@ -1463,6 +1548,7 @@ def _linear_w4a16(
         active_2d.dtype,
         out_features,
         input_features,
+        target=target_info,
     )
     scale_column_blocks = int(triton.cdiv(input_features, _layout.SCALE_COLUMN_TILE))
     is_splitk = split_k > 1
@@ -1508,7 +1594,10 @@ def _linear_w4a16(
                 block_n=_W4A16_REDUCE_BLOCK_N,
                 has_weight_per_tensor_scale=weight_per_tensor_scale is not None,
                 has_bias=bias is not None,
-                post_scale_only=not (use_dot and active_2d.dtype is torch.float16),
+                post_scale_only=(
+                    weight_per_tensor_scale is not None
+                    and not (use_dot and active_2d.dtype is torch.float16)
+                ),
                 num_warps=4,
             )
     return output.reshape(*input.shape[:-1], out_features)

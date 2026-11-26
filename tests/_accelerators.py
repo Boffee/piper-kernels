@@ -65,6 +65,19 @@ def w4a16_nvfp4_available() -> bool:
     )
 
 
+def trellis_encoder_available() -> bool:
+    """Return whether the default GPU supports GPU Trellis encoding (NVIDIA SM80+, >= 96 KiB)."""
+    if not torch.cuda.is_available():
+        return False
+    target = AcceleratorTarget.from_device(torch.device("cuda"))
+    if not target.is_nvidia_cuda or not target.cuda_capability_at_least(8, 0):
+        return False
+    return (
+        torch.cuda.get_device_properties(torch.device("cuda")).shared_memory_per_block_optin
+        >= 96 * 1024 + 128
+    )
+
+
 def uint8_int8_mma_available() -> bool:
     """Return whether the default CUDA device supports NVIDIA UINT8-by-INT8 MMAv2."""
     return (

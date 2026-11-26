@@ -1,9 +1,11 @@
 """Compile coverage for trellis decode and encode kernels across target families."""
 
+import re
 import sys
 
 import pytest
 import triton
+from _nvidia_resources import compile_with_spill_stores
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
@@ -49,15 +51,31 @@ def test_decode_kernel_compiles(target: GPUTarget, variable_rows: bool, exact_po
     else:
         constexprs["row_widths"] = None
         constexprs["row_offsets"] = None
-    compiled = triton.compile(
+    if target.backend == "hip":
+        compiled = triton.compile(
+            ASTSource(decode_int8_kernel, signature, constexprs=constexprs),
+            target=target,
+            options={"num_warps": 2},
+        )
+        assert compiled.asm["hsaco"]
+        amdgcn = compiled.asm["amdgcn"]
+        vgpr_spills = re.search(r"\.vgpr_spill_count:\s*(\d+)", amdgcn)
+        priv_size = re.search(r"\.private_segment_fixed_size:\s*(\d+)", amdgcn)
+        assert vgpr_spills is not None
+        assert int(vgpr_spills.group(1)) == 0
+        assert priv_size is not None
+        assert int(priv_size.group(1)) == 0
+        return
+    compiled, spills = compile_with_spill_stores(
         ASTSource(decode_int8_kernel, signature, constexprs=constexprs),
         target=target,
         options={"num_warps": 2},
     )
-    assert compiled.asm["hsaco" if target.backend == "hip" else "ptx"]
+    assert compiled.asm["ptx"]
+    assert spills == 0
 
 
-_NVIDIA_SM80_TARGETS = [GPUTarget("cuda", architecture, 32) for architecture in (80, 120)]
+_NVIDIA_SM80_TARGETS = [GPUTarget("cuda", architecture, 32) for architecture in (80, 86, 89, 120)]
 
 
 @pytest.mark.parametrize("target", _NVIDIA_SM80_TARGETS, ids=lambda target: f"cuda-{target.arch}")
@@ -135,10 +153,12 @@ def test_encoder_triton_kernels_compile(target: GPUTarget) -> None:
         ),
     ]
     for source, options in sources:
-        assert triton.compile(source, target=target, options=options).asm["ptx"]
+        compiled, spills = compile_with_spill_stores(source, target=target, options=options)
+        assert compiled.asm["ptx"]
+        assert spills == 0
 
 
-@pytest.mark.parametrize("architecture", [80, 120])
+@pytest.mark.parametrize("architecture", [80, 86, 89, 120])
 @pytest.mark.parametrize(("state_bits", "cost_only"), [(16, False), (12, True)])
 @pytest.mark.parametrize("step_widths", [(2,), (2, 3), (3, 4), (4, 5), (5, 6), (6,)], ids=str)
 def test_encoder_persistent_forward_compiles(
@@ -173,7 +193,7 @@ def test_encoder_persistent_forward_compiles(
         "out_ptr",
         "bp_pair_ptr",
     )
-    compiled = triton.compile(
+    compiled, spills = compile_with_spill_stores(
         GluonASTSource(
             kernel,
             signature,
@@ -184,4 +204,5 @@ def test_encoder_persistent_forward_compiles(
         options={"num_warps": num_warps},
     )
     assert compiled.asm["ptx"]
+    assert spills == 0
     assert compiled.metadata.shared <= _gluon_forward.SHARED_NEED

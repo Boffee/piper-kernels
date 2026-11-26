@@ -143,6 +143,9 @@ def test_empty_preparation_does_not_launch(shape, static):
     assert scale.shape == shape[:-1]
     assert (scale == (0.02 if static else 1e-30)).all()
 
+    out = (torch.empty(0, 64, dtype=torch.int8), torch.empty(0))
+    assert generic_triton.prepare_input(torch.empty(0, 64), 16, out=out) is out
+
 
 def test_generic_preparation_rejects_incompatible_outputs():
     value = torch.ones(2, 32)

@@ -34,25 +34,50 @@ if TYPE_CHECKING:
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
+def _resolve_block_size(
+    block_size: int | None,
+    blocks_per_row: int,
+    inferred_width: int | None,
+    *,
+    prefix: str,
+) -> int:
+    if block_size is not None:
+        return block_size
+    if inferred_width is None or blocks_per_row == 0 or inferred_width % blocks_per_row:
+        raise ValueError(f"{prefix} output storage is incompatible")
+    return inferred_width // blocks_per_row
+
+
 def _validate_uniform_storage(
     bitstreams: torch.Tensor,
     block_scales: torch.Tensor,
-    block_size: int,
-) -> tuple[int, int, TrellisLayout | None]:
+    block_size: int | None,
+    inferred_width: int | None,
+    *,
+    prefix: str,
+) -> tuple[int, int, int, TrellisLayout | None]:
     if bitstreams.dtype is not torch.uint8 or bitstreams.ndim != 3:
         raise ValueError(
-            "ConvRot Trellis bitstreams must be a 3-D uint8 tensor "
+            f"{prefix} bitstreams must be a 3-D uint8 tensor "
             f"[out, blocks, bytes], got {bitstreams.dtype} {tuple(bitstreams.shape)}"
         )
     rows, blocks_per_row, bytes_per_block = bitstreams.shape
+    resolved_block_size = _resolve_block_size(
+        block_size, blocks_per_row, inferred_width, prefix=prefix
+    )
     if type(bytes_per_block) is int:
-        layout: TrellisLayout | None = TrellisLayout.from_storage(block_size, bytes_per_block)
+        layout: TrellisLayout | None = TrellisLayout.from_storage(
+            resolved_block_size, bytes_per_block
+        )
     else:
-        validate_block_size(block_size)
-        lowest, highest = MIN_BITS_PER_WEIGHT * block_size, MAX_BITS_PER_WEIGHT * block_size
+        validate_block_size(resolved_block_size)
+        lowest, highest = (
+            MIN_BITS_PER_WEIGHT * resolved_block_size,
+            MAX_BITS_PER_WEIGHT * resolved_block_size,
+        )
         if 8 * bytes_per_block < lowest or 8 * bytes_per_block > highest:
             raise ValueError(
-                f"trellis blocks of {block_size} weights take {(lowest + 7) // 8} to "
+                f"trellis blocks of {resolved_block_size} weights take {(lowest + 7) // 8} to "
                 f"{highest // 8} whole bytes ({MIN_BITS_PER_WEIGHT} to {MAX_BITS_PER_WEIGHT} "
                 f"bits per weight), got {8 * bytes_per_block} bits"
             )
@@ -62,36 +87,96 @@ def _validate_uniform_storage(
         blocks_per_row,
     ):
         raise ValueError(
-            "ConvRot Trellis block_scales must be float8_e4m3fn with shape "
+            f"{prefix} block_scales must be float8_e4m3fn with shape "
             f"{(rows, blocks_per_row)}, got {block_scales.dtype} {tuple(block_scales.shape)}"
         )
-    return rows, blocks_per_row, layout
+    return rows, blocks_per_row, resolved_block_size, layout
 
 
 def _validate_variable_row_storage(
     bitstreams: torch.Tensor,
     block_scales: torch.Tensor,
     row_widths: torch.Tensor,
-    block_size: int,
-) -> tuple[int, int]:
-    validate_block_size(block_size)
+    block_size: int | None,
+    inferred_width: int | None,
+    *,
+    prefix: str,
+) -> tuple[int, int, int]:
+    if block_size is not None:
+        validate_block_size(block_size)
     if bitstreams.dtype is not torch.uint8 or bitstreams.ndim != 1:
         raise ValueError(
-            "ConvRot Trellis variable-row bitstreams must be a 1-D uint8 tensor "
+            f"{prefix} variable-row bitstreams must be a 1-D uint8 tensor "
             f"[total_bytes], got {bitstreams.dtype} {tuple(bitstreams.shape)}"
         )
     if block_scales.dtype is not torch.float8_e4m3fn or block_scales.ndim != 2:
         raise ValueError(
-            "ConvRot Trellis block_scales must be a 2-D float8_e4m3fn tensor "
+            f"{prefix} block_scales must be a 2-D float8_e4m3fn tensor "
             f"[out, blocks], got {block_scales.dtype} {tuple(block_scales.shape)}"
         )
     rows, blocks_per_row = block_scales.shape
+    resolved_block_size = validate_block_size(
+        _resolve_block_size(block_size, blocks_per_row, inferred_width, prefix=prefix)
+    )
     if row_widths.dtype is not torch.uint8 or tuple(row_widths.shape) != (rows,):
         raise ValueError(
-            f"ConvRot Trellis row_widths must be uint8 with shape {(rows,)}, "
+            f"{prefix} row_widths must be uint8 with shape {(rows,)}, "
             f"got {row_widths.dtype} {tuple(row_widths.shape)}"
         )
-    return rows, blocks_per_row
+    return rows, blocks_per_row, resolved_block_size
+
+
+def validate_trellis_tensors(
+    bitstreams: torch.Tensor,
+    block_scales: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int | None,
+    *,
+    row_widths: torch.Tensor | None = None,
+    inferred_width: int | None = None,
+    require_contiguous: bool = True,
+    allow_1d_scale: bool = False,
+    prefix: str = "ConvRot Trellis",
+) -> tuple[int, int, int, TrellisLayout | None, torch.Tensor]:
+    """Validate trellis tensor shapes, dtypes, layout, and devices."""
+    tensors = (
+        (bitstreams, block_scales, scale)
+        if row_widths is None
+        else (bitstreams, block_scales, scale, row_widths)
+    )
+    if any(tensor.layout is not torch.strided for tensor in tensors):
+        raise ValueError(f"{prefix} weight storage must use strided layout")
+
+    device = bitstreams.device
+    if any(tensor.device != device for tensor in tensors[1:]):
+        raise ValueError(
+            f"{prefix} weight tensors must share a device, "
+            f"got {tuple(tensor.device for tensor in tensors)}"
+        )
+
+    if row_widths is None:
+        rows, blocks_per_row, resolved_block_size, layout = _validate_uniform_storage(
+            bitstreams, block_scales, block_size, inferred_width, prefix=prefix
+        )
+    else:
+        rows, blocks_per_row, resolved_block_size = _validate_variable_row_storage(
+            bitstreams, block_scales, row_widths, block_size, inferred_width, prefix=prefix
+        )
+        layout = None
+
+    expected_shapes = ((rows,), (rows, 1)) if allow_1d_scale else ((rows, 1),)
+    if tuple(scale.shape) not in expected_shapes:
+        shape_desc = f"({rows},) or ({rows}, 1)" if allow_1d_scale else f"{(rows, 1)}"
+        raise ValueError(f"{prefix} scale must have shape {shape_desc}, got {tuple(scale.shape)}")
+    if scale.dtype is not torch.float32:
+        raise ValueError(f"{prefix} scale must be float32, got {scale.dtype}")
+
+    if require_contiguous and any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError(
+            f"{prefix} storage tensors must be contiguous; "
+            "use from_quantized to canonicalize storage"
+        )
+    return rows, blocks_per_row, resolved_block_size, layout, scale.view(rows, 1)
 
 
 def validate_storage(
@@ -111,51 +196,20 @@ def validate_storage(
         raise ValueError(
             f"ConvRot Trellis logical dtype must be float16, bfloat16, or float32, got {dtype}"
         )
-    tensors = (
-        (bitstreams, block_scales, scale)
-        if row_widths is None
-        else (bitstreams, block_scales, scale, row_widths)
+    rows, blocks_per_row, resolved_block_size, layout, _ = validate_trellis_tensors(
+        bitstreams,
+        block_scales,
+        scale,
+        block_size,
+        row_widths=row_widths,
+        require_contiguous=require_contiguous,
+        allow_1d_scale=False,
+        prefix="ConvRot Trellis",
     )
-    if any(tensor.layout is not torch.strided for tensor in tensors):
-        raise ValueError("ConvRot Trellis weight storage must use strided layout")
-
-    device = bitstreams.device
-    if block_scales.device != device or scale.device != device:
-        raise ValueError(
-            "ConvRot Trellis bitstreams, block_scales, and scale must share a device, "
-            f"got {device}/{block_scales.device}/{scale.device}"
-        )
-    if row_widths is not None and row_widths.device != device:
-        raise ValueError(
-            f"ConvRot Trellis row_widths must share weight device {device}, got {row_widths.device}"
-        )
-
-    if row_widths is None:
-        rows, blocks_per_row, layout = _validate_uniform_storage(
-            bitstreams, block_scales, block_size
-        )
-    else:
-        rows, blocks_per_row = _validate_variable_row_storage(
-            bitstreams, block_scales, row_widths, block_size
-        )
-        layout = None
-
-    in_features = blocks_per_row * block_size
+    in_features = blocks_per_row * resolved_block_size
     if in_features % group_size:
         raise ValueError(
             f"ConvRot Trellis in_features {in_features} is not divisible by group size {group_size}"
-        )
-    expected_scale_shape = (rows, 1)
-    if scale.dtype is not torch.float32 or tuple(scale.shape) != expected_scale_shape:
-        raise ValueError(
-            f"ConvRot Trellis scale must be float32 with shape {expected_scale_shape}, "
-            f"got {scale.dtype} {tuple(scale.shape)}"
-        )
-
-    if require_contiguous and any(not tensor.is_contiguous() for tensor in tensors):
-        raise ValueError(
-            "ConvRot Trellis storage tensors must be contiguous; "
-            "use from_quantized to canonicalize storage"
         )
     return rows, in_features, layout
 
@@ -410,7 +464,8 @@ class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatib
                 self.bitstreams, self.block_scales, self.row_widths, self.block_size
             )
 
-        result = dequantize_weight(qdata, self.scale, self.group_size, output_dtype)
+        with torch.amp.autocast(qdata.device.type, enabled=False):
+            result = dequantize_weight(qdata, self.scale, self.group_size, output_dtype)
         return result.t() if self.transposed else result
 
     def _stable_hash_for_caching(self) -> str:

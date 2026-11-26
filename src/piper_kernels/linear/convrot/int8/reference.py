@@ -5,6 +5,7 @@ import math
 import torch
 
 from piper_kernels._input_activations import apply_input_activation
+from piper_kernels.linear._dispatch import empty_linear_output
 from piper_kernels.trellis._layout import TrellisLayout
 from piper_kernels.trellis._reference import decode_reference, decode_variable_rows_reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
@@ -96,22 +97,6 @@ def _decode_trellis_qdata(
     return decode_variable_rows_reference(bitstreams, block_scales, row_widths, block_size)
 
 
-def _empty_trellis_result(
-    input: torch.Tensor,  # noqa: A002 - match linear terminology
-    out_features: int,
-    in_features: int,
-    bias: torch.Tensor | None,
-) -> torch.Tensor | None:
-    leading_shape = input.shape[:-1]
-    if math.prod(leading_shape) == 0 or out_features == 0:
-        return input.new_empty((*leading_shape, out_features))
-    if in_features == 0:
-        if bias is None:
-            return input.new_zeros((*leading_shape, out_features))
-        return bias.to(input.dtype).expand(*leading_shape, out_features).clone()
-    return None
-
-
 def linear_trellis_a16(
     input: torch.Tensor,  # noqa: A002 - match linear terminology
     bitstreams: torch.Tensor,
@@ -125,7 +110,7 @@ def linear_trellis_a16(
     """Portable FP32-rotated A16 reference for ConvRot Trellis linear."""
     out_features, blocks_per_row = block_scales.shape
     in_features = blocks_per_row * block_size
-    empty = _empty_trellis_result(input, out_features, in_features, bias)
+    empty = empty_linear_output(input, out_features, in_features, bias)
     if empty is not None:
         return empty
 
@@ -154,7 +139,7 @@ def linear_trellis_w8a8(
     """Portable W8A8 reference matching decoded ``ConvRotInt8Tensor`` linear."""
     out_features, blocks_per_row = block_scales.shape
     in_features = blocks_per_row * block_size
-    empty = _empty_trellis_result(input, out_features, in_features, bias)
+    empty = empty_linear_output(input, out_features, in_features, bias)
     if empty is not None:
         return empty
     with torch.amp.autocast(input.device.type, enabled=False):

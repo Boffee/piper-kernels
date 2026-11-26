@@ -242,7 +242,7 @@ def _check_parallel_plan(local_args, distributed_args, mesh, format_name, compil
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def _two_rank_linear(rank, store_path, device_type):
+def _two_rank_linear(rank, store_path, device_type, formats):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -254,11 +254,6 @@ def _two_rank_linear(rank, store_path, device_type):
     try:
         mesh = DeviceMesh(device_type, [0, 1])
         cpu_mesh = DeviceMesh("cpu", [0, 1])
-        formats = (
-            tuple(_FORMATS)
-            if device_type == "cuda"
-            else ("int8", "trellis_uniform", "trellis_variable")
-        )
         cases = product(formats, (Replicate(), Shard(0), Shard(1)), (False, True), (False, True))
         for format_name, placement, with_bias, compiled in cases:
             label = (
@@ -296,9 +291,19 @@ def _two_rank_linear(rank, store_path, device_type):
 def test_two_rank_replicated_and_sharded_linear(tmp_path, device_type):
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("requires distributed Gloo support")
-    if device_type == "cuda" and not exact_sm120_available():
-        pytest.skip("requires an SM120 CUDA device")
-    mp.spawn(_two_rank_linear, args=(str(tmp_path / "store"), device_type), nprocs=2, join=True)
+    if device_type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires a CUDA or ROCm device")
+    formats = (
+        tuple(_FORMATS)
+        if device_type == "cuda" and exact_sm120_available()
+        else ("int8", "trellis_uniform", "trellis_variable")
+    )
+    mp.spawn(
+        _two_rank_linear,
+        args=(str(tmp_path / "store"), device_type, formats),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.gpu
@@ -319,8 +324,11 @@ def test_cuda_dtensor_linear_matches_local_quantized_weight(
     compiled,
     case,
 ):
-    if not exact_sm120_available():
-        pytest.skip("requires an SM120 CUDA device")
+    if format_name in ("nvfp4", "convrot_nvfp4"):
+        if not exact_sm120_available():
+            pytest.skip("requires an SM120 CUDA device")
+    elif not torch.cuda.is_available():
+        pytest.skip("requires a CUDA or ROCm device")
     torch.manual_seed(19)
     weight = _weight(
         format_name,

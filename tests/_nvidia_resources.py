@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import uuid
+from collections.abc import Callable
 from contextlib import redirect_stdout, suppress
 from pathlib import Path
 
@@ -141,3 +142,24 @@ def compile_with_spill_stores(
     spill_stores = _parse_spill_stores(ptxas_log)
     _write_cached_spill_stores(_sidecar_path(compiled.hash), spill_stores)
     return compiled, spill_stores
+
+
+def capture_cuda_spill_stores() -> tuple[
+    dict[str, int],
+    Callable[[ASTSource, GPUTarget, dict[str, object]], CompiledKernel],
+]:
+    """Return a per-hash spill map and Triton compile callback capturing CUDA ptxas spills."""
+    spills_by_hash: dict[str, int] = {}
+
+    def _compile_fn(
+        source: ASTSource,
+        target: GPUTarget,
+        options: dict[str, object],
+    ) -> CompiledKernel:
+        if target.backend == "cuda":
+            compiled, spills = compile_with_spill_stores(source, target, options)
+            spills_by_hash[compiled.hash] = spills
+            return compiled
+        return triton.compile(source, target=target, options=options)
+
+    return spills_by_hash, _compile_fn

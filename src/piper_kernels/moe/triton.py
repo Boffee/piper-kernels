@@ -20,6 +20,11 @@ from triton.compiler import ASTSource
 from piper_kernels._input_activations import parse_input_activation
 from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._triton import amd_compiler_workarounds
+from piper_kernels._triton.primitives import (
+    TRITON_FLOAT_POINTER_TYPES,
+    default_triton_compile,
+    splitk_tile_bounds,
+)
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget, rdna4_int8_accumulator_seed
 from piper_kernels.linear._splitk import device_sm_count, select_split_k
@@ -34,6 +39,8 @@ from piper_kernels.linear.nvfp4.triton import (
 from piper_kernels.trellis._layout import TrellisLayout, validate_block_size
 from piper_kernels.trellis.triton import (
     _bit_window_params,
+    _uniform_row_start_bits,
+    _variable_row_start_bits,
     compute_row_offsets_2d,
     decode_slots_int8_kernel,
     decode_slots_int8_out,
@@ -120,17 +127,6 @@ def _resolve_slot(
     return tl.where((slot >= 0) & (slot < num_slots), slot, -1)
 
 
-@triton.jit
-def _splitk_tile_bounds(in_features, pid_k, split_k, block_k: tl.constexpr):
-    """Return the balanced K-tile interval ``[k_start, k_end)`` for ``pid_k``."""
-    total_k_tiles = tl.cdiv(in_features, block_k)
-    base_tiles = total_k_tiles // split_k
-    remainder_tiles = total_k_tiles % split_k
-    k_start = pid_k * base_tiles + tl.minimum(pid_k, remainder_tiles)
-    k_end = k_start + base_tiles + tl.where(pid_k < remainder_tiles, 1, 0)
-    return k_start, k_end
-
-
 @triton.jit(do_not_specialize=["split_k"])
 def nvfp4_moe_m1_gemv_kernel(
     input_ptr,
@@ -185,7 +181,7 @@ def nvfp4_moe_m1_gemv_kernel(
     )
     pre_scale, post_scale = _split_global_scale(global_scale)
 
-    k_tile_start, k_tile_end = _splitk_tile_bounds(input_features, pid_k, split_k, block_k)
+    k_tile_start, k_tile_end = splitk_tile_bounds(tl.cdiv(input_features, block_k), pid_k, split_k)
 
     acc = tl.zeros((block_n,), dtype=tl.float32)
     for k_tile in range(k_tile_start, k_tile_end):
@@ -442,7 +438,7 @@ def nvfp4_moe_batched_gemv_kernel(
     pre_scale, post_scale = _split_global_scale(global_scale)
     epilogue_scale = post_scale if pre_scale_in_gemv else global_scale
 
-    k_tile_start, k_tile_end = _splitk_tile_bounds(input_features, pid_k, split_k, block_k)
+    k_tile_start, k_tile_end = splitk_tile_bounds(tl.cdiv(input_features, block_k), pid_k, split_k)
     acc = tl.zeros((block_m, block_n), dtype=tl.float32)
 
     for k_tile in range(k_tile_start, k_tile_end):
@@ -685,7 +681,7 @@ def int8_moe_m1_matmul_kernel(
 
     offs_m = tl.arange(0, block_m)
 
-    k_start, k_end = _splitk_tile_bounds(in_features, pid_k, split_k, block_k)
+    k_start, k_end = splitk_tile_bounds(tl.cdiv(in_features, block_k), pid_k, split_k)
 
     slot_input_ptr = input_ptr + (k_idx.to(tl.int64) * in_features if per_expert_input else 0)
     slot_weight_ptr = weight_ptr + slot * out_features.to(tl.int64) * in_features
@@ -775,7 +771,7 @@ def int8_moe_batched_matmul_kernel(
     row_valid = pair_ids >= 0
     src_rows = tl.where(row_valid, pair_ids if per_expert_input else pair_ids // top_k, 0)
 
-    k_start, k_end = _splitk_tile_bounds(in_features, pid_k, split_k, block_k)
+    k_start, k_end = splitk_tile_bounds(tl.cdiv(in_features, block_k), pid_k, split_k)
 
     offsets_k = tl.arange(0, block_k)
     offsets_k_i64 = offsets_k.to(tl.int64)
@@ -1413,38 +1409,32 @@ def _trellis_slot_bit_window(
             slot_limit_bytes = slot_base + slot_bytes.to(tl.int64)
         row_base_bytes = slot_base + row_offset * blocks_per_row
         slot_bitstreams_ptr = bitstreams_ptr
-        row_bits = width * 8
-        row_step_bits = row_bits // denom
-        row_wide_steps = row_bits - row_step_bits * denom
-        start_bits = (
-            row_step_bits[:, None] * clamped_steps[None, :]
-            + row_wide_steps[:, None] * (clamped_steps[None, :] + 1) // denom
-        )
-        byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift = _bit_window_params(
-            start_bits, row_bits[:, None]
-        )
         width64 = width.to(tl.int64)
-        u_b0_mask = row_mask
-        u_b1_mask = row_mask
-        u_m0 = elem_mask
-        u_m1 = elem_mask
-        u_m2 = elem_mask
     else:
-        offsets = step_bits * clamped_steps + (clamped_steps + 1) * num_wide_steps // denom
-        byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift = _bit_window_params(
-            offsets[None, :], block_bits
-        )
+        width = tl.full((1,), 0, tl.int32)
         slot_bitstreams_ptr = bitstreams_ptr + slot * (
             out_features.to(tl.int64) * blocks_per_row * bytes_per_block
         )
         slot_limit_bytes = tl.full((), 0, tl.int64)
         row_base_bytes = tl.full((1,), 0, tl.int64)
         width64 = tl.full((1,), 0, tl.int64)
+    if variable_rows:
+        start_bits, stream_bits = _variable_row_start_bits(width, clamped_steps, denom)
+        u_b0_mask = row_mask
+        u_b1_mask = row_mask
+    else:
+        start_bits = _uniform_row_start_bits(step_bits, num_wide_steps, clamped_steps, denom)[
+            None, :
+        ]
+        stream_bits = block_bits
         u_b0_mask = row_mask & (bytes_per_block > 0)
         u_b1_mask = row_mask & (bytes_per_block > 1)
-        u_m0 = elem_mask & (byte < bytes_per_block)
-        u_m1 = elem_mask & ((byte + 1) < bytes_per_block)
-        u_m2 = elem_mask & ((byte + 2) < bytes_per_block)
+    byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift = _bit_window_params(
+        start_bits, stream_bits
+    )
+    u_m0 = elem_mask if variable_rows else (elem_mask & (byte < bytes_per_block))
+    u_m1 = elem_mask if variable_rows else (elem_mask & ((byte + 1) < bytes_per_block))
+    u_m2 = elem_mask if variable_rows else (elem_mask & ((byte + 2) < bytes_per_block))
     return (
         slot_bitstreams_ptr,
         slot_limit_bytes,
@@ -4092,13 +4082,6 @@ def moe_ffn(
     return result
 
 
-_TRITON_FLOAT_POINTER_TYPES = {
-    torch.float16: "*fp16",
-    torch.bfloat16: "*bf16",
-    torch.float32: "*fp32",
-}
-
-
 def _compile_bucket_kernel(
     target: GPUTarget,
     *,
@@ -4497,7 +4480,7 @@ def _compile_nvfp4_prefill_kernels(
         intermediate_size=intermediate_size,
     )
     active_dtype = torch.float32 if group_size > 0 else logical_dtype
-    active_ty = _TRITON_FLOAT_POINTER_TYPES[active_dtype]
+    active_ty = TRITON_FLOAT_POINTER_TYPES[active_dtype]
     cast_bf16, force_fp32_dot, half_scales, block_m, block_n, block_k, num_warps = (
         _nvfp4_prefill_config(
             accel,
@@ -4838,7 +4821,7 @@ def _compile_nvfp4_kernels(
     )
 
     active_dtype = torch.float32 if group_size > 0 else logical_dtype
-    active_ty = _TRITON_FLOAT_POINTER_TYPES[active_dtype]
+    active_ty = TRITON_FLOAT_POINTER_TYPES[active_dtype]
     is_splitk = split_k > 1
     if batched:
         use_dot, cast_fp32_to_bf16, post_scale_only, block_n, block_k, num_warps = (
@@ -5223,7 +5206,7 @@ def compile_moe_kernels(
     | None = None,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     """Compile quantized MoE Triton kernels matching runtime regime and chunking selection."""
-    if logical_dtype not in _TRITON_FLOAT_POINTER_TYPES:
+    if logical_dtype not in TRITON_FLOAT_POINTER_TYPES:
         raise ValueError(f"Unsupported MoE logical dtype: {logical_dtype}")
     if (
         hidden_size <= 0
@@ -5240,8 +5223,8 @@ def compile_moe_kernels(
     up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
     is_int8 = weight_format == "convrot_int8"
     is_trellis = weight_format == "convrot_trellis"
-    compile_fn = compiler or (lambda src, tgt, opts: triton.compile(src, target=tgt, options=opts))
-    out_ty = _TRITON_FLOAT_POINTER_TYPES[logical_dtype]
+    compile_fn = compiler or default_triton_compile
+    out_ty = TRITON_FLOAT_POINTER_TYPES[logical_dtype]
     accel = AcceleratorTarget.from_compiler_target(target)
 
     has_int8_backend = is_int8

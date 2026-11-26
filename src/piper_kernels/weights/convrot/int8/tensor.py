@@ -224,8 +224,7 @@ class ConvRotInt8Tensor(QuantizedWeight):  # pyright: ignore[reportIncompatibleM
         ``group_size``, so decoding produces its INT8 values without rotating;
         contiguous ``scale`` storage is reused. Decoding is exact by
         construction, so every backend produces the same INT8 values. It requires a
-        supported Triton accelerator and raises on other devices; it is validated on
-        NVIDIA, and ROCm has compile coverage only.
+        supported Triton accelerator and raises on other devices.
         """
         from piper_kernels.weights.convrot.int8._trellis import convert  # noqa: PLC0415
 
@@ -234,6 +233,8 @@ class ConvRotInt8Tensor(QuantizedWeight):  # pyright: ignore[reportIncompatibleM
             block_scales,
             scale,
             block_size=block_size,
+            group_size=group_size,
+            logical_dtype=logical_dtype,
             row_widths=row_widths,
         )
         return cls(qdata, row_scale, group_size, logical_dtype)

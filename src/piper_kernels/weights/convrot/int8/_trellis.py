@@ -5,34 +5,10 @@ from __future__ import annotations
 import torch
 
 from piper_kernels._triton import runtime
-from piper_kernels.trellis._layout import TrellisLayout, validate_block_size
-
-
-def _validate_scale(scale: torch.Tensor, rows: int, device: torch.device) -> torch.Tensor:
-    """Return the row scale as ``[rows, 1]`` after checking its metadata."""
-    if tuple(scale.shape) not in ((rows,), (rows, 1)):
-        raise ValueError(
-            f"ConvRot INT8 trellis scale must have shape ({rows},) or ({rows}, 1), "
-            f"got {tuple(scale.shape)}"
-        )
-    if scale.dtype is not torch.float32 or scale.device != device:
-        raise ValueError(
-            f"ConvRot INT8 trellis scale must be float32 on {device}, "
-            f"got {scale.dtype} on {scale.device}"
-        )
-    return scale.view(rows, 1)
-
-
-def _resolve_block_size(
-    block_size: int | None,
-    blocks_per_row: int,
-    out: tuple[torch.Tensor, torch.Tensor] | None,
-) -> int:
-    if block_size is not None:
-        return block_size
-    if out is None or blocks_per_row == 0 or out[0].shape[-1] % blocks_per_row:
-        raise ValueError("ConvRot INT8 trellis output storage is incompatible")
-    return out[0].shape[-1] // blocks_per_row
+from piper_kernels.trellis._layout import TrellisLayout
+from piper_kernels.weights.convrot._rotation import validate_group_size
+from piper_kernels.weights.convrot.int8._quantization import _SUPPORTED_LOGICAL_DTYPES
+from piper_kernels.weights.convrot.trellis.tensor import validate_trellis_tensors
 
 
 def _validate_inputs(
@@ -41,62 +17,34 @@ def _validate_inputs(
     scale: torch.Tensor,
     *,
     block_size: int | None,
+    group_size: int | None,
+    logical_dtype: torch.dtype | None,
     row_widths: torch.Tensor | None,
     out: tuple[torch.Tensor, torch.Tensor] | None,
 ) -> tuple[int, int, int, torch.Tensor, TrellisLayout | None]:
-    device = bitstreams.device
-    layout: TrellisLayout | None = None
-    if row_widths is None:
-        if bitstreams.dtype is not torch.uint8 or bitstreams.ndim != 3:
-            raise ValueError(
-                "ConvRot INT8 trellis bitstreams must be a 3-D uint8 tensor "
-                f"[out, blocks, bytes], got {bitstreams.dtype} {tuple(bitstreams.shape)}"
-            )
-        rows, blocks_per_row, num_bytes = bitstreams.shape
-        resolved_block_size = _resolve_block_size(block_size, blocks_per_row, out)
-        layout = TrellisLayout.from_storage(resolved_block_size, num_bytes)
-        if (
-            block_scales.dtype is not torch.float8_e4m3fn
-            or tuple(block_scales.shape) != (rows, blocks_per_row)
-            or block_scales.device != device
-        ):
-            raise ValueError(
-                "ConvRot INT8 trellis block_scales must be float8_e4m3fn with shape "
-                f"{(rows, blocks_per_row)} on {device}, got {block_scales.dtype} "
-                f"{tuple(block_scales.shape)} on {block_scales.device}"
-            )
-    else:
-        if bitstreams.dtype is not torch.uint8 or bitstreams.ndim != 1:
-            raise ValueError(
-                "ConvRot INT8 variable-row trellis bitstreams must be a 1-D uint8 tensor "
-                f"[total_bytes], got {bitstreams.dtype} {tuple(bitstreams.shape)}"
-            )
-        if (
-            block_scales.dtype is not torch.float8_e4m3fn
-            or block_scales.ndim != 2
-            or block_scales.device != device
-        ):
-            raise ValueError(
-                "ConvRot INT8 trellis block_scales must be a 2-D float8_e4m3fn tensor "
-                f"[out, blocks] on {device}, got {block_scales.dtype} "
-                f"{tuple(block_scales.shape)} on {block_scales.device}"
-            )
-        rows, blocks_per_row = block_scales.shape
-        if (
-            row_widths.dtype is not torch.uint8
-            or tuple(row_widths.shape) != (rows,)
-            or row_widths.device != device
-        ):
-            raise ValueError(
-                "ConvRot INT8 trellis row_widths must be uint8 with shape "
-                f"{(rows,)} on {device}, got {row_widths.dtype} "
-                f"{tuple(row_widths.shape)} on {row_widths.device}"
-            )
-        resolved_block_size = validate_block_size(
-            _resolve_block_size(block_size, blocks_per_row, out)
+    if group_size is not None:
+        validate_group_size(group_size)
+    if logical_dtype is not None and logical_dtype not in _SUPPORTED_LOGICAL_DTYPES:
+        raise ValueError(
+            f"ConvRot logical dtype must be float16, bfloat16, or float32, got {logical_dtype}"
         )
-
-    row_scale = _validate_scale(scale, rows, device)
+    device = bitstreams.device
+    rows, blocks_per_row, resolved_block_size, layout, row_scale = validate_trellis_tensors(
+        bitstreams,
+        block_scales,
+        scale,
+        block_size,
+        row_widths=row_widths,
+        inferred_width=None if out is None else out[0].shape[-1],
+        require_contiguous=False,
+        allow_1d_scale=True,
+        prefix="ConvRot INT8 trellis",
+    )
+    in_features = blocks_per_row * resolved_block_size
+    if group_size is not None and in_features % group_size:
+        raise ValueError(
+            f"ConvRot in_features {in_features} is not divisible by group size {group_size}"
+        )
     if not runtime.supports_device(device):
         raise ValueError(
             "ConvRot INT8 trellis decoding requires a supported Triton accelerator; "
@@ -111,6 +59,8 @@ def convert(
     scale: torch.Tensor,
     *,
     block_size: int | None = None,
+    group_size: int | None = None,
+    logical_dtype: torch.dtype | None = None,
     row_widths: torch.Tensor | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -129,6 +79,8 @@ def convert(
         block_scales,
         scale,
         block_size=block_size,
+        group_size=group_size,
+        logical_dtype=logical_dtype,
         row_widths=row_widths,
         out=out,
     )

@@ -347,7 +347,7 @@ def test_from_trellis_variable_rows_rejects_bad_block_size_and_cpu() -> None:
 @_gpu
 def test_from_trellis_variable_rows_rejects_mismatched_device() -> None:
     bitstreams, block_scales, scale, row_widths = _variable_storage()
-    with pytest.raises(ValueError, match="row_widths must be uint8"):
+    with pytest.raises(ValueError, match="must share a device"):
         ConvRotInt8Tensor.from_trellis(
             bitstreams.cuda(),
             block_scales.cuda(),
@@ -355,4 +355,39 @@ def test_from_trellis_variable_rows_rejects_mismatched_device() -> None:
             block_size=256,
             group_size=256,
             row_widths=row_widths,
+        )
+
+
+def test_from_trellis_validates_group_size_dtype_divisibility_and_layout_before_alloc() -> None:
+    bitstreams, block_scales, scale = _storage(blocks_per_row=1)
+    # Invalid group_size, logical_dtype, in_features divisibility, and non-strided layout must all
+    # reject on CPU storage before checking device support or allocating decoded storage.
+    with pytest.raises(ValueError, match="group size"):
+        ConvRotInt8Tensor.from_trellis(
+            bitstreams, block_scales, scale, block_size=256, group_size=3
+        )
+    with pytest.raises(ValueError, match="logical dtype"):
+        ConvRotInt8Tensor.from_trellis(
+            bitstreams,
+            block_scales,
+            scale,
+            block_size=256,
+            group_size=256,
+            logical_dtype=torch.int32,
+        )
+    with pytest.raises(ValueError, match="divisible by group size"):
+        ConvRotInt8Tensor.from_trellis(
+            bitstreams[:, :1, :64],
+            block_scales[:, :1],
+            scale,
+            block_size=128,
+            group_size=256,
+        )
+    with pytest.raises(ValueError, match="strided layout"):
+        ConvRotInt8Tensor.from_trellis(
+            bitstreams.to_sparse(),
+            block_scales,
+            scale,
+            block_size=256,
+            group_size=256,
         )
