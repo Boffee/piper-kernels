@@ -5,8 +5,18 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+## [0.9.0rc1] - 2026-11-26
+
 ### Added
 
+- GQA-grouped Split-KV chunked KV decode and natural-log LSE wave merging
+  (`piper_kernels`: `piper_attention_decode` and `merge_attention_lse`), combining
+  indirect `chunk_to_slot` lookups against finalized `PiperKVChunkPool` chunks with an
+  optional unfrozen BF16/FP16 tail, multi-token MTP causal verification
+  (`seq_q > 1`), zero-host-readback miss skipping, `torch.compile(fullgraph=True,
+  dynamic=True)`, and CUDA Graph capture across NVIDIA and AMD GPUs. Validated on CPU
+  and AMD RX 9070 XT (`gfx1201`), with NVIDIA `sm75`/`sm80`/`sm89`/`sm120` and AMD
+  `gfx942`/`gfx1100`/`gfx1151` targets validated via zero-spill offline compilation.
 - Unified TorchAO-free `piper_kernels.weights.QuantizedWeight` base class with a
   format-independent zero-copy transport boundary (`weight.as_storage()` and
   `cls.from_storage(tensors, metadata)`) across `ConvRotInt8Tensor` (2-D and 5-D),
@@ -33,14 +43,6 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
-- GQA-grouped Split-KV chunked KV decode and natural-log LSE wave merging
-  (`piper_kernels`: `piper_attention_decode` and `merge_attention_lse`), combining
-  indirect `chunk_to_slot` lookups against finalized `PiperKVChunkPool` chunks with an
-  optional unfrozen BF16/FP16 tail, multi-token MTP causal verification
-  (`seq_q > 1`), zero-host-readback miss skipping, `torch.compile(fullgraph=True,
-  dynamic=True)`, and CUDA Graph capture across NVIDIA and AMD GPUs. Validated on CPU
-  and AMD RX 9070 XT (`gfx1201`), with NVIDIA `sm75`/`sm80`/`sm89`/`sm120` and AMD
-  `gfx942`/`gfx1100`/`gfx1151` targets validated via zero-spill offline compilation.
 - Global chunk-major persistent KV cache pool and chunk freeze operator
   (`piper_kernels`: `PiperKVChunkPool`, `kv_chunk_storage_specs`, and
   `freeze_kv_chunks_`) storing K1024/V1024 centered
@@ -1330,7 +1332,8 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Initial ConvRot INT8 tensor, reference implementation, Triton backend, and in-place
   low-rank update support.
 
-[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc8...HEAD
+[Unreleased]: https://github.com/Boffee/piper-kernels/compare/v0.9.0rc1...HEAD
+[0.9.0rc1]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc8...v0.9.0rc1
 [0.8.0rc8]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc7...v0.8.0rc8
 [0.8.0rc7]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc6...v0.8.0rc7
 [0.8.0rc6]: https://github.com/Boffee/piper-kernels/compare/v0.8.0rc5...v0.8.0rc6
