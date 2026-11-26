@@ -29,7 +29,6 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
 
 from piper_kernels import compile_options, piper_attention
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -87,12 +86,7 @@ def _make_weight(
         if with_global_scales:
             options["compute_per_tensor_scale"] = True
             options["act_per_tensor_scale"] = torch.tensor(0.015, dtype=torch.float32)
-            options["act_quant_kwargs"] = QuantizeTensorToNVFP4Kwargs(
-                block_size=16,
-                is_swizzled_scales=True,
-                use_triton_kernel=False,
-                use_dynamic_per_tensor_scale=False,
-            )
+            options["act_quant"] = "static"
         weight = cls.from_hp(source, **options)
         if high_first:
             weight.qdata = _swap_nibbles(weight.qdata)
@@ -275,14 +269,14 @@ def test_copy_and_new_zeros_rejections_preserve_dst():
     snap_pts = dst.per_tensor_scale.clone()
     snap_apts = dst.act_per_tensor_scale.clone()
 
-    no_globals_same_kwargs = _make_weight(
+    no_globals_same_act_quant = _make_weight(
         ConvRotNVFP4Tensor,
         rows=32,
         swizzled=True,
         high_first=True,
         with_global_scales=False,
     )
-    no_globals_same_kwargs.act_quant_kwargs = dst.act_quant_kwargs
+    no_globals_same_act_quant.act_quant = dst.act_quant
 
     for bad_src, err in (
         (torch.zeros(32, 128, dtype=torch.bfloat16), NotImplementedError),
@@ -319,7 +313,7 @@ def test_copy_and_new_zeros_rejections_preserve_dst():
             ),
             NotImplementedError,
         ),
-        (no_globals_same_kwargs, ValueError),
+        (no_globals_same_act_quant, ValueError),
     ):
         with pytest.raises(err):
             dst.copy_(bad_src)
@@ -395,9 +389,7 @@ from datetime import timedelta
 
 class _BlockOptionalNVFP4:
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.startswith(
-            ("torchao.prototype.mx_formats", "piper_kernels.weights.nvfp4")
-        ):
+        if fullname.startswith("piper_kernels.weights.nvfp4"):
             raise ModuleNotFoundError(f"blocked optional dependency: {fullname}")
         return None
 

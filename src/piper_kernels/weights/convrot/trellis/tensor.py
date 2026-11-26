@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self
 import torch
 from torch._guards import detect_fake_mode
 from torch._subclasses.fake_tensor import FakeTensor
-from torchao.utils import TorchAOBaseTensor
 
 from piper_kernels._triton import runtime
 from piper_kernels.trellis._layout import (
@@ -18,9 +17,8 @@ from piper_kernels.trellis._layout import (
     validate_block_size,
 )
 from piper_kernels.weights._dispatch import (
-    QuantizedWeightMixin,
+    QuantizedWeight,
     register_conversion_ops,
-    register_inference_mode_dispatch,
     unsupported_operation_dispatch,
 )
 from piper_kernels.weights._matmul import register_matrix_ops
@@ -162,8 +160,7 @@ def validate_storage(
     return rows, in_features, layout
 
 
-# BaseTensor defines Tensor.addmm_/add_ with incompatible scalar/None/complex types.
-class ConvRotTrellisTensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright: ignore[reportIncompatibleMethodOverride]
+class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatibleMethodOverride]
     """Trellis-coded ConvRot 2-D linear weight for direct ``F.linear`` execution.
 
     Stores the same packed tensors encoded by :class:`~piper_kernels.trellis.TrellisStorage`:
@@ -297,7 +294,7 @@ class ConvRotTrellisTensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright:
         )
 
     @classmethod
-    def from_storage(
+    def from_trellis_storage(
         cls,
         storage: TrellisStorage,
         *,
@@ -340,7 +337,7 @@ class ConvRotTrellisTensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright:
             hessian=hessian,
             hessian_damping=hessian_damping,
         )
-        return cls.from_storage(
+        return cls.from_trellis_storage(
             storage,
             group_size=group_size,
             logical_dtype=hp_tensor.dtype,
@@ -440,6 +437,19 @@ class ConvRotTrellisTensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright:
             )
         )
 
+    def _validate_storage_for_export(self) -> None:
+        require_untransposed(self, "storage export")
+        validate_storage(
+            self.bitstreams,
+            self.block_scales,
+            self.scale,
+            self.block_size,
+            self.group_size,
+            self.dtype,
+            row_widths=self.row_widths,
+            require_contiguous=True,
+        )
+
     def _copy_storage_tensors(self, operation: str) -> dict[str, torch.Tensor]:
         require_untransposed(self, operation)
         validate_storage(
@@ -477,7 +487,6 @@ class ConvRotTrellisTensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright:
         raise NotImplementedError("ConvRot Trellis does not support FSDP2")
 
 
-register_inference_mode_dispatch(ConvRotTrellisTensor)
 register_view_ops(ConvRotTrellisTensor)
 register_matrix_ops(ConvRotTrellisTensor)
 register_conversion_ops(ConvRotTrellisTensor, format_name=ConvRotTrellisTensor._format_name)

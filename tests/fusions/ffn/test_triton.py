@@ -9,7 +9,6 @@ import pytest
 import torch
 from _accelerators import exact_gfx1201_available, exact_sm120_available, sm8x_available
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.fusions.ffn import _convrot_int8 as int8_ffn
 from piper_kernels.fusions.ffn import _nvfp4 as nvfp4_ffn
@@ -881,12 +880,10 @@ def test_nvfp4_activation_dynamic_scale_matches_fp32_reference(
     width = 512 if activation == "gelu_tanh" else 1024
     projections = torch.randn(rows, width, device="cuda", dtype=dtype)
     if activation == "gelu_tanh":
-        expected = per_tensor_amax_to_scale(
-            F.gelu(projections.float(), approximate="tanh").abs().amax()
-        )
+        expected = F.gelu(projections.float(), approximate="tanh").abs().amax() / (448.0 * 6.0)
     else:
         value, gate = projections.chunk(2, dim=-1)
-        expected = per_tensor_amax_to_scale((value.float() * F.silu(gate.float())).abs().amax())
+        expected = (value.float() * F.silu(gate.float())).abs().amax() / (448.0 * 6.0)
     torch.testing.assert_close(
         nvfp4_backend.dynamic_scale(projections, activation_fn=activation),
         expected,
@@ -900,9 +897,7 @@ def test_nvfp4_activation_dynamic_scale_matches_fp32_reference(
     assert torch.equal(zero_scale, torch.zeros((), device="cuda", dtype=torch.float32))
     if dtype is torch.float16 and activation == "swiglu" and rows == 127:
         overflow_safe = torch.full((rows, width), 512.0, device="cuda", dtype=dtype)
-        expected_fp32 = per_tensor_amax_to_scale(
-            (512.0 * F.silu(torch.tensor(512.0, device="cuda"))).abs()
-        )
+        expected_fp32 = (512.0 * F.silu(torch.tensor(512.0, device="cuda"))).abs() / (448.0 * 6.0)
         torch.testing.assert_close(
             nvfp4_backend.dynamic_scale(overflow_safe, activation_fn="swiglu"),
             expected_fp32,

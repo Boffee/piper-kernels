@@ -3,22 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import torch
 from torch._prims_common import infer_size
 from torch.utils._python_dispatch import return_and_correct_aliasing
-from torchao.utils import TorchAOBaseTensor
 
+from piper_kernels.weights._dispatch import (
+    QuantizedWeight,
+    unsupported_operation_dispatch,
+)
 from piper_kernels.weights._dispatch import (
     require_untransposed as require_untransposed,  # noqa: PLC0414 - shared export
 )
-from piper_kernels.weights._dispatch import (
-    unsupported_operation_dispatch,
-)
-
-if TYPE_CHECKING:
-    from piper_kernels.weights._dispatch import QuantizedWeight
 
 
 def _transpose_dispatch(
@@ -55,7 +52,7 @@ def _same_shape_view_dispatch(
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
     """Create a fresh wrapper without changing its quantized storage layout."""
-    tensor = cast(TorchAOBaseTensor, args[0])
+    tensor = cast(QuantizedWeight, args[0])
     size = args[1].shape if func is torch.ops.aten.view_as.default else args[1]
     shape = infer_size(size, tensor.numel())
     if shape == tuple(tensor.shape):
@@ -83,7 +80,7 @@ def _as_strided_dispatch(
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
     """Support AOTAutograd replay of an alias or a matrix transpose."""
-    tensor = cast(TorchAOBaseTensor, args[0])
+    tensor = cast(QuantizedWeight, args[0])
     shape, strides = args[1:3]
     offset = args[3] if len(args) > 3 else kwargs.get("storage_offset")
     if (
@@ -111,7 +108,7 @@ def _alias(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    tensor = cast(TorchAOBaseTensor, args[0])
+    tensor = cast(QuantizedWeight, args[0])
     # DTensor needs a distinct wrapper for autograd metadata, sharing the weight
     # storage. Rebuild through the concrete class to retain all quantization data.
     viewed = tensor._apply_fn_to_data(torch.ops.aten.alias.default)
@@ -167,7 +164,7 @@ def _full_extent_slice_dispatch(
     raise NotImplementedError(f"Piper quantized weights do not support {func}")
 
 
-def register_view_ops(cls: type[TorchAOBaseTensor]) -> None:
+def register_view_ops(cls: type[QuantizedWeight]) -> None:
     """Preserve wrappers through views and reject unsupported layout changes."""
     aten = torch.ops.aten
     cls.implements([aten.view.default, aten.view_as.default])(_same_shape_view_dispatch)
@@ -176,9 +173,8 @@ def register_view_ops(cls: type[TorchAOBaseTensor]) -> None:
     cls.implements(aten.clone.default)(_clone_dispatch)
     cls.implements(aten.contiguous.default)(_contiguous_dispatch)
     cls.implements_torch_function(torch.Tensor.contiguous)(_contiguous_dispatch)
-    # TorchAO's inherited slicing handlers construct a base NVFP4Tensor, losing
-    # interpretation metadata. Only full-extent dim-0 aliases (for FSDP2) are
-    # permitted here; use shard_quantized_weight for owning partitions.
+    # Only full-extent dim-0 aliases (for FSDP2) are permitted here;
+    # use shard_quantized_weight for owning partitions.
     cls.implements(aten.slice.Tensor)(_full_extent_slice_dispatch)
     cls.implements(aten.select.int)(unsupported_operation_dispatch)
 

@@ -5,13 +5,6 @@ import torch
 from _accelerators import exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    QuantizeTensorToNVFP4Kwargs,
-    per_tensor_amax_to_scale,
-)
 
 from piper_kernels import compile_options
 from piper_kernels.linear.nvfp4 import _ops as _nvfp4_ops  # noqa: F401 - registers custom ops
@@ -227,25 +220,20 @@ def test_cuda_compile_shares_three_static_projections(unit_scale: bool, autocast
     input = torch.randn(  # noqa: A001
         256, 256, device="cuda", dtype=torch.float32 if autocast else torch.bfloat16
     )
-    activation_scale = None if unit_scale else per_tensor_amax_to_scale(input.abs().amax())
+    activation_scale = (
+        None if unit_scale else (input.abs().amax().to(torch.float32) / (448.0 * 6.0))
+    )
     weights = []
     biases = []
-    quantization = QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=False,
-    )
     for _ in range(3):
         weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
-        torchao_weight = TorchAONVFP4Tensor.to_nvfp4(
+        wrapped = PiperNVFP4Tensor.from_hp(
             weight,
-            per_tensor_scale=per_tensor_amax_to_scale(weight.abs().amax()),
+            compute_per_tensor_scale=True,
             act_per_tensor_scale=activation_scale,
             is_swizzled_scales=True,
-            act_quant_kwargs=quantization,
+            act_quant="static",
         )
-        wrapped = PiperNVFP4Tensor.from_torchao(torchao_weight)
         # Unit metadata survives independent transfers of Q/K/V weights.
         weights.append(wrapped.to("cpu").to("cuda") if unit_scale else wrapped)
         biases.append(torch.randn(128, device="cuda", dtype=torch.bfloat16))

@@ -101,7 +101,7 @@ def _validate_addmm(
         mat1,
         mat2,
         device=weight.device,
-        dtype=weight.orig_dtype,
+        dtype=weight.dtype,
         differentiable_storage=(weight.scale, weight.per_tensor_scale),
         operation=operation,
     )
@@ -117,7 +117,7 @@ def _validate_add(
         tuple(weight.shape),
         update,
         device=weight.device,
-        dtype=weight.orig_dtype,
+        dtype=weight.dtype,
         differentiable_storage=(weight.scale, weight.per_tensor_scale),
         operation=operation,
     )

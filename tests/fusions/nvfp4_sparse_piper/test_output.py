@@ -5,12 +5,6 @@ from __future__ import annotations
 import pytest
 import torch
 from _accelerators import exact_sm120_available
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    per_tensor_amax_to_scale,
-)
 
 from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
@@ -20,6 +14,7 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
 from piper_kernels.fusions.nvfp4_sparse_piper import key, output, query, value
 from piper_kernels.linear.nvfp4 import _ops, _projection, reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 from .._accuracy import assert_fusion_output_close
 from ._helpers import make_operands
@@ -30,9 +25,13 @@ _OUTPUT_FEATURES = 320
 _GROUP_SIZES = [pytest.param(None, id="nvfp4"), pytest.param(64, id="convrot64")]
 
 
+def _amax_to_scale(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.float().abs().amax() / (448.0 * 6.0)
+
+
 def _affine_nvfp4_linear(
     input: torch.Tensor,  # noqa: A002
-    weight: TorchAONVFP4Tensor,
+    weight: PiperNVFP4Tensor,
     activation_scale: torch.Tensor,
     bias: torch.Tensor | None,
     *,
@@ -102,17 +101,12 @@ def _arguments(
     quantized_source = (
         dense_weight if group_size is None else rotate_groups(dense_weight, group_size)
     )
-    output_weight = TorchAONVFP4Tensor.to_nvfp4(
+    output_weight = PiperNVFP4Tensor.from_hp(
         quantized_source,
-        per_tensor_scale=(
-            per_tensor_amax_to_scale(quantized_source.abs().amax()) if weight_global_scale else None
-        ),
+        compute_per_tensor_scale=weight_global_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
     )
-    activation_scale = per_tensor_amax_to_scale(
-        torch.tensor(3.0, device="cuda", dtype=torch.float32)
-    )
+    activation_scale = _amax_to_scale(torch.tensor(3.0, device="cuda", dtype=torch.float32))
     projected_bias = (
         torch.randn(_OUTPUT_FEATURES, device="cuda", dtype=bias_dtype) if bias else None
     )
@@ -195,7 +189,7 @@ def _padded_arguments(
     weight_qdata, weight_scale, weight_per_tensor_scale, activation_scale, bias = (
         projection_arguments
     )
-    output_weight = TorchAONVFP4Tensor(
+    output_weight = PiperNVFP4Tensor(
         weight_qdata,
         weight_scale,
         16,
@@ -203,7 +197,6 @@ def _padded_arguments(
         per_tensor_scale=weight_per_tensor_scale,
         act_per_tensor_scale=activation_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
     )
     expected = _affine_nvfp4_linear(
         materialized_attention.flatten(2),
@@ -271,20 +264,17 @@ def _projected_gate_arguments(
         device="cuda",
         dtype=torch.bfloat16,
     )
-    activation_scale = per_tensor_amax_to_scale(hidden.abs().amax())
+    activation_scale = _amax_to_scale(hidden)
     gate_dense = torch.randn(
         (_HEADS * _HEAD_DIM, hidden.shape[-1]),
         device="cuda",
         dtype=torch.bfloat16,
     )
     gate_source = gate_dense if group_size is None else rotate_groups(gate_dense, group_size)
-    gate_weight = TorchAONVFP4Tensor.to_nvfp4(
+    gate_weight = PiperNVFP4Tensor.from_hp(
         gate_source,
-        per_tensor_scale=(
-            per_tensor_amax_to_scale(gate_source.abs().amax()) if weight_global_scale else None
-        ),
+        compute_per_tensor_scale=weight_global_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
     )
     gate_bias = torch.randn(
         _HEADS * _HEAD_DIM,
@@ -739,16 +729,15 @@ def _residual_projected_query_setup(
     quantized_source = (
         dense_weight if group_size is None else rotate_groups(dense_weight, group_size)
     )
-    output_weight = TorchAONVFP4Tensor.to_nvfp4(
+    output_weight = PiperNVFP4Tensor.from_hp(
         quantized_source,
-        per_tensor_scale=per_tensor_amax_to_scale(quantized_source.abs().amax()),
+        compute_per_tensor_scale=True,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
     )
     activation_scale = (
         None
         if dynamic_activation_scale
-        else per_tensor_amax_to_scale(torch.tensor(3.0, device="cuda", dtype=torch.float32))
+        else _amax_to_scale(torch.tensor(3.0, device="cuda", dtype=torch.float32))
     )
     output_bias = torch.randn(output_features, device="cuda", dtype=torch.float32)
     base_args, _ = _arguments(
@@ -781,15 +770,14 @@ def _residual_projected_query_setup(
     )
     if coarse:
         hidden = operands.input
-        gate_scale = per_tensor_amax_to_scale(hidden.abs().amax())
+        gate_scale = _amax_to_scale(hidden)
         gate_dense = torch.randn(
             (_HEADS * _HEAD_DIM, hidden.shape[-1]), device="cuda", dtype=torch.bfloat16
         )
-        gate_weight = TorchAONVFP4Tensor.to_nvfp4(
+        gate_weight = PiperNVFP4Tensor.from_hp(
             gate_dense,
-            per_tensor_scale=per_tensor_amax_to_scale(gate_dense.abs().amax()),
+            compute_per_tensor_scale=True,
             is_swizzled_scales=True,
-            use_triton_kernel=False,
         )
         gate_input = _ops.prepare_input(hidden, gate_scale, False, None, False)
         gate_bias = torch.randn(_HEADS * _HEAD_DIM, device="cuda", dtype=torch.float32)

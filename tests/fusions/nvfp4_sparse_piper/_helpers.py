@@ -6,21 +6,19 @@ from dataclasses import dataclass
 
 import torch
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    QuantizeTensorToNVFP4Kwargs,
-    per_tensor_amax_to_scale,
-)
 
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
 from piper_kernels.attention.kernels.sparse_piper.layout import padded_sequence_length
 from piper_kernels.linear.nvfp4._projection import matmul_prepared_chunk_out
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 _TILE_ROWS = 64
+
+
+def _amax_to_scale(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.float().abs().amax() / (448.0 * 6.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,21 +49,21 @@ class Operands:
 
     input: torch.Tensor
     activation_scale: torch.Tensor
-    weights: tuple[TorchAONVFP4Tensor, TorchAONVFP4Tensor, TorchAONVFP4Tensor]
+    weights: tuple[PiperNVFP4Tensor, PiperNVFP4Tensor, PiperNVFP4Tensor]
     query_norm: torch.Tensor
     key_norm: torch.Tensor
     cos: torch.Tensor
     sin: torch.Tensor
 
     def projection(self, index: int) -> Projection:
-        prepared = TorchAONVFP4Tensor.to_nvfp4(
+        prepared = PiperNVFP4Tensor.from_hp(
             self.input.reshape(-1, self.input.shape[-1]),
             per_tensor_scale=self.activation_scale,
             is_swizzled_scales=True,
-            use_triton_kernel=False,
         )
         weight = self.weights[index]
         assert weight.per_tensor_scale is not None
+        assert prepared.per_tensor_scale is not None
         return Projection(
             prepared.qdata,
             prepared.scale,
@@ -91,13 +89,7 @@ def make_operands(
         device="cuda",
         dtype=torch.bfloat16,
     )
-    activation_scale = per_tensor_amax_to_scale(input.abs().amax())
-    quantization = QuantizeTensorToNVFP4Kwargs(
-        block_size=16,
-        is_swizzled_scales=True,
-        use_triton_kernel=False,
-        use_dynamic_per_tensor_scale=False,
-    )
+    activation_scale = _amax_to_scale(input)
     weights = []
     for _ in range(3):
         dense = torch.randn(
@@ -106,12 +98,12 @@ def make_operands(
             dtype=torch.bfloat16,
         )
         weights.append(
-            TorchAONVFP4Tensor.to_nvfp4(
+            PiperNVFP4Tensor.from_hp(
                 dense,
-                per_tensor_scale=per_tensor_amax_to_scale(dense.abs().amax()),
+                compute_per_tensor_scale=True,
                 act_per_tensor_scale=activation_scale,
                 is_swizzled_scales=True,
-                act_quant_kwargs=quantization,
+                act_quant="static",
             )
         )
     norms = tuple(

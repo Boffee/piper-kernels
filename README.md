@@ -18,18 +18,17 @@ Requires Python 3.14 or newer and PyTorch 2.15 or newer.
 pip install piper-kernels
 ```
 
-The base package requires only PyTorch. Optional extras provide weight-format
-and accelerator dependencies:
+The base package requires only PyTorch and includes all quantized weight formats
+(ConvRot INT8, ConvRot Trellis, NVFP4, and ConvRot NVFP4). An optional extra provides
+Windows Triton support:
 
 | Extra | Use |
 |---|---|
-| `convrot` | ConvRot INT8 and Trellis weights |
-| `nvfp4` | Ordinary and ConvRot NVFP4 weights |
 | `triton` | Optimized GPU backends |
 
-For example, install `"piper-kernels[convrot,triton]"` for ConvRot INT8 GPU
-execution. On Linux, install the CUDA or ROCm PyTorch build and its matching
-Triton first; the extra does not install Linux Triton.
+For example, install `"piper-kernels[triton]"` on Windows or `piper-kernels` on Linux.
+On Linux, install the CUDA or ROCm PyTorch build and its matching Triton first; the
+extra does not install Linux Triton.
 
 On 64-bit Windows, the `triton` extra selects Triton 3.9 through
 [`triton-windows`](https://github.com/triton-lang/triton-windows). Optimized

@@ -10,7 +10,6 @@ import torch
 from _compile_capture import FunctionalTargetCapturePass
 from torch._dynamo.utils import ReinplaceCounters
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels import compile_options
 from piper_kernels.linear.convrot.int8 import _ops as int8_ops
@@ -331,7 +330,7 @@ class Nvfp4Operands:
 
 def _nvfp4_activation_scale(value: torch.Tensor, group_size: int | None) -> torch.Tensor:
     prepared = value if group_size is None else rotate_groups(value, group_size)
-    return per_tensor_amax_to_scale(prepared.abs().amax())
+    return prepared.abs().amax().float() / (448.0 * 6.0)
 
 
 def precise_nvfp4_linear(source: torch.Tensor, linear: Nvfp4Linear) -> torch.Tensor:

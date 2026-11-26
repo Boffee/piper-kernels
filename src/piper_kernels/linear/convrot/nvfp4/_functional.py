@@ -7,6 +7,7 @@ import torch
 
 from piper_kernels.linear._dispatch import apply_linear_autocast, bind_linear_arguments
 from piper_kernels.linear.nvfp4._functional import (
+    _canonical_weight_scale,
     _supports_common_nvfp4_linear,
     supports_semantic_linear,
     supports_weight_only_linear,
@@ -31,7 +32,7 @@ def _supports_convrot_weight_only_linear(
         _supports_common_nvfp4_linear(input, weight)
         and isinstance(input, torch.Tensor)
         and input.device.type == "cpu"
-        and weight.act_quant_kwargs is None
+        and weight.act_quant is None
         and weight.act_per_tensor_scale is None
     )
     return (
@@ -59,19 +60,18 @@ def convrot_nvfp4_linear(
     converted_input, converted_weight, bias = apply_linear_autocast(input, weight, bias)
     assert isinstance(converted_weight, ConvRotNVFP4Tensor)
     weight = converted_weight
+    weight_scale = _canonical_weight_scale(weight)
     if _supports_convrot_linear(converted_input, weight):
-        quantization = weight.act_quant_kwargs
-        assert quantization is not None
         from . import _ops  # noqa: PLC0415
 
         return _ops.linear(
             converted_input,
             weight.qdata,
-            weight.scale,
+            weight_scale,
             weight.per_tensor_scale,
             weight.act_per_tensor_scale,
             bias,
-            quantization.use_dynamic_per_tensor_scale,
+            weight.act_quant == "dynamic",
             weight.group_size,
             weight.high_first,
         )
@@ -81,7 +81,7 @@ def convrot_nvfp4_linear(
         return _ops.linear(
             converted_input,
             weight.qdata,
-            weight.scale,
+            weight_scale,
             weight.per_tensor_scale,
             None,
             bias,

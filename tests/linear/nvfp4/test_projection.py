@@ -6,11 +6,37 @@ from threading import Barrier
 import pytest
 import torch
 from _accelerators import exact_sm120_available
-from torchao.prototype.mx_formats.kernels import f4_unpacked_to_f32, unpack_uint4
-from torchao.prototype.mx_formats.utils import from_blocked
 
 from piper_kernels.linear.nvfp4 import _ops, _projection, reference
 from piper_kernels.weights.nvfp4 import _layout
+
+_E2M1_LUT = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+
+
+def _unpack_e2m1_to_f32(qdata: torch.Tensor) -> torch.Tensor:
+    low = (qdata & 0x0F).to(torch.int64)
+    high = (qdata >> 4).to(torch.int64)
+    unpacked = torch.stack((low, high), dim=-1).reshape(*qdata.shape[:-1], qdata.shape[-1] * 2)
+    lut = torch.tensor(_E2M1_LUT, device=qdata.device, dtype=torch.float32)
+    return lut[unpacked]
+
 
 pytestmark = [
     pytest.mark.gpu,
@@ -27,15 +53,15 @@ def test_independent_preparation_disagreements_are_rounding_boundaries(rows, see
     input = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16)  # noqa: A001
     expected_qdata, expected_scale, global_scale = reference.prepare_input(input, None, True)
     actual_qdata, actual_scale, _ = _ops._prepare_compiled(input, global_scale, False)
-    expected_scale = from_blocked(expected_scale, rows, 16).float()
-    actual_scale = from_blocked(actual_scale, rows, 16).float()
+    expected_scale = _layout.from_blocked(expected_scale, rows, 16).float()
+    actual_scale = _layout.from_blocked(actual_scale, rows, 16).float()
     scale_changed = actual_scale != expected_scale
     unrounded_scale = input.float().reshape(rows, 16, 16).abs().amax(-1) / 6 / global_scale
     scale_midpoint = (actual_scale[scale_changed] + expected_scale[scale_changed]) / 2
     torch.testing.assert_close(unrounded_scale[scale_changed], scale_midpoint, atol=1e-4, rtol=0)
 
-    expected = f4_unpacked_to_f32(unpack_uint4(expected_qdata))
-    actual = f4_unpacked_to_f32(unpack_uint4(actual_qdata))
+    expected = _unpack_e2m1_to_f32(expected_qdata)
+    actual = _unpack_e2m1_to_f32(actual_qdata)
     changed = (actual != expected) & (~scale_changed).repeat_interleave(16, dim=-1)
     scale = expected_scale.repeat_interleave(16, dim=-1)
     normalized = input.float() * ((1.0 / global_scale) / scale)

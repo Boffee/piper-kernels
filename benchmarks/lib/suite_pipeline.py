@@ -29,7 +29,7 @@ from .inputs import normal_tensor, sample_indices
 from .providers import Implementation, Operation
 from .quality import QualityCheck, measure_quality, validate_output_metadata
 
-# Native imports require optional TorchAO/Triton; resolve them after support checks.
+# Native imports require optional Triton; resolve them after support checks.
 # ruff: noqa: PLC0415
 
 if TYPE_CHECKING:
@@ -340,8 +340,6 @@ class CaptureFusion(CustomInferenceAwareGraphPass):
 
 
 def _unsupported_reason(case: PipelineCase, device: torch.device) -> str | None:  # noqa: PLR0911
-    if importlib.util.find_spec("torchao") is None:
-        return "quantized pipeline weight construction requires TorchAO"
     if device.type != "cuda" or not torch.cuda.is_available():
         return "requires native projection and attention backends on a supported accelerator"
     if importlib.util.find_spec("triton") is None:

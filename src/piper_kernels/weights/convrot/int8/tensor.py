@@ -4,10 +4,9 @@ from collections.abc import Callable
 from typing import Any, ClassVar, Self
 
 import torch
-from torchao.utils import TorchAOBaseTensor
 
 from piper_kernels.weights._dispatch import (
-    QuantizedWeightMixin,
+    QuantizedWeight,
     register_quantized_weight_ops,
     require_untransposed,
 )
@@ -19,8 +18,7 @@ from piper_kernels.weights.convrot.int8._quantization import (
 )
 
 
-# BaseTensor defines Tensor.addmm_/add_ with incompatible scalar/None/complex types.
-class ConvRotInt8Tensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright: ignore[reportIncompatibleMethodOverride]
+class ConvRotInt8Tensor(QuantizedWeight):  # pyright: ignore[reportIncompatibleMethodOverride]
     """INT8 rotated weight with per-output scale and logical floating dtype.
 
     Use :meth:`from_quantized` for existing quantized storage or :meth:`from_hp`
@@ -275,6 +273,11 @@ class ConvRotInt8Tensor(QuantizedWeightMixin, TorchAOBaseTensor):  # pyright: ig
             output_dtype = self.dtype
         result = dequantize_weight(self.qdata, self.scale, self.group_size, output_dtype)
         return result.t() if self.transposed else result
+
+    def _validate_storage_for_export(self) -> None:
+        require_untransposed(self, "storage export")
+        validate_storage(self.qdata, self.scale, self.group_size, self.dtype)
+        validate_activation_scale(self.act_per_tensor_scale, self.device)
 
     def _require_matrix(self, operation: str) -> None:
         if self.ndim != 2:

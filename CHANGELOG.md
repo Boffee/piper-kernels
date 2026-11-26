@@ -5,6 +5,25 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ## [Unreleased]
 
+### Added
+
+- Unified TorchAO-free `piper_kernels.weights.QuantizedWeight` base class with a
+  format-independent zero-copy transport boundary (`weight.as_storage()` and
+  `cls.from_storage(tensors, metadata)`) across `ConvRotInt8Tensor` (2-D and 5-D),
+  `PiperNVFP4Tensor` (2-D and 3-D), `ConvRotNVFP4Tensor`, and `ConvRotTrellisTensor`.
+- `PiperNVFP4Tensor.from_quantized` and `ConvRotNVFP4Tensor.from_quantized` zero-copy
+  packed-storage constructors.
+
+### Changed
+
+- **Breaking:** Decoupled all quantized weight classes from `torchao` and removed the
+  `torchao`/`numpy` dependencies and obsolete `convrot`/`nvfp4` extras; replaced
+  `orig_dtype`, `use_triton_kernel`, `act_quant_kwargs`, and `from_torchao` on NVFP4
+  tensors with `dtype`, `act_quant: Literal["static", "dynamic"] | None`, and
+  `from_quantized`, and renamed `ConvRotTrellisTensor.from_storage` to
+  `ConvRotTrellisTensor.from_trellis_storage`. Preserved `high_first` packed nibble order,
+  W4A16 weight-only execution, and non-foldable 3-D activation view dispatch.
+
 ## [0.8.0rc8] - 2026-11-25
 
 ### Added

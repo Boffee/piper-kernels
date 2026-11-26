@@ -4,15 +4,11 @@ import pytest
 import torch
 from _accelerators import exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor as TorchAONVFP4Tensor,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 
 from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
-from piper_kernels.weights.nvfp4 import _layout
+from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor, _layout
 from piper_kernels.weights.nvfp4 import triton as nvfp4_primitives
 
 
@@ -55,7 +51,7 @@ def test_dynamic_scale_matches_portable_reduction(rows: int, features: int) -> N
         dtype=torch.bfloat16,
     )
 
-    expected = per_tensor_amax_to_scale(input.abs().amax())
+    expected = _layout.per_tensor_amax_to_scale(input.abs().amax())
     actual = nvfp4_primitives.dynamic_scale(input)
 
     assert torch.equal(actual, expected)
@@ -221,14 +217,14 @@ def test_dynamic_activation_preparation_matches_fp32_reference_and_reuses_out(
     input_features = output_features * (2 if activation_fn == "swiglu" else 1)
     source = torch.randn(rows, input_features, device="cuda", dtype=dtype)
     if activation_fn is None:
-        expected_scale = per_tensor_amax_to_scale(source.abs().amax())
+        expected_scale = _layout.per_tensor_amax_to_scale(source.abs().amax())
     elif activation_fn == "gelu_tanh":
-        expected_scale = per_tensor_amax_to_scale(
+        expected_scale = _layout.per_tensor_amax_to_scale(
             F.gelu(source.float(), approximate="tanh").abs().amax()
         )
     else:
         value, gate = source.chunk(2, dim=-1)
-        expected_scale = per_tensor_amax_to_scale(
+        expected_scale = _layout.per_tensor_amax_to_scale(
             (value.float() * F.silu(gate.float())).abs().amax()
         )
 
@@ -454,19 +450,17 @@ def test_linear_mean_matches_batched_represented_projection() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    input_scale = per_tensor_amax_to_scale(source.abs().amax())
-    weight_scale = per_tensor_amax_to_scale(dense_weight.abs().amax())
-    prepared_input = TorchAONVFP4Tensor.to_nvfp4(
+    input_scale = _layout.per_tensor_amax_to_scale(source.abs().amax())
+    weight_scale = _layout.per_tensor_amax_to_scale(dense_weight.abs().amax())
+    prepared_input = PiperNVFP4Tensor.from_hp(
         source,
         per_tensor_scale=input_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
     )
-    prepared_weight = TorchAONVFP4Tensor.to_nvfp4(
+    prepared_weight = PiperNVFP4Tensor.from_hp(
         dense_weight,
         per_tensor_scale=weight_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
     )
     bias = torch.randn(output_features, device="cuda", dtype=torch.bfloat16)
 
@@ -510,19 +504,17 @@ def test_linear_mean_ignores_valid_front_padding() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     )
-    input_scale = per_tensor_amax_to_scale(source.abs().amax())
-    weight_scale = per_tensor_amax_to_scale(dense_weight.abs().amax())
-    prepared_input = TorchAONVFP4Tensor.to_nvfp4(
+    input_scale = _layout.per_tensor_amax_to_scale(source.abs().amax())
+    weight_scale = _layout.per_tensor_amax_to_scale(dense_weight.abs().amax())
+    prepared_input = PiperNVFP4Tensor.from_hp(
         source,
         per_tensor_scale=input_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
     )
-    prepared_weight = TorchAONVFP4Tensor.to_nvfp4(
+    prepared_weight = PiperNVFP4Tensor.from_hp(
         dense_weight,
         per_tensor_scale=weight_scale,
         is_swizzled_scales=True,
-        use_triton_kernel=False,
     )
     block_lengths = torch.tensor([37, 19], device="cuda", dtype=torch.int32)
     valid = torch.arange(64, device="cuda")[None, :] < block_lengths[:, None]
@@ -560,7 +552,7 @@ def test_dynamic_scale_small_final_reduction_boundaries(count, dtype):
     values = storage[::2]
     values[-1] = -123
     out = torch.empty((), device="cuda", dtype=torch.float32)
-    expected = per_tensor_amax_to_scale(values.float().abs().amax())
+    expected = _layout.per_tensor_amax_to_scale(values.float().abs().amax())
     actual = nvfp4_primitives.dynamic_scale(values, out=out)
     assert actual is out
     assert torch.equal(actual, expected)
@@ -573,5 +565,5 @@ def test_dynamic_scale_small_reduction_extremes(maximum):
     values = torch.zeros(1_797, device="cuda", dtype=torch.float32)
     values[-1] = maximum
     actual = nvfp4_primitives.dynamic_scale(values)
-    expected = per_tensor_amax_to_scale(values.abs().amax())
+    expected = _layout.per_tensor_amax_to_scale(values.abs().amax())
     torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)

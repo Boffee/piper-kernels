@@ -25,8 +25,6 @@ Issues = "https://github.com/Boffee/piper-kernels/issues"
 Changelog = "https://github.com/Boffee/piper-kernels/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-convrot = ["torchao>=0.17"]
-nvfp4 = ["numpy>=2", "torchao>=0.18"]
 triton = [
     # Linux PyTorch distributions supply their matching CUDA or ROCm Triton.
     # On Windows, triton-windows must match the Triton release PyTorch's
@@ -52,7 +50,7 @@ test = [
 ]
 dev = [
     { include-group = "test" },
-    "piper-kernels[convrot,nvfp4,triton]",
+    "piper-kernels[triton]",
     "pre-commit>=4.0",
     "pyright>=1.1.409",
     "ruff>=0.14.3",
@@ -132,9 +130,6 @@ version = "2.2.0"
 [tool.uv.sources]
 sageattention = { git = "https://github.com/thu-ml/SageAttention.git", rev = "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5" }
 torch = [
-    { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchao = [
     { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 

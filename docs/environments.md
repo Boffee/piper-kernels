@@ -35,8 +35,7 @@ uv --no-config venv --python 3.14 .venv-rocm
 uv --no-config pip install --python .venv-rocm/bin/python \
   --index-url https://stable.repo.amd.com/rocm/whl-next/ \
   "torch[device-gfx1201]==2.15.0+rocm10.2.0"
-uv --no-config pip install --python .venv-rocm/bin/python --group test \
-  "torchao==0.18.0" "numpy>=2"
+uv --no-config pip install --python .venv-rocm/bin/python --group test
 ```
 
 Do not use PyTorch's `download.pytorch.org/whl/rocm*` wheels: they are

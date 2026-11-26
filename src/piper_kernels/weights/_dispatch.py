@@ -1,51 +1,27 @@
-"""Shared dispatch helpers for quantized weight wrappers."""
+"""Shared base class, dispatch helpers, and zero-copy storage boundary for quantized weights."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar, cast
 
 import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
-from torchao.utils import TorchAOBaseTensor, _dispatch__torch_dispatch__
 
 if TYPE_CHECKING:
     from torch._ops import OpOverload
     from torch.distributed.device_mesh import DeviceMesh
 
-    from .convrot.int8.tensor import ConvRotInt8Tensor
-    from .convrot.trellis.tensor import ConvRotTrellisTensor
-    from .nvfp4.tensor import PiperNVFP4Tensor
-type QuantizedWeight = ConvRotInt8Tensor | PiperNVFP4Tensor
-type QuantizedWeightWrapper = QuantizedWeight | ConvRotTrellisTensor
-_WrapperT = TypeVar("_WrapperT", bound="QuantizedWeightWrapper")
-_IGNORED_COPY_METADATA = frozenset({"dtype", "orig_dtype", "transposed", "use_triton_kernel"})
+_WrapperT = TypeVar("_WrapperT", bound="QuantizedWeight")
+_IGNORED_COPY_METADATA = frozenset({"dtype", "transposed"})
 
 
-def require_untransposed(weight: QuantizedWeightWrapper, operation: str) -> None:
+def require_untransposed(weight: QuantizedWeight, operation: str) -> None:
     """Reject operations that would interpret a transpose as canonical storage."""
     if weight.transposed:
         raise NotImplementedError(
             f"{type(weight).__name__} {operation} does not support a transposed weight"
         )
-
-
-def _torch_dispatch(
-    cls: type[TorchAOBaseTensor],
-    func: OpOverload,
-    types: tuple[type, ...],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> object:
-    # object: an op returns whatever its schema declares, not only tensors.
-    if func not in cls._ATEN_OP_TABLE[cls]:
-        decomposed = func.decompose(*args, **kwargs)
-        if decomposed is not NotImplemented:
-            return decomposed
-    elif func.is_view and torch.is_inference_mode_enabled() and not args[0].is_inference():
-        with torch.inference_mode(False):
-            return _dispatch__torch_dispatch__(cls, func, types, args, kwargs)
-    return _dispatch__torch_dispatch__(cls, func, types, args, kwargs)
 
 
 def _decompose_dispatch(
@@ -57,24 +33,32 @@ def _decompose_dispatch(
     return func.decompose(*args, **kwargs)
 
 
-def register_inference_mode_dispatch(cls: type[TorchAOBaseTensor]) -> None:
-    """Dispatch the same way under ``torch.inference_mode`` as under ``torch.no_grad``.
+def _alias_or_detach_dispatch(
+    func: Callable[..., torch.Tensor],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> torch.Tensor:
+    return cast(
+        torch.Tensor,
+        return_and_correct_aliasing(
+            func,
+            args,
+            kwargs,
+            cast("QuantizedWeight", args[0])._apply_fn_to_data(
+                lambda value: func(value, *args[1:], **kwargs)
+            ),
+        ),
+    )
 
-    Autograd dispatch runs CompositeImplicitAutograd decompositions, such as ``aten.to``
-    returning ``self`` or lowering to ``_to_copy``, before an op reaches a wrapper.
-    Inference mode skips autograd dispatch, so those ops arrive intact; running their
-    decompositions here reaches the implementations every other grad mode reaches.
-    Registered implementations, such as ``linear``, keep precedence.
 
-    Inference mode still tracks views of a normal tensor, one created outside it, and
-    that tracking requires the view to be a normal tensor too, as ATen's views are.
-    A wrapper constructed in inference mode is an inference tensor, so registered view
-    implementations of a normal weight run with inference mode disabled.
-    """
-    cls.__torch_dispatch__ = classmethod(_torch_dispatch)
-    # Only inference mode reaches TorchAO's handler, which diverges from the
-    # decomposition: it copies for an unindexed same device and rejects non_blocking.
-    cls.implements(torch.ops.aten.to.dtype_layout)(_decompose_dispatch)
+def _compatible_shallow_copy_dispatch(
+    _func: Callable[..., object],
+    _types: tuple[type, ...],
+    args: tuple[Any, ...],
+    _kwargs: dict[str, Any],
+) -> bool:
+    return type(args[0]) is type(args[1]) and args[0].shape == args[1].shape
 
 
 def unsupported_operation_dispatch(
@@ -91,7 +75,7 @@ def _explicit_to_copy_args(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> tuple[tuple[object, ...], dict[str, object]] | None:
-    """Remove an explicit true ``copy`` before TorchAO parses ``Tensor.to``."""
+    """Remove an explicit true ``copy`` before parsing ``Tensor.to`` arguments."""
     parsed_args = args
     parsed_kwargs = dict(kwargs)
     if "copy" in parsed_kwargs:
@@ -142,7 +126,7 @@ def to_quantized_weight(
     return copied
 
 
-def register_conversion_ops(cls: type[TorchAOBaseTensor], *, format_name: str) -> None:
+def register_conversion_ops(cls: type[QuantizedWeight], *, format_name: str) -> None:
     """Preserve quantized storage across logical dtype and device conversion."""
 
     def _to_copy(
@@ -151,7 +135,7 @@ def register_conversion_ops(cls: type[TorchAOBaseTensor], *, format_name: str) -
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> torch.Tensor:
-        tensor = cast("QuantizedWeightWrapper", args[0])
+        tensor = cast(QuantizedWeight, args[0])
         assert isinstance(tensor, cls)
         arguments = dict(kwargs)
         dtype = arguments.pop("dtype", tensor.dtype)
@@ -180,7 +164,7 @@ def register_conversion_ops(cls: type[TorchAOBaseTensor], *, format_name: str) -
             tensor
             if metadata_only
             else cast(
-                "QuantizedWeightWrapper",
+                QuantizedWeight,
                 tensor._apply_fn_to_data(
                     lambda value: func(value, device=device, non_blocking=non_blocking)
                 ),
@@ -210,8 +194,8 @@ def _copy_dispatch(
     non_blocking = bool(args[2] if len(args) > 2 else kwargs.get("non_blocking", False))
     if type(dst) is not type(src):
         raise NotImplementedError(f"cannot copy {type(src).__name__} into {type(dst).__name__}")
-    dst_weight = cast("QuantizedWeightWrapper", dst)
-    src_weight = cast("QuantizedWeightWrapper", src)
+    dst_weight = cast(QuantizedWeight, dst)
+    src_weight = cast(QuantizedWeight, src)
     dst_tensors = dst_weight._copy_storage_tensors("copy_")
     src_tensors = src_weight._copy_storage_tensors("copy_")
     if tuple(dst_weight.shape) != tuple(src_weight.shape):
@@ -236,7 +220,14 @@ def _copy_dispatch(
         )
     for name, dst_val in dst_tensors.items():
         src_val = src_tensors[name]
-        if tuple(dst_val.shape) != tuple(src_val.shape) or dst_val.dtype is not src_val.dtype:
+        fp8_scale_reshape = (
+            name == "scale"
+            and dst_val.dtype is torch.float8_e4m3fn
+            and dst_val.numel() == src_val.numel()
+        )
+        if dst_val.dtype is not src_val.dtype or (
+            tuple(dst_val.shape) != tuple(src_val.shape) and not fp8_scale_reshape
+        ):
             raise ValueError(
                 f"quantized weight storage tensor {name!r} mismatch in "
                 f"{type(dst_weight).__name__} copy_: "
@@ -246,12 +237,12 @@ def _copy_dispatch(
     for name, dst_val in dst_tensors.items():
         src_val = src_tensors[name]
         if dst_val is not src_val:
-            if dst_val.dtype is torch.float8_e4m3fn:
-                dst_val.view(torch.uint8).copy_(
-                    src_val.view(torch.uint8), non_blocking=non_blocking
-                )
-            else:
-                dst_val.copy_(src_val, non_blocking=non_blocking)
+            src_copy = (
+                src_val.view(dst_val.shape)
+                if tuple(src_val.shape) != tuple(dst_val.shape)
+                else src_val
+            )
+            dst_val.copy_(src_copy, non_blocking=non_blocking)
     return cast(torch.Tensor, dst_weight)
 
 
@@ -261,7 +252,7 @@ def _is_pinned_dispatch(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> bool:
-    weight = cast("QuantizedWeightWrapper", args[0])
+    weight = cast(QuantizedWeight, args[0])
     names, _ = weight.__tensor_flatten__()
     return all(bool(func(getattr(weight, name), *args[1:], **kwargs)) for name in names)
 
@@ -272,26 +263,318 @@ def _pin_memory_dispatch(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    weight = cast("QuantizedWeightWrapper", args[0])
+    weight = cast(QuantizedWeight, args[0])
     return cast(
         torch.Tensor,
         weight._apply_fn_to_data(lambda value: func(value, *args[1:], **kwargs)),
     )
 
 
-class QuantizedWeightMixin:
-    """Shared Tensor subclass conversion, cache-key, and in-place update scaffolding."""
+class QuantizedWeight(torch.Tensor):
+    """Base tensor subclass for Piper quantized weights and zero-copy storage transport."""
+
+    tensor_data_names: ClassVar[list[str]]
+    tensor_attribute_names: ClassVar[list[str]]
+    optional_tensor_data_names: ClassVar[list[str]] = []
+    optional_tensor_attribute_names: ClassVar[list[str]] = []
 
     _format_name: ClassVar[str]
     _update_format_name: ClassVar[str]
     _contiguous_memory_format_only: ClassVar[bool] = False
+    _ATEN_OP_TABLE: ClassVar[dict[Any, Callable[..., Any]]] = {}
+    _TORCH_FN_TABLE: ClassVar[dict[Any, Callable[..., Any]]] = {}
+
+    qdata: torch.Tensor
+    scale: torch.Tensor
+    transposed: bool = False
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        cls._ATEN_OP_TABLE = {}
+        cls._TORCH_FN_TABLE = {}
+        for parent in reversed(cls.__bases__):
+            if isinstance(parent, type) and issubclass(parent, QuantizedWeight):
+                cls._ATEN_OP_TABLE.update(parent._ATEN_OP_TABLE)
+                cls._TORCH_FN_TABLE.update(parent._TORCH_FN_TABLE)
+
+    @classmethod
+    def implements(
+        cls,
+        aten_ops: object | Sequence[object],
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register an ATen operator handler for this quantized weight subclass."""
+        ops = aten_ops if isinstance(aten_ops, (list, tuple)) else [aten_ops]
+
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            for op in ops:
+                cls._ATEN_OP_TABLE[op] = fn
+            return fn
+
+        return decorator
+
+    @classmethod
+    def implements_torch_function(
+        cls,
+        torch_fns: object | Sequence[object],
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a ``__torch_function__`` handler for this quantized weight subclass."""
+        fns = torch_fns if isinstance(torch_fns, (list, tuple)) else [torch_fns]
+
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            for fn_key in fns:
+                cls._TORCH_FN_TABLE[fn_key] = fn
+            return fn
+
+        return decorator
+
+    @classmethod
+    def __torch_function__(  # pyright: ignore[reportIncompatibleMethodOverride]
+        cls,
+        func: Callable[..., Any],
+        types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> object:
+        # object: dispatched torch functions can return tensors, tuples, bools, or None.
+        resolved_kwargs = {} if kwargs is None else kwargs
+        handler = cls._TORCH_FN_TABLE.get(func)
+        if handler is not None:
+            return handler(func, types, args, resolved_kwargs)
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*args, **resolved_kwargs)
+
+    @classmethod
+    def __torch_dispatch__(  # pyright: ignore[reportIncompatibleMethodOverride]
+        cls,
+        func: OpOverload,
+        types: tuple[type, ...],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any] | None = None,
+    ) -> object:
+        """Dispatch registered ATen ops and preserve inference-mode decomposition/view rules."""
+        # object: an op returns whatever its schema declares, not only tensors.
+        resolved_kwargs = {} if kwargs is None else kwargs
+        handler = cls._ATEN_OP_TABLE.get(func)
+        if handler is None:
+            decomposed = func.decompose(*args, **resolved_kwargs)
+            if decomposed is not NotImplemented:
+                return decomposed
+            arg_types = tuple(type(arg) for arg in args)
+            kwarg_types = {key: type(value) for key, value in resolved_kwargs.items()}
+            raise NotImplementedError(
+                f"{cls.__name__} dispatch: attempting to run unimplemented operator/function: "
+                f"{func=}, {types=}, {arg_types=}, {kwarg_types=}"
+            )
+        if (
+            func.is_view
+            and torch.is_inference_mode_enabled()
+            and args
+            and isinstance(args[0], torch.Tensor)
+            and not args[0].is_inference()
+        ):
+            with torch.inference_mode(False):
+                return handler(func, types, args, resolved_kwargs)
+        return handler(func, types, args, resolved_kwargs)
+
+    def __tensor_flatten__(self) -> tuple[list[str], dict[str, Any]]:
+        """Flatten active storage tensors and non-tensor metadata for PyTorch subclasses."""
+        if not hasattr(self, "tensor_data_names") or not hasattr(self, "tensor_attribute_names"):
+            raise NotImplementedError(
+                f"{type(self).__name__} must define tensor_data_names and tensor_attribute_names"
+            )
+        tensor_names = list(self.tensor_data_names)
+        for name in self.optional_tensor_data_names:
+            if getattr(self, name) is not None:
+                tensor_names.append(name)
+        attributes = {name: getattr(self, name) for name in self.tensor_attribute_names}
+        for name in self.optional_tensor_attribute_names:
+            attributes[name] = getattr(self, name)
+        return tensor_names, attributes
+
+    @classmethod
+    def __tensor_unflatten__(
+        cls,
+        tensor_data_dict: Mapping[str, torch.Tensor],
+        tensor_attributes: Mapping[str, Any],
+        outer_size: object = None,
+        outer_stride: object = None,
+    ) -> Self:
+        """Reconstruct a quantized weight from flattened storage tensors and metadata."""
+        del outer_size, outer_stride
+        if not hasattr(cls, "tensor_data_names") or not hasattr(cls, "tensor_attribute_names"):
+            raise NotImplementedError(
+                f"{cls.__name__} must define tensor_data_names and tensor_attribute_names"
+            )
+        required_tensors = [tensor_data_dict[name] for name in cls.tensor_data_names]
+        optional_tensors = {
+            name: tensor_data_dict.get(name, None) for name in cls.optional_tensor_data_names
+        }
+        required_attributes = [tensor_attributes[name] for name in cls.tensor_attribute_names]
+        optional_attributes = {
+            name: tensor_attributes[name] for name in cls.optional_tensor_attribute_names
+        }
+        return cls(
+            *required_tensors,
+            *required_attributes,
+            **optional_tensors,
+            **optional_attributes,
+        )
+
+    def _apply_fn_to_data(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> Self:
+        names, attributes = self.__tensor_flatten__()
+        tensors = {name: fn(getattr(self, name)) for name in names}
+        return type(self).__tensor_unflatten__(tensors, attributes, None, None)
+
+    def _get_to_kwargs(self, *args: object, **kwargs: object) -> dict[str, Any]:
+        filtered_args = tuple(arg for arg in args if not isinstance(arg, torch.layout))
+        filtered_kwargs = dict(kwargs)
+        filtered_kwargs.pop("layout", None)
+        # PyTorch's internal C++ _parse_to helper is omitted from type stubs.
+        device, dtype, non_blocking, _ = cast(Any, torch._C)._nn._parse_to(
+            *filtered_args, **filtered_kwargs
+        )
+        return {
+            "device": self.device if device is None else device,
+            "dtype": self.dtype if dtype is None else dtype,
+            "non_blocking": non_blocking,
+        }
+
+    def __repr__(self, *, tensor_contents: object = None) -> str:
+        del tensor_contents
+        if not hasattr(self, "tensor_data_names") or not hasattr(self, "tensor_attribute_names"):
+            return f"{type(self).__name__}(shape={tuple(self.shape)}, dtype={self.dtype})"
+        fields = [
+            f"{name}={getattr(self, name)}"
+            for name in (
+                *self.tensor_data_names,
+                *self.tensor_attribute_names,
+                *self.optional_tensor_data_names,
+                *self.optional_tensor_attribute_names,
+            )
+        ]
+        return f"{type(self).__name__}({', '.join(fields)})"
+
+    def __setstate__(self, state: object) -> None:
+        # PyTorch's internal _set_obj_state helper is omitted from type stubs.
+        cast(Any, torch)._utils._set_obj_state(self, state)
+        cls = type(self)
+        for name in (*self.optional_tensor_data_names, *self.optional_tensor_attribute_names):
+            if name not in self.__dict__:
+                setattr(self, name, getattr(cls, name, None))
+
+    def _validate_storage_for_export(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement quantized storage export"
+        )
+
+    def as_storage(self) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        """Return canonical zero-copy storage tensors and plain metadata for transport."""
+        require_untransposed(self, "as_storage")
+        self._validate_storage_for_export()
+        names, attributes = self.__tensor_flatten__()
+        tensors = {name: getattr(self, name) for name in names}
+        metadata = {key: value for key, value in attributes.items() if key != "transposed"}
+        return tensors, metadata
+
+    @classmethod
+    def _parse_storage_tensors(
+        cls,
+        tensors: object,
+    ) -> tuple[list[torch.Tensor], dict[str, torch.Tensor | None]]:
+        if not isinstance(tensors, Mapping):
+            raise TypeError(f"{cls.__name__} from_storage tensors must be a mapping")
+        required_names = cls.tensor_data_names
+        optional_names = cls.optional_tensor_data_names
+        allowed_names = set(required_names) | set(optional_names)
+        missing = [name for name in required_names if name not in tensors]
+        if missing:
+            raise ValueError(f"{cls.__name__} from_storage missing required tensors: {missing}")
+        extra = sorted(set(tensors) - allowed_names)
+        if extra:
+            raise ValueError(f"{cls.__name__} from_storage received unexpected tensors: {extra}")
+
+        required: list[torch.Tensor] = []
+        for name in required_names:
+            value = tensors[name]
+            if not isinstance(value, torch.Tensor) or isinstance(value, QuantizedWeight):
+                raise TypeError(
+                    f"{cls.__name__} from_storage tensor {name!r} must be a plain torch.Tensor"
+                )
+            required.append(value)
+
+        optional: dict[str, torch.Tensor | None] = {}
+        for name in optional_names:
+            if name not in tensors:
+                continue
+            value = tensors[name]
+            if value is not None and (
+                not isinstance(value, torch.Tensor) or isinstance(value, QuantizedWeight)
+            ):
+                raise TypeError(
+                    f"{cls.__name__} from_storage optional tensor {name!r} must be a plain "
+                    "torch.Tensor or None"
+                )
+            optional[name] = value
+        return required, optional
+
+    @classmethod
+    def _parse_storage_metadata(
+        cls,
+        metadata: object,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        if not isinstance(metadata, Mapping):
+            raise TypeError(f"{cls.__name__} from_storage metadata must be a mapping")
+        if "transposed" in metadata:
+            raise ValueError(
+                f"{cls.__name__} from_storage does not accept transposed weight metadata"
+            )
+        required_names = cls.tensor_attribute_names
+        optional_names = [
+            name for name in cls.optional_tensor_attribute_names if name != "transposed"
+        ]
+        allowed_names = set(required_names) | set(optional_names)
+        missing = [name for name in required_names if name not in metadata]
+        if missing:
+            raise ValueError(f"{cls.__name__} from_storage missing required metadata: {missing}")
+        extra = sorted(set(metadata) - allowed_names)
+        if extra:
+            raise ValueError(f"{cls.__name__} from_storage received unexpected metadata: {extra}")
+        for key, value in metadata.items():
+            if isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"{cls.__name__} from_storage metadata {key!r} must not contain tensors"
+                )
+        return (
+            [metadata[name] for name in required_names],
+            {name: metadata[name] for name in optional_names if name in metadata},
+        )
+
+    @classmethod
+    def from_storage(
+        cls,
+        tensors: Mapping[str, torch.Tensor],
+        metadata: Mapping[str, Any],
+    ) -> Self:
+        """Reconstruct an untransposed quantized weight zero-copy from storage buffers."""
+        if cls is QuantizedWeight or not hasattr(cls, "tensor_data_names"):
+            raise TypeError("QuantizedWeight.from_storage must be called on a concrete subclass")
+        required_tensors, optional_tensors = cls._parse_storage_tensors(tensors)
+        required_attrs, optional_attrs = cls._parse_storage_metadata(metadata)
+        weight = cls(
+            *required_tensors,
+            *required_attrs,
+            **optional_tensors,
+            **optional_attrs,
+        )
+        weight._validate_storage_for_export()
+        return weight
 
     def _validate_memory_format(self, memory_format: object) -> None:
         if memory_format not in (None, torch.preserve_format):
-            require_untransposed(
-                cast("QuantizedWeightWrapper", self),
-                "to with a different memory format",
-            )
+            require_untransposed(self, "to with a different memory format")
             if self._contiguous_memory_format_only and memory_format is not torch.contiguous_format:
                 raise NotImplementedError(
                     f"{self._format_name} only supports contiguous memory format"
@@ -299,29 +582,25 @@ class QuantizedWeightMixin:
 
     def _rebuild_with_logical_dtype(self, dtype: torch.dtype) -> Self:
         """Rebuild the concrete semantic wrapper while preserving quantized storage."""
-        names, attributes = cast(TorchAOBaseTensor, self).__tensor_flatten__()
+        names, attributes = self.__tensor_flatten__()
         tensors = {name: getattr(self, name) for name in names}
         updated = dict(attributes)
-        updated["orig_dtype" if "orig_dtype" in updated else "dtype"] = dtype
-        return cast(
-            Self,
-            cast(Any, type(self)).__tensor_unflatten__(tensors, updated, None, None),
-        )
+        updated["dtype"] = dtype
+        return type(self).__tensor_unflatten__(tensors, updated, None, None)
 
     def _stable_cache_key(self, *extra: object) -> str:
         """Build an AOTAutograd cache fingerprint from common metadata and format fields."""
-        weight = cast("QuantizedWeight", self)
         return repr(
             (
                 type(self).__qualname__,
-                tuple(weight.shape),
-                weight.stride(),
-                str(weight.device),
-                str(weight.dtype),
-                tuple(weight.qdata.shape),
-                weight.qdata.stride(),
-                tuple(weight.scale.shape),
-                weight.scale.stride(),
+                tuple(self.shape),
+                self.stride(),
+                str(self.device),
+                str(self.dtype),
+                tuple(self.qdata.shape),
+                self.qdata.stride(),
+                tuple(self.scale.shape),
+                self.scale.stride(),
                 *extra,
             )
         )
@@ -329,17 +608,17 @@ class QuantizedWeightMixin:
     def _copy_storage_tensors(self, operation: str) -> dict[str, torch.Tensor]:
         from piper_kernels.weights._fsdp import _require_fsdp_weight  # noqa: PLC0415
 
-        weight = cast("QuantizedWeight", self)
-        canonical_scale = _require_fsdp_weight(weight, operation)
-        names, _ = weight.__tensor_flatten__()
-        tensors = {name: getattr(weight, name) for name in names}
-        tensors["scale"] = canonical_scale
-        return tensors
+        _require_fsdp_weight(self, operation)
+        names, _ = self.__tensor_flatten__()
+        return {name: getattr(self, name) for name in names}
+
+    def _transpose(self) -> Self:
+        raise NotImplementedError
 
     def _update_target(self, _operation: str) -> tuple[Any, tuple[object, ...]]:
         raise NotImplementedError
 
-    def addmm_(
+    def addmm_(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         mat1: torch.Tensor,
         mat2: torch.Tensor,
@@ -352,25 +631,22 @@ class QuantizedWeightMixin:
         from piper_kernels.weights._update import run_addmm_  # noqa: PLC0415
 
         target, prefix = self._update_target("addmm_")
-        return cast(
-            Self,
-            run_addmm_(
-                cast("QuantizedWeight", self),
-                mat1,
-                mat2,
-                operation=f"{self._update_format_name} addmm_",
-                apply=lambda left, right: target.addmm_(
-                    *prefix,
-                    left,
-                    right,
-                    beta=beta,
-                    alpha=alpha,
-                    rounding_seed=rounding_seed,
-                ),
+        return run_addmm_(
+            self,
+            mat1,
+            mat2,
+            operation=f"{self._update_format_name} addmm_",
+            apply=lambda left, right: target.addmm_(
+                *prefix,
+                left,
+                right,
+                beta=beta,
+                alpha=alpha,
+                rounding_seed=rounding_seed,
             ),
         )
 
-    def add_(
+    def add_(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         other: object,
         *,
@@ -382,33 +658,27 @@ class QuantizedWeightMixin:
         from piper_kernels.weights._update import run_add_  # noqa: PLC0415
 
         target, prefix = self._update_target("add_")
-        return cast(
-            Self,
-            run_add_(
-                cast("QuantizedWeight", self),
-                other,
-                operation=f"{self._update_format_name} add_",
-                apply=lambda update: target.add_(
-                    *prefix,
-                    update,
-                    beta=beta,
-                    alpha=alpha,
-                    rounding_seed=rounding_seed,
-                ),
+        return run_add_(
+            self,
+            other,
+            operation=f"{self._update_format_name} add_",
+            apply=lambda update: target.add_(
+                *prefix,
+                update,
+                beta=beta,
+                alpha=alpha,
+                rounding_seed=rounding_seed,
             ),
         )
 
-    def to(self, *args: object, **kwargs: object) -> Self:
+    def to(self, *args: object, **kwargs: object) -> Self:  # pyright: ignore[reportIncompatibleMethodOverride]
         """Preserve explicit-copy semantics hidden by ``aten._to_copy``."""
-        return cast(
-            Self,
-            to_quantized_weight(
-                cast("QuantizedWeightWrapper", self),
-                cast(Any, super()).to,
-                args,
-                kwargs,
-                format_name=self._format_name,
-            ),
+        return to_quantized_weight(
+            self,
+            cast(Any, super()).to,
+            args,
+            kwargs,
+            format_name=self._format_name,
         )
 
     def fsdp_pre_all_gather(
@@ -418,7 +688,7 @@ class QuantizedWeightMixin:
         """Expose sharded storage tensors and metadata for PyTorch FSDP2."""
         from piper_kernels.weights._fsdp import fsdp_pre_all_gather  # noqa: PLC0415
 
-        return fsdp_pre_all_gather(cast("QuantizedWeight", self), mesh)
+        return fsdp_pre_all_gather(self, mesh)
 
     def fsdp_post_all_gather(
         self,
@@ -432,7 +702,7 @@ class QuantizedWeightMixin:
         from piper_kernels.weights._fsdp import fsdp_post_all_gather  # noqa: PLC0415
 
         return fsdp_post_all_gather(
-            cast("QuantizedWeight", self),
+            self,
             all_gather_outputs,
             metadata,
             param_dtype,
@@ -440,18 +710,36 @@ class QuantizedWeightMixin:
         )
 
 
-def register_quantized_weight_ops(cls: type[TorchAOBaseTensor]) -> None:
+QuantizedWeight.implements(torch.ops.aten.to.dtype_layout)(_decompose_dispatch)
+QuantizedWeight.implements([torch.ops.aten.detach.default, torch.ops.aten.alias.default])(
+    _alias_or_detach_dispatch
+)
+QuantizedWeight.implements_torch_function(torch._has_compatible_shallow_copy_type)(
+    _compatible_shallow_copy_dispatch
+)
+
+
+def register_quantized_weight_ops(cls: type[QuantizedWeight]) -> None:
     """Register all standard dispatch handlers for a concrete quantized weight subclass."""
     from piper_kernels.weights._fsdp import register_fsdp_ops  # noqa: PLC0415
     from piper_kernels.weights._matmul import register_matrix_ops  # noqa: PLC0415
     from piper_kernels.weights._update import register_update_ops  # noqa: PLC0415
     from piper_kernels.weights._views import register_view_ops  # noqa: PLC0415
 
-    format_name = cast(Any, cls)._format_name
-    update_format_name = cast(Any, cls)._update_format_name
-    register_inference_mode_dispatch(cls)
+    format_name = cls._format_name
+    update_format_name = cls._update_format_name
     register_view_ops(cls)
     register_fsdp_ops(cls)
     register_matrix_ops(cls)
     register_conversion_ops(cls, format_name=format_name)
     register_update_ops(cls, format_name=update_format_name)
+
+
+__all__ = [
+    "QuantizedWeight",
+    "register_conversion_ops",
+    "register_quantized_weight_ops",
+    "require_untransposed",
+    "to_quantized_weight",
+    "unsupported_operation_dispatch",
+]
