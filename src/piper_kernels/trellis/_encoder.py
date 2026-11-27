@@ -37,10 +37,11 @@ from ._gluon_forward import FP16_SCALE, run_viterbi
 from ._layout import (
     CODE_RECIPROCAL,
     STATE_BITS,
+    WRAP_GUARD_BYTES,
     TrellisLayout,
 )
 from ._reference import decode_states
-from .triton import _decode_states_lcg_numerators
+from .triton import _decode_lcg_numerator_i32
 
 _MIN_SCALE = 1e-8
 _FP8_MIN_POSITIVE = 2.0**-9
@@ -191,7 +192,7 @@ def _refit_fp8_kernel(
     mask = t < block_size
     w = tl.load(w_ptr + bid * block_size + t, mask=mask, other=0.0).to(tl.float32)
     st = tl.load(states_ptr + bid * block_size + t, mask=mask, other=0).to(tl.uint32)
-    n = _decode_states_lcg_numerators(st).to(tl.float32)
+    n = _decode_lcg_numerator_i32(st, use_dp4a=True).to(tl.float32)
     p2 = tl.load(p2_ptr + bid).to(tl.float32)
     w_scaled = w / p2
 
@@ -267,15 +268,18 @@ def _search_and_refit_blocks(
     block_size = layout.block_size
     num_blocks = w_flat.shape[0]
     widths = layout.compute_step_widths()
+    # Reversing step order aligns Viterbi's left-shift transitions with little-endian windows.
+    viterbi_widths = (widths[0], *widths[:0:-1])
     w_norm_h = ((w_flat / p2_flat[:, None]).clamp(-256.0, 256.0) * FP16_SCALE).to(torch.float16)
+    w_rev_h = w_norm_h.flip(1).contiguous()
 
     # 2. Cost-only L=12 FP8 block-scale refinement (no backpointers).
     cands = _compute_fp8_window(block_scale, _FP8_SEARCH_RADIUS)
     num_cands = cands.shape[1]
     costs_12 = run_viterbi(
         _COARSE_STATE_BITS,
-        widths,
-        w_norm_h.repeat(num_cands, 1),
+        viterbi_widths,
+        w_rev_h.repeat(num_cands, 1),
         (cands.T.reshape(-1) * CODE_RECIPROCAL).contiguous(),
         cost_only=True,
     ).view(num_cands, num_blocks)
@@ -285,17 +289,18 @@ def _search_and_refit_blocks(
     # 3. L=16 wrap overlap, constrained L=16 walk, and fused FP8 refit.
     half = block_size // 2
     span = min(_OVERLAP_WINDOW, half)
-    rolled_widths = widths[-half:] + widths[:-half]
+    rolled_widths = viterbi_widths[-half:] + viterbi_widths[:-half]
     ov_widths = rolled_widths[half - span : half + span]
-    ov_w_h = w_norm_h.roll(half, 1)[:, half - span : half + span].contiguous()
+    ov_w_h = w_rev_h.roll(half, 1)[:, half - span : half + span].contiguous()
     ov_states = run_viterbi(
         STATE_BITS, ov_widths, ov_w_h, alpha_16, cost_only=False, write_bp_from=span
     )
-    overlap = (ov_states[:, 0] >> widths[0]).contiguous()
+    overlap = (ov_states[:, 0] >> viterbi_widths[0]).contiguous()
 
-    states = run_viterbi(
-        STATE_BITS, widths, w_norm_h, alpha_16, overlap, cost_only=False, write_bp_from=0
+    v_states = run_viterbi(
+        STATE_BITS, viterbi_widths, w_rev_h, alpha_16, overlap, cost_only=False, write_bp_from=0
     )
+    states = v_states.flip(1).contiguous()
 
     refit_win = _compute_fp8_window(block_scale, _FP8_REFIT_RADIUS).contiguous()
     final_scale = torch.empty_like(block_scale)
@@ -383,7 +388,7 @@ def _encode_rows_ldlq(
 def _build_pack_tables(
     layout: TrellisLayout, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Cached ``(source_index, shift_amount)`` bit-packing gather tables on ``device``."""
+    """Cached ``(source_index, shift_amount)`` little-endian bit-packing tables on ``device``."""
     total = layout.block_bits
     sources = [0] * total
     shifts = [0] * total
@@ -392,7 +397,7 @@ def _build_pack_tables(
         for i in range(width):
             position = (offset + STATE_BITS - width + i) % total
             sources[position] = t
-            shifts[position] = width - 1 - i
+            shifts[position] = STATE_BITS - width + i
     return (
         torch.tensor(sources, device=device).view(-1, 8),
         torch.tensor(shifts, dtype=torch.int32, device=device).view(-1, 8),
@@ -400,15 +405,17 @@ def _build_pack_tables(
 
 
 def pack_states(states: torch.Tensor, layout: TrellisLayout) -> torch.Tensor:
-    """Tail-biting bitstreams ``[N, bytes]`` uint8 of walks ``[N, T]``."""
+    """Little-endian bitstreams ``[N, bytes_per_block]`` uint8 with trailing guard bytes."""
     source_index, shift_amount = _build_pack_tables(layout, states.device)
     narrow = states.to(torch.int32)
+    code_bytes = layout.code_bytes
     packed = torch.zeros(
         states.shape[0], layout.bytes_per_block, dtype=torch.int32, device=states.device
     )
     for bit in range(8):
         value = (narrow[:, source_index[:, bit]] >> shift_amount[:, bit]) & 1
-        packed |= value << (7 - bit)
+        packed[:, :code_bytes] |= value << bit
+    packed[:, code_bytes : code_bytes + WRAP_GUARD_BYTES] = packed[:, :WRAP_GUARD_BYTES]
     return packed.to(torch.uint8)
 
 

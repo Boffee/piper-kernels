@@ -334,11 +334,13 @@ class TrellisStorage:
         ``hp_tensor`` is a 2-D float16, bfloat16 or float32 ``[out, in]`` weight on an
         NVIDIA SM80+ CUDA device (99 KiB opt-in shared memory, Triton 3.9+); it is rotated
         in FP32 for ConvRot ``group_size`` and encoded there. Specify either
-        ``bits_per_weight`` (the stored rate counting each block's FP8 scale: each block
-        takes the most whole bytes within it) or an exact whole-byte ``bytes_per_block``,
+        ``bits_per_weight`` (the stored rate counting each block's 2 wrap guard bytes and
+        FP8 scale: each block takes the most whole code bytes within it) or an exact
+        whole-byte ``bytes_per_block`` (stored bytes including the 2 trailing guard bytes),
         both yielding 2 to 6 code bits per weight. The block size is the largest multiple
         of 16, up to 256, that divides ``in``. For example, 4.5 bits per weight or
-        ``bytes_per_block=143`` stores each 256-weight block in 143 bytes plus its scale.
+        ``bytes_per_block=143`` stores each 256-weight block as 141 code bytes plus 2 wrap
+        guard bytes and its scale.
 
         Optionally pass ``hessian`` (a raw 2-D unrotated second-moment matrix ``[in, in]``
         or a reusable :class:`TrellisHessian`) and ``hessian_damping`` (default ``0.01`` for

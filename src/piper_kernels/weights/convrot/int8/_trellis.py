@@ -67,10 +67,11 @@ def convert(
     """Decode one trellis-coded matrix into ``(qdata, scale)``.
 
     With ``row_widths=None``, ``bitstreams`` is uint8 ``[out, blocks, bytes]`` and
-    the rate comes from its trailing dimension. With ``row_widths`` (uint8 ``[out]``),
-    ``bitstreams`` is 1-D uint8 holding concatenated blocks-per-row streams per row
-    and ``block_scales`` is 2-D float8_e4m3fn ``[out, blocks]``. Without ``out``,
-    ``qdata`` is new storage and ``scale`` is the supplied row scale as ``[rows, 1]``,
+    the rate comes from its trailing dimension (including 2 wrap guard bytes). With
+    ``row_widths`` (uint8 ``[out]``), ``bitstreams`` is 1-D uint8 holding concatenated
+    blocks-per-row streams per row (each block storing ``row_widths[r]`` bytes including
+    2 wrap guard bytes) and ``block_scales`` is 2-D float8_e4m3fn ``[out, blocks]``.
+    Without ``out``, ``qdata`` is new storage and ``scale`` is the supplied row scale
     reused when contiguous. With ``out``, both are written in place, and
     ``block_size`` defaults to the output width over the blocks per row.
     """

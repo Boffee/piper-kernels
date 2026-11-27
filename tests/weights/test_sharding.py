@@ -67,7 +67,7 @@ def _trellis_weight(
     block_size=64,
     group_size=64,
     variable_rows=False,
-    widths=(16, 20, 24, 32, 40, 48),
+    widths=(18, 22, 26, 34, 42, 50),
     extra_tail_bytes=0,
     dtype=torch.bfloat16,
     device="cpu",
@@ -303,10 +303,10 @@ def test_cuda_quantized_linear_composition(cls, high_first, compiled, creation_d
 @pytest.mark.parametrize(
     ("variable_rows", "widths", "extra_tail_bytes"),
     [
-        (False, (24,), 0),
-        (True, (24,), 0),
-        (True, (16, 20, 24, 32, 40, 48), 0),
-        (True, (16, 23, 31, 48), 19),
+        (False, (26,), 0),
+        (True, (26,), 0),
+        (True, (18, 22, 26, 34, 42, 50), 0),
+        (True, (18, 25, 33, 50), 19),
     ],
 )
 def test_trellis_sharding_preserves_full_weight_and_linear(variable_rows, widths, extra_tail_bytes):
@@ -370,7 +370,7 @@ def test_trellis_full_extent_nested_and_lcm_alignment(variable_rows):
         block_size=224,
         group_size=64,
         variable_rows=variable_rows,
-        widths=(56, 79, 112, 140, 168) if variable_rows else (112,),
+        widths=(58, 81, 114, 142, 170) if variable_rows else (114,),
     )
     reference = full.dequantize(torch.float32)
 
@@ -413,7 +413,7 @@ def test_trellis_row_shard_byte_range_and_validation():
         block_size=64,
         group_size=64,
         variable_rows=True,
-        widths=(16, 20, 27, 36, 48),
+        widths=(18, 22, 29, 38, 50),
         extra_tail_bytes=11,
     )
     assert full.row_widths is not None
@@ -456,11 +456,11 @@ def test_trellis_row_shard_byte_range_and_validation():
     ) == ByteRange(offset, byte_len)
 
     for bad_widths, err, msg in (
-        ([16, 20], TypeError, "row_widths must be a torch.Tensor"),
-        (torch.tensor([16, 20], dtype=torch.int32), ValueError, "1-D uint8 tensor"),
-        (torch.tensor([[16, 20]], dtype=torch.uint8), ValueError, "1-D uint8 tensor"),
-        (torch.tensor([15, 20], dtype=torch.uint8), ValueError, "variable-row widths"),
-        (torch.tensor([16, 49], dtype=torch.uint8), ValueError, "variable-row widths"),
+        ([18, 22], TypeError, "row_widths must be a torch.Tensor"),
+        (torch.tensor([18, 22], dtype=torch.int32), ValueError, "1-D uint8 tensor"),
+        (torch.tensor([[18, 22]], dtype=torch.uint8), ValueError, "1-D uint8 tensor"),
+        (torch.tensor([17, 22], dtype=torch.uint8), ValueError, "variable-row widths"),
+        (torch.tensor([18, 51], dtype=torch.uint8), ValueError, "variable-row widths"),
         (
             torch.empty((4,), dtype=torch.uint8, device="meta"),
             NotImplementedError,
@@ -503,7 +503,7 @@ def test_trellis_sharding_boundary_rejections_and_meta():
         block_size=64,
         group_size=64,
         variable_rows=True,
-        widths=(16, 24, 32, 48),
+        widths=(18, 26, 34, 50),
     )
     _, metadata = full.as_storage()
 
@@ -552,7 +552,7 @@ def test_trellis_sharding_boundary_rejections_and_meta():
         block_size=64,
         group_size=64,
         variable_rows=True,
-        widths=(16, 24, 32, 48),
+        widths=(18, 26, 34, 50),
     )
     noncontig_var.bitstreams = torch.empty(noncontig_var.bitstreams.numel() * 2, dtype=torch.uint8)[
         ::2
@@ -598,7 +598,7 @@ def test_cuda_trellis_linear_composition(mode, compiled, creation_device):
             block_size=64,
             group_size=64,
             variable_rows=mode == "variable",
-            widths=(16, 24, 32, 48) if mode == "variable" else (32,),
+            widths=(18, 26, 34, 50) if mode == "variable" else (34,),
             device=creation_device,
         )
     bias = torch.randn(384, device="cuda", dtype=torch.bfloat16)
@@ -648,7 +648,7 @@ def test_cuda_variable_row_trellis_multichunk_dim1_shard():
         block_size=64,
         group_size=64,
         variable_rows=True,
-        widths=(24, 32, 40, 48),
+        widths=(26, 34, 42, 50),
         extra_tail_bytes=37,
         device="cuda",
         seed=211,

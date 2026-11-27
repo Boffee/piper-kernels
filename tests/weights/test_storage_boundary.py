@@ -134,7 +134,7 @@ def _make_trellis_uniform() -> ConvRotTrellisTensor:
 
 def _make_trellis_variable_row() -> ConvRotTrellisTensor:
     rows, blocks, block_size = 8, 4, 16
-    row_widths = torch.tensor([4, 6, 8, 10, 12, 4, 6, 8], dtype=torch.uint8)
+    row_widths = torch.tensor([6, 8, 10, 12, 14, 6, 8, 10], dtype=torch.uint8)
     total_bytes = int(row_widths.sum().item()) * blocks
     bitstreams = torch.randint(0, 256, (total_bytes,), dtype=torch.uint8)
     block_scales = torch.ones((rows, blocks), dtype=torch.float8_e4m3fn)

@@ -149,8 +149,8 @@ def _make_trellis_proj_slab(
             None,
         )
 
-    low_bytes = (2 * block_size + 7) // 8
-    high_bytes = (6 * block_size) // 8
+    low_bytes = (2 * block_size + 7) // 8 + 2
+    high_bytes = (6 * block_size) // 8 + 2
     # Vary widths across both rows and slots (especially making 1-D slot totals asymmetric).
     row_widths = torch.randint(
         low_bytes,
@@ -5024,6 +5024,33 @@ def test_offline_trellis_compile_validation_errors() -> None:
             variable_rows=True,
             bytes_per_block=143,
         )
+
+
+def test_offline_trellis_non_multiple_of_16_block_size_compiles() -> None:
+    sm120 = GPUTarget("cuda", 120, 32)
+    decode_compiled = _compile_nvidia_and_assert_clean(
+        sm120,
+        weight_format="convrot_trellis",
+        rows=1,
+        top_k=2,
+        hidden_size=3200,
+        intermediate_size=3200,
+        group_size=64,
+        block_size=200,
+    )
+    prefill_compiled = _compile_nvidia_and_assert_clean(
+        sm120,
+        check_int8_mma=True,
+        weight_format="convrot_trellis",
+        rows=256,
+        top_k=6,
+        hidden_size=3200,
+        intermediate_size=3200,
+        group_size=64,
+        block_size=200,
+    )
+    assert {"trellis_gemv_up", "trellis_gemv_down"}.issubset(decode_compiled)
+    assert {"trellis_decode", "int8_grouped_up", "int8_grouped_down"}.issubset(prefill_compiled)
 
 
 def _assert_trellis_prefill_matches_oracle(

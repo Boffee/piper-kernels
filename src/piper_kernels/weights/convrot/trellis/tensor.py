@@ -11,9 +11,8 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from piper_kernels._triton import runtime
 from piper_kernels.trellis._layout import (
-    MAX_BITS_PER_WEIGHT,
-    MIN_BITS_PER_WEIGHT,
     TrellisLayout,
+    stored_bytes_bounds,
     validate_block_size,
 )
 from piper_kernels.weights._dispatch import (
@@ -70,16 +69,11 @@ def _validate_uniform_storage(
             resolved_block_size, bytes_per_block
         )
     else:
-        validate_block_size(resolved_block_size)
-        lowest, highest = (
-            MIN_BITS_PER_WEIGHT * resolved_block_size,
-            MAX_BITS_PER_WEIGHT * resolved_block_size,
-        )
-        if 8 * bytes_per_block < lowest or 8 * bytes_per_block > highest:
+        min_stored, max_stored = stored_bytes_bounds(resolved_block_size)
+        if not min_stored <= bytes_per_block <= max_stored:
             raise ValueError(
-                f"trellis blocks of {resolved_block_size} weights take {(lowest + 7) // 8} to "
-                f"{highest // 8} whole bytes ({MIN_BITS_PER_WEIGHT} to {MAX_BITS_PER_WEIGHT} "
-                f"bits per weight), got {8 * bytes_per_block} bits"
+                f"trellis blocks of {resolved_block_size} weights take {min_stored} to "
+                f"{max_stored} stored bytes, got {bytes_per_block}"
             )
         layout = None
     if block_scales.dtype is not torch.float8_e4m3fn or tuple(block_scales.shape) != (
@@ -224,9 +218,12 @@ class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatib
     ``[out, 1]``).
 
     Caller preconditions match trellis decoding: E4M3 block scales must be non-NaN
-    (not ``0x7F`` or ``0xFF``), and variable-row ``row_widths`` must lie in
-    ``[ceil(2 * block_size / 8), floor(6 * block_size / 8)]`` and fit within
-    ``bitstreams``. Wrapping and inference never issue host readbacks or synchronizations.
+    (not ``0x7F`` or ``0xFF``), and variable-row ``row_widths`` (including 2 trailing
+    wrap guard bytes) must lie in ``[ceil(2 * block_size / 8) + 2, floor(6 * block_size / 8) + 2]``
+    and fit within ``bitstreams``. Small-batch inference (``M <= 8``) and ``dequantize()``
+    use continuous block-scaled FP32 accumulation without per-weight INT8 rounding,
+    while large-batch prefill (``M >= 9``) decodes prescaled INT8 weights for W8A8 GEMM.
+    Wrapping and inference never issue host readbacks or synchronizations.
     """
 
     _format_name: ClassVar[str] = "ConvRot Trellis"
@@ -427,45 +424,49 @@ class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatib
 
         if runtime.supports_device(self.device):
             from piper_kernels.trellis.triton import (  # noqa: PLC0415
-                decode_int8_out,
-                decode_variable_rows_int8_out,
+                decode_fp32_out,
+                decode_variable_rows_fp32_out,
             )
 
-            qdata = torch.empty((rows, in_features), device=self.device, dtype=torch.int8)
+            values = torch.empty((rows, in_features), device=self.device, dtype=torch.float32)
             if self.row_widths is None:
                 assert layout is not None
-                decode_int8_out(
+                decode_fp32_out(
                     self.bitstreams.view(-1, layout.bytes_per_block),
                     self.block_scales.view(torch.uint8).view(-1),
                     layout,
-                    qdata,
+                    values,
                 )
             else:
-                decode_variable_rows_int8_out(
+                decode_variable_rows_fp32_out(
                     self.bitstreams,
                     self.block_scales.view(torch.uint8),
                     self.row_widths,
                     self.block_size,
-                    qdata,
+                    values,
                 )
         elif self.row_widths is None:
             from piper_kernels.trellis._reference import decode_reference  # noqa: PLC0415
 
             assert layout is not None
-            qdata = decode_reference(self.bitstreams, self.block_scales, layout).reshape(
-                rows, in_features
-            )
+            values = decode_reference(
+                self.bitstreams, self.block_scales, layout, round_int8=False
+            ).reshape(rows, in_features)
         else:
             from piper_kernels.trellis._reference import (  # noqa: PLC0415
                 decode_variable_rows_reference,
             )
 
-            qdata = decode_variable_rows_reference(
-                self.bitstreams, self.block_scales, self.row_widths, self.block_size
+            values = decode_variable_rows_reference(
+                self.bitstreams,
+                self.block_scales,
+                self.row_widths,
+                self.block_size,
+                round_int8=False,
             )
 
-        with torch.amp.autocast(qdata.device.type, enabled=False):
-            result = dequantize_weight(qdata, self.scale, self.group_size, output_dtype)
+        with torch.amp.autocast(values.device.type, enabled=False):
+            result = dequantize_weight(values, self.scale, self.group_size, output_dtype)
         return result.t() if self.transposed else result
 
     def _stable_hash_for_caching(self) -> str:

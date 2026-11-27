@@ -1,8 +1,8 @@
-"""Triton decode of trellis-coded blocks into INT8 values.
+"""Unified little-endian Triton decode of trellis-coded blocks into INT8 or FP32.
 
-Every weight decodes independently: its state is a 16-bit window of the stream at an
-offset the layout gives in closed form, so a tile of blocks decodes without a
-sequential walk. See the package README for the format and measured throughput.
+Every weight decodes independently: its state is a linear 16-bit little-endian
+window inside a block whose trailing ``WRAP_GUARD_BYTES`` (2) duplicate its first
+two bytes, eliminating wrap-around logic and byte swaps across all targets.
 """
 
 # Triton's JIT launcher and constexpr arguments are not fully represented by its
@@ -25,14 +25,13 @@ from ._layout import (
     CODE_RECIPROCAL,
     LCG_INCREMENT,
     LCG_MULTIPLIER,
-    STATE_BITS,
+    WRAP_GUARD_BYTES,
     TrellisLayout,
 )
 
-# Tuned on RTX 5090 (SM120): 4 blocks/program x 2 warps minimizes wrap-load and barrier overhead.
 _BLOCKS_PER_PROGRAM = 4
-_NUM_WARPS = 2
-_STATE_BITS = tl.constexpr(STATE_BITS)
+_DEFAULT_DECODE_WARPS = 2
+_WRAP_GUARD_BYTES = tl.constexpr(WRAP_GUARD_BYTES)
 _LCG_MULTIPLIER = tl.constexpr(LCG_MULTIPLIER)
 _LCG_INCREMENT = tl.constexpr(LCG_INCREMENT)
 _CODE_OFFSET = tl.constexpr(CODE_OFFSET)
@@ -52,88 +51,213 @@ def _decode_e4m3(code):
 
 
 @triton.jit
-def _decode_states_lcg_numerators(states):
+def _decode_lcg_numerator_i32(states, use_dp4a: tl.constexpr):
     """Compute signed LCG byte-sum numerators from 16-bit trellis states."""
     x = states * _LCG_MULTIPLIER + _LCG_INCREMENT
-    numerators = ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)).to(tl.int32)
-    return numerators - _CODE_OFFSET
+    if use_dp4a:
+        return tl.inline_asm_elementwise(
+            asm="dp4a.s32.u32 $0, 0x01010101, $1, -510;",
+            constraints="=r,r",
+            args=[x],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+    return ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)).to(
+        tl.int32
+    ) - _CODE_OFFSET
 
 
 @triton.jit
-def _decode_states_to_q_fp32(states, scale_codes):
-    """Decode 16-bit trellis states and raw E4M3 scale codes to quantized INT8 values in FP32."""
-    numerators = _decode_states_lcg_numerators(states)
-    multipliers = _decode_e4m3(scale_codes.to(tl.uint32)) * _CODE_RECIPROCAL
-    scaled = numerators.to(tl.float32) * multipliers[:, None]
-    return libdevice.rint(tl.clamp(scaled, -127.0, 127.0))
-
-
-@triton.jit
-def _uniform_row_start_bits(step_bits, num_wide_steps, clamped_steps, denom):
-    """Compute uniform per-step start bit offsets for one block."""
-    return step_bits * clamped_steps + (clamped_steps + 1) * num_wide_steps // denom
-
-
-@triton.jit
-def _variable_row_start_bits(width, clamped_steps, denom):
-    """Compute per-row variable-width start bit offsets and total stream bits."""
-    row_bits = width * 8
-    row_step_bits = row_bits // denom
-    row_wide_steps = row_bits - row_step_bits * denom
-    start_bits = (
-        row_step_bits[:, None] * clamped_steps[None, :]
-        + row_wide_steps[:, None] * (clamped_steps[None, :] + 1) // denom
-    )
-    return start_bits, row_bits[:, None]
-
-
-@triton.jit
-def _bit_window_params(start_bits, stream_bits):
-    """Compute closed-form byte indices and cyclic 16-bit head/tail masks."""
-    head_bits = tl.minimum(stream_bits - start_bits, _STATE_BITS)
-    tail_bits = _STATE_BITS - head_bits
-    byte = start_bits >> 3
-    bit_in_byte = start_bits & 7
-    shift = (24 - bit_in_byte - head_bits).to(tl.uint32)
-    head_mask = (tl.full(start_bits.shape, 1, tl.uint32) << head_bits.to(tl.uint32)) - 1
-    tail_shift = (16 - tail_bits).to(tl.uint32)
-    has_tail = tail_bits > 0
-    tail_bits_u32 = tail_bits.to(tl.uint32)
-    return byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift
-
-
-@triton.jit
-def _load_cyclic_states(
-    block_ptr_1d,
-    block_bytes,
-    byte,
-    shift,
-    head_mask,
-    has_tail,
-    tail_bits_u32,
-    tail_shift,
-    b0_mask,
-    b1_mask,
-    m0,
-    m1,
-    m2,
+def _load_u32_word(
+    u32_ptr,
+    byte_ptr,
+    idx,
+    full_words,
+    limit_bytes,
+    valid,
+    has_tail_bytes: tl.constexpr,
+    ptr_aligned: tl.constexpr,
+    evict_first: tl.constexpr = False,
 ):
-    """Load three stream bytes + two wrap bytes and assemble 16-bit cyclic trellis states."""
-    b0 = tl.load(block_ptr_1d, mask=b0_mask, other=0).to(tl.uint32)
-    b1 = tl.load(block_ptr_1d + 1, mask=b1_mask, other=0).to(tl.uint32)
-    wrap_u16 = (b0 << 8) | b1
-    w0 = tl.load(block_bytes + byte, mask=m0, other=0).to(tl.uint32)
-    w1 = tl.load(block_bytes + byte + 1, mask=m1, other=0).to(tl.uint32)
-    w2 = tl.load(block_bytes + byte + 2, mask=m2, other=0).to(tl.uint32)
-    window = (w0 << 16) | (w1 << 8) | w2
-    head = (window >> shift) & head_mask
-    tail = tl.where(has_tail, wrap_u16[:, None] >> tail_shift, 0)
-    return (head << tail_bits_u32) | tail
+    """Load one little-endian uint32 word safely within ``limit_bytes``."""
+    if ptr_aligned:
+        if evict_first:
+            w = tl.load(
+                u32_ptr + idx,
+                mask=valid & (idx < full_words),
+                other=0,
+                eviction_policy="evict_first",
+            )
+        else:
+            w = tl.load(u32_ptr + idx, mask=valid & (idx < full_words), other=0)
+        if has_tail_bytes:
+            is_tail = valid & (idx == full_words)
+            base = idx << 2
+            b0 = tl.load(byte_ptr + base, mask=is_tail & (base < limit_bytes), other=0).to(
+                tl.uint32
+            )
+            b1 = tl.load(
+                byte_ptr + base + 1, mask=is_tail & ((base + 1) < limit_bytes), other=0
+            ).to(tl.uint32)
+            b2 = tl.load(
+                byte_ptr + base + 2, mask=is_tail & ((base + 2) < limit_bytes), other=0
+            ).to(tl.uint32)
+            w = tl.where(is_tail, b0 | (b1 << 8) | (b2 << 16), w)
+        return w
+    base = idx << 2
+    b0 = tl.load(byte_ptr + base, mask=valid & (base < limit_bytes), other=0).to(tl.uint32)
+    b1 = tl.load(byte_ptr + base + 1, mask=valid & ((base + 1) < limit_bytes), other=0).to(
+        tl.uint32
+    )
+    b2 = tl.load(byte_ptr + base + 2, mask=valid & ((base + 2) < limit_bytes), other=0).to(
+        tl.uint32
+    )
+    b3 = tl.load(byte_ptr + base + 3, mask=valid & ((base + 3) < limit_bytes), other=0).to(
+        tl.uint32
+    )
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 
 
 @triton.jit
-def _decode_variable_addresses(
-    bitstreams,
+def _extract_16_le_u64(bits64, rel_bit):
+    """Extract 16 little-endian bits when the state lies inside ``bits64 = (w1 << 32) | w0``."""
+    return (bits64 >> rel_bit.to(tl.uint64)).to(tl.uint32) & 0xFFFF
+
+
+@triton.jit
+def _extract_16_le_3word(w0, w1, w2, rel_bit):
+    """Extract 16 little-endian bits across three uint32 words ``w0, w1, w2``."""
+    lo = tl.where(rel_bit < 32, w0, w1)
+    hi = tl.where(rel_bit < 32, w1, w2)
+    sh = (rel_bit & 31).to(tl.uint64)
+    return (((hi.to(tl.uint64) << 32) | lo.to(tl.uint64)) >> sh).to(tl.uint32) & 0xFFFF
+
+
+@triton.jit
+def _le_step_bit(step, step_bits, num_wide_steps, denom, block_size, exact_pow2: tl.constexpr):
+    """Compute bit start offset for one step."""
+    c = step if exact_pow2 else tl.minimum(step, block_size - 1)
+    return step_bits * c + (c + 1) * num_wide_steps // denom
+
+
+@triton.jit
+def _le_step_bits_4(
+    first_step,
+    step_bits,
+    num_wide_steps,
+    denom,
+    block_size,
+    exact_pow2: tl.constexpr,
+):
+    """Compute bit start offsets for a 4-step group."""
+    return (
+        _le_step_bit(first_step, step_bits, num_wide_steps, denom, block_size, exact_pow2),
+        _le_step_bit(first_step + 1, step_bits, num_wide_steps, denom, block_size, exact_pow2),
+        _le_step_bit(first_step + 2, step_bits, num_wide_steps, denom, block_size, exact_pow2),
+        _le_step_bit(first_step + 3, step_bits, num_wide_steps, denom, block_size, exact_pow2),
+    )
+
+
+@triton.jit
+def _decode_words_4(
+    u32_ptr,
+    byte_ptr,
+    base_byte,
+    first_byte,
+    full_words,
+    limit_bytes,
+    valid,
+    needs_w2: tl.constexpr,
+    has_tail_bytes: tl.constexpr,
+    ptr_aligned: tl.constexpr,
+    evict_first: tl.constexpr = False,
+):
+    """Load LE uint32 words covering a 4-step group and return ``(w0, w1, w2, bit_bias)``."""
+    blk_word_base = base_byte >> 2
+    blk_align = (base_byte & 3).to(tl.int32)
+    blk_align_bits = blk_align << 3
+    first_word = (blk_align + first_byte) >> 2
+    w0_idx = blk_word_base + first_word
+    bit_bias = blk_align_bits - (first_word << 5)
+    w0 = _load_u32_word(
+        u32_ptr, byte_ptr, w0_idx, full_words, limit_bytes, valid, has_tail_bytes, ptr_aligned,
+        evict_first=evict_first,
+    )  # fmt: skip
+    w1 = _load_u32_word(
+        u32_ptr, byte_ptr, w0_idx + 1, full_words, limit_bytes, valid, has_tail_bytes, ptr_aligned,
+        evict_first=evict_first,
+    )  # fmt: skip
+    if needs_w2:
+        w2 = _load_u32_word(
+            u32_ptr, byte_ptr, w0_idx + 2, full_words, limit_bytes, valid,
+            has_tail_bytes, ptr_aligned, evict_first=evict_first,
+        )  # fmt: skip
+    else:
+        w2 = tl.zeros_like(w0)
+    return w0, w1, w2, bit_bias
+
+
+@triton.jit
+def _decode_nums_from_words(
+    w0,
+    w1,
+    w2,
+    rel0,
+    rel1,
+    rel2,
+    rel3,
+    needs_w2: tl.constexpr,
+    use_dp4a: tl.constexpr,
+):
+    """Extract 4 16-bit LE states from ``w0, w1[, w2]`` and return float32 numerators."""
+    bits64 = (w1.to(tl.uint64) << 32) | w0.to(tl.uint64)
+    # Steps 0..2 always lie within [0, 58] bits of w0|w1 (rel0 <= 31, gap <= 12, window 16).
+    st0 = _extract_16_le_u64(bits64, rel0)
+    st1 = _extract_16_le_u64(bits64, rel1)
+    st2 = _extract_16_le_u64(bits64, rel2)
+    st3 = _extract_16_le_3word(w0, w1, w2, rel3) if needs_w2 else _extract_16_le_u64(bits64, rel3)
+    return (
+        _decode_lcg_numerator_i32(st0, use_dp4a).to(tl.float32),
+        _decode_lcg_numerator_i32(st1, use_dp4a).to(tl.float32),
+        _decode_lcg_numerator_i32(st2, use_dp4a).to(tl.float32),
+        _decode_lcg_numerator_i32(st3, use_dp4a).to(tl.float32),
+    )
+
+
+@triton.jit
+def _decode_group_4_nums(
+    u32_ptr,
+    byte_ptr,
+    base_byte,
+    sbit0,
+    sbit1,
+    sbit2,
+    sbit3,
+    first_byte,
+    full_words,
+    limit_bytes,
+    valid,
+    needs_w2: tl.constexpr,
+    use_dp4a: tl.constexpr,
+    has_tail_bytes: tl.constexpr,
+    ptr_aligned: tl.constexpr,
+    evict_first: tl.constexpr = False,
+):
+    """Load LE uint32 words for a 4-step group and return 4 float32 code numerators."""
+    w0, w1, w2, bit_bias = _decode_words_4(
+        u32_ptr, byte_ptr, base_byte, first_byte, full_words, limit_bytes, valid,
+        needs_w2=needs_w2, has_tail_bytes=has_tail_bytes, ptr_aligned=ptr_aligned,
+        evict_first=evict_first,
+    )  # fmt: skip
+    return _decode_nums_from_words(
+        w0, w1, w2, bit_bias + sbit0, bit_bias + sbit1, bit_bias + sbit2, bit_bias + sbit3,
+        needs_w2=needs_w2, use_dp4a=use_dp4a,
+    )  # fmt: skip
+
+
+@triton.jit
+def _resolve_decode_addresses(
     row_widths,
     row_offsets,
     slot_offsets_ptr,
@@ -141,13 +265,13 @@ def _decode_variable_addresses(
     blocks_per_row,
     bitstreams_bytes,
     denom,
-    clamped_steps,
-    block_mask,
     rows_per_slot,
     slot_bytes,
+    block_mask,
     has_slot_offsets: tl.constexpr,
     per_slot_2d: tl.constexpr,
 ):
+    """Resolve variable-row block base offsets, byte bounds, and step widths."""
     row = blocks // blocks_per_row
     block_in_row = blocks - row * blocks_per_row
     width = tl.load(row_widths + row, mask=block_mask, other=0).to(tl.int32)
@@ -156,41 +280,93 @@ def _decode_variable_addresses(
     if per_slot_2d:
         local_slot = row // rows_per_slot
         slot_base = local_slot.to(tl.int64) * tl.full((), slot_bytes, tl.int64)
-        base = slot_base + within_slot
-        remaining_bytes = tl.maximum(tl.full((), slot_bytes, tl.int64) - within_slot, 0)
+        base_bytes = (slot_base + within_slot)[:, None]
+        limit_bytes = tl.minimum(
+            slot_base + tl.full((), slot_bytes, tl.int64), bitstreams_bytes.to(tl.int64)
+        )[:, None]
+        valid_base = block_mask & (width > _WRAP_GUARD_BYTES)
     elif has_slot_offsets:
         local_slot = row // rows_per_slot
         raw_slot_base = tl.load(slot_offsets_ptr + local_slot, mask=block_mask, other=0).to(
             tl.int64
         )
-        valid_base = raw_slot_base >= 0
-        slot_base = tl.where(valid_base, raw_slot_base, 0)
-        base = slot_base + within_slot
-        remaining_bytes = tl.where(
-            valid_base, tl.maximum(bitstreams_bytes.to(tl.int64) - base, 0), 0
-        )
+        valid_s = raw_slot_base >= 0
+        slot_base = tl.where(valid_s, raw_slot_base, 0)
+        base_bytes = (slot_base + within_slot)[:, None]
+        limit_bytes = bitstreams_bytes.to(tl.int64)
+        valid_base = block_mask & valid_s & (width > _WRAP_GUARD_BYTES)
     else:
-        base = within_slot
-        # Bound loads to bitstreams even if caller-owned row_widths are malformed.
-        remaining_bytes = tl.maximum(bitstreams_bytes.to(tl.int64) - base, 0)
-    start_bits, stream_bits = _variable_row_start_bits(width, clamped_steps, denom)
-    block_ptr_1d = bitstreams + base
-    stream_bytes = tl.minimum(width.to(tl.int64), remaining_bytes).to(tl.int32)
-    return block_ptr_1d, start_bits, stream_bits, stream_bytes
+        base_bytes = within_slot[:, None]
+        limit_bytes = bitstreams_bytes.to(tl.int64)
+        valid_base = block_mask & (width > _WRAP_GUARD_BYTES)
+    eff_code_bits = tl.maximum(width - _WRAP_GUARD_BYTES, 0) * 8
+    eff_step_bits = (eff_code_bits // denom)[:, None]
+    eff_wide_steps = eff_code_bits[:, None] - eff_step_bits * denom
+    return base_bytes, limit_bytes, valid_base, eff_step_bits, eff_wide_steps
 
 
 @triton.jit
-def _decode_int8_blocks(
+def _store_decoded_group(
+    out_ptr,
+    blocks,
+    g,
+    first_step,
+    block_mask,
+    group_valid,
+    n0,
+    n1,
+    n2,
+    n3,
+    mult,
+    block_size,
+    denom,
+    exact_pow2: tl.constexpr,
+    q_u32_aligned: tl.constexpr,
+    round_int8: tl.constexpr,
+):
+    """Scale decoded 4-step numerators and store as packed INT8 or FP32."""
+    v0, v1, v2, v3 = n0 * mult, n1 * mult, n2 * mult, n3 * mult
+    if round_int8 and q_u32_aligned:
+        q0 = libdevice.rint(tl.clamp(v0, -127.0, 127.0)).to(tl.int8)
+        q1 = libdevice.rint(tl.clamp(v1, -127.0, 127.0)).to(tl.int8)
+        q2 = libdevice.rint(tl.clamp(v2, -127.0, 127.0)).to(tl.int8)
+        q3 = libdevice.rint(tl.clamp(v3, -127.0, 127.0)).to(tl.int8)
+        packed = (
+            q0.to(tl.uint8).to(tl.uint32)
+            | (q1.to(tl.uint8).to(tl.uint32) << 8)
+            | (q2.to(tl.uint8).to(tl.uint32) << 16)
+            | (q3.to(tl.uint8).to(tl.uint32) << 24)
+        )
+        q_u32_ptr = out_ptr.to(tl.pointer_type(tl.uint32))
+        dst_u32 = blocks.to(tl.int64)[:, None] * (denom >> 2) + g[None, :]
+        tl.store(q_u32_ptr + dst_u32, packed, mask=group_valid)
+    else:
+        if round_int8:
+            o0 = libdevice.rint(tl.clamp(v0, -127.0, 127.0)).to(tl.int8)
+            o1 = libdevice.rint(tl.clamp(v1, -127.0, 127.0)).to(tl.int8)
+            o2 = libdevice.rint(tl.clamp(v2, -127.0, 127.0)).to(tl.int8)
+            o3 = libdevice.rint(tl.clamp(v3, -127.0, 127.0)).to(tl.int8)
+        else:
+            o0, o1, o2, o3 = v0, v1, v2, v3
+        dst_base = blocks.to(tl.int64)[:, None] * denom
+        m_base = block_mask[:, None]
+        for k in tl.static_range(4):  # pyright: ignore[reportGeneralTypeIssues]
+            val = o0 if k == 0 else (o1 if k == 1 else (o2 if k == 2 else o3))
+            m_k = m_base if exact_pow2 else (m_base & ((first_step + k) < block_size)[None, :])
+            tl.store(out_ptr + dst_base + (first_step + k)[None, :], val, mask=m_k)
+
+
+@triton.jit
+def _decode_blocks_le(
     bitstreams,
     block_scales,
-    qdata,
+    out_ptr,
     row_widths,
     row_offsets,
     num_blocks,
     blocks_per_row,
     bitstreams_bytes,
     block_size,
-    block_bits,
     step_bits,
     num_wide_steps,
     bytes_per_block,
@@ -205,381 +381,80 @@ def _decode_int8_blocks(
     filter_active: tl.constexpr,
     has_slot_offsets: tl.constexpr,
     per_slot_2d: tl.constexpr,
+    needs_w2: tl.constexpr,
+    use_dp4a: tl.constexpr,
+    has_tail_bytes: tl.constexpr,
+    ptr_aligned: tl.constexpr,
+    q_u32_aligned: tl.constexpr,
+    round_int8: tl.constexpr,
 ):
     blocks = tl.program_id(0) * tile_blocks + tl.arange(0, tile_blocks)
-    steps = tl.arange(0, tile_steps)
-    clamped_steps = steps if exact_pow2 else tl.minimum(steps, block_size - 1)
     block_mask = blocks < num_blocks
     if filter_active:
-        row_all = blocks // blocks_per_row
-        local_slot_all = row_all // rows_per_slot
+        local_slot_all = (blocks // blocks_per_row) // rows_per_slot
         slot_active = tl.load(active_counts_ptr + local_slot_all, mask=block_mask, other=0) > 0
         if tl.sum(slot_active.to(tl.int32)) == 0:
             return
         block_mask = block_mask & slot_active
-    mask = (
-        block_mask[:, None] if exact_pow2 else (block_mask[:, None] & (steps < block_size)[None, :])
-    )
-    denom = tile_steps if exact_pow2 else block_size
 
-    if variable_rows:
-        block_ptr_1d, start_bits, stream_bits, stream_bytes = _decode_variable_addresses(
-            bitstreams,
-            row_widths,
-            row_offsets,
-            slot_offsets_ptr,
-            blocks,
-            blocks_per_row,
-            bitstreams_bytes,
-            denom,
-            clamped_steps,
-            block_mask,
-            rows_per_slot,
-            slot_bytes,
-            has_slot_offsets=has_slot_offsets,
-            per_slot_2d=per_slot_2d,
-        )
-        stream_bytes_2d = stream_bytes[:, None]
-    else:
-        offsets = _uniform_row_start_bits(step_bits, num_wide_steps, clamped_steps, denom)
-        block_ptr_1d = bitstreams + blocks.to(tl.int64) * bytes_per_block
-        start_bits = tl.broadcast_to(offsets[None, :], (tile_blocks, tile_steps))
-        stream_bits = block_bits
-        stream_bytes = tl.full((tile_blocks,), bytes_per_block, tl.int32)
-        stream_bytes_2d = bytes_per_block
-
-    byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift = _bit_window_params(
-        start_bits, stream_bits
-    )
-    states = _load_cyclic_states(
-        block_ptr_1d,
-        block_ptr_1d[:, None],
-        byte,
-        shift,
-        head_mask,
-        has_tail,
-        tail_bits_u32,
-        tail_shift,
-        block_mask & (stream_bytes > 0),
-        block_mask & (stream_bytes > 1),
-        mask & (byte < stream_bytes_2d),
-        mask & ((byte + 1) < stream_bytes_2d),
-        mask & ((byte + 2) < stream_bytes_2d),
-    )
-
-    scale_codes = tl.load(block_scales + blocks.to(tl.int64), mask=block_mask, other=0)
-    values = _decode_states_to_q_fp32(states, scale_codes).to(tl.int8)
-    destination = blocks.to(tl.int64)[:, None] * denom + steps[None, :]
-    tl.store(qdata + destination, values, mask=mask)
-
-
-@triton.jit
-def _extract_16_from_3be_4step(be0, be1, be2, rel_bit):
-    """Extract a 16-bit big-endian trellis state across up to three BE uint32 words."""
-    hi = tl.where(rel_bit < 32, be0, tl.where(rel_bit < 64, be1, be2))
-    lo = tl.where(rel_bit < 32, be1, tl.where(rel_bit < 64, be2, 0))
-    sh = (rel_bit & 31).to(tl.uint32)
-    top32 = tl.inline_asm_elementwise(
-        asm="shf.l.clamp.b32 $0, $1, $2, $3;",
-        constraints="=r,r,r,r",
-        args=[lo, hi, sh],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    return top32 >> 16
-
-
-@triton.jit
-def _load_3be_and_head_u32(
-    u32_ptr,
-    total_full_words,
-    base_byte,
-    first_byte,
-    group_valid,
-    head_valid,
-):
-    """Load three byte-swapped uint32 words per 4-step group plus the block wrap head uint16."""
-    blk_word_base = base_byte >> 2
-    blk_align = (base_byte & 3).to(tl.int32)
-    blk_align_bits = blk_align << 3
-    first_word = (blk_align + first_byte) >> 2
-    w0_idx = blk_word_base + first_word
-    word_base_bit = first_word << 5
-
-    w0 = tl.load(u32_ptr + w0_idx, mask=group_valid & (w0_idx < total_full_words), other=0)
-    w1 = tl.load(
-        u32_ptr + w0_idx + 1,
-        mask=group_valid & ((w0_idx + 1) < total_full_words),
-        other=0,
-    )
-    w2 = tl.load(
-        u32_ptr + w0_idx + 2,
-        mask=group_valid & ((w0_idx + 2) < total_full_words),
-        other=0,
-    )
-    be0 = tl.inline_asm_elementwise(
-        asm="prmt.b32 $0, $1, 0, 0x0123;",
-        constraints="=r,r",
-        args=[w0],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    be1 = tl.inline_asm_elementwise(
-        asm="prmt.b32 $0, $1, 0, 0x0123;",
-        constraints="=r,r",
-        args=[w1],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    be2 = tl.inline_asm_elementwise(
-        asm="prmt.b32 $0, $1, 0, 0x0123;",
-        constraints="=r,r",
-        args=[w2],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    h0 = tl.load(
-        u32_ptr + blk_word_base,
-        mask=head_valid & (blk_word_base < total_full_words),
-        other=0,
-    )
-    h1 = tl.load(
-        u32_ptr + blk_word_base + 1,
-        mask=head_valid & ((blk_word_base + 1) < total_full_words),
-        other=0,
-    )
-    head_raw = tl.inline_asm_elementwise(
-        asm="shf.r.clamp.b32 $0, $1, $2, $3;",
-        constraints="=r,r,r,r",
-        args=[h0, h1, blk_align_bits.to(tl.uint32)],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    head_u16 = tl.inline_asm_elementwise(
-        asm="prmt.b32 $0, $1, 0, 0x4401;",
-        constraints="=r,r",
-        args=[head_raw],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-    return be0, be1, be2, head_u16, blk_align_bits, word_base_bit
-
-
-@triton.jit
-def _decode_step_3be_sm120(
-    be0,
-    be1,
-    be2,
-    head_u16,
-    blk_align_bits,
-    word_base_bit,
-    step_j,
-    step_bits,
-    num_wide_steps,
-    denom,
-    block_bits,
-    mult,
-    exact_pow2: tl.constexpr,
-    block_size,
-):
-    """Extract and decode one trellis step via 3-word BE shifts and SM120 dp4a."""
-    clamped = step_j if exact_pow2 else tl.minimum(step_j, block_size - 1)
-    sbit = step_bits * clamped + (clamped + 1) * num_wide_steps // denom
-    rel_bit = blk_align_bits + sbit - word_base_bit
-    st = _extract_16_from_3be_4step(be0, be1, be2, rel_bit)
-    rem = block_bits - sbit
-    wrap_mask = rem < _STATE_BITS
-    rem_u = tl.minimum(rem, _STATE_BITS).to(tl.uint32)
-    tail_bits = _STATE_BITS - rem_u
-    keep_mask = (0xFFFF << tail_bits) & 0xFFFF
-    st = tl.where(wrap_mask, (st & keep_mask) | (head_u16 >> rem_u), st)
-    x = st * _LCG_MULTIPLIER + _LCG_INCREMENT
-    # CODE_OFFSET (= 510) is folded directly into the dp4a accumulator seed.
-    num = tl.inline_asm_elementwise(
-        asm="dp4a.s32.u32 $0, 0x01010101, $1, -510;",
-        constraints="=r,r",
-        args=[x],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
-    q = libdevice.rint(tl.clamp(num.to(tl.float32) * mult, -127.0, 127.0))
-    return q if exact_pow2 else tl.where(step_j < block_size, q, 0.0)
-
-
-@triton.jit
-def _decode_int8_blocks_sm120_3word(
-    bitstreams,
-    block_scales,
-    qdata,
-    row_widths,
-    row_offsets,
-    num_blocks,
-    blocks_per_row,
-    bitstreams_bytes,
-    block_size,
-    block_bits,
-    step_bits,
-    num_wide_steps,
-    bytes_per_block,
-    tile_steps: tl.constexpr,
-    tile_blocks: tl.constexpr,
-    variable_rows: tl.constexpr,
-    exact_pow2: tl.constexpr,
-):
-    """SM120 3-word uint32 bitstream decode with packed 4x INT8 uint32 stores."""
-    blocks = tl.program_id(0) * tile_blocks + tl.arange(0, tile_blocks)
-    block_mask = blocks < num_blocks
     denom = tile_steps if exact_pow2 else block_size
     num_groups: tl.constexpr = tile_steps // 4
     g = tl.arange(0, num_groups)
     first_step = g * 4
-    clamped_first = first_step if exact_pow2 else tl.minimum(first_step, block_size - 1)
 
     if variable_rows:
-        row = blocks // blocks_per_row
-        block_in_row = blocks - row * blocks_per_row
-        width = tl.load(row_widths + row, mask=block_mask, other=0).to(tl.int32)
-        row_offset = tl.load(row_offsets + row, mask=block_mask, other=0).to(tl.int64)
-        base_bytes = row_offset * blocks_per_row + block_in_row.to(tl.int64) * width.to(tl.int64)
-        eff_block_bits = (width * 8)[:, None]
-        eff_step_bits = eff_block_bits // denom
-        eff_wide_steps = eff_block_bits - eff_step_bits * denom
-        first_bit = (
-            eff_step_bits * clamped_first[None, :]
-            + eff_wide_steps * (clamped_first[None, :] + 1) // denom
-        )
-        remaining_bytes = tl.maximum(bitstreams_bytes.to(tl.int64) - base_bytes, 0)
-        stream_bytes = tl.minimum(width.to(tl.int64), remaining_bytes).to(tl.int32)
+        base_bytes, limit_bytes, valid_base, eff_step_bits, eff_wide_steps = (
+            _resolve_decode_addresses(
+                row_widths, row_offsets, slot_offsets_ptr, blocks, blocks_per_row,
+                bitstreams_bytes, denom, rows_per_slot, slot_bytes,
+                block_mask, has_slot_offsets, per_slot_2d,
+            )
+        )  # fmt: skip
     else:
-        base_bytes = blocks.to(tl.int64) * bytes_per_block
-        eff_block_bits = block_bits
+        base_bytes = (blocks.to(tl.int64) * bytes_per_block.to(tl.int64))[:, None]
+        limit_bytes = bitstreams_bytes.to(tl.int64)
+        valid_base = block_mask
         eff_step_bits = step_bits
         eff_wide_steps = num_wide_steps
-        first_bit = (step_bits * clamped_first + (clamped_first + 1) * num_wide_steps // denom)[
-            None, :
-        ]
-        stream_bytes = tl.full((tile_blocks,), bytes_per_block, tl.int32)
-    first_byte = first_bit >> 3
 
-    u32_ptr = bitstreams.to(tl.pointer_type(tl.uint32))
-    total_full_words = bitstreams_bytes.to(tl.int64) >> 2
+    sbit0 = _le_step_bit(
+        first_step[None, :], eff_step_bits, eff_wide_steps, denom, block_size, exact_pow2
+    )
+    first_byte = sbit0 >> 3
     group_valid = (
         block_mask[:, None]
         if exact_pow2
         else (block_mask[:, None] & (first_step < block_size)[None, :])
     )
-    non_empty = block_mask & (stream_bytes > 0)
-    be0, be1, be2, head_u16, blk_align_bits, word_base_bit = _load_3be_and_head_u32(
-        u32_ptr,
-        total_full_words,
-        base_bytes[:, None],
-        first_byte,
-        group_valid & (stream_bytes > 0)[:, None],
-        non_empty[:, None],
+    decode_valid = (
+        valid_base[:, None]
+        if exact_pow2
+        else (valid_base[:, None] & (first_step < block_size)[None, :])
     )
-    head_clamp_shift = 16 - tl.minimum(tl.maximum(stream_bytes, 0) * 8, 16).to(tl.uint32)
-    head_clamp = (0xFFFF << head_clamp_shift) & 0xFFFF
-    head_u16 = head_u16 & head_clamp[:, None]
-
+    w0, w1, w2, bit_bias = _decode_words_4(
+        bitstreams.to(tl.pointer_type(tl.uint32)), bitstreams, base_bytes, first_byte,
+        limit_bytes >> 2, limit_bytes, decode_valid, needs_w2=needs_w2,
+        has_tail_bytes=has_tail_bytes, ptr_aligned=ptr_aligned,
+    )  # fmt: skip
+    sbit1 = _le_step_bit(
+        (first_step + 1)[None, :], eff_step_bits, eff_wide_steps, denom, block_size, exact_pow2
+    )
+    sbit2 = _le_step_bit(
+        (first_step + 2)[None, :], eff_step_bits, eff_wide_steps, denom, block_size, exact_pow2
+    )
+    sbit3 = _le_step_bit(
+        (first_step + 3)[None, :], eff_step_bits, eff_wide_steps, denom, block_size, exact_pow2
+    )
+    n0, n1, n2, n3 = _decode_nums_from_words(
+        w0, w1, w2, bit_bias + sbit0, bit_bias + sbit1, bit_bias + sbit2, bit_bias + sbit3,
+        needs_w2=needs_w2, use_dp4a=use_dp4a,
+    )  # fmt: skip
     sc = tl.load(block_scales + blocks.to(tl.int64), mask=block_mask, other=0)
-    mult = (sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * _CODE_RECIPROCAL)[:, None]
-
-    q0 = (
-        _decode_step_3be_sm120(
-            be0,
-            be1,
-            be2,
-            head_u16,
-            blk_align_bits,
-            word_base_bit,
-            first_step[None, :],
-            eff_step_bits,
-            eff_wide_steps,
-            denom,
-            eff_block_bits,
-            mult,
-            exact_pow2,
-            block_size,
-        )
-        .to(tl.int8)
-        .to(tl.uint8)
-        .to(tl.uint32)
-    )
-    q1 = (
-        _decode_step_3be_sm120(
-            be0,
-            be1,
-            be2,
-            head_u16,
-            blk_align_bits,
-            word_base_bit,
-            (first_step + 1)[None, :],
-            eff_step_bits,
-            eff_wide_steps,
-            denom,
-            eff_block_bits,
-            mult,
-            exact_pow2,
-            block_size,
-        )
-        .to(tl.int8)
-        .to(tl.uint8)
-        .to(tl.uint32)
-    )
-    q2 = (
-        _decode_step_3be_sm120(
-            be0,
-            be1,
-            be2,
-            head_u16,
-            blk_align_bits,
-            word_base_bit,
-            (first_step + 2)[None, :],
-            eff_step_bits,
-            eff_wide_steps,
-            denom,
-            eff_block_bits,
-            mult,
-            exact_pow2,
-            block_size,
-        )
-        .to(tl.int8)
-        .to(tl.uint8)
-        .to(tl.uint32)
-    )
-    q3 = (
-        _decode_step_3be_sm120(
-            be0,
-            be1,
-            be2,
-            head_u16,
-            blk_align_bits,
-            word_base_bit,
-            (first_step + 3)[None, :],
-            eff_step_bits,
-            eff_wide_steps,
-            denom,
-            eff_block_bits,
-            mult,
-            exact_pow2,
-            block_size,
-        )
-        .to(tl.int8)
-        .to(tl.uint8)
-        .to(tl.uint32)
-    )
-    packed = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24)
-
-    q_u32_ptr = qdata.to(tl.pointer_type(tl.uint32))
-    dst_u32_base = blocks.to(tl.int64)[:, None] * (denom >> 2)
-    tl.store(q_u32_ptr + dst_u32_base + g[None, :], packed, mask=group_valid)
+    mult = (_decode_e4m3(sc.to(tl.uint32)) * _CODE_RECIPROCAL)[:, None]
+    _store_decoded_group(
+        out_ptr, blocks, g, first_step, block_mask, group_valid, n0, n1, n2, n3, mult,
+        block_size, denom, exact_pow2, q_u32_aligned, round_int8,
+    )  # fmt: skip
 
 
 @triton.jit(
@@ -588,7 +463,6 @@ def _decode_int8_blocks_sm120_3word(
         "blocks_per_row",
         "bitstreams_bytes",
         "block_size",
-        "block_bits",
         "step_bits",
         "num_wide_steps",
         "bytes_per_block",
@@ -604,7 +478,6 @@ def decode_int8_kernel(
     blocks_per_row,
     bitstreams_bytes,
     block_size,
-    block_bits,
     step_bits,
     num_wide_steps,
     bytes_per_block,
@@ -612,55 +485,22 @@ def decode_int8_kernel(
     tile_blocks: tl.constexpr,
     variable_rows: tl.constexpr,
     exact_pow2: tl.constexpr,
-    use_sm120_3word: tl.constexpr = False,
+    needs_w2: tl.constexpr,
+    use_dp4a: tl.constexpr,
+    has_tail_bytes: tl.constexpr,
+    ptr_aligned: tl.constexpr,
+    q_u32_aligned: tl.constexpr,
+    round_int8: tl.constexpr = True,
 ):
-    if use_sm120_3word:
-        _decode_int8_blocks_sm120_3word(
-            bitstreams,
-            block_scales,
-            qdata,
-            row_widths,
-            row_offsets,
-            num_blocks,
-            blocks_per_row,
-            bitstreams_bytes,
-            block_size,
-            block_bits,
-            step_bits,
-            num_wide_steps,
-            bytes_per_block,
-            tile_steps=tile_steps,
-            tile_blocks=tile_blocks,
-            variable_rows=variable_rows,
-            exact_pow2=exact_pow2,
-        )
-    else:
-        _decode_int8_blocks(
-            bitstreams,
-            block_scales,
-            qdata,
-            row_widths,
-            row_offsets,
-            num_blocks,
-            blocks_per_row,
-            bitstreams_bytes,
-            block_size,
-            block_bits,
-            step_bits,
-            num_wide_steps,
-            bytes_per_block,
-            None,
-            None,
-            0,
-            0,
-            tile_steps=tile_steps,
-            tile_blocks=tile_blocks,
-            variable_rows=variable_rows,
-            exact_pow2=exact_pow2,
-            filter_active=False,
-            has_slot_offsets=False,
-            per_slot_2d=False,
-        )
+    """Unified LE decode of uniform or variable-row trellis blocks into INT8 or FP32."""
+    _decode_blocks_le(
+        bitstreams, block_scales, qdata, row_widths, row_offsets, num_blocks, blocks_per_row,
+        bitstreams_bytes, block_size, step_bits, num_wide_steps, bytes_per_block, None, None, 0,
+        0, tile_steps=tile_steps, tile_blocks=tile_blocks, variable_rows=variable_rows,
+        exact_pow2=exact_pow2, filter_active=False, has_slot_offsets=False, per_slot_2d=False,
+        needs_w2=needs_w2, use_dp4a=use_dp4a, has_tail_bytes=has_tail_bytes,
+        ptr_aligned=ptr_aligned, q_u32_aligned=q_u32_aligned, round_int8=round_int8,
+    )  # fmt: skip
 
 
 @triton.jit(
@@ -669,7 +509,6 @@ def decode_int8_kernel(
         "blocks_per_row",
         "bitstreams_bytes",
         "block_size",
-        "block_bits",
         "step_bits",
         "num_wide_steps",
         "bytes_per_block",
@@ -689,7 +528,6 @@ def decode_slots_int8_kernel(
     blocks_per_row,
     bitstreams_bytes,
     block_size,
-    block_bits,
     step_bits,
     num_wide_steps,
     bytes_per_block,
@@ -702,51 +540,86 @@ def decode_slots_int8_kernel(
     filter_active: tl.constexpr,
     has_slot_offsets: tl.constexpr,
     per_slot_2d: tl.constexpr,
+    needs_w2: tl.constexpr,
+    use_dp4a: tl.constexpr,
+    has_tail_bytes: tl.constexpr,
+    ptr_aligned: tl.constexpr,
+    q_u32_aligned: tl.constexpr,
 ):
-    _decode_int8_blocks(
-        bitstreams,
-        block_scales,
-        qdata,
-        row_widths,
-        row_offsets,
-        num_blocks,
-        blocks_per_row,
-        bitstreams_bytes,
-        block_size,
-        block_bits,
-        step_bits,
-        num_wide_steps,
-        bytes_per_block,
-        active_counts_ptr,
-        slot_offsets_ptr,
-        rows_per_slot,
-        slot_bytes,
-        tile_steps=tile_steps,
-        tile_blocks=tile_blocks,
-        variable_rows=variable_rows,
-        exact_pow2=exact_pow2,
-        filter_active=filter_active,
-        has_slot_offsets=has_slot_offsets,
-        per_slot_2d=per_slot_2d,
-    )
+    """Unified LE decode of MoE slot-major uniform or variable-row trellis blocks into INT8."""
+    _decode_blocks_le(
+        bitstreams, block_scales, qdata, row_widths, row_offsets, num_blocks, blocks_per_row,
+        bitstreams_bytes, block_size, step_bits, num_wide_steps, bytes_per_block,
+        active_counts_ptr, slot_offsets_ptr, rows_per_slot, slot_bytes, tile_steps=tile_steps,
+        tile_blocks=tile_blocks, variable_rows=variable_rows, exact_pow2=exact_pow2,
+        filter_active=filter_active, has_slot_offsets=has_slot_offsets, per_slot_2d=per_slot_2d,
+        needs_w2=needs_w2, use_dp4a=use_dp4a, has_tail_bytes=has_tail_bytes,
+        ptr_aligned=ptr_aligned, q_u32_aligned=q_u32_aligned, round_int8=True,
+    )  # fmt: skip
 
 
-def _use_sm120_3word_decode(
+def _decode_launch_flags(
     bitstreams: torch.Tensor,
-    qdata: torch.Tensor,
+    out: torch.Tensor,
     block_size: int,
-    tile_steps: int,
-) -> bool:
-    return (
-        AcceleratorTarget.from_device(bitstreams.device).is_cuda_capability(12)
-        and tile_steps >= 64
-        and block_size % 4 == 0
-        and bitstreams.is_contiguous()
-        and qdata.is_contiguous()
-        and bitstreams.data_ptr() % 4 == 0
-        and bitstreams.numel() % 4 == 0
-        and qdata.data_ptr() % 4 == 0
+    *,
+    per_slot_2d: bool = False,
+    round_int8: bool = True,
+) -> tuple[bool, bool, bool, int]:
+    """Return ``(use_dp4a, has_tail_bytes, q_u32_aligned, num_warps)`` for decode launches."""
+    target = AcceleratorTarget.from_device(bitstreams.device)
+    use_dp4a = target.is_nvidia_cuda
+    has_tail_bytes = per_slot_2d or (bitstreams.numel() % 4 != 0)
+    q_u32_aligned = (
+        round_int8 and block_size % 4 == 0 and out.is_contiguous() and out.data_ptr() % 4 == 0
     )
+    return use_dp4a, has_tail_bytes, q_u32_aligned, _DEFAULT_DECODE_WARPS
+
+
+def _launch_uniform_decode(
+    bitstreams: torch.Tensor,
+    block_scales: torch.Tensor,
+    layout: TrellisLayout,
+    out: torch.Tensor,
+    *,
+    round_int8: bool,
+) -> None:
+    num_blocks = bitstreams.shape[0]
+    if num_blocks == 0:
+        return
+    tile_steps = triton.next_power_of_2(layout.block_size)
+    grid = (triton.cdiv(num_blocks, _BLOCKS_PER_PROGRAM),)
+    needs_w2 = layout.block_bits > 5 * layout.block_size
+    ptr_aligned = bitstreams.is_contiguous() and bitstreams.data_ptr() % 4 == 0
+    use_dp4a, has_tail_bytes, q_u32_aligned, num_warps = _decode_launch_flags(
+        bitstreams, out, layout.block_size, round_int8=round_int8
+    )
+    with device_context(bitstreams.device):
+        decode_int8_kernel[grid](
+            bitstreams,
+            block_scales,
+            out,
+            None,
+            None,
+            num_blocks,
+            0,
+            bitstreams.numel(),
+            layout.block_size,
+            layout.step_bits,
+            layout.num_wide_steps,
+            layout.bytes_per_block,
+            tile_steps=tile_steps,
+            tile_blocks=_BLOCKS_PER_PROGRAM,
+            variable_rows=False,
+            exact_pow2=layout.block_size == tile_steps,
+            needs_w2=needs_w2,
+            use_dp4a=use_dp4a,
+            has_tail_bytes=has_tail_bytes,
+            ptr_aligned=ptr_aligned,
+            q_u32_aligned=q_u32_aligned,
+            round_int8=round_int8,
+            num_warps=num_warps,
+        )
 
 
 def decode_int8_out(
@@ -759,34 +632,17 @@ def decode_int8_out(
 
     ``qdata`` is contiguous INT8 holding ``S · block_size`` values in block order.
     """
-    num_blocks = bitstreams.shape[0]
-    if num_blocks == 0:
-        return
-    tile_steps = triton.next_power_of_2(layout.block_size)
-    grid = (triton.cdiv(num_blocks, _BLOCKS_PER_PROGRAM),)
-    use_sm120_3word = _use_sm120_3word_decode(bitstreams, qdata, layout.block_size, tile_steps)
-    with device_context(bitstreams.device):
-        decode_int8_kernel[grid](
-            bitstreams,
-            block_scales,
-            qdata,
-            None,
-            None,
-            num_blocks,
-            0,
-            bitstreams.numel(),
-            layout.block_size,
-            layout.block_bits,
-            layout.step_bits,
-            layout.num_wide_steps,
-            layout.bytes_per_block,
-            tile_steps=tile_steps,
-            tile_blocks=_BLOCKS_PER_PROGRAM,
-            variable_rows=False,
-            exact_pow2=layout.block_size == tile_steps,
-            use_sm120_3word=use_sm120_3word,
-            num_warps=_NUM_WARPS,
-        )
+    _launch_uniform_decode(bitstreams, block_scales, layout, qdata, round_int8=True)
+
+
+def decode_fp32_out(
+    bitstreams: torch.Tensor,
+    block_scales: torch.Tensor,
+    layout: TrellisLayout,
+    out: torch.Tensor,
+) -> None:
+    """Decode contiguous uint8 ``[S, bytes]`` streams into unrounded block-scaled FP32 ``out``."""
+    _launch_uniform_decode(bitstreams, block_scales, layout, out, round_int8=False)
 
 
 def compute_row_offsets(row_widths: torch.Tensor) -> torch.Tensor:
@@ -815,6 +671,57 @@ def compute_row_offsets_2d(
     return row_offsets
 
 
+def _launch_variable_rows_decode(
+    bitstreams: torch.Tensor,
+    block_scales: torch.Tensor,
+    row_widths: torch.Tensor,
+    block_size: int,
+    out: torch.Tensor,
+    *,
+    row_offsets: torch.Tensor | None = None,
+    round_int8: bool,
+) -> None:
+    rows, blocks_per_row = block_scales.shape
+    num_blocks = rows * blocks_per_row
+    if num_blocks == 0:
+        return
+    tile_steps = triton.next_power_of_2(block_size)
+    grid = (triton.cdiv(num_blocks, _BLOCKS_PER_PROGRAM),)
+    ptr_aligned = bitstreams.is_contiguous() and bitstreams.data_ptr() % 4 == 0
+    use_dp4a, has_tail_bytes, q_u32_aligned, num_warps = _decode_launch_flags(
+        bitstreams, out, block_size, round_int8=round_int8
+    )
+    with device_context(bitstreams.device):
+        resolved_row_offsets = (
+            compute_row_offsets(row_widths) if row_offsets is None else row_offsets
+        )
+        decode_int8_kernel[grid](
+            bitstreams,
+            block_scales.view(-1),
+            out,
+            row_widths,
+            resolved_row_offsets,
+            num_blocks,
+            blocks_per_row,
+            bitstreams.numel(),
+            block_size,
+            0,
+            0,
+            0,
+            tile_steps=tile_steps,
+            tile_blocks=_BLOCKS_PER_PROGRAM,
+            variable_rows=True,
+            exact_pow2=block_size == tile_steps,
+            needs_w2=True,
+            use_dp4a=use_dp4a,
+            has_tail_bytes=has_tail_bytes,
+            ptr_aligned=ptr_aligned,
+            q_u32_aligned=q_u32_aligned,
+            round_int8=round_int8,
+            num_warps=num_warps,
+        )
+
+
 def decode_variable_rows_int8_out(
     bitstreams: torch.Tensor,
     block_scales: torch.Tensor,
@@ -826,42 +733,39 @@ def decode_variable_rows_int8_out(
 ) -> None:
     """Decode variable-width row streams ``[total_bytes]`` and uint8 E4M3 scales ``[R, B]``.
 
-    ``row_widths`` is contiguous uint8 ``[R]`` holding each row's bytes per block;
-    ``qdata`` is contiguous INT8 holding ``R · B · block_size`` values in row-major
-    order.
+    ``row_widths`` is contiguous uint8 ``[R]`` holding each row's stored bytes per block;
+    ``qdata`` is contiguous INT8 holding ``R · B · block_size`` values in row-major order.
     """
-    rows, blocks_per_row = block_scales.shape
-    num_blocks = rows * blocks_per_row
-    if num_blocks == 0:
-        return
-    tile_steps = triton.next_power_of_2(block_size)
-    grid = (triton.cdiv(num_blocks, _BLOCKS_PER_PROGRAM),)
-    use_sm120_3word = _use_sm120_3word_decode(bitstreams, qdata, block_size, tile_steps)
-    with device_context(bitstreams.device):
-        resolved_row_offsets = (
-            compute_row_offsets(row_widths) if row_offsets is None else row_offsets
-        )
-        decode_int8_kernel[grid](
-            bitstreams,
-            block_scales.view(-1),
-            qdata,
-            row_widths,
-            resolved_row_offsets,
-            num_blocks,
-            blocks_per_row,
-            bitstreams.numel(),
-            block_size,
-            0,
-            0,
-            0,
-            0,
-            tile_steps=tile_steps,
-            tile_blocks=_BLOCKS_PER_PROGRAM,
-            variable_rows=True,
-            exact_pow2=block_size == tile_steps,
-            use_sm120_3word=use_sm120_3word,
-            num_warps=_NUM_WARPS,
-        )
+    _launch_variable_rows_decode(
+        bitstreams,
+        block_scales,
+        row_widths,
+        block_size,
+        qdata,
+        row_offsets=row_offsets,
+        round_int8=True,
+    )
+
+
+def decode_variable_rows_fp32_out(
+    bitstreams: torch.Tensor,
+    block_scales: torch.Tensor,
+    row_widths: torch.Tensor,
+    block_size: int,
+    out: torch.Tensor,
+    *,
+    row_offsets: torch.Tensor | None = None,
+) -> None:
+    """Decode variable-width row streams into unrounded block-scaled FP32 ``out``."""
+    _launch_variable_rows_decode(
+        bitstreams,
+        block_scales,
+        row_widths,
+        block_size,
+        out,
+        row_offsets=row_offsets,
+        round_int8=False,
+    )
 
 
 def decode_slots_int8_out(
@@ -890,19 +794,25 @@ def decode_slots_int8_out(
         assert row_widths is not None
         resolved_block_size = block_size
         bitstreams_bytes = bitstreams.numel()
-        block_bits = step_bits = num_wide_steps = bytes_per_block = 0
+        step_bits = num_wide_steps = bytes_per_block = 0
         slot_bytes = bitstreams.shape[1] if per_slot_2d else 0
+        needs_w2 = True
         row_widths_arg = row_widths.contiguous().view(-1)
     else:
         layout = TrellisLayout.from_storage(block_size, bitstreams.shape[3])
         resolved_block_size = layout.block_size
-        bitstreams_bytes = 0
-        block_bits = layout.block_bits
+        bitstreams_bytes = bitstreams.numel()
         step_bits = layout.step_bits
         num_wide_steps = layout.num_wide_steps
         bytes_per_block = layout.bytes_per_block
         slot_bytes = 0
+        needs_w2 = layout.block_bits > 5 * layout.block_size
         row_widths_arg = None
+
+    ptr_aligned = bitstreams.is_contiguous() and bitstreams.data_ptr() % 4 == 0
+    use_dp4a, has_tail_bytes, q_u32_aligned, num_warps = _decode_launch_flags(
+        bitstreams, q_out, resolved_block_size, per_slot_2d=per_slot_2d
+    )
 
     with device_context(bitstreams.device):
         row_offsets_arg = (
@@ -928,7 +838,6 @@ def decode_slots_int8_out(
             blocks_per_row,
             bitstreams_bytes,
             resolved_block_size,
-            block_bits,
             step_bits,
             num_wide_steps,
             bytes_per_block,
@@ -941,16 +850,23 @@ def decode_slots_int8_out(
             filter_active=filter_active,
             has_slot_offsets=has_slot_offsets,
             per_slot_2d=per_slot_2d,
-            num_warps=_NUM_WARPS,
+            needs_w2=needs_w2,
+            use_dp4a=use_dp4a,
+            has_tail_bytes=has_tail_bytes,
+            ptr_aligned=ptr_aligned,
+            q_u32_aligned=q_u32_aligned,
+            num_warps=num_warps,
         )
 
 
 __all__ = [
     "compute_row_offsets",
     "compute_row_offsets_2d",
+    "decode_fp32_out",
     "decode_int8_kernel",
     "decode_int8_out",
     "decode_slots_int8_kernel",
     "decode_slots_int8_out",
+    "decode_variable_rows_fp32_out",
     "decode_variable_rows_int8_out",
 ]

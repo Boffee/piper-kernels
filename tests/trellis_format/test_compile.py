@@ -14,37 +14,42 @@ from piper_kernels.trellis.triton import decode_int8_kernel
 _HIP = pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only")
 
 
-@pytest.mark.parametrize("exact_pow2", [True, False], ids=["pow2", "nonpow2"])
-@pytest.mark.parametrize("variable_rows", [False, True], ids=["uniform", "variable_rows"])
-@pytest.mark.parametrize(
-    "target",
-    [
-        *[GPUTarget("cuda", architecture, 32) for architecture in (70, 80, 120)],
-        pytest.param(GPUTarget("hip", "gfx942", 64), marks=_HIP),
-        pytest.param(GPUTarget("hip", "gfx1201", 32), marks=_HIP),
-    ],
-    ids=lambda target: f"{target.backend}-{target.arch}",
-)
-def test_decode_kernel_compiles(target: GPUTarget, variable_rows: bool, exact_pow2: bool) -> None:
+def _assert_decode_compiles_zero_spills(
+    target: GPUTarget,
+    *,
+    tile_steps: int,
+    variable_rows: bool,
+    exact_pow2: bool,
+    round_int8: bool,
+    needs_w2: bool,
+    has_tail_bytes: bool,
+    ptr_aligned: bool,
+    q_u32_aligned: bool,
+) -> None:
+    out_ptr_ty = "*i8" if round_int8 else "*fp32"
     signature = {
         "bitstreams": "*u8",
         "block_scales": "*u8",
-        "qdata": "*i8",
+        "qdata": out_ptr_ty,
         "num_blocks": "i32",
         "blocks_per_row": "i32",
         "bitstreams_bytes": "i64",
         "block_size": "i32",
-        "block_bits": "i32",
         "step_bits": "i32",
         "num_wide_steps": "i32",
         "bytes_per_block": "i32",
     }
     constexprs: dict[str, object] = {
-        "tile_steps": 256,
+        "tile_steps": tile_steps,
         "tile_blocks": 4,
         "variable_rows": variable_rows,
         "exact_pow2": exact_pow2,
-        "use_sm120_3word": False,
+        "needs_w2": needs_w2,
+        "use_dp4a": target.backend == "cuda",
+        "has_tail_bytes": has_tail_bytes,
+        "ptr_aligned": ptr_aligned,
+        "q_u32_aligned": q_u32_aligned,
+        "round_int8": round_int8,
     }
     if variable_rows:
         signature["row_widths"] = "*u8"
@@ -72,51 +77,195 @@ def test_decode_kernel_compiles(target: GPUTarget, variable_rows: bool, exact_po
         target=target,
         options={"num_warps": 2},
     )
-    assert compiled.asm["ptx"]
-    assert spills == 0
-
-
-@pytest.mark.parametrize("tile_steps", [64, 128, 256], ids=lambda v: f"tile{v}")
-@pytest.mark.parametrize("variable_rows", [False, True], ids=["uniform", "variable_rows"])
-@pytest.mark.parametrize("exact_pow2", [True, False], ids=["pow2", "nonpow2"])
-def test_decode_kernel_sm120_3word_compiles(
-    tile_steps: int, variable_rows: bool, exact_pow2: bool
-) -> None:
-    signature = {
-        "bitstreams": "*u8",
-        "block_scales": "*u8",
-        "qdata": "*i8",
-        "num_blocks": "i32",
-        "blocks_per_row": "i32",
-        "bitstreams_bytes": "i64",
-        "block_size": "i32",
-        "block_bits": "i32",
-        "step_bits": "i32",
-        "num_wide_steps": "i32",
-        "bytes_per_block": "i32",
-    }
-    constexprs: dict[str, object] = {
-        "tile_steps": tile_steps,
-        "tile_blocks": 4,
-        "variable_rows": variable_rows,
-        "exact_pow2": exact_pow2,
-        "use_sm120_3word": True,
-    }
-    if variable_rows:
-        signature["row_widths"] = "*u8"
-        signature["row_offsets"] = "*i64"
-    else:
-        constexprs["row_widths"] = None
-        constexprs["row_offsets"] = None
-    compiled, spills = compile_with_spill_stores(
-        ASTSource(decode_int8_kernel, signature, constexprs=constexprs),
-        target=GPUTarget("cuda", 120, 32),
-        options={"num_warps": 2},
-    )
     ptx = compiled.asm["ptx"]
     assert ptx
     assert "dp4a.s32.u32" in ptx
     assert spills == 0
+
+
+@pytest.mark.parametrize(
+    ("variable_rows", "exact_pow2", "round_int8", "needs_w2"),
+    [
+        pytest.param(False, True, True, False, id="uniform-pow2-int8"),
+        pytest.param(True, False, True, True, id="var-nonpow2-int8"),
+        pytest.param(True, False, False, True, id="var-nonpow2-fp32"),
+    ],
+)
+@pytest.mark.parametrize(
+    "target",
+    [
+        *[GPUTarget("cuda", architecture, 32) for architecture in (70, 75, 80, 120)],
+        pytest.param(GPUTarget("hip", "gfx942", 64), marks=_HIP),
+        pytest.param(GPUTarget("hip", "gfx1201", 32), marks=_HIP),
+    ],
+    ids=lambda target: f"{target.backend}-{target.arch}",
+)
+def test_decode_kernel_compiles(
+    target: GPUTarget,
+    variable_rows: bool,
+    exact_pow2: bool,
+    round_int8: bool,
+    needs_w2: bool,
+) -> None:
+    _assert_decode_compiles_zero_spills(
+        target,
+        tile_steps=256,
+        variable_rows=variable_rows,
+        exact_pow2=exact_pow2,
+        round_int8=round_int8,
+        needs_w2=needs_w2,
+        has_tail_bytes=True,
+        ptr_aligned=True,
+        q_u32_aligned=round_int8,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "target",
+        "tile_steps",
+        "variable_rows",
+        "exact_pow2",
+        "round_int8",
+        "needs_w2",
+        "has_tail_bytes",
+        "ptr_aligned",
+        "q_u32_aligned",
+    ),
+    [
+        pytest.param(
+            GPUTarget("cuda", 120, 32),
+            64,
+            False,
+            True,
+            True,
+            True,
+            False,
+            True,
+            True,
+            id="sm120-t64-u-pow2-i8-w2",
+        ),
+        pytest.param(
+            GPUTarget("cuda", 120, 32),
+            64,
+            True,
+            False,
+            False,
+            True,
+            True,
+            True,
+            False,
+            id="sm120-t64-var-nonpow2-fp32",
+        ),
+        pytest.param(
+            GPUTarget("cuda", 120, 32),
+            128,
+            False,
+            False,
+            True,
+            False,
+            False,
+            True,
+            True,
+            id="sm120-t128-u-nonpow2-i8",
+        ),
+        pytest.param(
+            GPUTarget("cuda", 120, 32),
+            128,
+            True,
+            True,
+            False,
+            True,
+            True,
+            True,
+            False,
+            id="sm120-t128-var-pow2-fp32",
+        ),
+        pytest.param(
+            GPUTarget("cuda", 120, 32),
+            256,
+            False,
+            True,
+            True,
+            True,
+            False,
+            True,
+            True,
+            id="sm120-t256-u-pow2-i8-w2",
+        ),
+        pytest.param(
+            GPUTarget("cuda", 120, 32),
+            256,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+            False,
+            id="sm120-t256-u-nonpow2-fp32",
+        ),
+        pytest.param(
+            GPUTarget("cuda", 120, 32),
+            256,
+            True,
+            False,
+            True,
+            True,
+            True,
+            False,
+            True,
+            id="sm120-t256-var-ptr-unaligned",
+        ),
+        pytest.param(
+            GPUTarget("cuda", 120, 32),
+            256,
+            True,
+            False,
+            True,
+            True,
+            True,
+            True,
+            False,
+            id="sm120-t256-var-q-unaligned",
+        ),
+        pytest.param(
+            GPUTarget("hip", "gfx1201", 32),
+            256,
+            True,
+            False,
+            True,
+            True,
+            True,
+            False,
+            False,
+            marks=_HIP,
+            id="gfx1201-t256-var-unaligned",
+        ),
+    ],
+)
+def test_decode_kernel_variant_paths_compile(
+    target: GPUTarget,
+    tile_steps: int,
+    variable_rows: bool,
+    exact_pow2: bool,
+    round_int8: bool,
+    needs_w2: bool,
+    has_tail_bytes: bool,
+    ptr_aligned: bool,
+    q_u32_aligned: bool,
+) -> None:
+    _assert_decode_compiles_zero_spills(
+        target,
+        tile_steps=tile_steps,
+        variable_rows=variable_rows,
+        exact_pow2=exact_pow2,
+        round_int8=round_int8,
+        needs_w2=needs_w2,
+        has_tail_bytes=has_tail_bytes,
+        ptr_aligned=ptr_aligned,
+        q_u32_aligned=q_u32_aligned,
+    )
 
 
 _NVIDIA_SM80_TARGETS = [GPUTarget("cuda", architecture, 32) for architecture in (80, 86, 89, 120)]

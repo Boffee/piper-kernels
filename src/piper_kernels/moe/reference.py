@@ -81,7 +81,7 @@ def _decode_trellis_slot(
     if row_widths is None:
         layout = TrellisLayout.from_storage(block_size, qdata.shape[3])
         slot_qdata = torch.index_select(qdata, 0, safe_slot_1d).squeeze(0)
-        return decode_reference(slot_qdata, slot_block_scales, layout).reshape(
+        return decode_reference(slot_qdata, slot_block_scales, layout, round_int8=False).reshape(
             slot_block_scales.shape[0], -1
         )
     slot_widths = torch.index_select(row_widths, 0, safe_slot_1d).squeeze(0)
@@ -92,7 +92,12 @@ def _decode_trellis_slot(
         stream = qdata
         base_offset = torch.index_select(slot_offsets, 0, safe_slot_1d).squeeze(0)
     return decode_variable_rows_reference(
-        stream, slot_block_scales, slot_widths, block_size, base_offset=base_offset
+        stream,
+        slot_block_scales,
+        slot_widths,
+        block_size,
+        base_offset=base_offset,
+        round_int8=False,
     )
 
 

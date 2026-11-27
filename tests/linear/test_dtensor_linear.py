@@ -43,7 +43,7 @@ def _weight(format_name, source, *, high_first=False, dynamic=True):
         )
         scale = (torch.rand(rows, 1, generator=generator) * 0.02 + 0.005).to(source.device)
         if format_name == "trellis_variable":
-            widths = (16, 24, 32, 48)
+            widths = (18, 26, 34, 50)
             row_widths = torch.tensor(
                 [widths[idx % len(widths)] for idx in range(rows)],
                 dtype=torch.uint8,

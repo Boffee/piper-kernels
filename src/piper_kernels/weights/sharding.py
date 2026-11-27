@@ -8,8 +8,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from piper_kernels.trellis._layout import (
-    MAX_BITS_PER_WEIGHT,
-    MIN_BITS_PER_WEIGHT,
+    stored_bytes_bounds,
     validate_block_size,
 )
 from piper_kernels.weights._dispatch import QuantizedWeight
@@ -70,8 +69,7 @@ def _validate_trellis_row_widths(
     )
     widths_cpu = source_widths.detach().to(device="cpu", dtype=torch.int64)
     if size is not None:
-        min_bytes = (MIN_BITS_PER_WEIGHT * size + 7) // 8
-        max_bytes = (MAX_BITS_PER_WEIGHT * size) // 8
+        min_bytes, max_bytes = stored_bytes_bounds(size)
         if widths_cpu.numel() > 0:
             low = int(widths_cpu.min().item())
             high = int(widths_cpu.max().item())
