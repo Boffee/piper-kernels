@@ -665,6 +665,8 @@ def test_w4a16_workloads_compile_without_vgpr_spills(
 _SM120_W4A16_REGIMES = [
     (1, 1024, 5120, torch.bfloat16, torch.float32, False, True, 0),
     (1, 1024, 5120, torch.float16, torch.float16, True, True, 0),
+    (1, 4096, 4096, torch.bfloat16, torch.float32, False, True, 0),
+    (1, 4096, 14336, torch.bfloat16, torch.float32, False, True, 0),
     (1, 8192, 5120, torch.bfloat16, torch.float32, False, True, 0),
     (4, 5120, 5120, torch.float32, torch.float32, False, True, 0),
     (4, 5120, 5120, torch.float16, torch.float16, False, True, 16),
@@ -721,6 +723,7 @@ def test_w4a16_arch_regimes_compile_without_spills(
     num_sms: int,
     regimes: list[tuple[int, int, int, torch.dtype, torch.dtype | None, bool, bool, int]],
 ) -> None:
+    is_sm120 = target.backend == "cuda" and target.arch == 120
     seen_roles: set[str] = set()
     for (
         rows,
@@ -747,6 +750,26 @@ def test_w4a16_arch_regimes_compile_without_spills(
         roles = set(compiled)
         assert roles <= {"gemv", "dequant", "reduce"}
         seen_roles |= roles
+        if is_sm120 and rows == 1:
+            if (out_features, input_features) == (4096, 4096):
+                assert "reduce" not in compiled
+            elif (out_features, input_features) in ((1024, 5120), (4096, 14336)):
+                assert "reduce" in compiled
+            ptx = compiled["gemv"].asm["ptx"]
+            assert "cvt.rn.f16x2.e2m1x2" in ptx
+            assert "cvt.rn.bf16x2.e2m1x2" not in ptx
+        if (
+            is_sm120
+            and rows == 64
+            and (out_features, input_features) == (5120, 5120)
+            and (
+                input_dtype is torch.float32 or (input_dtype is torch.float16 and group_size == 16)
+            )
+        ):
+            assert "dequant" in compiled
+            ptx = compiled["dequant"].asm["ptx"]
+            assert "cvt.rn.f16x2.e2m1x2" in ptx
+            assert "cvt.rn.bf16x2.e2m1x2" not in ptx
     assert {"gemv", "dequant", "reduce"} <= seen_roles
 
 
@@ -985,6 +1008,35 @@ def test_gpu_w4a16_splitk_is_deterministic_and_accurate(rows: int, group_size: i
 
     assert torch.equal(first, second)
     rel_l2 = ((first.float() - expected.float()).norm() / expected.float().norm()).item()
+    assert rel_l2 < _tolerance(torch.bfloat16)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+def test_gpu_w4a16_m1_square_shape_matches_reference() -> None:
+    torch.manual_seed(745)
+    weight = _make_nvfp4_weight(
+        4096,
+        4096,
+        dtype=torch.bfloat16,
+        device="cuda",
+        two_level=True,
+    )
+    x = torch.randn(1, 4096, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
+
+    actual = F.linear(x, weight, bias)
+    expected = nvfp4_reference.linear_w4a16(
+        x.cpu(),
+        weight.qdata.cpu(),
+        weight.scale.cpu(),
+        weight.per_tensor_scale.cpu() if weight.per_tensor_scale is not None else None,
+        bias.cpu(),
+    ).cuda()
+
+    assert actual.dtype is torch.bfloat16
+    assert actual.shape == (1, 4096)
+    rel_l2 = ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
     assert rel_l2 < _tolerance(torch.bfloat16)
 
 

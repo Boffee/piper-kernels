@@ -45,10 +45,11 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201`; live SM75/SM8x, AMD ROCm/RDNA4,
   multi-GPU, and Windows execution remain unexercised locally.
 - Improved NVIDIA SM120 (`sm120`) weight-only NVFP4 W4A16 execution across small-batch
-  and large-batch workloads via hardware `e2m1x2` decoding, 2D L2-swizzled fused
-  GEMV/GEMM scheduling, and wide `e2m1x2` dequantization fallback while preserving
-  zero-spill schedules across SM75/SM8x and AMD ROCm targets. Verified on RTX 5090
-  (`sm120`) and offline across `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
+  and large-batch workloads via hardware `e2m1x2` decoding (using `f16x2` decode for
+  `M=1` GEMV and FP16/FP32 dequantization), reduced `M=1` Split-K launch overhead on
+  multi-wave shallow-K projections, and 2D L2-swizzled fused GEMV/GEMM scheduling
+  while preserving zero-spill schedules across SM75/SM8x and AMD ROCm targets. Verified
+  on RTX 5090 (`sm120`) and offline across `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
   `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201`; live SM75/SM8x, RDNA4/ROCm, and
   Windows execution remain unexercised locally.
 - Tuned NVIDIA SM120 (`sm120`) execution schedules for `piper_attention_decode`:
