@@ -807,12 +807,12 @@ def _decode_sm120_e2m1x2_f32(packed_u8, high_first: tl.constexpr):
         asm=(
             "{ .reg .b8 b0; .reg .b32 p; "
             "mov.b16 {b0, _}, $2; "
-            "cvt.rn.bf16x2.e2m1x2 p, b0; "
+            "cvt.rn.f16x2.e2m1x2 p, b0; "
             "mov.b32 {$0, $1}, p; }"
         ),
         constraints="=h,=h,h",
         args=[packed_u8.to(tl.uint16)],
-        dtype=(tl.bfloat16, tl.bfloat16),
+        dtype=(tl.float16, tl.float16),
         is_pure=True,
         pack=1,
     )
@@ -1083,8 +1083,11 @@ def _load_scaled_nvfp4_pairs(
     use_sm120_e2m1x2: tl.constexpr,
 ):
     """Load, decode, and scale one NVFP4 K-tile into even/odd pairs."""
-    if use_sm120_e2m1x2 and (out_dtype != tl.float32):
-        is_fp16: tl.constexpr = tl.constexpr(out_dtype == tl.float16)
+    if use_sm120_e2m1x2:
+        # Every finite (E2M1, E4M3FN) product fits exactly in FP16 (max 2688, min 2^-10,
+        # 6 significand bits), so f16x2 decode+scale is bit-exact for both FP16 and FP32.
+        is_fp16_scale: tl.constexpr = tl.constexpr(out_dtype != tl.bfloat16)
+        scale_dtype = tl.float16 if is_fp16_scale else tl.bfloat16
         packed, scale_u8 = _load_nvfp4_raw_tile(
             weight_ptr,
             weight_scale_ptr,
@@ -1097,11 +1100,12 @@ def _load_scaled_nvfp4_pairs(
             block_k,
         )
         scales_16 = _expand_nvfp4_scales(
-            scale_u8.to(tl.float8e4nv, bitcast=True).to(out_dtype),
+            scale_u8.to(tl.float8e4nv, bitcast=True).to(scale_dtype),
             block_n,
             block_k,
         )
-        return _decode_scale_sm120_e2m1x2(packed, scales_16, high_first, is_fp16)
+        w_e, w_o = _decode_scale_sm120_e2m1x2(packed, scales_16, high_first, is_fp16_scale)
+        return w_e.to(out_dtype), w_o.to(out_dtype)
 
     w_even, w_odd, scales = _load_nvfp4_tile(
         weight_ptr,
@@ -1524,7 +1528,7 @@ def _sm120_w4a16_fp32_schedule(
     input_features: int,
 ) -> _W4A16Schedule:
     if rows > _W4A16_GEMV_MAX_ROWS:
-        return _W4A16_DEQUANT_SCHEDULE
+        return _W4A16_SM120_DEQUANT_SCHEDULE
     block_m = 4 if rows <= 4 else (8 if rows <= 8 else _W4A16_GEMV_MAX_ROWS)
     split_k = _select_w4a16_split_k(
         num_sms,
@@ -1625,6 +1629,7 @@ def _sm120_w4a16_schedule(
 ) -> _W4A16Schedule:
     if rows == 1:
         output_tiles = int(triton.cdiv(out_features, _W4A16_NARROW_BLOCK_N))
+        underfilled = output_tiles < num_sms
         split_k = (
             _select_w4a16_split_k(
                 num_sms,
@@ -1633,8 +1638,8 @@ def _sm120_w4a16_schedule(
                 block_m=1,
                 block_n=_W4A16_NARROW_BLOCK_N,
                 block_k=512,
-                cta_multiplier=6,
-                min_k_tiles=4,
+                cta_multiplier=6 if underfilled else 5,
+                min_k_tiles=4 if underfilled else 20,
                 min_tiles_per_split=2,
                 power_of_two=True,
                 cap_workspace=True,
