@@ -28,11 +28,12 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   **Trellis v2** layout with 2 trailing wrap guard bytes per block (`stored_bytes =
   code_bytes + 2`, 24-bit per-block overhead including one FP8 scale, variable-row
   bounds `[⌈2·T/8⌉ + 2, ⌊6·T/8⌋ + 2]`), using continuous block-scaled FP32 accumulation
-  (no per-weight INT8 rounding) for small-batch linear A16, MoE A16, and
+  (no per-weight INT8 rounding) for small-batch linear A16 (`M <= 4`), MoE A16, and
   `ConvRotTrellisTensor.dequantize()` while retaining prescaled INT8 decoding for
-  large-batch W8A8 prefill, `ConvRotInt8Tensor.from_trellis`, and `copy_from_trellis_`
-  (removing big-endian byte swaps and cyclic wrap logic). Verified live on RTX 5090
-  (`sm120`) and CPU with zero-spill offline compile coverage across
+  `M >= 5` W8A8 linear (with adaptive `32`/`64 MiB` decode scratch for large prefill),
+  MoE prefill, `ConvRotInt8Tensor.from_trellis`, and `copy_from_trellis_` (removing
+  big-endian byte swaps and cyclic wrap logic). Verified live on RTX 5090 (`sm120`) and
+  CPU with zero-spill offline compile coverage across
   `sm70`/`sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
   `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201`; live SM75/SM8x, AMD ROCm/RDNA4,
   multi-GPU, and Windows execution remain unexercised locally.
