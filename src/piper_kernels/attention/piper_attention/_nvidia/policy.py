@@ -1,4 +1,4 @@
-"""NVIDIA execution planning for dense Piper Attention.
+"""NVIDIA execution planning for dense, chunked prefill, and Split-KV decode Piper Attention.
 
 Scheduling and backend boundaries:
 - Full query tiles and a ragged final tile share one launch. Full tiles use
@@ -35,6 +35,13 @@ from piper_kernels.attention.scheduling import (
     LOOP_NUM_STAGES_VALUES,
     NUM_STAGES_VALUES,
     NUM_WARPS_VALUES,
+)
+
+from .._decode_schedule import (
+    CENTER_CHUNK,
+    FAST_MAX_DECODE_SPLITS,
+    DecodeSchedule,
+    default_decode_schedule,
 )
 
 ATTENTION_KERNELS = ("triton", "gluon_async_copy")
@@ -234,17 +241,43 @@ def _sm120_execution_plan(
     )
 
 
+def _sm120_decode_schedule() -> DecodeSchedule:
+    return DecodeSchedule(
+        block_n=64,
+        num_warps=4,
+        num_stages=2,
+        loop_num_stages=2,
+        frozen_qk_mode="tf32x2",
+        tail_qk_precision="tf32x3",
+        pv_precision="tf32",
+        max_splits=FAST_MAX_DECODE_SPLITS,
+        target_ctas_per_sm=3,
+        tiles_per_chunk_cap=CENTER_CHUNK // 64,
+        max_tail_splits=4,
+    )
+
+
+def select_decode_schedule(target: AcceleratorTarget, head_dim: int) -> DecodeSchedule:
+    """Return the NVIDIA Split-KV decode schedule for ``target`` and ``head_dim``."""
+    if target.is_cuda_capability(12):
+        return _sm120_decode_schedule()
+    return default_decode_schedule(head_dim)
+
+
 def select_prefill_config(
     target: AcceleratorTarget,
     *,
     head_dim: int,
     is_tail: bool,
     has_chunk_map: bool = True,
+    has_chunk_splits: bool = False,
 ) -> tuple[int, int, bool, int, int]:
     """Return ``(block_m, num_warps, split_pv_head_dim, num_stages, loop_num_stages)``."""
     if target.is_cuda_capability(12):
         if head_dim == 64:
-            return 64, 4, False, 3, 3
+            # Free one pipeline buffer register when unmapped FP32 split partials spill at loop=2.
+            loop_stages = 1 if (has_chunk_splits and not has_chunk_map) else 3
+            return 64, 4, False, 3, loop_stages
         loop_stages = 2 if (not is_tail and has_chunk_map) else 1
         return 64, 4, True, 2, loop_stages
     if not is_tail:
