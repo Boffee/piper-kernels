@@ -24,6 +24,13 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Improved AMD RDNA4 (`gfx1200`/`gfx1201`) weight-only NVFP4 W4A16 execution across
+  single-token, small-batch, and large-batch workloads via single-wave GEMV, fused WMMA
+  tiling, and wider dequantization fallback while preserving zero-spill schedules across
+  NVIDIA and non-RDNA4 AMD targets. Verified live on AMD RX 9070 XT (`gfx1201`) and
+  offline across `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
+  `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201`; live NVIDIA (`sm75`/`sm8x`/`sm120`),
+  non-RDNA4 AMD, and Windows execution remain unexercised locally.
 - **Breaking:** Upgraded ConvRot Trellis storage and kernels to the little-endian
   **Trellis v2** layout with 2 trailing wrap guard bytes per block (`stored_bytes =
   code_bytes + 2`, 24-bit per-block overhead including one FP8 scale, variable-row

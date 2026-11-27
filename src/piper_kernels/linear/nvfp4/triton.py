@@ -780,6 +780,12 @@ _W4A16_SM120_DEQUANT_SCHEDULE = _W4A16Schedule(
     num_warps=8,
     use_sm120_e2m1x2=True,
 )
+_W4A16_RDNA4_DEQUANT_SCHEDULE = _W4A16Schedule(
+    mode="dequant",
+    block_n=64,
+    block_k=256,
+    num_warps=8,
+)
 
 
 @triton.jit
@@ -954,6 +960,25 @@ def _split_global_scale(global_scale):
 
 
 @triton.jit
+def _accumulate_scaled_row_blocks(
+    x_vec,
+    w_even,
+    w_odd,
+    scales,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    """Compute scaled per-block dot partials ``[block_n, block_k // 16]`` for one row."""
+    block_packed_k: tl.constexpr = block_k // 2
+    block_scale_k: tl.constexpr = block_k // _NVFP4_BLOCK_SIZE_TL
+    x_even, x_odd = tl.split(tl.reshape(x_vec.to(tl.float32), (block_packed_k, 2)))
+    prod = w_even * x_even[None, :] + w_odd * x_odd[None, :]
+    grouped = tl.reshape(prod, (block_n, block_scale_k, _NVFP4_QDATA_BLOCK_SIZE_TL))
+    block_sum = tl.sum(grouped, axis=2)
+    return tl.where(scales == 0.0, 0.0, block_sum * scales)
+
+
+@triton.jit
 def _accumulate_scaled_row(
     x_vec,
     w_even,
@@ -962,13 +987,10 @@ def _accumulate_scaled_row(
     block_n: tl.constexpr,
     block_k: tl.constexpr,
 ):
-    block_packed_k: tl.constexpr = block_k // 2
-    block_scale_k: tl.constexpr = block_k // _NVFP4_BLOCK_SIZE_TL
-    x_even, x_odd = tl.split(tl.reshape(x_vec.to(tl.float32), (block_packed_k, 2)))
-    prod = w_even * x_even[None, :] + w_odd * x_odd[None, :]
-    grouped = tl.reshape(prod, (block_n, block_scale_k, _NVFP4_QDATA_BLOCK_SIZE_TL))
-    block_sum = tl.sum(grouped, axis=2)
-    return tl.sum(tl.where(scales == 0.0, 0.0, block_sum * scales), axis=1)
+    return tl.sum(
+        _accumulate_scaled_row_blocks(x_vec, w_even, w_odd, scales, block_n, block_k),
+        axis=1,
+    )
 
 
 @triton.jit
@@ -1215,7 +1237,7 @@ def _w4a16_accumulate_scalar_tile(
         x_vec = tl.load(input_ptr + k_elem_offs, mask=k_elem_valid, other=0.0).to(tl.float32)
         if pre_scale_in_gemv:
             x_vec = x_vec * pre_scale
-        acc += _accumulate_scaled_row(x_vec, w_even, w_odd, scales, block_n, block_k)
+        acc += _accumulate_scaled_row_blocks(x_vec, w_even, w_odd, scales, block_n, block_k)
     else:
         # Triton's typing does not declare static_range iterable.
         for row_idx in tl.static_range(block_m):  # pyright: ignore[reportGeneralTypeIssues]
@@ -1242,7 +1264,7 @@ def w4a16_gemv_splitk_kernel(
     output_ptr,
     rows,
     out_features,
-    input_features,
+    packed_k,
     scale_column_blocks,
     split_k,
     block_m: tl.constexpr,
@@ -1258,6 +1280,8 @@ def w4a16_gemv_splitk_kernel(
     group_m: tl.constexpr = 0,
 ):
     """Stream swizzled NVFP4 weights with Split-K/2D tiling and accumulate in FP32."""
+    tl.static_assert(use_dot or group_m == 0)
+    tl.static_assert(not (block_m == 1 and use_dot))
     pid_m, pid_n = _w4a16_program_coords(rows, out_features, block_m, block_n, group_m)
     pid_k = tl.program_id(1)
     n_offs = pid_n * block_n + tl.arange(0, block_n)
@@ -1266,8 +1290,9 @@ def w4a16_gemv_splitk_kernel(
     m_offs = pid_m * block_m + tl.arange(0, block_m)
     m_offs_i64 = m_offs.to(tl.int64)
 
-    packed_k = input_features // 2
-    scale_k = input_features // _NVFP4_BLOCK_SIZE_TL
+    # Pass packed_k so Triton keeps 16-byte divisibility for vectorized weight loads.
+    input_features = packed_k * 2
+    scale_k = packed_k // _NVFP4_QDATA_BLOCK_SIZE_TL
     # Keep FP16 tl.dot unscaled (cannot overflow FP32, would underflow FP16); BF16 pre-scales
     # against FP32 overflow, trading away deep subnormal |x * pre_scale| < 2^-133 products.
     pre_scale_in_gemv: tl.constexpr = tl.constexpr(
@@ -1280,8 +1305,9 @@ def w4a16_gemv_splitk_kernel(
     epilogue_scale = post_scale if pre_scale_in_gemv else global_scale
     k_tile_start, k_tile_end = splitk_tile_bounds(tl.cdiv(input_features, block_k), pid_k, split_k)
 
+    block_scale_k: tl.constexpr = block_k // _NVFP4_BLOCK_SIZE_TL
     acc = (
-        tl.zeros((block_n,), dtype=tl.float32)
+        tl.zeros((block_n, block_scale_k), dtype=tl.float32)
         if block_m == 1
         else tl.zeros((block_m, block_n), dtype=tl.float32)
     )
@@ -1335,6 +1361,9 @@ def w4a16_gemv_splitk_kernel(
                 pre_scale_in_gemv,
                 use_sm120_e2m1x2,
             )
+
+    if block_m == 1:
+        acc = tl.sum(acc, axis=1)
 
     _store_w4a16_result(
         acc,
@@ -1401,7 +1430,7 @@ def dequantize_nvfp4_swizzled_kernel(
     weight_scale_ptr,
     output_ptr,
     out_features,
-    input_features,
+    packed_k,
     scale_column_blocks,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -1415,8 +1444,9 @@ def dequantize_nvfp4_swizzled_kernel(
     n_offs_i64 = n_offs.to(tl.int64)
     n_valid = n_offs < out_features
 
-    packed_k = input_features // 2
-    scale_k = input_features // _NVFP4_BLOCK_SIZE_TL
+    # Pass packed_k so Triton keeps 16-byte divisibility for vectorized weight loads.
+    input_features = packed_k * 2
+    scale_k = packed_k // _NVFP4_QDATA_BLOCK_SIZE_TL
     k_base = pid_k * block_k
 
     w_e, w_o = _load_scaled_nvfp4_pairs(
@@ -1754,18 +1784,214 @@ def _sm8x_w4a16_schedule(
     )
 
 
+def _rdna4_w4a16_large_m_schedule(
+    num_sms: int,
+    rows: int,
+    input_dtype: torch.dtype,
+    out_features: int,
+    input_features: int,
+) -> _W4A16Schedule:
+    if rows <= 32:
+        split_k = _select_w4a16_split_k(
+            num_sms,
+            out_features,
+            input_features,
+            rows=rows,
+            block_m=32,
+            block_n=_W4A16_DOT_BLOCK_N,
+            block_k=_W4A16_DOT_BLOCK_K,
+            cta_multiplier=8,
+            max_split_k=4,
+            round_up=False,
+            power_of_two=True,
+            cap_workspace=True,
+        )
+        return _W4A16Schedule(
+            mode="gemv",
+            block_m=32,
+            block_n=_W4A16_DOT_BLOCK_N,
+            block_k=_W4A16_DOT_BLOCK_K,
+            num_warps=8,
+            use_dot=True,
+            split_k=split_k,
+        )
+    if rows <= 64:
+        split_k = _select_w4a16_split_k(
+            num_sms,
+            out_features,
+            input_features,
+            rows=rows,
+            block_m=64,
+            block_n=_W4A16_DOT_BLOCK_N,
+            block_k=_W4A16_DOT_BLOCK_K,
+            cta_multiplier=3,
+            max_split_k=2,
+            min_tiles_per_split=16,
+            round_up=False,
+            power_of_two=True,
+            cap_workspace=True,
+        )
+        return _W4A16Schedule(
+            mode="gemv",
+            block_m=64,
+            block_n=_W4A16_DOT_BLOCK_N,
+            block_k=_W4A16_DOT_BLOCK_K,
+            num_warps=8,
+            use_dot=True,
+            split_k=split_k,
+            group_m=8,
+        )
+    dequant_crossover = 512 if input_dtype is torch.bfloat16 else 1024
+    if rows > dequant_crossover:
+        return _W4A16_RDNA4_DEQUANT_SCHEDULE
+    tiles_128x128 = int(triton.cdiv(rows, 128)) * int(triton.cdiv(out_features, 128))
+    if (
+        input_dtype is torch.bfloat16
+        and rows > 128
+        and num_sms > 0
+        and tiles_128x128 >= 2 * num_sms
+    ):
+        return _W4A16Schedule(
+            mode="gemv",
+            block_m=128,
+            block_n=128,
+            block_k=64,
+            num_warps=8,
+            use_dot=True,
+            single_dot=False,
+            split_k=1,
+            group_m=8,
+        )
+    tiles_128x64 = int(triton.cdiv(rows, 128)) * int(triton.cdiv(out_features, 64))
+    if num_sms > 0 and tiles_128x64 >= 2 * num_sms:
+        return _W4A16Schedule(
+            mode="gemv",
+            block_m=128,
+            block_n=64,
+            block_k=64,
+            num_warps=8,
+            use_dot=True,
+            single_dot=True,
+            split_k=1,
+            group_m=8,
+        )
+    split_k = _select_w4a16_split_k(
+        num_sms,
+        out_features,
+        input_features,
+        rows=rows,
+        block_m=64,
+        block_n=_W4A16_DOT_BLOCK_N,
+        block_k=_W4A16_DOT_BLOCK_K,
+        cta_multiplier=2,
+        max_split_k=2,
+        round_up=False,
+        power_of_two=True,
+        cap_workspace=True,
+    )
+    return _W4A16Schedule(
+        mode="gemv",
+        block_m=64,
+        block_n=_W4A16_DOT_BLOCK_N,
+        block_k=_W4A16_DOT_BLOCK_K,
+        num_warps=8,
+        use_dot=True,
+        split_k=split_k,
+        group_m=8,
+    )
+
+
 def _rdna4_w4a16_schedule(
     num_sms: int,
     rows: int,
     input_dtype: torch.dtype,
     out_features: int,
     input_features: int,
-    *,
-    target: AcceleratorTarget | None = None,
 ) -> _W4A16Schedule:
-    return _generic_w4a16_schedule(
-        num_sms, rows, input_dtype, out_features, input_features, target=target
-    )
+    if input_dtype is torch.float32 and rows > 1:
+        if rows > _W4A16_GEMV_MAX_ROWS:
+            return _W4A16_RDNA4_DEQUANT_SCHEDULE
+        block_m = 4 if rows <= 4 else (8 if rows <= 8 else _W4A16_GEMV_MAX_ROWS)
+        split_k = _select_w4a16_split_k(
+            num_sms,
+            out_features,
+            input_features,
+            rows=rows,
+            block_m=block_m,
+            block_n=_W4A16_NARROW_BLOCK_N,
+            block_k=512,
+            cta_multiplier=16,
+            min_k_tiles=4,
+            min_tiles_per_split=2,
+            max_split_k=8,
+            power_of_two=True,
+            cap_workspace=True,
+        )
+        return _W4A16Schedule(
+            mode="gemv",
+            block_m=block_m,
+            block_n=_W4A16_NARROW_BLOCK_N,
+            block_k=512,
+            num_warps=4,
+            use_dot=False,
+            split_k=split_k,
+        )
+    if rows <= 4:
+        block_m, block_n, block_k = (
+            (1, 1, 512 if input_features < 1024 else 1024) if rows == 1 else (4, 2, 512)
+        )
+        split_k = (
+            _select_w4a16_split_k(
+                num_sms,
+                out_features,
+                input_features,
+                rows=rows,
+                block_m=block_m,
+                block_n=block_n,
+                block_k=block_k,
+                cta_multiplier=4,
+                min_k_tiles=4,
+                min_tiles_per_split=2,
+                power_of_two=True,
+                cap_workspace=True,
+            )
+            if (num_sms > 0 and int(triton.cdiv(out_features, block_n)) < 4 * num_sms)
+            else 1
+        )
+        return _W4A16Schedule(
+            mode="gemv",
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            num_warps=1,
+            use_dot=False,
+            split_k=split_k,
+        )
+    if rows <= _W4A16_GEMV_MAX_ROWS:
+        split_k = _select_w4a16_split_k(
+            num_sms,
+            out_features,
+            input_features,
+            rows=rows,
+            block_m=_W4A16_GEMV_MAX_ROWS,
+            block_n=32,
+            block_k=_W4A16_DOT_BLOCK_K,
+            cta_multiplier=4,
+            max_split_k=4,
+            round_up=False,
+            power_of_two=True,
+            cap_workspace=True,
+        )
+        return _W4A16Schedule(
+            mode="gemv",
+            block_m=_W4A16_GEMV_MAX_ROWS,
+            block_n=32,
+            block_k=_W4A16_DOT_BLOCK_K,
+            num_warps=4,
+            use_dot=True,
+            split_k=split_k,
+        )
+    return _rdna4_w4a16_large_m_schedule(num_sms, rows, input_dtype, out_features, input_features)
 
 
 def _select_w4a16_schedule(
@@ -1778,20 +2004,23 @@ def _select_w4a16_schedule(
     target: AcceleratorTarget | None = None,
 ) -> _W4A16Schedule:
     """Resolve the architecture-specific W4A16 schedule shared by runtime and offline compile."""
-    if target is not None:
-        if target.is_cuda_capability(12):
-            return _sm120_w4a16_schedule(num_sms, rows, input_dtype, out_features, input_features)
-        if target.is_cuda_capability(8):
-            return _sm8x_w4a16_schedule(
-                num_sms, rows, input_dtype, out_features, input_features, target=target
-            )
-        if target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201"):
-            return _rdna4_w4a16_schedule(
-                num_sms, rows, input_dtype, out_features, input_features, target=target
-            )
-    return _generic_w4a16_schedule(
-        num_sms, rows, input_dtype, out_features, input_features, target=target
-    )
+    if target is not None and target.is_cuda_capability(12):
+        schedule = _sm120_w4a16_schedule(num_sms, rows, input_dtype, out_features, input_features)
+    elif target is not None and target.is_cuda_capability(8):
+        schedule = _sm8x_w4a16_schedule(
+            num_sms, rows, input_dtype, out_features, input_features, target=target
+        )
+    elif target is not None and target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201"):
+        schedule = _rdna4_w4a16_schedule(num_sms, rows, input_dtype, out_features, input_features)
+    else:
+        schedule = _generic_w4a16_schedule(
+            num_sms, rows, input_dtype, out_features, input_features, target=target
+        )
+    if schedule.mode == "gemv" and schedule.group_m == 0 and rows > schedule.block_m:
+        raise ValueError(
+            f"W4A16 schedule requires group_m > 0 when rows ({rows}) > block_m ({schedule.block_m})"
+        )
+    return schedule
 
 
 def _optional_ptr_binding(
@@ -1895,7 +2124,7 @@ def compile_w4a16_kernels(
                         "weight_scale_ptr": "*u8",
                         "output_ptr": "*fp32" if sm75_bf16 else active_ty,
                         "out_features": "i32",
-                        "input_features": "i32",
+                        "packed_k": "i32",
                         "scale_column_blocks": "i32",
                     },
                     constexprs={
@@ -1942,7 +2171,7 @@ def compile_w4a16_kernels(
                     "output_ptr": "*fp32" if is_splitk else out_ty,
                     "rows": "i32",
                     "out_features": "i32",
-                    "input_features": "i32",
+                    "packed_k": "i32",
                     "scale_column_blocks": "i32",
                     "split_k": "i32",
                 },
@@ -2014,7 +2243,7 @@ def _dequantize_nvfp4_swizzled(
             weight_scale.view(torch.uint8),
             output,
             out_features,
-            input_features,
+            packed_k,
             scale_column_blocks,
             block_n=block_n,
             block_k=block_k,
@@ -2188,7 +2417,7 @@ def _linear_w4a16(
             target,
             rows,
             out_features,
-            input_features,
+            packed_k,
             scale_column_blocks,
             schedule.split_k,
             block_m=schedule.block_m,

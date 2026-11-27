@@ -657,29 +657,70 @@ def test_w4a16_workloads_compile_without_vgpr_spills(
         high_first=high_first,
         has_weight_per_tensor_scale=two_level,
     )
-    if rows > 16:
-        assert "dequant" in compiled
-    else:
-        assert "gemv" in compiled
+    roles = set(compiled)
+    assert roles <= {"gemv", "dequant", "reduce"}
+    assert {"gemv", "dequant"} & roles
 
 
-def test_w4a16_sm120_regimes_compile_without_spills() -> None:
-    target = GPUTarget("cuda", 120, 32)
-    regimes = [
-        (1, 1024, 5120, torch.bfloat16, torch.float32, False, True, 0),
-        (1, 1024, 5120, torch.float16, torch.float16, True, True, 0),
-        (1, 8192, 5120, torch.bfloat16, torch.float32, False, True, 0),
-        (4, 5120, 5120, torch.float32, torch.float32, False, True, 0),
-        (4, 5120, 5120, torch.float16, torch.float16, False, True, 16),
-        (16, 5120, 5120, torch.bfloat16, torch.bfloat16, True, True, 0),
-        (32, 1024, 5120, torch.float16, torch.float32, False, False, 0),
-        (64, 1024, 5120, torch.bfloat16, torch.float32, False, True, 0),
-        (64, 14336, 5120, torch.bfloat16, torch.float32, False, True, 0),
-        (64, 5120, 5120, torch.float32, torch.float32, False, True, 0),
-        (64, 5120, 5120, torch.float16, torch.float16, False, True, 16),
-        (1024, 5120, 5120, torch.float16, None, True, False, 0),
-        (1024, 1024, 8192, torch.bfloat16, torch.float32, False, True, 0),
-    ]
+_SM120_W4A16_REGIMES = [
+    (1, 1024, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (1, 1024, 5120, torch.float16, torch.float16, True, True, 0),
+    (1, 8192, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (4, 5120, 5120, torch.float32, torch.float32, False, True, 0),
+    (4, 5120, 5120, torch.float16, torch.float16, False, True, 16),
+    (16, 5120, 5120, torch.bfloat16, torch.bfloat16, True, True, 0),
+    (32, 1024, 5120, torch.float16, torch.float32, False, False, 0),
+    (64, 1024, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (64, 14336, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (64, 5120, 5120, torch.float32, torch.float32, False, True, 0),
+    (64, 5120, 5120, torch.float16, torch.float16, False, True, 16),
+    (128, 1024, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (256, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (1024, 5120, 5120, torch.float16, None, True, False, 0),
+    (1024, 1024, 8192, torch.bfloat16, torch.float32, False, True, 0),
+]
+
+_RDNA4_W4A16_REGIMES = [
+    (1, 4096, 512, torch.bfloat16, torch.float32, False, True, 0),
+    (1, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (1, 64, 5120, torch.bfloat16, torch.float16, True, True, 0),
+    (2, 4096, 5120, torch.float16, torch.float16, False, True, 0),
+    (4, 128, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (4, 4096, 5120, torch.float32, torch.float32, False, True, 0),
+    (4, 4096, 5120, torch.bfloat16, torch.float32, False, False, 0),
+    (16, 1024, 5120, torch.float16, torch.float32, False, True, 0),
+    (16, 4096, 5120, torch.float32, torch.float32, False, True, 0),
+    (16, 4096, 5120, torch.float16, torch.float16, False, True, 16),
+    (32, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (64, 4096, 5120, torch.float16, torch.float32, False, True, 0),
+    (128, 1024, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (128, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (256, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (256, 4096, 5120, torch.float16, None, True, True, 0),
+    (1024, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
+    (1024, 4096, 5120, torch.float16, torch.float16, False, True, 0),
+    (2048, 4096, 5120, torch.float16, torch.float16, False, True, 0),
+]
+
+
+@pytest.mark.parametrize(
+    ("target", "num_sms", "regimes"),
+    [
+        pytest.param(GPUTarget("cuda", 120, 32), 170, _SM120_W4A16_REGIMES, id="sm120"),
+        pytest.param(
+            GPUTarget("hip", "gfx1201", 32),
+            32,
+            _RDNA4_W4A16_REGIMES,
+            marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
+            id="gfx1201",
+        ),
+    ],
+)
+def test_w4a16_arch_regimes_compile_without_spills(
+    target: GPUTarget,
+    num_sms: int,
+    regimes: list[tuple[int, int, int, torch.dtype, torch.dtype | None, bool, bool, int]],
+) -> None:
     seen_roles: set[str] = set()
     for (
         rows,
@@ -701,7 +742,7 @@ def test_w4a16_sm120_regimes_compile_without_spills() -> None:
             group_size=group_size,
             high_first=high_first,
             has_weight_per_tensor_scale=two_level,
-            num_sms=170,
+            num_sms=num_sms,
         )
         roles = set(compiled)
         assert roles <= {"gemv", "dequant", "reduce"}
@@ -730,6 +771,22 @@ def test_w4a16_additional_amd_arches_compile_without_spills(target: GPUTarget) -
         has_weight_per_tensor_scale=True,
     )
     assert "gemv" in compiled
+    if target.arch == "gfx1200":
+        canary = _compile_w4a16_and_assert_clean(
+            target,
+            rows=256,
+            out_features=4096,
+            input_features=5120,
+            input_dtype=torch.bfloat16,
+            bias_dtype=torch.float32,
+            group_size=0,
+            high_first=False,
+            has_weight_per_tensor_scale=True,
+            num_sms=32,
+        )
+        roles = set(canary)
+        assert roles <= {"gemv", "dequant", "reduce"}
+        assert {"gemv", "dequant"} & roles
 
 
 @pytest.mark.parametrize("target", _ADDITIONAL_CUDA_TARGETS)
@@ -1273,3 +1330,74 @@ def test_gpu_w4a16_convrot_fp16_under_autocast_preserves_range() -> None:
     assert actual.dtype is torch.float16
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.parametrize("input_features", [16, 48, 80])
+@pytest.mark.parametrize("rows", [1, 16, 65])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_gpu_w4a16_ignores_unaligned_scale_padding(
+    input_features: int,
+    rows: int,
+    dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(910 + input_features + rows)
+    out_features = 130
+    weight = _make_nvfp4_weight(
+        out_features,
+        input_features,
+        dtype=dtype,
+        device="cuda",
+        high_first=(rows % 2 == 1),
+        seed=911 + input_features,
+    )
+    valid_r = torch.arange(out_features, device="cuda")[:, None]
+    valid_c = torch.arange(input_features // 16, device="cuda")[None, :]
+    scale_col_blocks = (input_features + 63) // 64
+    valid_offsets = (
+        (((valid_r // 128) * scale_col_blocks + (valid_c // 4)) * 32 + (valid_r % 128) % 32) * 16
+        + ((valid_r % 128) // 32) * 4
+        + (valid_c % 4)
+    )
+    flat_valid_offsets = valid_offsets.reshape(-1)
+    flat_scale = weight.scale.view(torch.uint8).reshape(-1)
+    valid_mask = torch.zeros(flat_scale.numel(), dtype=torch.bool, device="cuda")
+    valid_mask[flat_valid_offsets] = True
+    assert torch.all(flat_scale[~valid_mask] == 0)
+
+    # Fill unused swizzled scale lanes with alternating FP8 NaN (0x7F) and max finite (0x7E).
+    pad_u8 = torch.where(
+        (torch.arange(flat_scale.numel(), device="cuda") & 1) == 0,
+        0x7F,
+        0x7E,
+    ).to(torch.uint8)
+    pad_u8[flat_valid_offsets] = flat_scale[flat_valid_offsets]
+    padded_scale = pad_u8.view(weight.scale.shape).view(torch.float8_e4m3fn)
+    padded_weight = PiperNVFP4Tensor(
+        weight.qdata,
+        padded_scale,
+        weight.block_size,
+        weight.dtype,
+        weight.per_tensor_scale,
+        weight.act_per_tensor_scale,
+        weight.is_swizzled_scales,
+        weight.act_quant,
+        high_first=weight.high_first,
+    )
+
+    x = torch.randn(rows, input_features, device="cuda", dtype=dtype)
+    actual = F.linear(x, padded_weight)
+    expected = nvfp4_reference.linear_w4a16(
+        x.cpu(),
+        weight.qdata.cpu(),
+        weight.scale.cpu(),
+        None if weight.per_tensor_scale is None else weight.per_tensor_scale.cpu(),
+        None,
+        high_first=weight.high_first,
+    ).cuda()
+    assert actual.dtype is dtype
+    assert actual.shape == (rows, out_features)
+    assert torch.isfinite(actual).all()
+    rel_l2 = ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
+    assert rel_l2 < _tolerance(dtype)
