@@ -44,6 +44,7 @@ def test_decode_kernel_compiles(target: GPUTarget, variable_rows: bool, exact_po
         "tile_blocks": 4,
         "variable_rows": variable_rows,
         "exact_pow2": exact_pow2,
+        "use_sm120_3word": False,
     }
     if variable_rows:
         signature["row_widths"] = "*u8"
@@ -72,6 +73,49 @@ def test_decode_kernel_compiles(target: GPUTarget, variable_rows: bool, exact_po
         options={"num_warps": 2},
     )
     assert compiled.asm["ptx"]
+    assert spills == 0
+
+
+@pytest.mark.parametrize("tile_steps", [64, 128, 256], ids=lambda v: f"tile{v}")
+@pytest.mark.parametrize("variable_rows", [False, True], ids=["uniform", "variable_rows"])
+@pytest.mark.parametrize("exact_pow2", [True, False], ids=["pow2", "nonpow2"])
+def test_decode_kernel_sm120_3word_compiles(
+    tile_steps: int, variable_rows: bool, exact_pow2: bool
+) -> None:
+    signature = {
+        "bitstreams": "*u8",
+        "block_scales": "*u8",
+        "qdata": "*i8",
+        "num_blocks": "i32",
+        "blocks_per_row": "i32",
+        "bitstreams_bytes": "i64",
+        "block_size": "i32",
+        "block_bits": "i32",
+        "step_bits": "i32",
+        "num_wide_steps": "i32",
+        "bytes_per_block": "i32",
+    }
+    constexprs: dict[str, object] = {
+        "tile_steps": tile_steps,
+        "tile_blocks": 4,
+        "variable_rows": variable_rows,
+        "exact_pow2": exact_pow2,
+        "use_sm120_3word": True,
+    }
+    if variable_rows:
+        signature["row_widths"] = "*u8"
+        signature["row_offsets"] = "*i64"
+    else:
+        constexprs["row_widths"] = None
+        constexprs["row_offsets"] = None
+    compiled, spills = compile_with_spill_stores(
+        ASTSource(decode_int8_kernel, signature, constexprs=constexprs),
+        target=GPUTarget("cuda", 120, 32),
+        options={"num_warps": 2},
+    )
+    ptx = compiled.asm["ptx"]
+    assert ptx
+    assert "dp4a.s32.u32" in ptx
     assert spills == 0
 
 

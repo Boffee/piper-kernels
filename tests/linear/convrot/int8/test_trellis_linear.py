@@ -705,6 +705,70 @@ def test_trellis_gemv_compiles_without_spills_secondary_targets(target: GPUTarge
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "rows",
+        "out_features",
+        "input_features",
+        "block_size",
+        "bytes_per_block",
+        "variable_rows",
+        "expect_splitk",
+        "expect_sm120_3word",
+    ),
+    [
+        (1, 14336, 4096, 256, 144, False, False, True),
+        (1, 1024, 4096, 256, 144, False, False, True),
+        (2, 4096, 4096, 256, 144, False, True, True),
+        (4, 4096, 2688, 224, None, True, False, True),
+        (8, 4096, 14336, 256, 144, False, True, True),
+        (8, 64, 65536, 256, 143, False, True, True),
+        (1, 4096, 4096, 128, 72, False, True, True),
+        (4, 1024, 512, 64, 36, False, False, True),
+        (17, 64, 256, 128, None, True, False, True),
+        (1, 77, 512, 256, 143, False, False, False),
+        (1, 256, 256, 16, 9, False, False, False),
+    ],
+    ids=[
+        "m1-14336x4096-3word",
+        "m1-1024x4096-no-splitk",
+        "m2-4096x4096-3word-splitk",
+        "m4-bs224-var-3word",
+        "m8-4096x14336-3word-splitk",
+        "m8-64x65536-3word-splitk",
+        "m1-bs128-3word-splitk",
+        "m4-bs64-3word",
+        "m17-direct-a16-3word",
+        "m1-unaligned-fallback",
+        "m1-bs16-fallback",
+    ],
+)
+def test_trellis_sm120_regimes_compile_without_spills(
+    rows: int,
+    out_features: int,
+    input_features: int,
+    block_size: int,
+    bytes_per_block: int | None,
+    variable_rows: bool,
+    expect_splitk: bool,
+    expect_sm120_3word: bool,
+) -> None:
+    kernels = _compile_and_assert_zero_spills(
+        GPUTarget("cuda", 120, 32),
+        expect_splitk=expect_splitk,
+        rows=rows,
+        out_features=out_features,
+        input_features=input_features,
+        block_size=block_size,
+        input_dtype=torch.bfloat16,
+        bias_dtype=torch.bfloat16,
+        variable_rows=variable_rows,
+        bytes_per_block=bytes_per_block,
+        num_sms=170,
+    )
+    assert ("dp4a.s32.u32" in kernels["gemv"].asm["ptx"]) is expect_sm120_3word
+
+
 # ---------------------------------------------------------------------------
 # Hardware GPU tests
 # ---------------------------------------------------------------------------
@@ -772,6 +836,111 @@ def test_gpu_small_batch_a16_gemv_matches_reference(
         weight.group_size,
     )
     rtol, atol = _tolerance(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.gpu
+@_gpu
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32], ids=str)
+@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+def test_gpu_sm120_aligned_a16_gemv_matches_reference(dtype: torch.dtype, rows: int) -> None:
+    out_features, in_features = 128, 512
+    weight = _make_weight(
+        out_features,
+        in_features,
+        block_size=256,
+        group_size=256,
+        dtype=dtype,
+        device="cuda",
+        bytes_per_block=144,
+        seed=420 + rows,
+    )
+    torch.manual_seed(420 + rows)
+    x = torch.randn(rows, in_features, dtype=dtype, device="cuda") * 0.1
+    bias = torch.randn(out_features, dtype=dtype, device="cuda")
+
+    actual = F.linear(x, weight, bias)
+    expected = convrot_reference.linear_trellis_a16(
+        x.cpu(),
+        weight.bitstreams.cpu(),
+        weight.block_scales.cpu(),
+        weight.scale.cpu(),
+        None,
+        bias.cpu(),
+        weight.block_size,
+        weight.group_size,
+    )
+    rtol, atol = _tolerance(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.gpu
+@_gpu
+@pytest.mark.parametrize(
+    (
+        "out_features",
+        "in_features",
+        "block_size",
+        "group_size",
+        "bytes_per_block",
+        "variable_rows",
+        "rows",
+    ),
+    [
+        (256, 512, 256, 256, 65, False, 1),
+        (256, 512, 256, 256, 65, False, 8),
+        (256, 512, 256, 256, 192, False, 1),
+        (256, 512, 256, 256, 192, False, 8),
+        (192, 2688, 224, 16, None, True, 4),
+        (64, 65536, 256, 256, 143, False, 8),
+    ],
+    ids=[
+        "m1-2.03bpw",
+        "m8-2.03bpw",
+        "m1-6.0bpw",
+        "m8-6.0bpw",
+        "m4-bs224-var-aligned",
+        "m8-splitk-n64-k65536",
+    ],
+)
+def test_gpu_sm120_aligned_a16_rates_var_and_splitk(
+    out_features: int,
+    in_features: int,
+    block_size: int,
+    group_size: int,
+    bytes_per_block: int | None,
+    variable_rows: bool,
+    rows: int,
+) -> None:
+    row_widths = _variable_row_widths(out_features, block_size) if variable_rows else None
+    weight = _make_weight(
+        out_features,
+        in_features,
+        block_size=block_size,
+        group_size=group_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        bytes_per_block=bytes_per_block,
+        row_widths=row_widths,
+        seed=520 + rows,
+    )
+    assert weight.bitstreams.numel() % 4 == 0
+    torch.manual_seed(520 + rows)
+    x = torch.randn(rows, in_features, dtype=torch.bfloat16, device="cuda") * 0.05
+    bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
+
+    actual = F.linear(x, weight, bias)
+    expected = convrot_reference.linear_trellis_a16(
+        x.cpu(),
+        weight.bitstreams.cpu(),
+        weight.block_scales.cpu(),
+        weight.scale.cpu(),
+        None if weight.row_widths is None else weight.row_widths.cpu(),
+        bias.cpu(),
+        block_size,
+        group_size,
+    )
+    rtol, atol = _tolerance(torch.bfloat16)
     torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
 
 
