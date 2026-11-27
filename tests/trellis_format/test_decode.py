@@ -55,6 +55,7 @@ def test_triton_matches_research_encodings(vector: ResearchVector) -> None:
 
 @pytest.mark.gpu
 @_gpu
+@pytest.mark.parametrize("num_blocks", [1036, 1037], ids=["u32-aligned", "tail"])
 @pytest.mark.parametrize(
     "layout",
     [
@@ -71,10 +72,11 @@ def test_triton_matches_research_encodings(vector: ResearchVector) -> None:
     ],
     ids=str,
 )
-def test_triton_matches_reference_on_arbitrary_streams(layout: TrellisLayout) -> None:
+def test_triton_matches_reference_on_arbitrary_streams(
+    layout: TrellisLayout, num_blocks: int
+) -> None:
     from piper_kernels.trellis.triton import decode_int8_out  # noqa: PLC0415
 
-    num_blocks = 1037  # not a multiple of the blocks per program
     bitstreams, scales = _random_storage(layout, num_blocks, seed=layout.block_bits)
     values = torch.empty(num_blocks, layout.block_size, dtype=torch.int8, device="cuda")
 
@@ -106,8 +108,11 @@ def _random_variable_storage(
     [
         # 39 blocks (% 8 != 0)
         (256, [64, 79, 96, 112, 128, 144, 160, 176, 192, 143, 145, 64, 192], 3),
+        # Total bytes divisible by 4 with odd per-row widths mixing base alignments (0..3).
+        (256, [64, 79, 96, 143, 145, 192, 113, 144], 4),
         (224, [56, 70, 84, 98, 112, 126, 140, 154, 168], 3),
         (200, [50, 75, 100, 136, 150, 99], 3),
+        (200, [50, 75, 100, 136, 150, 99], 4),
         (16, [4, 5, 6, 7, 8, 9, 10, 11, 12], 3),
         (256, [144], 5),
         (256, [], 2),
@@ -185,17 +190,23 @@ def test_variable_rows_reference_handles_strided_and_rejects_bad_shapes() -> Non
 
 @pytest.mark.gpu
 @_gpu
-@pytest.mark.parametrize("num_bytes", [0, 1])
-def test_triton_variable_rows_bounds_clamp_handles_truncated_bitstreams(num_bytes: int) -> None:
+@pytest.mark.parametrize(
+    ("block_size", "width", "num_bytes"),
+    [(16, 6, 0), (16, 6, 1), (64, 24, 4)],
+    ids=["bs16-0B", "bs16-1B", "bs64-4B"],
+)
+def test_triton_variable_rows_bounds_clamp_handles_truncated_bitstreams(
+    block_size: int, width: int, num_bytes: int
+) -> None:
     from piper_kernels.trellis.triton import decode_variable_rows_int8_out  # noqa: PLC0415
 
     bitstreams = torch.arange(1, 1 + num_bytes, dtype=torch.uint8, device="cuda")
     scales = torch.full((1, 1), 0x3C, dtype=torch.uint8, device="cuda")
-    row_widths = torch.tensor([6], dtype=torch.uint8, device="cuda")
-    values = torch.empty(1, 16, dtype=torch.int8, device="cuda")
+    row_widths = torch.tensor([width], dtype=torch.uint8, device="cuda")
+    values = torch.empty(1, block_size, dtype=torch.int8, device="cuda")
 
-    decode_variable_rows_int8_out(bitstreams, scales, row_widths, 16, values)
+    decode_variable_rows_int8_out(bitstreams, scales, row_widths, block_size, values)
     expected = decode_variable_rows_reference(
-        bitstreams.cpu(), scales.view(torch.float8_e4m3fn).cpu(), row_widths.cpu(), 16
+        bitstreams.cpu(), scales.view(torch.float8_e4m3fn).cpu(), row_widths.cpu(), block_size
     )
     assert torch.equal(values.cpu(), expected)

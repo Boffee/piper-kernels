@@ -24,6 +24,16 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Improved NVIDIA SM120 (`sm120`) ConvRot Trellis INT8 decode (`decode_int8_kernel`)
+  and fused `Trellis -> A16` GEMV/Split-K (`trellis_gemv_splitk_kernel`) performance
+  across aligned (`block_size >= 64`) uniform and variable-row workloads via 3-word BE
+  `uint32` (`prmt.b32`/`shf.l.clamp.b32`) state extraction, `dp4a.s32.u32` LCG byte
+  accumulation, hardware FP8 scale bitcast, packed 4x INT8 `uint32` decode stores,
+  coalesced `x_rot` `tl.split` GEMV lanes, and calibrated SM120 Split-K schedules while
+  preserving zero-spill portable schedules across SM75/SM8x and AMD ROCm targets.
+  Verified on RTX 5090 (`sm120`) and offline across `sm75`/`sm80`/`sm86`/`sm89`/`sm120`
+  and `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201`; live SM75/SM8x, RDNA4/ROCm,
+  and Windows execution remain unexercised locally.
 - Improved NVIDIA SM120 (`sm120`) weight-only NVFP4 W4A16 execution across small-batch
   and large-batch workloads via hardware `e2m1x2` decoding, 2D L2-swizzled fused
   GEMV/GEMM scheduling, and wide `e2m1x2` dequantization fallback while preserving

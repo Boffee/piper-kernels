@@ -74,12 +74,12 @@ A block's `B` bits are stored most significant bit first.
 
 Both products are single IEEE FP32 multiplies of exactly representable values, so
 CUDA, HIP and the PyTorch reference decode identical INT8 values by construction.
-Tests confirm decoding on NVIDIA hardware and decoding, direct
-`ConvRotTrellisTensor` linear execution, and `piper_kernels.moe` `"convrot_trellis"`
-execution on AMD RX 9070 XT (`gfx1201`); NVIDIA direct linear and MoE execution
-(`sm75`, `sm80`, `sm89`, `sm120`) and AMD `gfx942`, `gfx1100`, and `gfx1151` have
-offline compile coverage only. Scales must not be NaN encodings (`0x7F`, `0xFF`);
-this is a caller precondition, not a runtime check.
+Tests confirm decoding, direct `ConvRotTrellisTensor` linear execution, and
+`piper_kernels.moe` `"convrot_trellis"` execution on NVIDIA RTX 5090 (`sm120`) and
+AMD RX 9070 XT (`gfx1201`); NVIDIA `sm75`, `sm80`, `sm86`, and `sm89` and AMD
+`gfx942`, `gfx1100`, `gfx1151`, and `gfx1200` have offline compile coverage only.
+Scales must not be NaN encodings (`0x7F`, `0xFF`); this is a caller precondition, not
+a runtime check.
 
 ## Layout limits
 
