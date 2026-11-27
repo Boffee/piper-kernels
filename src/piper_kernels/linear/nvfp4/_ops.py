@@ -116,9 +116,9 @@ def linear(
         )
         if shape.rows == 0:
             return input.new_empty((*input.shape[:-1], shape.output_features))
-        from . import triton as nvfp4_triton  # noqa: PLC0415
+        from . import _w4a16_triton  # noqa: PLC0415
 
-        return nvfp4_triton._linear_w4a16(
+        return _w4a16_triton.linear_w4a16(
             input,
             weight_qdata,
             weight_scale,
