@@ -74,6 +74,11 @@ class AcceleratorTarget:
         """Return whether this target uses AMD's HIP backend."""
         return self.backend == "hip"
 
+    @property
+    def is_rdna4(self) -> bool:
+        """Return whether this target is an AMD RDNA4 (``gfx1200``/``gfx1201``) GPU."""
+        return self.is_amd_hip and self.is_architecture("gfx1200", "gfx1201")
+
     def is_architecture(self, *architectures: str) -> bool:
         """Match one of the exact canonical architecture names."""
         return self.architecture is not None and self.architecture in (

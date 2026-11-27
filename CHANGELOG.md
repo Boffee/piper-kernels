@@ -35,15 +35,19 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   **Trellis v2** layout with 2 trailing wrap guard bytes per block (`stored_bytes =
   code_bytes + 2`, 24-bit per-block overhead including one FP8 scale, variable-row
   bounds `[⌈2·T/8⌉ + 2, ⌊6·T/8⌋ + 2]`), using continuous block-scaled FP32 accumulation
-  (no per-weight INT8 rounding) for small-batch linear A16 (`M <= 4`), MoE A16, and
+  (no per-weight INT8 rounding) for small-batch linear A16 (`M <= 4`, or `M <= 8` on AMD
+  RDNA4, plus targets without an optimized INT8 backend), MoE A16, and
   `ConvRotTrellisTensor.dequantize()` while retaining prescaled INT8 decoding for
-  `M >= 5` W8A8 linear (with adaptive `32`/`64 MiB` decode scratch for large prefill),
-  MoE prefill, `ConvRotInt8Tensor.from_trellis`, and `copy_from_trellis_` (removing
-  big-endian byte swaps and cyclic wrap logic). Verified live on RTX 5090 (`sm120`) and
-  CPU with zero-spill offline compile coverage across
+  larger batches with an INT8 backend (`M >= 5`, or `M >= 9` on AMD RDNA4, with `32`/`64 MiB`
+  decode scratch scaling on large prefill and `gfx1201`), MoE prefill,
+  `ConvRotInt8Tensor.from_trellis`, and `copy_from_trellis_` (removing big-endian byte
+  swaps and cyclic wrap logic). Accelerated AMD RDNA4 (`gfx1200`/`gfx1201`) decode,
+  dense A16 linear, and `"convrot_trellis"` MoE execution while preserving existing
+  NVIDIA and non-RDNA4 AMD schedules. Verified live on AMD RX 9070 XT (`gfx1201`) and
+  CPU, with offline zero-spill compile coverage across
   `sm70`/`sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
-  `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201`; live SM75/SM8x, AMD ROCm/RDNA4,
-  multi-GPU, and Windows execution remain unexercised locally.
+  `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201`; live NVIDIA (on the refactored
+  branch), non-RDNA4 AMD, multi-GPU, and Windows execution remain unexercised locally.
 - Improved NVIDIA SM120 (`sm120`) weight-only NVFP4 W4A16 execution across small-batch
   and large-batch workloads via hardware `e2m1x2` decoding (using `f16x2` decode for
   `M=1` GEMV and FP16/FP32 dequantization), reduced `M=1` Split-K launch overhead on

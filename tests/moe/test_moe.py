@@ -5047,6 +5047,38 @@ def test_offline_amd_trellis_compile_matrix_and_fences(
         )
         if name.startswith("int8_grouped"):
             assert expected_int8_isa in kernel.asm["amdgcn"]
+        elif name in ("trellis_decode", "trellis_gemv_up", "trellis_gemv_down"):
+            assert ("v_sad_u8" in kernel.asm["amdgcn"]) == (arch in ("gfx1200", "gfx1201"))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="ROCm HIP compiler is Linux-only")
+@pytest.mark.parametrize("layout_spec", _TRELLIS_COMPILE_LAYOUTS)
+def test_offline_rdna4_trellis_dense_batched_compiles_zero_spills(
+    layout_spec: tuple[bool, bool, int, int, int],
+) -> None:
+    variable_rows, has_slot_offsets, block_size, hidden_size, inter_size = layout_spec
+    target = GPUTarget("hip", "gfx1201", 32)
+    compiled = moe_triton.compile_moe_kernels(
+        target,
+        weight_format="convrot_trellis",
+        logical_dtype=torch.bfloat16,
+        rows=16,
+        top_k=8,
+        num_slots=16,
+        hidden_size=hidden_size,
+        intermediate_size=inter_size,
+        group_size=64,
+        split_k=1,
+        accumulate=True,
+        block_size=block_size,
+        variable_rows=variable_rows,
+        has_slot_offsets=has_slot_offsets,
+    )
+    assert {"trellis_gemv_up", "trellis_gemv_down", "bucket"}.issubset(compiled)
+    for name, kernel in compiled.items():
+        _assert_clean_amd_compile(kernel, "gfx1201", check_vgpr_spills=True, check_lds_fences=False)
+        if name in ("trellis_gemv_up", "trellis_gemv_down"):
+            assert "v_sad_u8" in kernel.asm["amdgcn"]
 
 
 def test_offline_trellis_compile_validation_errors() -> None:
@@ -5307,6 +5339,56 @@ def test_gpu_trellis_m1_and_batched_parity(
                 weight_format="convrot_trellis",
                 dtype=torch.bfloat16,
             )
+
+        # Sparse-batched parity (covers block_m=2, block_n=2 RDNA4 schedule as well as block_m=4).
+        w_sparse = _make_trellis_moe_weights(
+            16,
+            256,
+            128,
+            group_size=64,
+            activation_fn="swiglu",
+            dtype=torch.bfloat16,
+            device="cuda",
+            layouts=("var1d", "var2d"),
+            seed=967,
+        )
+        x_sp = torch.randn((2, 256), device="cuda", dtype=torch.bfloat16)
+        ids_sp = torch.tensor([[0, 3], [5, 9]], device="cuda", dtype=torch.int64)
+        wts_sp = torch.tensor([[0.6, 0.4], [0.3, 0.7]], device="cuda", dtype=torch.bfloat16)
+        _assert_matches_reference(
+            moe_ffn(x_sp, w_sparse, ids_sp, wts_sp),
+            _reference_for_weights(x_sp, w_sparse, ids_sp, wts_sp),
+            weight_format="convrot_trellis",
+            dtype=torch.bfloat16,
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+def test_gpu_trellis_single_slot_high_tile_batched_parity() -> None:
+    torch.manual_seed(968)
+    w_hi = _make_trellis_moe_weights(
+        1,
+        32768,
+        128,
+        group_size=64,
+        activation_fn="gelu_tanh",
+        dtype=torch.bfloat16,
+        device="cuda",
+        layouts=("uniform", "uniform"),
+        seed=968,
+    )
+    x_hi = torch.randn((16, 32768), device="cuda", dtype=torch.bfloat16) * 0.05
+    ids_hi = torch.zeros((16, 1), device="cuda", dtype=torch.int64)
+    wts_hi = torch.ones((16, 1), device="cuda", dtype=torch.bfloat16)
+    out_hi, launches_hi = _record_triton_launches(lambda: moe_ffn(x_hi, w_hi, ids_hi, wts_hi))
+    assert any("trellis_moe_gemv_kernel" in name for name in launches_hi)
+    _assert_matches_reference(
+        out_hi,
+        _reference_for_weights(x_hi, w_hi, ids_hi, wts_hi),
+        weight_format="convrot_trellis",
+        dtype=torch.bfloat16,
+    )
 
 
 @pytest.mark.gpu

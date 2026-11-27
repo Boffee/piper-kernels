@@ -19,9 +19,19 @@ from typing import Literal, NamedTuple
 import torch
 
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.linear._splitk import select_split_k
 from piper_kernels.weights.convrot.int8._packing import fused_preparation_chunks
 
-from .._plan import LinearExecutionPlan
+from .._plan import (
+    TRELLIS_A16_MAX_BLOCK_M,
+    TRELLIS_DEFAULT_GEMV_MAX_ROWS,
+    TRELLIS_SPLITK_MIN_WEIGHT_BYTES,
+    LinearExecutionPlan,
+    TrellisLinearSchedule,
+    default_trellis_w8a8_scratch_budget,
+    select_default_trellis_schedule,
+    trellis_block_m,
+)
 
 _FUSED_NUM_WARPS_VALUES = (1, 2, 4, 8, 16)
 _ROTATION_NUM_WARPS_VALUES = (1, 2, 4, 8)
@@ -366,3 +376,77 @@ def select_execution_plan(
     else:
         matmul = _BASE_MATMUL
     return _execution_plan(in_features, matmul, sm8x=sm8x)
+
+
+_TRELLIS_SM120_SPLITK_MIN_WEIGHT_BYTES = 4 * 1024 * 1024
+_TRELLIS_SM120_SPLITK_MAX = 16
+_TRELLIS_SM120_FP32_WORKSPACE_BYTES = 64 * 1024 * 1024
+
+
+def trellis_gemv_max_rows(target: AcceleratorTarget) -> int:
+    """Return the small-batch continuous Trellis A16 row cutoff for NVIDIA targets."""
+    del target
+    return TRELLIS_DEFAULT_GEMV_MAX_ROWS
+
+
+def trellis_w8a8_scratch_budget(target: AcceleratorTarget, rows: int, in_features: int) -> int:
+    """Return bounded Trellis W8A8 INT8 scratch decode budget for NVIDIA targets."""
+    del target, in_features
+    return default_trellis_w8a8_scratch_budget(rows)
+
+
+def select_trellis_schedule(
+    target: AcceleratorTarget,
+    num_sms: int,
+    rows: int,
+    out_features: int,
+    blocks_per_row: int,
+    weight_bytes: int,
+) -> TrellisLinearSchedule:
+    """Resolve NVIDIA Trellis A16 GEMV tile, unroll, and Split-K parameters."""
+    if not target.is_cuda_capability(12):
+        return select_default_trellis_schedule(
+            num_sms, rows, out_features, blocks_per_row, weight_bytes, use_dp4a=True
+        )
+    block_m = trellis_block_m(rows)
+    if rows > TRELLIS_A16_MAX_BLOCK_M:
+        return TrellisLinearSchedule(
+            block_m=block_m,
+            num_warps=2,
+            split_k=1,
+            unroll_k=1,
+            use_dp4a=True,
+        )
+    max_split_k = min(
+        _TRELLIS_SM120_SPLITK_MAX,
+        max(1, _TRELLIS_SM120_FP32_WORKSPACE_BYTES // max(1, rows * out_features * 4)),
+    )
+    output_tiles = out_features * ((rows + block_m - 1) // block_m)
+    min_weight_bytes = (
+        TRELLIS_SPLITK_MIN_WEIGHT_BYTES
+        if output_tiles <= num_sms
+        else _TRELLIS_SM120_SPLITK_MIN_WEIGHT_BYTES
+    )
+    split_k = (
+        select_split_k(
+            num_sms,
+            output_tiles=output_tiles,
+            k_tiles=blocks_per_row,
+            weight_bytes=weight_bytes,
+            min_weight_bytes=min_weight_bytes,
+            max_split_k=max_split_k,
+            cta_multiplier=100,
+            min_k_tiles=8,
+            min_tiles_per_split=8,
+            round_up=False,
+        )
+        if max_split_k > 1
+        else 1
+    )
+    return TrellisLinearSchedule(
+        block_m=block_m,
+        num_warps=1,
+        split_k=split_k,
+        unroll_k=2 if block_m <= 2 else 1,
+        use_dp4a=True,
+    )
