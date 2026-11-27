@@ -1,200 +1,35 @@
 """Schedules, execution plans, and target policy for ConvRot INT8 Conv3D.
 
 Kept Triton-free so CPU imports, validation, and offline compilation/benchmark
-planning never depend on Triton. SM120, SM8x, and RDNA4 share the kernels in
-``triton.py`` while selecting independently measured launch schedules.
+planning never depend on Triton. Vendor-specific SM120/SM8x and RDNA4 policies
+live in ``_nvidia/policy.py`` and ``_amd/policy.py`` while sharing the kernels in
+``triton.py``.
 """
 
 from __future__ import annotations
 
 import math
-import sys
-from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import NamedTuple
 
 import torch
 
-from piper_kernels._triton.targets import (
-    RDNA4_MIN_FULL_GRID_TILES,
-    AcceleratorTarget,
-    rdna4_int8_accumulator_seed,
+from piper_kernels._triton.targets import AcceleratorTarget
+
+from ._amd import policy as _amd_policy
+from ._nvidia import policy as _nvidia_policy
+from ._schedule import (
+    ConvolutionExecutionPlan,
+    ConvolutionSchedule,
+    Padding,
+    PreparationSchedule,
+    output_shape,
 )
 
-type Padding = tuple[int, int, int, int, int, int]
-
-# Fill SM120 with 128-row tiles before falling back to 64-row tiles for small grids.
-_SM120_MIN_FULL_GRID_TILES = 128
-_PREPARE_C256_MIN_ROWS = 200_000
-_PREPARE_C512_MIN_ROWS = 5_000
-
-# SM89 measurements favor narrower tiles below 32 row tiles of 64.
-_SM8X_WIDE_MIN_ROWS = 2048
-
-
-class ConvolutionSchedule(NamedTuple):
-    """Complete immutable convolution tile and launch choices."""
-
-    block_m: int
-    block_n: int
-    block_k: int
-    num_warps: int
-    num_stages: int
-
-
-class PreparationSchedule(NamedTuple):
-    """Rotation/quantization tile and warp count."""
-
-    block_m: int
-    num_warps: int
-
-
-@dataclass(frozen=True, slots=True)
-class ConvolutionExecutionPlan:
-    """Concrete preparation, convolution, and weight-load choices for one operation."""
-
-    preparation: PreparationSchedule
-    convolution: ConvolutionSchedule
-    use_weight_descriptor: bool
-    # Fence only LDS at barriers; an RDNA workaround in _triton.amd_compiler_workarounds.
-    lds_only_fences: bool = False
-    accumulator_seed: int = 0
-
-
-_BASE_CONVOLUTION = ConvolutionSchedule(64, 128, 128, 4, 3)
-_SM120_K64 = ConvolutionSchedule(128, 128, 64, 4, 3)
-_SM120_NARROW_WIDE_M = ConvolutionSchedule(128, 64, 64, 4, 3)
-_SM120_NARROW_OUTPUT = ConvolutionSchedule(64, 64, 64, 4, 3)
-_SM8X_SHORT = ConvolutionSchedule(64, 64, 128, 4, 3)
-_SM8X_NARROW_OUTPUT = ConvolutionSchedule(32, 32, 128, 2, 3)
-
-_PREPARE_DEFAULT = PreparationSchedule(8, 8)
-_PREPARE_WIDE = PreparationSchedule(64, 4)
-_PREPARE_MEDIUM = PreparationSchedule(32, 4)
-_PREPARE_SHORT = PreparationSchedule(16, 4)
-_PREPARE_MEDIUM_8_WARPS = PreparationSchedule(32, 8)
-_PREPARE_SHORT_8_WARPS = PreparationSchedule(16, 8)
-
-
-def output_shape(
-    input_shape: Sequence[int],
-    output_channels: int,
-    stride: Sequence[int],
-    padding: Padding,
-) -> tuple[int, int, int, int, int]:
-    """Compute the NCTHW output shape for a 3x3x3 convolution with F.pad-order padding."""
-    batch, _, frames, height, width = input_shape
-    return (
-        batch,
-        output_channels,
-        (frames + padding[4] + padding[5] - 3) // stride[0] + 1,
-        (height + padding[2] + padding[3] - 3) // stride[1] + 1,
-        (width + padding[0] + padding[1] - 3) // stride[2] + 1,
-    )
-
-
-def _supports_nvidia(target: AcceleratorTarget) -> bool:
-    """Enable exact SM120 and the SM8x family (SM80, SM86, SM87, SM89)."""
-    return target.is_cuda_capability(12, 0) or target.is_cuda_capability(8)
-
-
-def _supports_amd(target: AcceleratorTarget) -> bool:
-    """gfx1201 has runtime coverage; gfx1200 also has offline compilation coverage."""
-    return (
-        sys.platform in ("linux", "win32")
-        and target.is_amd_hip
-        and target.is_architecture("gfx1200", "gfx1201")
-    )
+_amd_preparation_schedule = _amd_policy.preparation_schedule
 
 
 def supports_target(target: AcceleratorTarget) -> bool:
     """Return whether ``target`` has a tuned native Conv3D schedule."""
-    return _supports_nvidia(target) or _supports_amd(target)
-
-
-def _sm120_use_weight_descriptor(
-    channels: int, outputs: int, height: int, block_n: int, *, aligned: bool
-) -> bool:
-    # TMA saves weight-addressing overhead on C=128/256 shorter K-loops; C=64 and
-    # C>=512 prefer pointer loads.
-    return (
-        aligned
-        and channels in (128, 256)
-        and outputs % block_n == 0
-        and (height >= 256 or outputs > 128)
-    )
-
-
-def _sm120_convolution_schedule(outputs: int, rows: int) -> ConvolutionSchedule:
-    if outputs <= 64:
-        return (
-            _SM120_NARROW_WIDE_M
-            if rows >= 128 and _tile_count(rows, outputs, 128, 64) >= _SM120_MIN_FULL_GRID_TILES
-            else _SM120_NARROW_OUTPUT
-        )
-    return (
-        _SM120_K64
-        if rows >= 128 and _tile_count(rows, outputs, 128, 128) >= _SM120_MIN_FULL_GRID_TILES
-        else _BASE_CONVOLUTION
-    )
-
-
-def _sm8x_convolution_schedule(outputs: int, rows: int) -> ConvolutionSchedule:
-    if outputs <= 64:
-        return _SM8X_NARROW_OUTPUT
-    return _BASE_CONVOLUTION if rows >= _SM8X_WIDE_MIN_ROWS else _SM8X_SHORT
-
-
-def _nvidia_preparation_schedule(
-    channels: int, rows: int, *, group_norm: bool
-) -> PreparationSchedule:
-    # SM120 and SM8x share bandwidth-bound preparation schedules; C=64 and C=512 were
-    # updated from SM120 measurements and verified spill-free on sm_89 offline.
-    if channels <= 128:
-        return _PREPARE_WIDE
-    if channels == 256:
-        if group_norm:
-            return _PREPARE_MEDIUM if rows >= _PREPARE_C256_MIN_ROWS else _PREPARE_SHORT
-        return _PREPARE_WIDE if rows >= _PREPARE_C256_MIN_ROWS else _PREPARE_MEDIUM_8_WARPS
-    if channels == 512 and rows >= _PREPARE_C512_MIN_ROWS:
-        return _PREPARE_SHORT_8_WARPS
-    return _PREPARE_DEFAULT
-
-
-def _tile_count(rows: int, outputs: int, block_m: int, block_n: int) -> int:
-    return ((rows + block_m - 1) // block_m) * ((outputs + block_n - 1) // block_n)
-
-
-def _amd_convolution_schedule(outputs: int, rows: int) -> ConvolutionSchedule:
-    # Fill at least two workgroups per WGP (64 tiles) across 32-WGP RDNA4 while
-    # requiring 256-column outputs to be divisible so BN=256 never wastes a half tile.
-    if (
-        rows >= 128
-        and outputs >= 256
-        and outputs % 256 == 0
-        and _tile_count(rows, outputs, 128, 256) >= RDNA4_MIN_FULL_GRID_TILES
-    ):
-        return ConvolutionSchedule(128, 256, 64, 8, 2)
-    if (
-        rows >= 128
-        and outputs >= 128
-        and _tile_count(rows, outputs, 128, 128) >= RDNA4_MIN_FULL_GRID_TILES
-    ):
-        return ConvolutionSchedule(128, 128, 64, 8, 2)
-    if (
-        rows >= 64
-        and outputs >= 128
-        and _tile_count(rows, outputs, 64, 128) >= RDNA4_MIN_FULL_GRID_TILES
-    ):
-        return ConvolutionSchedule(64, 128, 128, 4, 2)
-    if outputs >= 64 and rows >= 128:
-        return ConvolutionSchedule(64, 64, 64, 4, 2)
-    return ConvolutionSchedule(32, 64, 64, 4, 2)
-
-
-def _amd_preparation_schedule(channels: int) -> PreparationSchedule:
-    # Bound the FP32 rotation tile independently of the convolution output width.
-    return PreparationSchedule(max(1, min(16, 4096 // channels)), 4)
+    return _nvidia_policy.supports_target(target) or _amd_policy.supports_target(target)
 
 
 def select_execution_plan(
@@ -214,42 +49,25 @@ def select_execution_plan(
     An explicit ``convolution_schedule`` lets tuning reuse production preparation
     and recompute weight-descriptor eligibility for the candidate's column width.
     """
-    if _supports_nvidia(target):
-        sm8x = target.is_cuda_capability(8)
-        if convolution_schedule is None:
-            convolution_schedule = (
-                _sm8x_convolution_schedule(outputs, output_rows)
-                if sm8x
-                else _sm120_convolution_schedule(outputs, output_rows)
-            )
-        return ConvolutionExecutionPlan(
-            preparation=_nvidia_preparation_schedule(channels, input_rows, group_norm=group_norm),
-            convolution=convolution_schedule,
-            use_weight_descriptor=not sm8x
-            and _sm120_use_weight_descriptor(
-                channels,
-                outputs,
-                output_height,
-                convolution_schedule.block_n,
-                aligned=weight_aligned,
-            ),
+    if _nvidia_policy.supports_target(target):
+        return _nvidia_policy.select_execution_plan(
+            target,
+            channels=channels,
+            outputs=outputs,
+            input_rows=input_rows,
+            output_rows=output_rows,
+            output_height=output_height,
+            weight_aligned=weight_aligned,
+            group_norm=group_norm,
+            convolution_schedule=convolution_schedule,
         )
-    if _supports_amd(target):
-        schedule = (
-            _amd_convolution_schedule(outputs, output_rows)
-            if convolution_schedule is None
-            else convolution_schedule
-        )
-        return ConvolutionExecutionPlan(
-            preparation=_amd_preparation_schedule(channels),
-            convolution=schedule,
-            use_weight_descriptor=False,
-            lds_only_fences=True,
-            accumulator_seed=rdna4_int8_accumulator_seed(
-                target,
-                27 * channels,
-                _tile_count(output_rows, outputs, schedule.block_m, schedule.block_n),
-            ),
+    if _amd_policy.supports_target(target):
+        return _amd_policy.select_execution_plan(
+            target,
+            channels=channels,
+            outputs=outputs,
+            output_rows=output_rows,
+            convolution_schedule=convolution_schedule,
         )
     raise ValueError(f"ConvRot INT8 convolution has no native policy for {target}")
 
@@ -280,3 +98,15 @@ def default_execution_plan(
         group_norm=group_norm,
         convolution_schedule=convolution_schedule,
     )
+
+
+__all__ = [
+    "ConvolutionExecutionPlan",
+    "ConvolutionSchedule",
+    "Padding",
+    "PreparationSchedule",
+    "default_execution_plan",
+    "output_shape",
+    "select_execution_plan",
+    "supports_target",
+]
