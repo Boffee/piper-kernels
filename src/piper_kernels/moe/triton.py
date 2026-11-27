@@ -31,7 +31,7 @@ from piper_kernels._triton.targets import AcceleratorTarget, rdna4_int8_accumula
 from piper_kernels.linear._splitk import device_sm_count, select_split_k
 from piper_kernels.linear.convrot.int8.trellis_triton import _gemv_accumulate_k_blocks
 from piper_kernels.linear.convrot.int8.triton import _accumulate_int8_tile, splitk_accumulator_seed
-from piper_kernels.linear.nvfp4.triton import (
+from piper_kernels.linear.nvfp4._w4a16_triton import (
     _accumulate_scaled_row,
     _accumulate_scaled_row_blocks,
     _load_nvfp4_tile,

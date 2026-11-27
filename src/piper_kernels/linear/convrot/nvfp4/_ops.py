@@ -60,9 +60,9 @@ def linear(
                 high_first=high_first,
                 group_size=group_size,
             )
-        from piper_kernels.linear.nvfp4 import triton as nvfp4_triton  # noqa: PLC0415
+        from piper_kernels.linear.nvfp4 import _w4a16_triton as nvfp4_w4a16  # noqa: PLC0415
 
-        return nvfp4_triton._linear_w4a16(
+        return nvfp4_w4a16.linear_w4a16(
             input,
             weight_qdata,
             weight_scale,
