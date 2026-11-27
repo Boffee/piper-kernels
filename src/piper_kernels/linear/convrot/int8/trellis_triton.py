@@ -1,6 +1,6 @@
 """Triton hybrid execution for ConvRot Trellis linear.
 
-Small batches (``M <= 8``, and Triton GPUs without an optimized ConvRot INT8
+Small batches (``M <= 4``, and Triton GPUs without an optimized ConvRot INT8
 W8A8 backend) execute a fused in-register ``Trellis -> A16`` Split-K GEMV
 kernel without materializing decoded INT8 weights or per-weight INT8 rounding.
 Larger batches with an INT8 backend rotate/quantize inputs once and stream
@@ -51,8 +51,11 @@ from piper_kernels.weights.convrot.triton import rotate_input
 
 from . import _backend as convrot_int8_backend
 
-_GEMV_MAX_ROWS = 8
+_GEMV_MAX_ROWS = 4
+_A16_MAX_BLOCK_M = 8
 _SCRATCH_DECODE_MAX_BYTES = 32 * 1024 * 1024
+_LARGE_BATCH_SCRATCH_DECODE_MAX_BYTES = 64 * 1024 * 1024
+_LARGE_BATCH_SCRATCH_MIN_ROWS = 1024
 _REDUCE_BLOCK_N = 256
 _SPLITK_MIN_WEIGHT_BYTES = 2 * 1024 * 1024
 _SM120_SPLITK_MIN_WEIGHT_BYTES = 4 * 1024 * 1024
@@ -333,7 +336,7 @@ def _select_block_m(rows: int) -> int:
         return 2
     if rows <= 4:
         return 4
-    return _GEMV_MAX_ROWS
+    return _A16_MAX_BLOCK_M
 
 
 def _select_generic_split_k(
@@ -344,7 +347,7 @@ def _select_generic_split_k(
     weight_bytes: int,
     block_m: int,
 ) -> int:
-    if rows > _GEMV_MAX_ROWS:
+    if rows > _A16_MAX_BLOCK_M:
         # Large-M fallback (devices without an optimized W8A8 backend) already fills SMs on M x N.
         return 1
     return select_split_k(
@@ -373,7 +376,7 @@ def _select_trellis_schedule(
     is_sm120 = target.is_cuda_capability(12)
     unroll_k = 2 if (is_sm120 and block_m <= 2) else 1
     if is_sm120:
-        if rows > _GEMV_MAX_ROWS:
+        if rows > _A16_MAX_BLOCK_M:
             return _TrellisSchedule(
                 block_m=block_m,
                 num_warps=2,
@@ -566,7 +569,12 @@ def _linear_w8a8(
     output = torch.empty((rows, out_features), device=input.device, dtype=input.dtype)
     input_qdata, input_scale = int8_backend.prepare_input(input_2d, group_size)
 
-    raw_chunk_rows = max(1, _SCRATCH_DECODE_MAX_BYTES // in_features)
+    scratch_budget = (
+        _LARGE_BATCH_SCRATCH_DECODE_MAX_BYTES
+        if rows >= _LARGE_BATCH_SCRATCH_MIN_ROWS
+        else _SCRATCH_DECODE_MAX_BYTES
+    )
+    raw_chunk_rows = max(1, scratch_budget // in_features)
     chunk_align = 256 if raw_chunk_rows >= 256 else 128
     if raw_chunk_rows < out_features and raw_chunk_rows >= chunk_align:
         chunk_rows = (raw_chunk_rows // chunk_align) * chunk_align

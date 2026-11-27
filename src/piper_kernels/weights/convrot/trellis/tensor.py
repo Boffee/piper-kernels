@@ -220,9 +220,9 @@ class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatib
     Caller preconditions match trellis decoding: E4M3 block scales must be non-NaN
     (not ``0x7F`` or ``0xFF``), and variable-row ``row_widths`` (including 2 trailing
     wrap guard bytes) must lie in ``[ceil(2 * block_size / 8) + 2, floor(6 * block_size / 8) + 2]``
-    and fit within ``bitstreams``. Small-batch inference (``M <= 8``) and ``dequantize()``
+    and fit within ``bitstreams``. Small-batch inference (``M <= 4``) and ``dequantize()``
     use continuous block-scaled FP32 accumulation without per-weight INT8 rounding,
-    while large-batch prefill (``M >= 9``) decodes prescaled INT8 weights for W8A8 GEMM.
+    while larger batches (``M >= 5``) decode prescaled INT8 weights for W8A8 GEMM.
     Wrapping and inference never issue host readbacks or synchronizations.
     """
 

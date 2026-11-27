@@ -71,11 +71,11 @@ and bytes `[code_bytes, code_bytes + 1]` duplicate bytes `[0, 1]` so every
 4. **Dequantization & INT8 decoding.** With `R` the FP32 value `0x1.bb688ep-8`
    nearest `1 / 147.800537109375`, execution uses one of two exact paths:
 
-   - **Continuous block-scaled FP32** (small-batch `M <= 8` linear A16, MoE A16,
+   - **Continuous block-scaled FP32** (small-batch `M <= 4` linear A16, MoE A16,
      and `ConvRotTrellisTensor.dequantize()`): skips per-weight INT8 rounding and
      accumulates `x_t · n_t` per block before multiplying once by
      `fp32(block_scale · R)` and applying `scale`.
-   - **Prescaled rounded INT8** (large-batch `M >= 9` W8A8 prefill, MoE prefill,
+   - **Prescaled rounded INT8** (large-batch `M >= 5` W8A8 linear, MoE prefill,
      and `ConvRotInt8Tensor.from_trellis` / `copy_from_trellis_`):
      `q_t = clamp(round_half_even(fp32(n_t) · fp32(block_scale · R)), -127, 127)`
      in the rotated basis, as for any ConvRot INT8 weight.

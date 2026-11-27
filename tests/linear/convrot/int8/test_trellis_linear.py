@@ -823,7 +823,7 @@ def test_gpu_dequantize_matches_cpu_reference(variable_rows: bool, block_size: i
 @pytest.mark.gpu
 @_gpu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32], ids=str)
-@pytest.mark.parametrize("rows", [1, 2, 3, 5, 8])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4])
 @pytest.mark.parametrize("use_bias", [False, True], ids=["nobias", "bias"])
 def test_gpu_small_batch_a16_gemv_matches_reference(
     dtype: torch.dtype, rows: int, use_bias: bool
@@ -861,7 +861,7 @@ def test_gpu_small_batch_a16_gemv_matches_reference(
 @pytest.mark.gpu
 @_gpu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32], ids=str)
-@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4])
 def test_gpu_sm120_aligned_a16_gemv_matches_reference(dtype: torch.dtype, rows: int) -> None:
     out_features, in_features = 128, 512
     weight = _make_weight(
@@ -907,19 +907,19 @@ def test_gpu_sm120_aligned_a16_gemv_matches_reference(dtype: torch.dtype, rows: 
     ),
     [
         (256, 512, 256, 256, 67, False, 1),
-        (256, 512, 256, 256, 67, False, 8),
+        (256, 512, 256, 256, 67, False, 4),
         (256, 512, 256, 256, 194, False, 1),
-        (256, 512, 256, 256, 194, False, 8),
+        (256, 512, 256, 256, 194, False, 4),
         (192, 2688, 224, 16, None, True, 4),
-        (64, 65536, 256, 256, 143, False, 8),
+        (64, 65536, 256, 256, 143, False, 4),
     ],
     ids=[
         "m1-2.1bpw",
-        "m8-2.1bpw",
+        "m4-2.1bpw",
         "m1-6.0bpw",
-        "m8-6.0bpw",
+        "m4-6.0bpw",
         "m4-bs224-var-aligned",
-        "m8-splitk-n64-k65536",
+        "m4-splitk-n64-k65536",
     ],
 )
 def test_gpu_sm120_aligned_a16_rates_var_and_splitk(
@@ -1030,7 +1030,7 @@ def test_gpu_gemv_variants_rates_nonpow2_and_splitk(
 
 @pytest.mark.gpu
 @_gpu
-@pytest.mark.parametrize("rows", [9, 16, 32, 64])
+@pytest.mark.parametrize("rows", [5, 8, 16, 32, 64])
 @pytest.mark.parametrize("variable_rows", [False, True], ids=["uniform", "variable"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32], ids=str)
 def test_gpu_large_batch_w8a8_prefill_matches_int8(
@@ -1094,13 +1094,14 @@ def test_gpu_large_batch_w8a8_prefill_matches_int8(
 
 @pytest.mark.gpu
 @_gpu
+@pytest.mark.parametrize("rows", [16, 1024], ids=["m16-32mib", "m1024-64mib"])
 @pytest.mark.parametrize("variable_rows", [False, True], ids=["uniform", "variable"])
-def test_gpu_large_batch_w8a8_multi_chunk_matches_int8(variable_rows: bool) -> None:
-    # 9000 * 4096 = 36,864,000 bytes > 32 MiB scratch threshold -> forces 2 chunks.
+def test_gpu_large_batch_w8a8_multi_chunk_matches_int8(rows: int, variable_rows: bool) -> None:
+    # 9000 * 4096 = 36,864,000 bytes: 2 chunks at M=16 (32 MiB cap), 1 chunk at M=1024 (64 MiB cap).
     out_features, in_features, block_size, group_size = 9000, 4096, 256, 256
     row_widths = _variable_row_widths(out_features, block_size) if variable_rows else None
     bitstreams, block_scales, scale, widths = _make_trellis_inputs(
-        out_features, in_features, block_size=block_size, row_widths=row_widths, seed=707
+        out_features, in_features, block_size=block_size, row_widths=row_widths, seed=707 + rows
     )
     gpu_bs = bitstreams.cuda()
     gpu_sc = block_scales.cuda()
@@ -1123,8 +1124,8 @@ def test_gpu_large_batch_w8a8_multi_chunk_matches_int8(variable_rows: bool) -> N
         group_size=group_size,
         row_widths=gpu_widths,
     )
-    torch.manual_seed(708)
-    x = torch.randn(16, in_features, dtype=torch.bfloat16, device="cuda") * 0.05
+    torch.manual_seed(708 + rows)
+    x = torch.randn(rows, in_features, dtype=torch.bfloat16, device="cuda") * 0.05
     bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
 
     actual = F.linear(x, w_trellis, bias)
@@ -1145,31 +1146,32 @@ def test_gpu_direct_a16_large_batch_fallback_and_truncated_variable_bounds() -> 
         row_widths=_variable_row_widths(64, 128),
         seed=801,
     )
-    torch.manual_seed(802)
-    x = torch.randn(17, 256, dtype=torch.bfloat16, device="cuda") * 0.1
-    bias = torch.randn(64, dtype=torch.bfloat16, device="cuda")
-    actual = linear_a16(
-        x,
-        weight.bitstreams,
-        weight.block_scales,
-        weight.scale,
-        weight.row_widths,
-        bias,
-        weight.block_size,
-        weight.group_size,
-    )
-    expected = convrot_reference.linear_trellis_a16(
-        x.cpu(),
-        weight.bitstreams.cpu(),
-        weight.block_scales.cpu(),
-        weight.scale.cpu(),
-        weight.row_widths.cpu(),  # type: ignore[union-attr]
-        bias.cpu(),
-        weight.block_size,
-        weight.group_size,
-    )
-    rtol, atol = _tolerance(torch.bfloat16)
-    torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
+    for rows in (8, 17):
+        torch.manual_seed(802 + rows)
+        x = torch.randn(rows, 256, dtype=torch.bfloat16, device="cuda") * 0.1
+        bias = torch.randn(64, dtype=torch.bfloat16, device="cuda")
+        actual = linear_a16(
+            x,
+            weight.bitstreams,
+            weight.block_scales,
+            weight.scale,
+            weight.row_widths,
+            bias,
+            weight.block_size,
+            weight.group_size,
+        )
+        expected = convrot_reference.linear_trellis_a16(
+            x.cpu(),
+            weight.bitstreams.cpu(),
+            weight.block_scales.cpu(),
+            weight.scale.cpu(),
+            weight.row_widths.cpu(),  # type: ignore[union-attr]
+            bias.cpu(),
+            weight.block_size,
+            weight.group_size,
+        )
+        rtol, atol = _tolerance(torch.bfloat16)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=rtol, atol=atol)
 
     # Truncated variable-row bitstreams must clamp safely without device fault in both regimes.
     for num_bytes in (0, 1):
@@ -1293,7 +1295,7 @@ def test_gpu_torch_compile_dynamic_single_graph(variable_rows: bool) -> None:
         fullgraph=True,
         dynamic=True,
     )
-    for rows in (3, 4, 8, 9, 16, 32):
+    for rows in (3, 4, 5, 8, 16, 32):
         x = torch.randn(rows, in_features, dtype=torch.bfloat16, device="cuda") * 0.1
         torch._dynamo.mark_dynamic(x, 0)
         actual = compiled(x)
@@ -1378,7 +1380,7 @@ def test_gpu_executes_cleanly_on_non_current_device() -> None:
                 weight.block_size,
                 weight.group_size,
             )
-            if rows > 8
+            if rows > 4
             else convrot_reference.linear_trellis_a16(
                 x.cpu(),
                 weight.bitstreams.cpu(),
