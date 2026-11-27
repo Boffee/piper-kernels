@@ -3847,8 +3847,51 @@ def test_gpu_chunked_prefill_frozen_chunk_splits(head_dim: int) -> None:
     assert (o_s0 == 0.0).all()
     assert (l_s0 == -float("inf")).all()
 
-    # +inf k_bias across frozen chunk splits:
-    # one +inf split dominates finite; two +inf splits produce NaN.
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_gpu_chunked_prefill_frozen_chunk_splits_two_term_lse(head_dim: int) -> None:
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    nc4 = torch.tensor([4], device=device, dtype=torch.int32)
+
+    # Shared large finite k_bias across splits must preserve small centered LSE differences.
+    bias_pool = _make_strided_pool(2, 1, head_dim, device=device, kv_dtype=torch.uint8)
+    freeze_kv_chunks_(
+        torch.full((1, 1, KV_CHUNK_TOKENS, head_dim), 1e8, device=device, dtype=dtype),
+        torch.zeros((1, 1, KV_CHUNK_TOKENS, head_dim), device=device, dtype=dtype),
+        bias_pool,
+        torch.tensor([0], device=device, dtype=torch.int32),
+    )
+    k_pm = torch.cat(
+        [
+            torch.full((1, 1, KV_CHUNK_TOKENS // 2, head_dim), 1.0, device=device, dtype=dtype),
+            torch.full((1, 1, KV_CHUNK_TOKENS // 2, head_dim), -1.0, device=device, dtype=dtype),
+        ],
+        dim=2,
+    )
+    freeze_kv_chunks_(
+        k_pm,
+        torch.ones((1, 1, KV_CHUNK_TOKENS, head_dim), device=device, dtype=dtype),
+        bias_pool,
+        torch.tensor([1], device=device, dtype=torch.int32),
+    )
+    bias_pool.key_center[1].copy_(bias_pool.key_center[0])
+    q_bias = torch.ones((1, 1, 64, head_dim), device=device, dtype=dtype)
+    c2s_bias = torch.tensor([[0, 0, 1, 1]], device=device, dtype=torch.int32)
+
+    o_bias_split, l_bias_split = piper_attention_decode(
+        q_bias, bias_pool, c2s_bias, nc4, return_lse=True
+    )
+    o_bias_unsplit, l_bias_unsplit = piper_attention_decode(
+        q_bias, bias_pool, c2s_bias, nc4, active_chunks_hint=1, return_lse=True
+    )
+    torch.testing.assert_close(o_bias_split, o_bias_unsplit, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(l_bias_split, l_bias_unsplit, atol=1e-4, rtol=1e-4)
+    assert (o_bias_split > 0.99).all()
+
+    # +inf k_bias across frozen chunk splits matches unsplit / Split-KV same-bias semantics.
     inf_pool = _make_strided_pool(2, 1, head_dim, device=device, kv_dtype=torch.uint8)
     freeze_kv_chunks_(
         torch.full((1, 1, KV_CHUNK_TOKENS, head_dim), 1e34, device=device, dtype=dtype),
@@ -3858,7 +3901,6 @@ def test_gpu_chunked_prefill_frozen_chunk_splits(head_dim: int) -> None:
     )
     _populate_test_pool(inf_pool, [1], device=device, dtype=dtype, seed=1603 + head_dim)
     q_med = torch.full((1, 1, 64, head_dim), 1e6, device=device, dtype=dtype)
-    nc4 = torch.tensor([4], device=device, dtype=torch.int32)
 
     o_one_inf, l_one_inf = piper_attention_decode(
         q_med,
@@ -3870,12 +3912,13 @@ def test_gpu_chunked_prefill_frozen_chunk_splits(head_dim: int) -> None:
     torch.testing.assert_close(o_one_inf, torch.ones_like(o_one_inf), atol=1e-2, rtol=1e-2)
     assert (l_one_inf == float("inf")).all()
 
+    c2s_two_inf = torch.tensor([[0, 1, 0, 1]], device=device, dtype=torch.int32)
     o_two_inf, l_two_inf = piper_attention_decode(
-        q_med,
-        inf_pool,
-        torch.tensor([[0, 1, 0, 1]], device=device, dtype=torch.int32),
-        nc4,
-        return_lse=True,
+        q_med, inf_pool, c2s_two_inf, nc4, return_lse=True
     )
-    assert torch.isnan(o_two_inf).all()
-    assert torch.isnan(l_two_inf).all()
+    o_two_inf_unsplit, l_two_inf_unsplit = piper_attention_decode(
+        q_med, inf_pool, c2s_two_inf, nc4, active_chunks_hint=1, return_lse=True
+    )
+    torch.testing.assert_close(o_two_inf, o_two_inf_unsplit, atol=1e-2, rtol=1e-2)
+    assert (l_two_inf == l_two_inf_unsplit).all()
+    assert (l_two_inf == float("inf")).all()

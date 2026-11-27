@@ -673,7 +673,6 @@ def _piper_decode_splitkv_reduce_kernel(
     stride_lb,
     stride_lh,
     head_dim: tl.constexpr,
-    has_bias: tl.constexpr = True,  # pyright: ignore[reportArgumentType]
 ):
     """Merge partial Split-KV outputs and two-term base-2 LSE pairs into natural-log LSE."""
     pid = tl.program_id(0)
@@ -699,7 +698,7 @@ def _piper_decode_splitkv_reduce_kernel(
         s64 = split_idx.to(tl.int64)
         lse_off = pl_offset + s64 * split_lse_stride
         m_s = tl.load(partial_lse_ptr + lse_off)
-        b_s = tl.load(partial_bias_ptr + lse_off) if has_bias else 0.0
+        b_s = tl.load(partial_bias_ptr + lse_off)
         m_win, bias_win, old_w, cur_w, has_s, safe_m_s = advance_tile_max_safe(
             m_win, bias_win, m_s, b_s
         )
@@ -923,6 +922,8 @@ def _launch_frozen_pool_prefill(
     lse_target = lse
     partial_out: torch.Tensor | None = None
     partial_lse: torch.Tensor | None = None
+    partial_bias: torch.Tensor | None = None
+    bias_target: torch.Tensor | None = None
     if prefill_backend == "nvidia":
         sm_count = device_sm_count(query_int8.device)
         base_blocks = max(1, batch * q_heads * triton.cdiv(seq_q, 64))
@@ -940,8 +941,10 @@ def _launch_frozen_pool_prefill(
             device=output.device,
             dtype=torch.float32,
         )
+        partial_bias = torch.empty_like(partial_lse)
         out_target = partial_out.view(batch * frozen_splits, q_heads, seq_q, head_dim)
         lse_target = partial_lse.view(batch * frozen_splits, q_heads, seq_q)
+        bias_target = partial_bias.view(batch * frozen_splits, q_heads, seq_q)
 
     common_args: tuple[object, ...] = (
         query_int8,
@@ -1005,16 +1008,18 @@ def _launch_frozen_pool_prefill(
             is_tail=False,
             is_causal=False,
             split_chunks=frozen_splits,
+            partial_bias=bias_target,
             target=target,
         )
-        if partial_out is not None and partial_lse is not None:
+        if partial_out is not None and partial_lse is not None and partial_bias is not None:
             po_view = partial_out.permute(0, 2, 3, 1, 4)
             pl_view = partial_lse.permute(0, 2, 3, 1)
+            pb_view = partial_bias.permute(0, 2, 3, 1)
             with device_context(output.device):
                 _piper_decode_splitkv_reduce_kernel[(batch * q_heads * seq_q,)](
                     po_view,
                     pl_view,
-                    pl_view,
+                    pb_view,
                     output,
                     lse,
                     q_heads,
@@ -1034,7 +1039,6 @@ def _launch_frozen_pool_prefill(
                     lse.stride(0),
                     lse.stride(1),
                     head_dim=head_dim,
-                    has_bias=False,
                     num_warps=_REDUCE_NUM_WARPS,
                 )
 
@@ -1483,7 +1487,6 @@ def piper_attention_decode_triton(
             lse.stride(0),
             lse.stride(1),
             head_dim=head_dim,
-            has_bias=True,
             num_warps=_REDUCE_NUM_WARPS,
         )
 
@@ -1610,7 +1613,7 @@ def compile_kv_decode_kernels(
     )
     reduce_source = _quantization.build_kernel_source(
         _piper_decode_splitkv_reduce_kernel,
-        constants={"head_dim": head_dim, "has_bias": True},
+        constants={"head_dim": head_dim},
         overrides={
             "partial_out_ptr": "*fp32",
             "partial_lse_ptr": "*fp32",
