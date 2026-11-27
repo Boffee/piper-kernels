@@ -44,9 +44,16 @@ def test_state_offsets_accumulate_later_step_widths(layout: TrellisLayout) -> No
 def test_rate_follows_from_the_stored_bytes() -> None:
     layout = TrellisLayout.from_storage(256, 143)
 
-    assert layout == TrellisLayout(256, 1144)
-    assert (layout.step_bits, layout.num_wide_steps, layout.bytes_per_block) == (4, 120, 143)
-    assert layout.compute_step_widths().count(5) == 120
+    assert layout == TrellisLayout(256, 1128)
+    assert (layout.step_bits, layout.num_wide_steps, layout.code_bytes, layout.bytes_per_block) == (
+        4,
+        104,
+        141,
+        143,
+    )
+    assert layout.compute_step_widths().count(5) == 104
+    assert TrellisLayout.from_storage(256, 66) == TrellisLayout(256, 512)
+    assert TrellisLayout.from_storage(256, 194) == TrellisLayout(256, 1536)
     assert TrellisLayout(256, 1536).step_bits == 6
     assert TrellisLayout(256, 1536).num_wide_steps == 0
 
@@ -56,14 +63,18 @@ def test_rate_follows_from_the_stored_bytes() -> None:
     [
         ((15, 48), "hold 16 to 256 weights, got 15"),
         ((257, 1032), "hold 16 to 256 weights, got 257"),
-        ((256, 504), "take 64 to 192 whole bytes"),
-        ((256, 1544), "take 64 to 192 whole bytes"),
-        ((256, 1145), "take 64 to 192 whole bytes"),
+        ((256, 504), "take 64 to 192 whole code bytes"),
+        ((256, 1544), "take 64 to 192 whole code bytes"),
+        ((256, 1145), "take 64 to 192 whole code bytes"),
     ],
 )
 def test_layout_rejects_unsupported_rates(arguments: tuple[int, int], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         TrellisLayout(*arguments)
+    with pytest.raises(ValueError, match="take 64 to 192 whole code bytes"):
+        TrellisLayout.from_storage(256, 65)
+    with pytest.raises(ValueError, match="take 64 to 192 whole code bytes"):
+        TrellisLayout.from_storage(256, 195)
 
 
 def test_layout_requires_integers() -> None:

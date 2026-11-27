@@ -145,8 +145,8 @@ def _make_weight(
 
 
 def _variable_row_widths(out_features: int, block_size: int) -> list[int]:
-    lo = (2 * block_size + 7) // 8
-    hi = (6 * block_size) // 8
+    lo = (2 * block_size + 7) // 8 + 2
+    hi = (6 * block_size) // 8 + 2
     mid = (lo + hi) // 2
     choices = (lo, mid, hi)
     return [choices[idx % len(choices)] for idx in range(out_features)]
@@ -714,33 +714,38 @@ def test_trellis_gemv_compiles_without_spills_secondary_targets(target: GPUTarge
         "bytes_per_block",
         "variable_rows",
         "expect_splitk",
-        "expect_sm120_3word",
     ),
     [
-        (1, 14336, 4096, 256, 144, False, False, True),
-        (1, 1024, 4096, 256, 144, False, False, True),
-        (2, 4096, 4096, 256, 144, False, True, True),
-        (4, 4096, 2688, 224, None, True, False, True),
-        (8, 4096, 14336, 256, 144, False, True, True),
-        (8, 64, 65536, 256, 143, False, True, True),
-        (1, 4096, 4096, 128, 72, False, True, True),
-        (4, 1024, 512, 64, 36, False, False, True),
-        (17, 64, 256, 128, None, True, False, True),
-        (1, 77, 512, 256, 143, False, False, False),
-        (1, 256, 256, 16, 9, False, False, False),
+        (1, 14336, 4096, 256, 144, False, False),
+        (1, 1024, 4096, 256, 144, False, False),
+        (2, 4096, 4096, 256, 144, False, True),
+        (1, 4096, 4096, 256, 194, False, True),
+        (4, 4096, 2688, 224, None, True, False),
+        (8, 4096, 14336, 256, 144, False, True),
+        (8, 64, 65536, 256, 143, False, True),
+        (1, 4096, 4096, 128, 72, False, True),
+        (4, 1024, 512, 64, 36, False, False),
+        (17, 64, 256, 128, None, True, False),
+        (1, 77, 512, 256, 143, False, False),
+        (1, 256, 256, 16, 9, False, False),
+        (1, 64, 400, 200, None, False, False),
+        (1, 64, 400, 200, None, True, False),
     ],
     ids=[
-        "m1-14336x4096-3word",
+        "m1-14336x4096-u2",
         "m1-1024x4096-no-splitk",
-        "m2-4096x4096-3word-splitk",
+        "m2-4096x4096-u2-splitk",
+        "m1-4096x4096-6bpw-3word-splitk",
         "m4-bs224-var-3word",
-        "m8-4096x14336-3word-splitk",
-        "m8-64x65536-3word-splitk",
-        "m1-bs128-3word-splitk",
-        "m4-bs64-3word",
-        "m17-direct-a16-3word",
-        "m1-unaligned-fallback",
-        "m1-bs16-fallback",
+        "m8-4096x14336-splitk",
+        "m8-64x65536-splitk",
+        "m1-bs128-splitk",
+        "m4-bs64",
+        "m17-direct-a16",
+        "m1-unaligned-bytes",
+        "m1-bs16",
+        "m1-bs200-default-layout",
+        "m1-bs200-var-default-layout",
     ],
 )
 def test_trellis_sm120_regimes_compile_without_spills(
@@ -751,7 +756,6 @@ def test_trellis_sm120_regimes_compile_without_spills(
     bytes_per_block: int | None,
     variable_rows: bool,
     expect_splitk: bool,
-    expect_sm120_3word: bool,
 ) -> None:
     kernels = _compile_and_assert_zero_spills(
         GPUTarget("cuda", 120, 32),
@@ -766,7 +770,7 @@ def test_trellis_sm120_regimes_compile_without_spills(
         bytes_per_block=bytes_per_block,
         num_sms=170,
     )
-    assert ("dp4a.s32.u32" in kernels["gemv"].asm["ptx"]) is expect_sm120_3word
+    assert "dp4a.s32.u32" in kernels["gemv"].asm["ptx"]
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +782,7 @@ def test_trellis_sm120_regimes_compile_without_spills(
 @_gpu
 @pytest.mark.parametrize("variable_rows", [False, True], ids=["uniform", "variable"])
 @pytest.mark.parametrize("block_size", [256, 224], ids=["bs256", "bs224"])
-def test_gpu_dequantize_matches_int8_from_trellis(variable_rows: bool, block_size: int) -> None:
+def test_gpu_dequantize_matches_cpu_reference(variable_rows: bool, block_size: int) -> None:
     out_features, in_features = 16, block_size * 4
     row_widths = _variable_row_widths(out_features, block_size) if variable_rows else None
     bitstreams, block_scales, scale, widths = _make_trellis_inputs(
@@ -792,13 +796,28 @@ def test_gpu_dequantize_matches_int8_from_trellis(variable_rows: bool, block_siz
     w_trellis = ConvRotTrellisTensor.from_quantized(
         gpu_bs, gpu_sc, gpu_scale, block_size=block_size, group_size=16, row_widths=gpu_widths
     )
+    w_cpu = ConvRotTrellisTensor.from_quantized(
+        bitstreams, block_scales, scale, block_size=block_size, group_size=16, row_widths=widths
+    )
+    torch.testing.assert_close(
+        w_trellis.dequantize(torch.float32).cpu(),
+        w_cpu.dequantize(torch.float32),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        w_trellis.t().dequantize(torch.float32).cpu(),
+        w_cpu.t().dequantize(torch.float32),
+        rtol=1e-5,
+        atol=1e-5,
+    )
     w_int8 = ConvRotInt8Tensor.from_trellis(
         gpu_bs, gpu_sc, gpu_scale, block_size=block_size, group_size=16, row_widths=gpu_widths
     )
-    assert torch.equal(w_trellis.dequantize(), w_int8.dequantize())
-    assert torch.equal(
-        w_trellis.t().dequantize(torch.float32), w_int8.t().dequantize(torch.float32)
-    )
+    diff = (w_trellis.dequantize(torch.float32) - w_int8.dequantize(torch.float32)).abs()
+    norm_rms = (diff / gpu_scale.reshape(-1, 1)).pow(2).mean(dim=1).sqrt()
+    assert float(diff.max().item()) > 0.0
+    assert float(norm_rms.max().item()) <= 0.5 + 1e-4
 
 
 @pytest.mark.gpu
@@ -887,16 +906,16 @@ def test_gpu_sm120_aligned_a16_gemv_matches_reference(dtype: torch.dtype, rows: 
         "rows",
     ),
     [
-        (256, 512, 256, 256, 65, False, 1),
-        (256, 512, 256, 256, 65, False, 8),
-        (256, 512, 256, 256, 192, False, 1),
-        (256, 512, 256, 256, 192, False, 8),
+        (256, 512, 256, 256, 67, False, 1),
+        (256, 512, 256, 256, 67, False, 8),
+        (256, 512, 256, 256, 194, False, 1),
+        (256, 512, 256, 256, 194, False, 8),
         (192, 2688, 224, 16, None, True, 4),
         (64, 65536, 256, 256, 143, False, 8),
     ],
     ids=[
-        "m1-2.03bpw",
-        "m8-2.03bpw",
+        "m1-2.1bpw",
+        "m8-2.1bpw",
         "m1-6.0bpw",
         "m8-6.0bpw",
         "m4-bs224-var-aligned",
@@ -949,12 +968,12 @@ def test_gpu_sm120_aligned_a16_rates_var_and_splitk(
 @pytest.mark.parametrize(
     ("out_features", "in_features", "block_size", "group_size", "bytes_per_block", "variable_rows"),
     [
-        (128, 512, 256, 256, 64, False),  # 2.0 bpw
+        (128, 512, 256, 256, 66, False),  # 2.0 code bpw
         (301, 512, 256, 64, 111, False),  # 3.5 bpw + N tail
         (128, 512, 256, 256, 176, False),  # 5.5 bpw
         (96, 2688, 224, 16, None, True),  # non-pow2 block size + variable-row
-        (64, 64, 16, 16, 4, False),  # minimal block_size=16 at 2.0 bpw
-        (64, 64, 16, 16, 7, False),  # minimal block_size=16
+        (64, 64, 16, 16, 6, False),  # minimal block_size=16 at 2.0 code bpw
+        (64, 64, 16, 16, 9, False),  # minimal block_size=16
         (64, 65536, 256, 256, 143, False),  # triggers Split-K > 1 (> 2 MiB, low N)
     ],
     ids=[

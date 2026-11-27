@@ -27,18 +27,18 @@ _nvidia = pytest.mark.skipif(
 @pytest.mark.parametrize(
     ("in_features", "bits_per_weight", "layout"),
     [
-        (5120, 4.5, TrellisLayout(256, 1144)),
-        (2688, 4.5, TrellisLayout(224, 1000)),
-        (5120, 4.03125, TrellisLayout(256, 1024)),
-        (5120, 4, TrellisLayout(256, 1016)),
-        (5120, 3.5, TrellisLayout(256, 888)),
-        (5120, 3.03125, TrellisLayout(256, 768)),
-        (5120, 2.5, TrellisLayout(256, 632)),
-        (5120, 2.03125, TrellisLayout(256, 512)),
-        (5120, 6.05, TrellisLayout(256, 1536)),
-        (336, 4.5, TrellisLayout(112, 496)),
-        (272, 2.5, TrellisLayout(16, 32)),
-        (272, 4.5, TrellisLayout(16, 64)),
+        (5120, 4.5, TrellisLayout(256, 1128)),
+        (2688, 4.5, TrellisLayout(224, 984)),
+        (5120, 4.09375, TrellisLayout(256, 1024)),
+        (5120, 4, TrellisLayout(256, 1000)),
+        (5120, 3.5, TrellisLayout(256, 872)),
+        (5120, 3.09375, TrellisLayout(256, 768)),
+        (5120, 2.5, TrellisLayout(256, 616)),
+        (5120, 2.09375, TrellisLayout(256, 512)),
+        (5120, 6.1, TrellisLayout(256, 1536)),
+        (336, 4.5, TrellisLayout(112, 480)),
+        (272, 3.5, TrellisLayout(16, 32)),
+        (272, 4.5, TrellisLayout(16, 48)),
     ],
 )
 def test_resolve_layout_takes_the_most_whole_bytes_within_the_rate(
@@ -50,8 +50,8 @@ def test_resolve_layout_takes_the_most_whole_bytes_within_the_rate(
 @pytest.mark.parametrize(
     ("in_features", "bits_per_weight", "message"),
     [
-        (5120, 2, "store 2.03125 to 6.03125 bits per weight"),
-        (5120, 6.1, "store 2.03125 to 6.03125 bits per weight"),
+        (5120, 2.05, "store 2.09375 to 6.09375 bits per weight"),
+        (5120, 6.15, "store 2.09375 to 6.09375 bits per weight"),
         (100, 4.5, "multiple of 16 wide, got 100"),
     ],
 )
@@ -77,8 +77,8 @@ def test_pack_states_inverts_the_decoder_windows(layout: TrellisLayout) -> None:
     from piper_kernels.trellis._encoder import pack_states  # noqa: PLC0415 - needs Triton
 
     generator = torch.Generator().manual_seed(0)
-    shape = (5, layout.bytes_per_block)
-    bitstreams = torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+    raw = torch.randint(0, 256, (5, layout.code_bytes), dtype=torch.uint8, generator=generator)
+    bitstreams = torch.cat((raw, raw[:, :2]), dim=1)
 
     assert torch.equal(pack_states(compute_states(bitstreams, layout), layout), bitstreams)
 
@@ -106,7 +106,7 @@ def _sqnr_db(reference: torch.Tensor, approximation: torch.Tensor) -> float:
 
 @pytest.mark.parametrize(
     ("bits_per_weight", "min_sqnr_db"),
-    [(2.03125, 10.5), (2.5, 13.5), (3.5, 19.5), (4.5, 25.5), (5.5, 31.0)],
+    [(2.09375, 10.5), (2.5, 13.5), (3.5, 19.5), (4.5, 25.5), (5.5, 31.0)],
 )
 @pytest.mark.gpu
 @_nvidia
@@ -124,6 +124,9 @@ def test_from_hp_round_trips_through_int8_decode(
         block_size=storage.block_size,
         group_size=256,
     )
+    direct = ConvRotTrellisTensor.from_trellis_storage(
+        storage, group_size=256, logical_dtype=torch.bfloat16
+    )
 
     layout = resolve_layout(1024, bits_per_weight)
     assert storage.block_size == layout.block_size == 256
@@ -135,6 +138,7 @@ def test_from_hp_round_trips_through_int8_decode(
     assert storage.scale.dtype == torch.float32
     assert decoded.dtype == torch.bfloat16
     assert _sqnr_db(weight, decoded.dequantize(torch.float32)) > min_sqnr_db
+    assert _sqnr_db(weight, direct.dequantize(torch.float32)) > min_sqnr_db
 
 
 @pytest.mark.gpu
@@ -252,13 +256,13 @@ def test_from_hp_encodes_large_finite_weights_without_overflow() -> None:
 @pytest.mark.parametrize(
     ("cols", "bytes_per_block", "bits_per_weight"),
     [
-        (512, 64, 2.03125),
+        (512, 66, 2.09375),
         (512, 143, 4.5),
-        (448, 56, 2.036),
-        (448, 70, 2.536),
-        (448, 84, 3.036),
+        (448, 58, 2.11),
+        (448, 72, 2.61),
+        (448, 86, 3.11),
         (448, 125, 4.5),
-        (448, 168, 6.05),
+        (448, 170, 6.11),
     ],
 )
 @pytest.mark.gpu
@@ -310,8 +314,12 @@ def test_from_hp_validates_its_arguments(
             TypeError,
             "bytes_per_block must be an integer",
         ),
-        ({"group_size": 256, "bytes_per_block": 63}, ValueError, "take 64 to 192 whole bytes"),
-        ({"group_size": 256, "bytes_per_block": 193}, ValueError, "take 64 to 192 whole bytes"),
+        ({"group_size": 256, "bytes_per_block": 65}, ValueError, "take 64 to 192 whole code bytes"),
+        (
+            {"group_size": 256, "bytes_per_block": 195},
+            ValueError,
+            "take 64 to 192 whole code bytes",
+        ),
     ],
 )
 def test_from_hp_validates_bytes_per_block_arguments(
@@ -596,15 +604,15 @@ def test_from_hp_ldlq_variable_rows_mixed_rates() -> None:
     ).cuda()
     factor = TrellisHessian.from_hessian(hessian_cpu, group_size=group_size, device="cuda")
 
-    widths = [64 if i < 16 else 112 for i in range(32)]
+    widths = [66 if i < 16 else 114 for i in range(32)]
     row_widths = torch.tensor(widths, dtype=torch.uint8, device="cuda")
-    low_df = TrellisStorage.from_hp(weight[:16], group_size=group_size, bytes_per_block=64)
-    hi_df = TrellisStorage.from_hp(weight[16:], group_size=group_size, bytes_per_block=112)
+    low_df = TrellisStorage.from_hp(weight[:16], group_size=group_size, bytes_per_block=66)
+    hi_df = TrellisStorage.from_hp(weight[16:], group_size=group_size, bytes_per_block=114)
     low_h = TrellisStorage.from_hp(
-        weight[:16], group_size=group_size, bytes_per_block=64, hessian=factor
+        weight[:16], group_size=group_size, bytes_per_block=66, hessian=factor
     )
     hi_h = TrellisStorage.from_hp(
-        weight[16:], group_size=group_size, bytes_per_block=112, hessian=factor
+        weight[16:], group_size=group_size, bytes_per_block=114, hessian=factor
     )
 
     streams_df = torch.cat((low_df.bitstreams.reshape(-1), hi_df.bitstreams.reshape(-1)))
@@ -635,13 +643,23 @@ def test_from_hp_ldlq_variable_rows_mixed_rates() -> None:
         logical_dtype=torch.bfloat16,
         row_widths=row_widths,
     )
-    torch.testing.assert_close(h_direct.dequantize(), h_int8.dequantize(), atol=0, rtol=0)
+    torch.testing.assert_close(
+        h_direct.dequantize(torch.float32).cpu(),
+        h_direct.cpu().dequantize(torch.float32),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert _sqnr_db(h_direct.dequantize(torch.float32), h_int8.dequantize(torch.float32)) > 25.0
 
     x_bf16 = activations[:16].to(torch.bfloat16)
     ref_out = F.linear(x_bf16, weight)
     df_out = F.linear(x_bf16, df_int8)
     h_out = F.linear(x_bf16, h_direct)
     assert _sqnr_db(ref_out, h_out) - _sqnr_db(ref_out, df_out) > 1.5
+    ref_low_m = F.linear(x_bf16[:4], weight)
+    df_low_m = F.linear(x_bf16[:4], df_int8)
+    h_low_m = F.linear(x_bf16[:4], h_direct)
+    assert _sqnr_db(ref_low_m, h_low_m) - _sqnr_db(ref_low_m, df_low_m) > 1.5
 
 
 @pytest.mark.gpu

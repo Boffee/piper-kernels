@@ -37,11 +37,15 @@ from piper_kernels.linear.nvfp4.triton import (
     _load_nvfp4_tile,
     _split_global_scale,
 )
-from piper_kernels.trellis._layout import TrellisLayout, validate_block_size
+from piper_kernels.trellis._layout import (
+    WRAP_GUARD_BYTES,
+    TrellisLayout,
+    default_layout_for_block_size,
+    validate_block_size,
+)
 from piper_kernels.trellis.triton import (
-    _bit_window_params,
-    _uniform_row_start_bits,
-    _variable_row_start_bits,
+    _DEFAULT_DECODE_WARPS,
+    _le_step_bits_4,
     compute_row_offsets_2d,
     decode_slots_int8_kernel,
     decode_slots_int8_out,
@@ -82,6 +86,7 @@ _TRELLIS_GEMV_NUM_WARPS = 1
 _TRELLIS_MAX_SPLIT_K = 8
 _TRELLIS_MIN_SPLITK_WEIGHT_BYTES = 1024 * 1024
 _TRELLIS_SCRATCH_BYTES = 32 * 1024 * 1024
+_WRAP_GUARD_BYTES = tl.constexpr(WRAP_GUARD_BYTES)
 
 _BATCH_BLOCK_M = 16
 _BATCH_BLOCK_M_TL = tl.constexpr(_BATCH_BLOCK_M)
@@ -1333,22 +1338,17 @@ def int8_moe_grouped_gemm_kernel(
 
 
 @triton.jit
-def _trellis_slot_bit_window(
-    bitstreams_ptr,
+def _trellis_slot_row_params(
     row_widths_ptr,
     row_offsets_ptr,
     slot_offsets_ptr,
     slot,
     width_slot_idx,
-    row_index,
-    row_mask,
-    elem_mask,
+    pid_n,
     out_features,
     blocks_per_row,
     bitstreams_bytes,
-    clamped_steps,
     denom,
-    block_bits,
     step_bits,
     num_wide_steps,
     bytes_per_block,
@@ -1356,63 +1356,37 @@ def _trellis_slot_bit_window(
     variable_rows: tl.constexpr,
     has_slot_offsets: tl.constexpr,
 ):
+    """Resolve slot/row bitstream offsets, byte bounds, and LE step widths for MoE GEMV."""
     if variable_rows:
-        width_idx = width_slot_idx * out_features + row_index
-        width = tl.load(row_widths_ptr + width_idx, mask=row_mask, other=0).to(tl.int32)
-        row_offset = tl.load(row_offsets_ptr + width_idx, mask=row_mask, other=0).to(tl.int64)
+        width_idx = width_slot_idx * out_features + pid_n
+        width = tl.load(row_widths_ptr + width_idx).to(tl.int32)
+        row_offset = tl.load(row_offsets_ptr + width_idx).to(tl.int64)
+        width64 = width.to(tl.int64)
+        eff_code_bits = tl.maximum(width - _WRAP_GUARD_BYTES, 0) * 8
+        eff_step_bits = eff_code_bits // denom
+        eff_wide_steps = eff_code_bits - eff_step_bits * denom
         if has_slot_offsets:
             raw_slot_base = tl.load(slot_offsets_ptr + slot).to(tl.int64)
             valid_base = raw_slot_base >= 0
             slot_base = tl.where(valid_base, raw_slot_base, 0)
-            slot_limit_bytes = tl.where(valid_base, bitstreams_bytes.to(tl.int64), 0)
+            row_base_bytes = slot_base + row_offset * blocks_per_row
+            limit_bytes = tl.where(valid_base, bitstreams_bytes.to(tl.int64), 0)
+            non_empty = valid_base & (width > _WRAP_GUARD_BYTES)
         else:
             slot_base = slot * slot_bytes.to(tl.int64)
-            slot_limit_bytes = slot_base + slot_bytes.to(tl.int64)
-        row_base_bytes = slot_base + row_offset * blocks_per_row
-        slot_bitstreams_ptr = bitstreams_ptr
-        width64 = width.to(tl.int64)
+            row_base_bytes = slot_base + row_offset * blocks_per_row
+            limit_bytes = tl.minimum(
+                slot_base + slot_bytes.to(tl.int64), bitstreams_bytes.to(tl.int64)
+            )
+            non_empty = width > _WRAP_GUARD_BYTES
     else:
-        width = tl.full((1,), 0, tl.int32)
-        slot_bitstreams_ptr = bitstreams_ptr + slot * (
-            out_features.to(tl.int64) * blocks_per_row * bytes_per_block
-        )
-        slot_limit_bytes = tl.full((), 0, tl.int64)
-        row_base_bytes = tl.full((1,), 0, tl.int64)
-        width64 = tl.full((1,), 0, tl.int64)
-    if variable_rows:
-        start_bits, stream_bits = _variable_row_start_bits(width, clamped_steps, denom)
-        u_b0_mask = row_mask
-        u_b1_mask = row_mask
-    else:
-        start_bits = _uniform_row_start_bits(step_bits, num_wide_steps, clamped_steps, denom)[
-            None, :
-        ]
-        stream_bits = block_bits
-        u_b0_mask = row_mask & (bytes_per_block > 0)
-        u_b1_mask = row_mask & (bytes_per_block > 1)
-    byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift = _bit_window_params(
-        start_bits, stream_bits
-    )
-    u_m0 = elem_mask if variable_rows else (elem_mask & (byte < bytes_per_block))
-    u_m1 = elem_mask if variable_rows else (elem_mask & ((byte + 1) < bytes_per_block))
-    u_m2 = elem_mask if variable_rows else (elem_mask & ((byte + 2) < bytes_per_block))
-    return (
-        slot_bitstreams_ptr,
-        slot_limit_bytes,
-        row_base_bytes,
-        width64,
-        byte,
-        shift,
-        head_mask,
-        has_tail,
-        tail_bits_u32,
-        tail_shift,
-        u_b0_mask,
-        u_b1_mask,
-        u_m0,
-        u_m1,
-        u_m2,
-    )
+        width64 = bytes_per_block.to(tl.int64)
+        row_base_bytes = (slot * out_features.to(tl.int64) + pid_n) * blocks_per_row * width64
+        limit_bytes = bitstreams_bytes.to(tl.int64)
+        eff_step_bits = step_bits
+        eff_wide_steps = num_wide_steps
+        non_empty = True
+    return row_base_bytes, width64, limit_bytes, eff_step_bits, eff_wide_steps, non_empty
 
 
 @triton.jit(
@@ -1422,7 +1396,6 @@ def _trellis_slot_bit_window(
         "blocks_per_row",
         "bitstreams_bytes",
         "block_size",
-        "block_bits",
         "step_bits",
         "num_wide_steps",
         "bytes_per_block",
@@ -1452,7 +1425,6 @@ def trellis_moe_gemv_kernel(
     blocks_per_row,
     bitstreams_bytes,
     block_size,
-    block_bits,
     step_bits,
     num_wide_steps,
     bytes_per_block,
@@ -1471,8 +1443,14 @@ def trellis_moe_gemv_kernel(
     variable_rows: tl.constexpr,
     has_slot_offsets: tl.constexpr,
     exact_pow2: tl.constexpr,
+    needs_w2: tl.constexpr,
+    use_dp4a: tl.constexpr,
+    has_tail_bytes: tl.constexpr,
+    ptr_aligned: tl.constexpr,
+    x_mul4: tl.constexpr,
+    unroll_k: tl.constexpr = 1,
 ):
-    """Fused in-register Trellis -> A16 Split-K GEMV for ``m1`` and bucketed ``batched`` MoE."""
+    """Fused in-register LE Trellis -> A16 Split-K GEMV for ``m1`` and bucketed ``batched`` MoE."""
     pid_0 = tl.program_id(0)
     pid_n = pid_0 % out_features
     pid_tile = pid_0 // out_features
@@ -1494,6 +1472,7 @@ def trellis_moe_gemv_kernel(
             return
         safe_pairs = tl.where(m_mask, pair_ids, 0).to(tl.int64)
         ms = safe_pairs if per_expert_input else (safe_pairs // top_k)
+        m0 = tl.full((), 0, tl.int64)
         width_slot_idx = bucket_idx.to(tl.int64)
     else:
         slot = _resolve_slot(
@@ -1508,94 +1487,34 @@ def trellis_moe_gemv_kernel(
             return
         m_mask = tl.arange(0, 1) >= 0
         safe_pairs = tl.full((1,), pid_tile, tl.int64)
+        m0 = pid_tile.to(tl.int64) if per_expert_input else tl.full((), 0, tl.int64)
         ms = tl.full((1,), pid_tile if per_expert_input else 0, tl.int64)
         width_slot_idx = pid_tile.to(tl.int64)
 
-    row_index = pid_n + tl.arange(0, 1)
-    row_mask = row_index < out_features
-    steps = tl.arange(0, tile_steps)
-    clamped_steps = steps if exact_pow2 else tl.minimum(steps, block_size - 1)
-    elem_mask = (
-        row_mask[:, None] if exact_pow2 else (row_mask[:, None] & (steps < block_size)[None, :])
-    )
-    x_mask = m_mask[:, None] if exact_pow2 else (m_mask[:, None] & (steps < block_size)[None, :])
     denom = tile_steps if exact_pow2 else block_size
-
-    slot_block_scales_ptr = block_scales_ptr + slot * (out_features.to(tl.int64) * blocks_per_row)
-    (
-        slot_bitstreams_ptr,
-        slot_limit_bytes,
-        row_base_bytes,
-        width64,
-        byte,
-        shift,
-        head_mask,
-        has_tail,
-        tail_bits_u32,
-        tail_shift,
-        u_b0_mask,
-        u_b1_mask,
-        u_m0,
-        u_m1,
-        u_m2,
-    ) = _trellis_slot_bit_window(
-        bitstreams_ptr,
-        row_widths_ptr,
-        row_offsets_ptr,
-        slot_offsets_ptr,
-        slot,
-        width_slot_idx,
-        row_index,
-        row_mask,
-        elem_mask,
-        out_features,
-        blocks_per_row,
-        bitstreams_bytes,
-        clamped_steps,
-        denom,
-        block_bits,
-        step_bits,
-        num_wide_steps,
-        bytes_per_block,
-        slot_bytes,
-        variable_rows=variable_rows,
-        has_slot_offsets=has_slot_offsets,
+    row_base_bytes, width64, limit_bytes, eff_step_bits, eff_wide_steps, non_empty = (
+        _trellis_slot_row_params(
+            row_widths_ptr, row_offsets_ptr, slot_offsets_ptr, slot, width_slot_idx, pid_n,
+            out_features, blocks_per_row, bitstreams_bytes, denom, step_bits, num_wide_steps,
+            bytes_per_block, slot_bytes, variable_rows=variable_rows,
+            has_slot_offsets=has_slot_offsets,
+        )
+    )  # fmt: skip
+    first_step = tl.arange(0, tile_steps // 4) * 4
+    sbit0, sbit1, sbit2, sbit3 = _le_step_bits_4(
+        first_step, eff_step_bits, eff_wide_steps, denom, block_size, exact_pow2
     )
+    first_byte = sbit0 >> 3
+    row_blk_base = (slot * out_features.to(tl.int64) + pid_n) * blocks_per_row
 
     acc = _gemv_accumulate_k_blocks(
-        x_rot_ptr,
-        slot_bitstreams_ptr,
-        slot_block_scales_ptr,
-        row_index,
-        row_mask,
-        ms,
-        steps,
-        elem_mask,
-        x_mask,
-        byte,
-        shift,
-        head_mask,
-        has_tail,
-        tail_bits_u32,
-        tail_shift,
-        pid_k,
-        blocks_per_row,
-        slot_limit_bytes,
-        block_size,
-        bytes_per_block,
-        in_features,
-        split_k,
-        row_base_bytes,
-        width64,
-        u_b0_mask,
-        u_b1_mask,
-        u_m0,
-        u_m1,
-        u_m2,
-        block_m=block_m,
-        tile_steps=tile_steps,
-        variable_rows=variable_rows,
-    )
+        x_rot_ptr, bitstreams_ptr, block_scales_ptr, row_blk_base, row_base_bytes, width64,
+        sbit0, sbit1, sbit2, sbit3, first_byte, m0, ms, m_mask, pid_k, blocks_per_row,
+        limit_bytes, block_size, in_features, split_k, non_empty, tile_steps=tile_steps,
+        block_m=block_m, exact_pow2=exact_pow2, needs_w2=needs_w2, use_dp4a=use_dp4a,
+        has_tail_bytes=has_tail_bytes, ptr_aligned=ptr_aligned, x_mul4=x_mul4,
+        unroll_k=unroll_k,
+    )  # fmt: skip
 
     sums = tl.sum(acc, axis=1)
     n_valid = m_mask & (pid_n < out_features)
@@ -3671,27 +3590,36 @@ def _launch_trellis_proj(
             else None
         )
 
+    per_slot_2d = variable_rows and not has_slot_offsets
     if variable_rows:
         assert row_widths is not None
         assert active_slots is not None
         active_widths = row_widths.index_select(0, active_slots).contiguous()
         active_offsets = compute_row_offsets_2d(active_widths, dtype=torch.int32)
         slot_bytes = 0 if has_slot_offsets else qdata.shape[1]
-        block_bits = step_bits = num_wide_steps = bytes_per_block = 0
+        step_bits = num_wide_steps = bytes_per_block = 0
+        needs_w2 = True
     else:
         layout = TrellisLayout.from_storage(block_size, qdata.shape[3])
         active_widths = active_offsets = None
         slot_bytes = 0
-        block_bits = layout.block_bits
         step_bits = layout.step_bits
         num_wide_steps = layout.num_wide_steps
         bytes_per_block = layout.bytes_per_block
+        needs_w2 = layout.block_bits > 5 * layout.block_size
+
+    target = AcceleratorTarget.from_device(x_rot.device)
+    flat_qdata = qdata.view(-1)
+    ptr_aligned = qdata.is_contiguous() and qdata.data_ptr() % 4 == 0
+    has_tail_bytes = per_slot_2d or (qdata.numel() % 4 != 0)
+    x_mul4 = block_size % 4 == 0 and in_features % 4 == 0
+    unroll_k = 2 if (target.is_cuda_capability(12) and block_m == 1) else 1
 
     grid = (out_features * grid_tiles, split_k)
     with device_context(x_rot.device):
         trellis_moe_gemv_kernel[grid](
             x_rot,
-            qdata.view(-1),
+            flat_qdata,
             block_scales.view(torch.uint8),
             row_scale,
             active_widths,
@@ -3707,7 +3635,6 @@ def _launch_trellis_proj(
             blocks_per_row,
             qdata.numel(),
             block_size,
-            block_bits,
             step_bits,
             num_wide_steps,
             bytes_per_block,
@@ -3726,6 +3653,12 @@ def _launch_trellis_proj(
             variable_rows=variable_rows,
             has_slot_offsets=has_slot_offsets,
             exact_pow2=exact_pow2,
+            needs_w2=needs_w2,
+            use_dp4a=target.is_nvidia_cuda,
+            has_tail_bytes=has_tail_bytes,
+            ptr_aligned=ptr_aligned,
+            x_mul4=x_mul4,
+            unroll_k=unroll_k,
             num_warps=_TRELLIS_GEMV_NUM_WARPS,
         )
 
@@ -4983,6 +4916,7 @@ def _compile_trellis_prefill_kernels(
     block_size: int,
     variable_rows: bool,
     has_slot_offsets: bool,
+    bytes_per_block: int | None,
     activation_fn: str,
     gate_first: bool,
     has_slot_map: bool,
@@ -5008,6 +4942,14 @@ def _compile_trellis_prefill_kernels(
     )
 
     tile_steps = triton.next_power_of_2(block_size)
+    per_slot_2d = variable_rows and not has_slot_offsets
+    if variable_rows:
+        needs_w2 = True
+        has_tail_bytes = per_slot_2d or has_slot_offsets
+    else:
+        layout = default_layout_for_block_size(block_size, bytes_per_block)
+        needs_w2 = layout.block_bits > 5 * layout.block_size
+        has_tail_bytes = (layout.bytes_per_block % 4) != 0
     dec_sig: dict[str, str] = {
         "bitstreams": "*u8",
         "block_scales": "*u8",
@@ -5017,7 +4959,6 @@ def _compile_trellis_prefill_kernels(
         "blocks_per_row": "i32",
         "bitstreams_bytes": "i64",
         "block_size": "i32",
-        "block_bits": "i32",
         "step_bits": "i32",
         "num_wide_steps": "i32",
         "bytes_per_block": "i32",
@@ -5031,7 +4972,12 @@ def _compile_trellis_prefill_kernels(
         "exact_pow2": block_size == tile_steps,
         "filter_active": True,
         "has_slot_offsets": has_slot_offsets,
-        "per_slot_2d": variable_rows and not has_slot_offsets,
+        "per_slot_2d": per_slot_2d,
+        "needs_w2": needs_w2,
+        "use_dp4a": accel.is_nvidia_cuda,
+        "has_tail_bytes": has_tail_bytes,
+        "ptr_aligned": True,
+        "q_u32_aligned": (block_size % 4 == 0),
     }
     _bind_opt_ptrs(
         dec_sig,
@@ -5044,7 +4990,7 @@ def _compile_trellis_prefill_kernels(
     compiled["trellis_decode"] = compile_fn(
         ASTSource(decode_slots_int8_kernel, dec_sig, constexprs=dec_constexprs),
         target,
-        {"num_warps": 2},
+        {"num_warps": _DEFAULT_DECODE_WARPS},
     )
     return compiled
 
@@ -5058,6 +5004,7 @@ def _compile_trellis_kernels(
     block_size: int,
     variable_rows: bool,
     has_slot_offsets: bool,
+    bytes_per_block: int | None,
     group_size: int,
     activation_fn: str,
     gate_first: bool,
@@ -5070,6 +5017,13 @@ def _compile_trellis_kernels(
     exact_pow2 = block_size == tile_steps
     block_m = _TRELLIS_GEMV_BATCH_BLOCK_M if batched else 1
     is_splitk = split_k > 1
+    if variable_rows:
+        needs_w2 = True
+        has_tail_bytes = True
+    else:
+        layout = default_layout_for_block_size(block_size, bytes_per_block)
+        needs_w2 = layout.block_bits > 5 * layout.block_size
+        has_tail_bytes = (layout.bytes_per_block % 4) != 0
 
     gemv_sig: dict[str, str] = {
         "x_rot_ptr": "*fp32",
@@ -5082,7 +5036,6 @@ def _compile_trellis_kernels(
         "blocks_per_row": "i32",
         "bitstreams_bytes": "i64",
         "block_size": "i32",
-        "block_bits": "i32",
         "step_bits": "i32",
         "num_wide_steps": "i32",
         "bytes_per_block": "i32",
@@ -5102,6 +5055,12 @@ def _compile_trellis_kernels(
         "variable_rows": variable_rows,
         "has_slot_offsets": has_slot_offsets,
         "exact_pow2": exact_pow2,
+        "needs_w2": needs_w2,
+        "use_dp4a": accel.is_nvidia_cuda,
+        "has_tail_bytes": has_tail_bytes,
+        "ptr_aligned": True,
+        "x_mul4": (block_size % 4 == 0),
+        "unroll_k": 2 if (accel.is_cuda_capability(12) and block_m == 1) else 1,
     }
     _bind_opt_ptrs(
         gemv_sig,
@@ -5249,6 +5208,7 @@ def compile_moe_kernels(
                 block_size=block_size,
                 variable_rows=variable_rows,
                 has_slot_offsets=has_slot_offsets,
+                bytes_per_block=bytes_per_block,
                 activation_fn=activation_fn,
                 gate_first=gate_first,
                 has_slot_map=has_slot_map,
@@ -5308,6 +5268,7 @@ def compile_moe_kernels(
             block_size=block_size,
             variable_rows=variable_rows,
             has_slot_offsets=has_slot_offsets,
+            bytes_per_block=bytes_per_block,
             group_size=group_size,
             activation_fn=activation_fn,
             gate_first=gate_first,

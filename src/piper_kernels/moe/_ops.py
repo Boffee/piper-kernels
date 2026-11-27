@@ -20,9 +20,8 @@ from piper_kernels._input_activations import parse_input_activation
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.trellis._layout import (
-    MAX_BITS_PER_WEIGHT,
-    MIN_BITS_PER_WEIGHT,
     TrellisLayout,
+    stored_bytes_bounds,
     validate_block_size,
 )
 from piper_kernels.weights.convrot._rotation import validate_group_size
@@ -240,12 +239,11 @@ def _validate_trellis_projection(
         if type(bytes_per_block) is int:
             TrellisLayout.from_storage(resolved_block_size, bytes_per_block)
         else:
-            lowest = MIN_BITS_PER_WEIGHT * resolved_block_size
-            highest = MAX_BITS_PER_WEIGHT * resolved_block_size
-            if 8 * bytes_per_block < lowest or 8 * bytes_per_block > highest:
+            min_stored, max_stored = stored_bytes_bounds(resolved_block_size)
+            if bytes_per_block < min_stored or bytes_per_block > max_stored:
                 raise ValueError(
                     f"ConvRot Trellis blocks of {resolved_block_size} weights take "
-                    f"{(lowest + 7) // 8} to {highest // 8} bytes, got {8 * bytes_per_block} bits"
+                    f"{min_stored} to {max_stored} stored bytes, got {bytes_per_block}"
                 )
         return resolved_block_size
 

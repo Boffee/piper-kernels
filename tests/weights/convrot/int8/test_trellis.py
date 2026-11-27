@@ -97,7 +97,7 @@ def test_from_trellis_rejects_cpu_storage() -> None:
 @pytest.mark.parametrize(
     ("change", "message"),
     [
-        (lambda b, s, r: (b[..., :63], s, r), "take 64 to 192 whole bytes"),
+        (lambda b, s, r: (b[..., :65], s, r), "take 64 to 192 whole code bytes"),
         (lambda b, s, r: (b.view(3, -1), s, r), "must be a 3-D uint8 tensor"),
         (lambda b, s, r: (b, s.float(), r), "block_scales must be float8_e4m3fn"),
         (lambda b, s, r: (b, s[:, :1], r), r"block_scales must be .* with shape \(3, 2\)"),
@@ -143,11 +143,11 @@ def _variable_storage(
 @pytest.mark.parametrize(
     ("block_size", "widths", "blocks_per_row", "noncontiguous"),
     [
-        (256, (64, 79, 96, 128, 143, 176), 2, False),
-        (224, (56, 70, 84, 112, 140, 168), 2, False),
+        (256, (66, 81, 98, 130, 143, 178), 2, False),
+        (224, (58, 72, 86, 114, 142, 170), 2, False),
         (256, (144,), 3, False),
         (256, (), 2, False),
-        (256, (64, 144, 192), 2, True),
+        (256, (66, 144, 194), 2, True),
     ],
 )
 def test_from_trellis_variable_rows_matches_rectangular_and_reference(
@@ -256,7 +256,7 @@ def test_copy_from_trellis_variable_rows_rejects_incompatible_shape_without_muta
 def test_from_hp_bytes_per_block_round_trips_through_variable_row_trellis() -> None:
     weight = (torch.randn(8, 512, generator=torch.Generator().manual_seed(7)) * 0.02).cuda()
     weight = weight.to(torch.bfloat16)
-    widths = [64, 79, 96, 128, 144, 176, 64, 192]
+    widths = [66, 81, 98, 130, 144, 178, 66, 194]
     row_widths = torch.tensor(widths, dtype=torch.uint8, device="cuda")
     blocks_per_row = 2
 

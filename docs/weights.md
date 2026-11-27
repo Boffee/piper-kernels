@@ -195,12 +195,14 @@ multiple of 16) and at most `131_071`, and three bitstream layouts independently
 
 Caller preconditions (not checked via host readbacks when wrapping or dispatching): E4M3
 `block_scales` must be non-NaN (`0x7F`/`0xFF` excluded), each variable-row width must lie in
-`[⌈2·block_size / 8⌉, ⌊6·block_size / 8⌋]`, each slot's `(in / block_size) · sum(row_widths[s])`
-must fit within `slot_bytes` (2-D) or `qdata.numel() - slot_offsets[s]` (1-D), and `slot_offsets`
-must be non-negative and within `qdata.numel()`. At runtime, single-token, small-batch, and
-non-INT8 GPUs (such as NVIDIA SM75) keep high-precision activations via fused in-register A16
-execution, while larger batches on SM80+ and supported AMD ROCm GPUs skip unrouted slots and stream
-active slots through a bounded decoded INT8 scratch workspace for ConvRot INT8 W8A8 execution.
+`[⌈2·block_size / 8⌉ + 2, ⌊6·block_size / 8⌋ + 2]` (including 2 trailing wrap guard bytes),
+each slot's `(in / block_size) · sum(row_widths[s])` must fit within `slot_bytes` (2-D) or
+`qdata.numel() - slot_offsets[s]` (1-D), and `slot_offsets` must be non-negative and within
+`qdata.numel()`. At runtime, single-token, small-batch, and non-INT8 GPUs (such as NVIDIA
+SM75) keep high-precision activations via fused in-register A16 execution with continuous
+block-scaled FP32 accumulation (no per-weight INT8 rounding), while larger batches on SM80+
+and supported AMD ROCm GPUs skip unrouted slots and stream active slots through a bounded
+prescaled rounded INT8 scratch workspace for ConvRot INT8 W8A8 execution.
 
 ```python
 import torch
@@ -417,27 +419,29 @@ int8_weight.copy_from_trellis_(storage.bitstreams, storage.block_scales, storage
 `ConvRotTrellisTensor` also wraps checkpoint storage zero-copy via
 `ConvRotTrellisTensor.from_quantized(...)`, accepts `TrellisStorage.from_hp`
 arguments directly via `ConvRotTrellisTensor.from_hp(...)`, and supports
-`dequantize()`, transposed `mm`/`addmm`/`matmul`, and CPU execution; small
-batches keep high-precision activations while larger batches use dynamic INT8
-activation quantization on supported W8A8 backends (`F.embedding`, FSDP2,
-and in-place weight updates are unsupported on `ConvRotTrellisTensor`).
+`dequantize()` (returning continuous block-scaled weights without per-weight INT8
+rounding), transposed `mm`/`addmm`/`matmul`, and CPU execution; small-batch execution
+keeps high-precision activations with continuous block-scaled accumulation while
+larger batches decode prescaled INT8 weights for dynamic W8A8 execution on supported
+backends (`F.embedding`, FSDP2, and in-place weight updates are unsupported on
+`ConvRotTrellisTensor`).
 
 A checkpoint stores `(bitstreams, block_scales, scale, block_size, group_size)`.
-`TrellisStorage.from_hp` also accepts an exact `bytes_per_block` instead of
-`bits_per_weight`, plus optional `hessian` (`[in, in]` unrotated second-moment
-matrix or a reusable `TrellisHessian.from_hessian(hessian, group_size=...)`) and
-`hessian_damping` (default `0.01` for raw tensors) for Hessian-aware Block-LDLQ
-encoding, and `piper_kernels.trellis` exports `TrellisHessian`, `TrellisLayout`,
-`resolve_block_size`, and `resolve_layout`. `ConvRotTrellisTensor.from_quantized`,
-`ConvRotInt8Tensor.from_trellis`, and `copy_from_trellis_` accept optional
-`row_widths` (`uint8 [out]`) with 1-D row-concatenated `bitstreams`
-(`uint8 [total_bytes]`), where valid row widths (`2–6` code bits per weight)
-and bitstream capacity are caller preconditions. `TrellisStorage.from_hp`
-requires an NVIDIA SM80+ GPU and validates finite input weights and raw Hessians. GPU decoding and
-execution require a supported Triton GPU (validated on NVIDIA decode and AMD
-RDNA4 decode/execution hardware, with offline compile coverage for NVIDIA direct
-execution and additional AMD targets), reuse contiguous `scale` storage, and
-support in-place `ConvRotInt8Tensor` refills via `copy_from_trellis_`; see
+`TrellisStorage.from_hp` also accepts an exact `bytes_per_block` (stored bytes including
+2 wrap guard bytes) instead of `bits_per_weight`, plus optional `hessian` (`[in, in]`
+unrotated second-moment matrix or a reusable `TrellisHessian.from_hessian(hessian,
+group_size=...)`) and `hessian_damping` (default `0.01` for raw tensors) for
+Hessian-aware Block-LDLQ encoding, and `piper_kernels.trellis` exports `TrellisHessian`,
+`TrellisLayout`, `resolve_block_size`, and `resolve_layout`.
+`ConvRotTrellisTensor.from_quantized`, `ConvRotInt8Tensor.from_trellis`, and
+`copy_from_trellis_` accept optional `row_widths` (`uint8 [out]`) with 1-D
+row-concatenated `bitstreams` (`uint8 [total_bytes]`), where valid row widths (`2–6` code
+bits per weight plus 2 wrap guard bytes, i.e., `[⌈2·block_size / 8⌉ + 2,
+⌊6·block_size / 8⌋ + 2]`) and bitstream capacity are caller preconditions.
+`TrellisStorage.from_hp` requires an NVIDIA SM80+ GPU and validates finite input weights
+and raw Hessians. GPU decoding and execution require a supported Triton GPU, reuse
+contiguous `scale` storage, and support prescaled INT8 in-place `ConvRotInt8Tensor`
+refills via `copy_from_trellis_`; see
 [trellis format details](../src/piper_kernels/trellis/README.md).
 
 ## Shard a quantized weight

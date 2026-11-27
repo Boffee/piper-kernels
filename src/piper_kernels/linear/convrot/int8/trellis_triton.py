@@ -2,9 +2,9 @@
 
 Small batches (``M <= 8``, and Triton GPUs without an optimized ConvRot INT8
 W8A8 backend) execute a fused in-register ``Trellis -> A16`` Split-K GEMV
-kernel without materializing decoded INT8 weights in global memory. Larger
-batches with an INT8 backend rotate/quantize inputs once and stream bounded
-scratch-decoded N chunks through ``ConvRotInt8`` W8A8 execution.
+kernel without materializing decoded INT8 weights or per-weight INT8 rounding.
+Larger batches with an INT8 backend rotate/quantize inputs once and stream
+bounded scratch-decoded N chunks through ``ConvRotInt8`` W8A8 execution.
 """
 
 # Triton's JIT launcher and constexpr options are not fully represented by its typing surface.
@@ -32,16 +32,17 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._dispatch import empty_linear_output
 from piper_kernels.linear._splitk import device_sm_count, select_split_k
-from piper_kernels.trellis._layout import TrellisLayout, validate_block_size
+from piper_kernels.trellis._layout import (
+    WRAP_GUARD_BYTES,
+    TrellisLayout,
+    default_layout_for_block_size,
+    validate_block_size,
+)
 from piper_kernels.trellis.triton import (
     _CODE_RECIPROCAL,
-    _bit_window_params,
-    _decode_states_to_q_fp32,
-    _decode_step_3be_sm120,
-    _load_3be_and_head_u32,
-    _load_cyclic_states,
-    _uniform_row_start_bits,
-    _variable_row_start_bits,
+    _decode_e4m3,
+    _decode_group_4_nums,
+    _le_step_bits_4,
     compute_row_offsets,
     decode_int8_out,
     decode_variable_rows_int8_out,
@@ -58,6 +59,34 @@ _SM120_SPLITK_MIN_WEIGHT_BYTES = 4 * 1024 * 1024
 _SPLITK_MAX = 8
 _SM120_SPLITK_MAX = 16
 _SM120_FP32_WORKSPACE_BYTES = 64 * 1024 * 1024
+_WRAP_GUARD_BYTES = tl.constexpr(WRAP_GUARD_BYTES)
+
+
+@triton.jit
+def _fma_4steps_block_scaled(
+    acc,
+    x_all,
+    n0,
+    n1,
+    n2,
+    n3,
+    mult,
+    tile_steps: tl.constexpr,
+    block_m: tl.constexpr,
+):
+    """Accumulate block-scaled 4-step dot products into ``acc`` without per-weight rounding."""
+    num_groups: tl.constexpr = tile_steps // 4
+    if block_m == 1:
+        xe, xo = tl.split(tl.reshape(x_all, (tile_steps // 2, 2)))
+        x0, x2 = tl.split(tl.reshape(xe, (num_groups, 2)))
+        x1, x3 = tl.split(tl.reshape(xo, (num_groups, 2)))
+        acc += (x0 * n0 + x1 * n1 + x2 * n2 + x3 * n3) * mult
+    else:
+        xe, xo = tl.split(tl.reshape(x_all, (block_m, tile_steps // 2, 2)))
+        x0, x2 = tl.split(tl.reshape(xe, (block_m, num_groups, 2)))
+        x1, x3 = tl.split(tl.reshape(xo, (block_m, num_groups, 2)))
+        acc += (x0 * n0[None, :] + x1 * n1[None, :] + x2 * n2[None, :] + x3 * n3[None, :]) * mult
+    return acc
 
 
 @triton.jit
@@ -65,471 +94,80 @@ def _gemv_accumulate_k_blocks(
     x_rot_ptr,
     bitstreams_ptr,
     block_scales_ptr,
-    row_index,
-    row_mask,
-    ms,
-    steps,
-    elem_mask,
-    x_mask,
-    byte,
-    shift,
-    head_mask,
-    has_tail,
-    tail_bits_u32,
-    tail_shift,
-    pid_k,
-    blocks_per_row,
-    bitstreams_bytes,
-    block_size,
-    bytes_per_block,
-    stride_xm,
-    split_k,
+    row_blk_base,
     row_base_bytes,
     width64,
-    u_b0_mask,
-    u_b1_mask,
-    u_m0,
-    u_m1,
-    u_m2,
-    block_m: tl.constexpr,
-    tile_steps: tl.constexpr,
-    variable_rows: tl.constexpr,
-):
-    """Run the unified uniform/variable K-block accumulation loop for one CTA split."""
-    b_start, b_end = splitk_tile_bounds(blocks_per_row, pid_k, split_k)
-    row_blk_base = row_index.to(tl.int64) * blocks_per_row
-    bpb64 = bytes_per_block.to(tl.int64)
-
-    acc = tl.zeros((block_m, tile_steps), dtype=tl.float32)
-    for b in range(b_start, b_end):
-        blk_idx = row_blk_base + b
-        if variable_rows:
-            base = row_base_bytes + tl.full((), b, tl.int64) * width64
-            # Bound loads to bitstreams even if caller-owned row_widths are malformed.
-            remaining_bytes = tl.maximum(bitstreams_bytes - base, 0)
-            stream_bytes = tl.minimum(width64, remaining_bytes).to(tl.int32)
-            stream_bytes_2d = stream_bytes[:, None]
-            block_ptr_1d = bitstreams_ptr + base
-            iter_b0_mask = row_mask & (stream_bytes > 0)
-            iter_b1_mask = row_mask & (stream_bytes > 1)
-            iter_m0 = elem_mask & (byte < stream_bytes_2d)
-            iter_m1 = elem_mask & ((byte + 1) < stream_bytes_2d)
-            iter_m2 = elem_mask & ((byte + 2) < stream_bytes_2d)
-        else:
-            block_ptr_1d = bitstreams_ptr + blk_idx * bpb64
-            iter_b0_mask = u_b0_mask
-            iter_b1_mask = u_b1_mask
-            iter_m0 = u_m0
-            iter_m1 = u_m1
-            iter_m2 = u_m2
-        states = _load_cyclic_states(
-            block_ptr_1d,
-            block_ptr_1d[:, None],
-            byte,
-            shift,
-            head_mask,
-            has_tail,
-            tail_bits_u32,
-            tail_shift,
-            iter_b0_mask,
-            iter_b1_mask,
-            iter_m0,
-            iter_m1,
-            iter_m2,
-        )
-        scale_codes = tl.load(block_scales_ptr + blk_idx, mask=row_mask, other=0)
-        q = _decode_states_to_q_fp32(states, scale_codes)
-        x_offs = ms[:, None].to(tl.int64) * stride_xm + (b * block_size + steps)[None, :]
-        x_val = tl.load(x_rot_ptr + x_offs, mask=x_mask, other=0.0).to(tl.float32)
-        acc += x_val * q
-    return acc
-
-
-@triton.jit
-def _gemv_fma_4steps_sm120(
-    acc,
-    x_all,
-    be0,
-    be1,
-    be2,
-    head_u16,
-    blk_align_bits,
-    word_base_bit,
-    first_step,
-    eff_step_bits,
-    eff_wide_steps,
-    denom,
-    eff_block_bits,
-    mult,
-    block_size,
-    tile_steps: tl.constexpr,
-    block_m: tl.constexpr,
-    exact_pow2: tl.constexpr,
-):
-    """Split contiguous 4-step ``x_all`` into lanes and accumulate one decoded step at a time."""
-    num_groups: tl.constexpr = tile_steps // 4
-    if block_m == 1:
-        xe, xo = tl.split(tl.reshape(x_all, (tile_steps // 2, 2)))
-        x0, x2 = tl.split(tl.reshape(xe, (num_groups, 2)))
-        x1, x3 = tl.split(tl.reshape(xo, (num_groups, 2)))
-        acc += x0 * _decode_step_3be_sm120(
-            be0,
-            be1,
-            be2,
-            head_u16,
-            blk_align_bits,
-            word_base_bit,
-            first_step,
-            eff_step_bits,
-            eff_wide_steps,
-            denom,
-            eff_block_bits,
-            mult,
-            exact_pow2,
-            block_size,
-        )
-        acc += x1 * _decode_step_3be_sm120(
-            be0,
-            be1,
-            be2,
-            head_u16,
-            blk_align_bits,
-            word_base_bit,
-            first_step + 1,
-            eff_step_bits,
-            eff_wide_steps,
-            denom,
-            eff_block_bits,
-            mult,
-            exact_pow2,
-            block_size,
-        )
-        acc += x2 * _decode_step_3be_sm120(
-            be0,
-            be1,
-            be2,
-            head_u16,
-            blk_align_bits,
-            word_base_bit,
-            first_step + 2,
-            eff_step_bits,
-            eff_wide_steps,
-            denom,
-            eff_block_bits,
-            mult,
-            exact_pow2,
-            block_size,
-        )
-        acc += x3 * _decode_step_3be_sm120(
-            be0,
-            be1,
-            be2,
-            head_u16,
-            blk_align_bits,
-            word_base_bit,
-            first_step + 3,
-            eff_step_bits,
-            eff_wide_steps,
-            denom,
-            eff_block_bits,
-            mult,
-            exact_pow2,
-            block_size,
-        )
-    else:
-        xe, xo = tl.split(tl.reshape(x_all, (block_m, tile_steps // 2, 2)))
-        x0, x2 = tl.split(tl.reshape(xe, (block_m, num_groups, 2)))
-        x1, x3 = tl.split(tl.reshape(xo, (block_m, num_groups, 2)))
-        acc += (
-            x0
-            * _decode_step_3be_sm120(
-                be0,
-                be1,
-                be2,
-                head_u16,
-                blk_align_bits,
-                word_base_bit,
-                first_step,
-                eff_step_bits,
-                eff_wide_steps,
-                denom,
-                eff_block_bits,
-                mult,
-                exact_pow2,
-                block_size,
-            )[None, :]
-        )
-        acc += (
-            x1
-            * _decode_step_3be_sm120(
-                be0,
-                be1,
-                be2,
-                head_u16,
-                blk_align_bits,
-                word_base_bit,
-                first_step + 1,
-                eff_step_bits,
-                eff_wide_steps,
-                denom,
-                eff_block_bits,
-                mult,
-                exact_pow2,
-                block_size,
-            )[None, :]
-        )
-        acc += (
-            x2
-            * _decode_step_3be_sm120(
-                be0,
-                be1,
-                be2,
-                head_u16,
-                blk_align_bits,
-                word_base_bit,
-                first_step + 2,
-                eff_step_bits,
-                eff_wide_steps,
-                denom,
-                eff_block_bits,
-                mult,
-                exact_pow2,
-                block_size,
-            )[None, :]
-        )
-        acc += (
-            x3
-            * _decode_step_3be_sm120(
-                be0,
-                be1,
-                be2,
-                head_u16,
-                blk_align_bits,
-                word_base_bit,
-                first_step + 3,
-                eff_step_bits,
-                eff_wide_steps,
-                denom,
-                eff_block_bits,
-                mult,
-                exact_pow2,
-                block_size,
-            )[None, :]
-        )
-    return acc
-
-
-@triton.jit
-def _gemv_accumulate_k_blocks_sm120_3word(
-    x_rot_ptr,
-    bitstreams_ptr,
-    block_scales_ptr,
-    row_widths_ptr,
-    row_offsets_ptr,
-    pid_n,
-    pid_k,
+    sbit0,
+    sbit1,
+    sbit2,
+    sbit3,
+    first_byte,
+    m0,
     ms,
     m_mask,
+    pid_k,
     blocks_per_row,
-    bitstreams_bytes,
+    limit_bytes,
     block_size,
-    block_bits,
-    step_bits,
-    num_wide_steps,
-    bytes_per_block,
     stride_xm,
     split_k,
+    non_empty,
     tile_steps: tl.constexpr,
     block_m: tl.constexpr,
-    variable_rows: tl.constexpr,
     exact_pow2: tl.constexpr,
+    needs_w2: tl.constexpr,
+    use_dp4a: tl.constexpr,
+    has_tail_bytes: tl.constexpr,
+    ptr_aligned: tl.constexpr,
+    x_mul4: tl.constexpr,
+    unroll_k: tl.constexpr,
 ):
-    """SM120 3-word uint32 bitstream decode with coalesced x_rot tl.split GEMV accumulation."""
-    denom = tile_steps if exact_pow2 else block_size
-    if variable_rows:
-        width = tl.load(row_widths_ptr + pid_n).to(tl.int32)
-        row_offset = tl.load(row_offsets_ptr + pid_n).to(tl.int64)
-        row_base_bytes = row_offset * blocks_per_row
-        width64 = width.to(tl.int64)
-        eff_block_bits = width * 8
-        eff_step_bits = eff_block_bits // denom
-        eff_wide_steps = eff_block_bits - eff_step_bits * denom
-    else:
-        row_base_bytes = tl.full((), 0, tl.int64)
-        width64 = bytes_per_block.to(tl.int64)
-        eff_block_bits = block_bits
-        eff_step_bits = step_bits
-        eff_wide_steps = num_wide_steps
-    non_empty = eff_block_bits > 0
-
-    num_groups: tl.constexpr = tile_steps // 4
-    first_step = tl.arange(0, num_groups) * 4
-    clamped_first = first_step if exact_pow2 else tl.minimum(first_step, block_size - 1)
-    first_bit = eff_step_bits * clamped_first + (clamped_first + 1) * eff_wide_steps // denom
-    first_byte = first_bit >> 3
-
-    u32_ptr = bitstreams_ptr.to(tl.pointer_type(tl.uint32))
-    total_full_words = bitstreams_bytes.to(tl.int64) >> 2
+    """Run the unified LE unrounded block-scaled K-block accumulation loop for one CTA split."""
     b_start, b_end = splitk_tile_bounds(blocks_per_row, pid_k, split_k)
-    row_blk_base = pid_n.to(tl.int64) * blocks_per_row
+    u32_ptr = bitstreams_ptr.to(tl.pointer_type(tl.uint32))
+    full_words = limit_bytes >> 2
+    num_groups: tl.constexpr = tile_steps // 4
     steps_all = tl.arange(0, tile_steps)
     x_step_mask = steps_all < block_size
+    x_row_base = m0.to(tl.int64) * stride_xm
 
     acc = (
-        tl.zeros((block_m, num_groups), dtype=tl.float32)
-        if block_m > 1
-        else tl.zeros((num_groups,), dtype=tl.float32)
+        tl.zeros((num_groups,), dtype=tl.float32)
+        if block_m == 1
+        else tl.zeros((block_m, num_groups), dtype=tl.float32)
     )
-    for b in range(b_start, b_end):
+    for b in tl.range(  # pyright: ignore[reportGeneralTypeIssues]
+        b_start, b_end, loop_unroll_factor=unroll_k
+    ):
         blk_idx = row_blk_base + b
-        base_byte = (
-            row_base_bytes + tl.full((), b, tl.int64) * width64
-            if variable_rows
-            else blk_idx * width64
-        )
-        be0, be1, be2, head_u16, blk_align_bits, word_base_bit = _load_3be_and_head_u32(
-            u32_ptr,
-            total_full_words,
-            base_byte,
-            first_byte,
-            non_empty,
-            non_empty,
-        )
-        sc = tl.load(block_scales_ptr + blk_idx)
-        mult = sc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * _CODE_RECIPROCAL
+        base_byte = row_base_bytes + tl.full((), b, tl.int64) * width64
+        n0, n1, n2, n3 = _decode_group_4_nums(
+            u32_ptr, bitstreams_ptr, base_byte, sbit0, sbit1, sbit2, sbit3, first_byte,
+            full_words, limit_bytes, non_empty, needs_w2=needs_w2, use_dp4a=use_dp4a,
+            has_tail_bytes=has_tail_bytes, ptr_aligned=ptr_aligned, evict_first=True,
+        )  # fmt: skip
+        sc = tl.load(block_scales_ptr + blk_idx, eviction_policy="evict_first")
+        mult = _decode_e4m3(sc.to(tl.uint32)) * _CODE_RECIPROCAL
 
         if block_m == 1:
-            x_offs_1d = tl.multiple_of(b * block_size + steps_all, 4)
+            base_x = x_row_base + b.to(tl.int64) * block_size + steps_all
+            x_offs = tl.multiple_of(base_x, 4) if x_mul4 else base_x
             if exact_pow2:
-                x_all = tl.load(x_rot_ptr + x_offs_1d).to(tl.float32)
+                x_all = tl.load(x_rot_ptr + x_offs).to(tl.float32)
             else:
-                x_all = tl.load(x_rot_ptr + x_offs_1d, mask=x_step_mask, other=0.0).to(tl.float32)
+                x_all = tl.load(x_rot_ptr + x_offs, mask=x_step_mask, other=0.0).to(tl.float32)
         else:
             x_mask = m_mask[:, None] if exact_pow2 else (m_mask[:, None] & x_step_mask[None, :])
-            x_offs = tl.multiple_of(
-                ms[:, None].to(tl.int64) * stride_xm + (b * block_size + steps_all)[None, :],
-                [1, 4],
+            base_x = (
+                ms[:, None].to(tl.int64) * stride_xm
+                + (b.to(tl.int64) * block_size + steps_all)[None, :]
             )
+            x_offs = tl.multiple_of(base_x, [1, 4]) if x_mul4 else base_x
             x_all = tl.load(x_rot_ptr + x_offs, mask=x_mask, other=0.0).to(tl.float32)
-
-        acc = _gemv_fma_4steps_sm120(
-            acc,
-            x_all,
-            be0,
-            be1,
-            be2,
-            head_u16,
-            blk_align_bits,
-            word_base_bit,
-            first_step,
-            eff_step_bits,
-            eff_wide_steps,
-            denom,
-            eff_block_bits,
-            mult,
-            block_size,
-            tile_steps=tile_steps,
-            block_m=block_m,
-            exact_pow2=exact_pow2,
+        acc = _fma_4steps_block_scaled(
+            acc, x_all, n0, n1, n2, n3, mult, tile_steps=tile_steps, block_m=block_m
         )
     return acc[None, :] if block_m == 1 else acc
-
-
-@triton.jit
-def _gemv_accumulate_k_blocks_portable(
-    x_rot_ptr,
-    bitstreams_ptr,
-    block_scales_ptr,
-    row_widths_ptr,
-    row_offsets_ptr,
-    pid_n,
-    pid_k,
-    out_features,
-    ms,
-    m_mask,
-    blocks_per_row,
-    bitstreams_bytes,
-    block_size,
-    block_bits,
-    step_bits,
-    num_wide_steps,
-    bytes_per_block,
-    stride_xm,
-    split_k,
-    tile_steps: tl.constexpr,
-    block_m: tl.constexpr,
-    variable_rows: tl.constexpr,
-    exact_pow2: tl.constexpr,
-):
-    """Portable per-byte cyclic-window Trellis A16 GEMV K-loop."""
-    row_index = pid_n + tl.arange(0, 1)
-    row_mask = row_index < out_features
-    steps = tl.arange(0, tile_steps)
-    clamped_steps = steps if exact_pow2 else tl.minimum(steps, block_size - 1)
-    elem_mask = (
-        row_mask[:, None] if exact_pow2 else (row_mask[:, None] & (steps < block_size)[None, :])
-    )
-    x_mask = m_mask[:, None] if exact_pow2 else (m_mask[:, None] & (steps < block_size)[None, :])
-    denom = tile_steps if exact_pow2 else block_size
-
-    if variable_rows:
-        width = tl.load(row_widths_ptr + row_index, mask=row_mask, other=0).to(tl.int32)
-        row_offset = tl.load(row_offsets_ptr + row_index, mask=row_mask, other=0).to(tl.int64)
-        row_base_bytes = row_offset * blocks_per_row
-        width64 = width.to(tl.int64)
-        start_bits, stream_bits = _variable_row_start_bits(width, clamped_steps, denom)
-        u_b0_mask = row_mask
-        u_b1_mask = row_mask
-    else:
-        row_base_bytes = tl.full((1,), 0, tl.int64)
-        width64 = tl.full((1,), 0, tl.int64)
-        start_bits = _uniform_row_start_bits(step_bits, num_wide_steps, clamped_steps, denom)[
-            None, :
-        ]
-        stream_bits = block_bits
-        u_b0_mask = row_mask & (bytes_per_block > 0)
-        u_b1_mask = row_mask & (bytes_per_block > 1)
-    byte, shift, head_mask, has_tail, tail_bits_u32, tail_shift = _bit_window_params(
-        start_bits, stream_bits
-    )
-    u_m0 = elem_mask if variable_rows else (elem_mask & (byte < bytes_per_block))
-    u_m1 = elem_mask if variable_rows else (elem_mask & ((byte + 1) < bytes_per_block))
-    u_m2 = elem_mask if variable_rows else (elem_mask & ((byte + 2) < bytes_per_block))
-
-    return _gemv_accumulate_k_blocks(
-        x_rot_ptr,
-        bitstreams_ptr,
-        block_scales_ptr,
-        row_index,
-        row_mask,
-        ms,
-        steps,
-        elem_mask,
-        x_mask,
-        byte,
-        shift,
-        head_mask,
-        has_tail,
-        tail_bits_u32,
-        tail_shift,
-        pid_k,
-        blocks_per_row,
-        bitstreams_bytes,
-        block_size,
-        bytes_per_block,
-        stride_xm,
-        split_k,
-        row_base_bytes,
-        width64,
-        u_b0_mask,
-        u_b1_mask,
-        u_m0,
-        u_m1,
-        u_m2,
-        block_m=block_m,
-        tile_steps=tile_steps,
-        variable_rows=variable_rows,
-    )
 
 
 @triton.jit(
@@ -539,7 +177,6 @@ def _gemv_accumulate_k_blocks_portable(
         "blocks_per_row",
         "bitstreams_bytes",
         "block_size",
-        "block_bits",
         "step_bits",
         "num_wide_steps",
         "bytes_per_block",
@@ -562,7 +199,6 @@ def trellis_gemv_splitk_kernel(
     blocks_per_row,
     bitstreams_bytes,
     block_size,
-    block_bits,
     step_bits,
     num_wide_steps,
     bytes_per_block,
@@ -575,68 +211,53 @@ def trellis_gemv_splitk_kernel(
     variable_rows: tl.constexpr,
     exact_pow2: tl.constexpr,
     has_bias: tl.constexpr,
-    use_sm120_3word: tl.constexpr = False,
+    needs_w2: tl.constexpr,
+    use_dp4a: tl.constexpr,
+    has_tail_bytes: tl.constexpr,
+    ptr_aligned: tl.constexpr,
+    x_mul4: tl.constexpr,
+    unroll_k: tl.constexpr = 1,
 ):
-    """Fused in-register Trellis -> A16 Split-K GEMV over one output row per CTA."""
+    """Fused in-register LE Trellis -> A16 Split-K GEMV over one output row per CTA."""
     pid_mn = tl.program_id(0)
     pid_n = pid_mn % out_features
     pid_m = pid_mn // out_features
     pid_k = tl.program_id(1)
-
     ms = pid_m * block_m + tl.arange(0, block_m)
     m_mask = ms < rows
 
-    if use_sm120_3word:
-        acc = _gemv_accumulate_k_blocks_sm120_3word(
-            x_rot_ptr,
-            bitstreams_ptr,
-            block_scales_ptr,
-            row_widths_ptr,
-            row_offsets_ptr,
-            pid_n,
-            pid_k,
-            ms,
-            m_mask,
-            blocks_per_row,
-            bitstreams_bytes,
-            block_size,
-            block_bits,
-            step_bits,
-            num_wide_steps,
-            bytes_per_block,
-            stride_xm,
-            split_k,
-            tile_steps=tile_steps,
-            block_m=block_m,
-            variable_rows=variable_rows,
-            exact_pow2=exact_pow2,
-        )
+    denom = tile_steps if exact_pow2 else block_size
+    if variable_rows:
+        width = tl.load(row_widths_ptr + pid_n).to(tl.int32)
+        row_offset = tl.load(row_offsets_ptr + pid_n).to(tl.int64)
+        row_base_bytes = row_offset * blocks_per_row
+        width64 = width.to(tl.int64)
+        eff_code_bits = tl.maximum(width - _WRAP_GUARD_BYTES, 0) * 8
+        eff_step_bits = eff_code_bits // denom
+        eff_wide_steps = eff_code_bits - eff_step_bits * denom
+        non_empty = width > _WRAP_GUARD_BYTES
     else:
-        acc = _gemv_accumulate_k_blocks_portable(
-            x_rot_ptr,
-            bitstreams_ptr,
-            block_scales_ptr,
-            row_widths_ptr,
-            row_offsets_ptr,
-            pid_n,
-            pid_k,
-            out_features,
-            ms,
-            m_mask,
-            blocks_per_row,
-            bitstreams_bytes,
-            block_size,
-            block_bits,
-            step_bits,
-            num_wide_steps,
-            bytes_per_block,
-            stride_xm,
-            split_k,
-            tile_steps=tile_steps,
-            block_m=block_m,
-            variable_rows=variable_rows,
-            exact_pow2=exact_pow2,
-        )
+        width64 = bytes_per_block.to(tl.int64)
+        row_base_bytes = pid_n.to(tl.int64) * blocks_per_row * width64
+        eff_step_bits = step_bits
+        eff_wide_steps = num_wide_steps
+        non_empty = True
+
+    first_step = tl.arange(0, tile_steps // 4) * 4
+    sbit0, sbit1, sbit2, sbit3 = _le_step_bits_4(
+        first_step, eff_step_bits, eff_wide_steps, denom, block_size, exact_pow2
+    )
+    first_byte = sbit0 >> 3
+    row_blk_base = pid_n.to(tl.int64) * blocks_per_row
+
+    acc = _gemv_accumulate_k_blocks(
+        x_rot_ptr, bitstreams_ptr, block_scales_ptr, row_blk_base, row_base_bytes, width64,
+        sbit0, sbit1, sbit2, sbit3, first_byte, pid_m, ms, m_mask, pid_k, blocks_per_row,
+        bitstreams_bytes.to(tl.int64), block_size, stride_xm, split_k, non_empty,
+        tile_steps=tile_steps, block_m=block_m, exact_pow2=exact_pow2, needs_w2=needs_w2,
+        use_dp4a=use_dp4a, has_tail_bytes=has_tail_bytes, ptr_aligned=ptr_aligned,
+        x_mul4=x_mul4, unroll_k=unroll_k,
+    )  # fmt: skip
 
     sums = tl.sum(acc, axis=1)
     n_valid = m_mask & (pid_n < out_features)
@@ -700,8 +321,9 @@ class _TrellisSchedule:
     block_m: int
     num_warps: int
     split_k: int
-    num_stages: int | None = None
-    use_sm120_3word: bool = False
+    unroll_k: int
+    use_dp4a: bool
+    num_stages: int = 1
 
 
 def _select_block_m(rows: int) -> int:
@@ -738,96 +360,6 @@ def _select_generic_split_k(
     )
 
 
-def _generic_trellis_schedule(
-    num_sms: int,
-    rows: int,
-    out_features: int,
-    blocks_per_row: int,
-    weight_bytes: int,
-) -> _TrellisSchedule:
-    block_m = _select_block_m(rows)
-    split_k = _select_generic_split_k(
-        num_sms, rows, out_features, blocks_per_row, weight_bytes, block_m
-    )
-    return _TrellisSchedule(block_m=block_m, num_warps=1, split_k=split_k)
-
-
-def _sm120_trellis_schedule(
-    num_sms: int,
-    rows: int,
-    out_features: int,
-    blocks_per_row: int,
-    weight_bytes: int,
-    tile_steps: int,
-    u32_aligned: bool,
-) -> _TrellisSchedule:
-    block_m = _select_block_m(rows)
-    if tile_steps < 64 or not u32_aligned:
-        split_k = _select_generic_split_k(
-            num_sms, rows, out_features, blocks_per_row, weight_bytes, block_m
-        )
-        return _TrellisSchedule(block_m=block_m, num_warps=1, split_k=split_k)
-    if rows > _GEMV_MAX_ROWS:
-        return _TrellisSchedule(
-            block_m=block_m,
-            num_warps=2,
-            num_stages=1,
-            split_k=1,
-            use_sm120_3word=True,
-        )
-    max_split_k = min(
-        _SM120_SPLITK_MAX,
-        max(1, _SM120_FP32_WORKSPACE_BYTES // max(1, rows * out_features * 4)),
-    )
-    output_tiles = out_features * triton.cdiv(rows, block_m)
-    min_weight_bytes = (
-        _SPLITK_MIN_WEIGHT_BYTES if output_tiles <= num_sms else _SM120_SPLITK_MIN_WEIGHT_BYTES
-    )
-    split_k = (
-        select_split_k(
-            num_sms,
-            output_tiles=output_tiles,
-            k_tiles=blocks_per_row,
-            weight_bytes=weight_bytes,
-            min_weight_bytes=min_weight_bytes,
-            max_split_k=max_split_k,
-            cta_multiplier=100,
-            min_k_tiles=8,
-            min_tiles_per_split=8,
-            round_up=False,
-        )
-        if max_split_k > 1
-        else 1
-    )
-    return _TrellisSchedule(
-        block_m=block_m,
-        num_warps=2,
-        num_stages=1,
-        split_k=split_k,
-        use_sm120_3word=True,
-    )
-
-
-def _sm8x_trellis_schedule(
-    num_sms: int,
-    rows: int,
-    out_features: int,
-    blocks_per_row: int,
-    weight_bytes: int,
-) -> _TrellisSchedule:
-    return _generic_trellis_schedule(num_sms, rows, out_features, blocks_per_row, weight_bytes)
-
-
-def _rdna4_trellis_schedule(
-    num_sms: int,
-    rows: int,
-    out_features: int,
-    blocks_per_row: int,
-    weight_bytes: int,
-) -> _TrellisSchedule:
-    return _generic_trellis_schedule(num_sms, rows, out_features, blocks_per_row, weight_bytes)
-
-
 def _select_trellis_schedule(
     target: AcceleratorTarget,
     num_sms: int,
@@ -835,24 +367,61 @@ def _select_trellis_schedule(
     out_features: int,
     blocks_per_row: int,
     weight_bytes: int,
-    tile_steps: int,
-    u32_aligned: bool,
 ) -> _TrellisSchedule:
-    if target.is_cuda_capability(12):
-        return _sm120_trellis_schedule(
-            num_sms,
-            rows,
-            out_features,
-            blocks_per_row,
-            weight_bytes,
-            tile_steps,
-            u32_aligned,
+    block_m = _select_block_m(rows)
+    use_dp4a = target.is_nvidia_cuda
+    is_sm120 = target.is_cuda_capability(12)
+    unroll_k = 2 if (is_sm120 and block_m <= 2) else 1
+    if is_sm120:
+        if rows > _GEMV_MAX_ROWS:
+            return _TrellisSchedule(
+                block_m=block_m,
+                num_warps=2,
+                split_k=1,
+                unroll_k=1,
+                use_dp4a=use_dp4a,
+            )
+        max_split_k = min(
+            _SM120_SPLITK_MAX,
+            max(1, _SM120_FP32_WORKSPACE_BYTES // max(1, rows * out_features * 4)),
         )
-    if target.is_cuda_capability(8):
-        return _sm8x_trellis_schedule(num_sms, rows, out_features, blocks_per_row, weight_bytes)
-    if target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201"):
-        return _rdna4_trellis_schedule(num_sms, rows, out_features, blocks_per_row, weight_bytes)
-    return _generic_trellis_schedule(num_sms, rows, out_features, blocks_per_row, weight_bytes)
+        output_tiles = out_features * triton.cdiv(rows, block_m)
+        min_weight_bytes = (
+            _SPLITK_MIN_WEIGHT_BYTES if output_tiles <= num_sms else _SM120_SPLITK_MIN_WEIGHT_BYTES
+        )
+        split_k = (
+            select_split_k(
+                num_sms,
+                output_tiles=output_tiles,
+                k_tiles=blocks_per_row,
+                weight_bytes=weight_bytes,
+                min_weight_bytes=min_weight_bytes,
+                max_split_k=max_split_k,
+                cta_multiplier=100,
+                min_k_tiles=8,
+                min_tiles_per_split=8,
+                round_up=False,
+            )
+            if max_split_k > 1
+            else 1
+        )
+        return _TrellisSchedule(
+            block_m=block_m,
+            num_warps=1,
+            split_k=split_k,
+            unroll_k=unroll_k,
+            use_dp4a=use_dp4a,
+        )
+    split_k = _select_generic_split_k(
+        num_sms, rows, out_features, blocks_per_row, weight_bytes, block_m
+    )
+    return _TrellisSchedule(
+        block_m=block_m,
+        num_warps=1,
+        split_k=split_k,
+        unroll_k=1,
+        use_dp4a=use_dp4a,
+    )
 
 
 def linear_a16(
@@ -881,24 +450,18 @@ def linear_a16(
 
     variable_rows = row_widths is not None
     if variable_rows:
-        block_bits = step_bits = num_wide_steps = bytes_per_block = 0
+        step_bits = num_wide_steps = bytes_per_block = 0
+        needs_w2 = True
         bitstreams_ptr = bitstreams
     else:
         layout = TrellisLayout.from_storage(block_size, bitstreams.shape[2])
-        block_bits = layout.block_bits
         step_bits = layout.step_bits
         num_wide_steps = layout.num_wide_steps
         bytes_per_block = layout.bytes_per_block
+        needs_w2 = layout.block_bits > 5 * layout.block_size
         bitstreams_ptr = bitstreams.view(-1)
 
     tile_steps = triton.next_power_of_2(block_size)
-    u32_aligned = (
-        block_size % 4 == 0
-        and rotated.stride(0) % 4 == 0
-        and bitstreams_ptr.is_contiguous()
-        and bitstreams_ptr.data_ptr() % 4 == 0
-        and bitstreams_ptr.numel() % 4 == 0
-    )
     schedule = _select_trellis_schedule(
         AcceleratorTarget.from_device(input.device),
         device_sm_count(input.device),
@@ -906,9 +469,10 @@ def linear_a16(
         out_features,
         blocks_per_row,
         bitstreams_ptr.numel(),
-        tile_steps,
-        u32_aligned,
     )
+    ptr_aligned = bitstreams_ptr.is_contiguous() and bitstreams_ptr.data_ptr() % 4 == 0
+    has_tail_bytes = bitstreams_ptr.numel() % 4 != 0
+    x_mul4 = block_size % 4 == 0 and rotated.stride(0) % 4 == 0
     is_splitk = schedule.split_k > 1
     exact_pow2 = block_size == tile_steps
     has_bias = bias is not None
@@ -923,9 +487,6 @@ def linear_a16(
         else output
     )
     grid = (out_features * triton.cdiv(rows, schedule.block_m), schedule.split_k)
-    launch_options: dict[str, int] = {"num_warps": schedule.num_warps}
-    if schedule.num_stages is not None:
-        launch_options["num_stages"] = schedule.num_stages
     with device_context(input.device):
         row_offsets = compute_row_offsets(row_widths) if row_widths is not None else None
         trellis_gemv_splitk_kernel[grid](
@@ -942,7 +503,6 @@ def linear_a16(
             blocks_per_row,
             bitstreams_ptr.numel(),
             block_size,
-            block_bits,
             step_bits,
             num_wide_steps,
             bytes_per_block,
@@ -955,8 +515,14 @@ def linear_a16(
             variable_rows=variable_rows,
             exact_pow2=exact_pow2,
             has_bias=has_bias,
-            use_sm120_3word=schedule.use_sm120_3word,
-            **launch_options,
+            needs_w2=needs_w2,
+            use_dp4a=schedule.use_dp4a,
+            has_tail_bytes=has_tail_bytes,
+            ptr_aligned=ptr_aligned,
+            x_mul4=x_mul4,
+            unroll_k=schedule.unroll_k,
+            num_warps=schedule.num_warps,
+            num_stages=schedule.num_stages,
         )
         if is_splitk:
             reduce_grid = (triton.cdiv(out_features, _REDUCE_BLOCK_N), rows)
@@ -1124,12 +690,10 @@ def compile_trellis_kernels(
     )
     bias_constexpr: dict[str, object] = {"bias_ptr": None} if bias_dtype is None else {}
     blocks_per_row = input_features // block_size
-    effective_bytes = (
-        (9 * block_size) // 16
-        if bytes_per_block is None
-        else TrellisLayout.from_storage(block_size, bytes_per_block).bytes_per_block
-    )
+    layout = default_layout_for_block_size(block_size, bytes_per_block)
+    effective_bytes = layout.bytes_per_block
     weight_bytes = out_features * blocks_per_row * effective_bytes
+    needs_w2 = True if variable_rows else (layout.block_bits > 5 * layout.block_size)
 
     tile_steps = triton.next_power_of_2(block_size)
     schedule = _select_trellis_schedule(
@@ -1139,8 +703,6 @@ def compile_trellis_kernels(
         out_features,
         blocks_per_row,
         weight_bytes,
-        tile_steps,
-        u32_aligned=(weight_bytes % 4 == 0 and block_size % 4 == 0),
     )
     is_splitk = schedule.split_k > 1
     exact_pow2 = block_size == tile_steps
@@ -1157,7 +719,6 @@ def compile_trellis_kernels(
         "blocks_per_row": "i32",
         "bitstreams_bytes": "i64",
         "block_size": "i32",
-        "block_bits": "i32",
         "step_bits": "i32",
         "num_wide_steps": "i32",
         "bytes_per_block": "i32",
@@ -1173,7 +734,12 @@ def compile_trellis_kernels(
         "variable_rows": variable_rows,
         "exact_pow2": exact_pow2,
         "has_bias": has_bias,
-        "use_sm120_3word": schedule.use_sm120_3word,
+        "needs_w2": needs_w2,
+        "use_dp4a": schedule.use_dp4a,
+        "has_tail_bytes": (weight_bytes % 4) != 0 or variable_rows,
+        "ptr_aligned": True,
+        "x_mul4": (block_size % 4 == 0 and input_features % 4 == 0),
+        "unroll_k": schedule.unroll_k,
     }
     if variable_rows:
         gemv_signature["row_widths_ptr"] = "*u8"
@@ -1182,9 +748,10 @@ def compile_trellis_kernels(
         gemv_constexprs["row_widths_ptr"] = None
         gemv_constexprs["row_offsets_ptr"] = None
 
-    compile_options: dict[str, int] = {"num_warps": schedule.num_warps}
-    if schedule.num_stages is not None:
-        compile_options["num_stages"] = schedule.num_stages
+    compile_options: dict[str, int] = {
+        "num_warps": schedule.num_warps,
+        "num_stages": schedule.num_stages,
+    }
     compiled: dict[str, triton.compiler.CompiledKernel] = {
         "gemv": compile_fn(
             ASTSource(trellis_gemv_splitk_kernel, gemv_signature, constexprs=gemv_constexprs),

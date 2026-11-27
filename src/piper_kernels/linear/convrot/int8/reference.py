@@ -88,13 +88,19 @@ def _decode_trellis_qdata(
     block_scales: torch.Tensor,
     row_widths: torch.Tensor | None,
     block_size: int,
+    *,
+    round_int8: bool = True,
 ) -> torch.Tensor:
     out_features, blocks_per_row = block_scales.shape
     in_features = blocks_per_row * block_size
     if row_widths is None:
         layout = TrellisLayout.from_storage(block_size, bitstreams.shape[2])
-        return decode_reference(bitstreams, block_scales, layout).reshape(out_features, in_features)
-    return decode_variable_rows_reference(bitstreams, block_scales, row_widths, block_size)
+        return decode_reference(bitstreams, block_scales, layout, round_int8=round_int8).reshape(
+            out_features, in_features
+        )
+    return decode_variable_rows_reference(
+        bitstreams, block_scales, row_widths, block_size, round_int8=round_int8
+    )
 
 
 def linear_trellis_a16(
@@ -117,7 +123,9 @@ def linear_trellis_a16(
     leading_shape = input.shape[:-1]
     rows = math.prod(leading_shape)
     with torch.amp.autocast(input.device.type, enabled=False):
-        qdata = _decode_trellis_qdata(bitstreams, block_scales, row_widths, block_size)
+        qdata = _decode_trellis_qdata(
+            bitstreams, block_scales, row_widths, block_size, round_int8=False
+        )
         rotated = rotate_groups(input.reshape(rows, in_features).float(), group_size)
         accumulated = torch.matmul(rotated, qdata.float().T)
         accumulated.mul_(scale.reshape(1, out_features).to(torch.float32))
@@ -143,5 +151,7 @@ def linear_trellis_w8a8(
     if empty is not None:
         return empty
     with torch.amp.autocast(input.device.type, enabled=False):
-        qdata = _decode_trellis_qdata(bitstreams, block_scales, row_widths, block_size)
+        qdata = _decode_trellis_qdata(
+            bitstreams, block_scales, row_widths, block_size, round_int8=True
+        )
         return linear(input, qdata, scale, group_size, bias)
