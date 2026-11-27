@@ -71,12 +71,32 @@ device moves included):
   updates, fused residuals), never retry after a launch may have mutated output, and
   restore active device state on failure.
 
-## Execution plans and schedules
+## Accelerator boundaries and schedules
 
-Apply the Rule of Two before creating `_plan.py`, `policy.py`, or `_interfaces.py`; keep
-single-schedule or constant-tile operators without plan/policy layers. When they exist,
-keep plan/policy modules importable without Triton (`select_execution_plan(...)`,
-`default_execution_plan(...)`, `execution_plan` / `schedule` naming).
+Keep host orchestration, validation, and identical Triton algorithm loops single-source so
+numerical and edge-case fixes land once across accelerators. Introduce `_nvidia/` or
+`_amd/` subpackages once a vendor has real specialization—a multi-regime launch schedule,
+inline PTX/GCN ISA primitives, or a genuinely divergent GPU kernel (such as Gluon TMA vs.
+WMMA)—while keeping trivial one-line constant overrides inline and keeping abstract wrapper
+layers (`_interfaces.py`, `_plan.py`, `_dispatch.py`) gated by the Rule of Two (`>= 2`
+distinct implementations) and `<= 3` runtime module hops from public entry to kernel launch.
+
+Model multi-accelerator operator packages on
+[`linear/convrot/int8/`](../src/piper_kernels/linear/convrot/int8/) by grouping vendor
+files by role rather than GPU generation:
+
+- **Shared operator modules:** public dispatch, `_ops.py`, `reference.py`, shared
+  `triton.py` (parameterized by `tl.constexpr`), and sibling modules when a file covers
+  multiple distinct concerns (such as offline compile harnesses, W4A4 vs. W4A16 paths, or
+  separate format kernels in `moe/`).
+- **`_nvidia/` and `_amd/`:**
+  - `policy.py` — per-architecture schedules (e.g., SM75/SM8x/SM120 or CDNA3/RDNA4),
+    importable without Triton (`select_execution_plan(...)`, `default_execution_plan(...)`,
+    `execution_plan` / `schedule` naming).
+  - `isa.py` (when needed) — vendor inline-assembly or hardware-intrinsic decode/pack
+    primitives (such as SM120 `e2m1x2` PTX) isolated from portable Triton code.
+  - Divergent kernel modules (such as `gluon_tma.py`, `gluon_async_copy.py`, or `gluon.py`)
+    only when the GPU loop genuinely diverges at the programming-model or ISA level.
 
 Put Inductor post-grad rewrites into a unified phase-ordered pipeline using anchor-based
 FX matching with schema argument binding rather than standalone `*_compile_options`
