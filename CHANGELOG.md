@@ -52,6 +52,18 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   on RTX 5090 (`sm120`) and offline across `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
   `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201`; live SM75/SM8x, RDNA4/ROCm, and
   Windows execution remain unexercised locally.
+- Accelerated NVIDIA SM120 (`sm120`) NVFP4 MoE execution across single-token GEMV,
+  small-batch bucketed GEMV, and grouped prefill GEMM by sharing hardware `e2m1x2` and
+  native E4M3FN block-scale decoding with weight-only NVFP4 linear kernels, vectorizing
+  128-bit packed weight loads, deferring single-token per-block K-reductions until after
+  the K-loop, fusing even/odd nibble half-products into single tensor-core dots on
+  batched/prefill paths, and tuning SM120 block tiling and single-token Split-K thresholds
+  while preserving zero register/stack spills on NVIDIA targets and zero VGPR/scratch
+  spills on AMD ROCm targets (adjusting SM75 batched scalar K-tiling to 64 under aligned
+  offline specialization). Verified live on RTX 5090 (`sm120`) and offline across
+  `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and `gfx942`/`gfx1100`/`gfx1151`/`gfx1201` for MoE
+  (plus `gfx1200` for shared NVFP4 linear W4A16); live SM75/SM8x, AMD ROCm/RDNA4,
+  multi-GPU, and Windows execution remain unexercised locally.
 - Tuned NVIDIA SM120 (`sm120`) execution schedules for `piper_attention_decode`:
   Split-KV decode now uses 64-token K64-aligned blocks, 4 warps, 2 pipeline stages,
   exact two-pass TF32 Q decomposition against INT8 keys (three-pass TF32 for BF16/FP16

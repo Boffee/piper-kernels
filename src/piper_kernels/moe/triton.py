@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -33,8 +33,9 @@ from piper_kernels.linear.convrot.int8.trellis_triton import _gemv_accumulate_k_
 from piper_kernels.linear.convrot.int8.triton import _accumulate_int8_tile, splitk_accumulator_seed
 from piper_kernels.linear.nvfp4.triton import (
     _accumulate_scaled_row,
-    _expand_nvfp4_scales,
+    _accumulate_scaled_row_blocks,
     _load_nvfp4_tile,
+    _load_scaled_nvfp4_pairs,
     _split_global_scale,
 )
 from piper_kernels.trellis._layout import (
@@ -61,9 +62,14 @@ if TYPE_CHECKING:
     from piper_kernels.linear.convrot.int8._backend import LinearBackend, LinearExecutionPlan
 
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(nvfp4_layout.BLOCK_SIZE)
+_NVFP4_QDATA_BLOCK_SIZE_TL = tl.constexpr(nvfp4_layout.QDATA_BLOCK_SIZE)
 _NVFP4_GEMV_BLOCK_N = 16
 _NVFP4_GEMV_BLOCK_K = 128
 _NVFP4_GEMV_NUM_WARPS = 4
+_NVFP4_SM120_GEMV_BLOCK_K = 512
+_NVFP4_SM120_M1_SPLITK_CTA_MULT = 3
+_NVFP4_SM75_SCALAR_BLOCK_K = 64
+_NVFP4_SM120_DOT_NUM_WARPS = 4
 _NVFP4_DOT_NUM_WARPS_CUDA = 8
 _NVFP4_DOT_BLOCK_N = 64
 _NVFP4_DOT_BLOCK_K = 128
@@ -103,6 +109,7 @@ _PREFILL_NVFP4_DENSE_BLOCK_M = 32
 _PREFILL_NVFP4_SPARSE_BLOCK_N = 64
 _PREFILL_NVFP4_DENSE_BLOCK_N = 128
 _PREFILL_NVFP4_BLOCK_K = 64
+_NVFP4_SM120_PREFILL_BLOCK_K = 128
 _PREFILL_INT8_SPARSE_BLOCK_M = 16
 _PREFILL_INT8_DENSE_BLOCK_M = 64
 _PREFILL_INT8_SPARSE_BLOCK_N = 64
@@ -153,7 +160,7 @@ def nvfp4_moe_m1_gemv_kernel(
     expert_to_slot_ptr,
     output_ptr,
     out_features,
-    input_features,
+    packed_k,
     scale_column_blocks,
     expert_scale_stride,
     num_experts,
@@ -167,6 +174,7 @@ def nvfp4_moe_m1_gemv_kernel(
     has_global_scale: tl.constexpr,
     per_expert_input: tl.constexpr,
     is_splitk: tl.constexpr,
+    use_sm120_e2m1x2: tl.constexpr = False,
 ):
     """Single-token slot-indirect NVFP4 W4A16 GEMV across ``(N * top_k, split_k)``."""
     n_tiles = tl.cdiv(out_features, block_n)
@@ -189,8 +197,9 @@ def nvfp4_moe_m1_gemv_kernel(
     n_offs_i64 = n_offs.to(tl.int64)
     n_valid = n_offs < out_features
 
-    packed_k = input_features // 2
-    scale_k = input_features // _NVFP4_BLOCK_SIZE_TL
+    # Pass packed_k so Triton keeps 16-byte divisibility for vectorized weight loads.
+    input_features = packed_k * 2
+    scale_k = packed_k // _NVFP4_QDATA_BLOCK_SIZE_TL
     slot_weight_ptr = weight_ptr + slot * out_features.to(tl.int64) * packed_k
     slot_scale_ptr = weight_scale_ptr + slot * expert_scale_stride
     slot_input_ptr = input_ptr + (k_idx.to(tl.int64) * input_features if per_expert_input else 0)
@@ -201,9 +210,10 @@ def nvfp4_moe_m1_gemv_kernel(
         pre_scale = 1.0
         post_scale = 1.0
 
-    k_tile_start, k_tile_end = splitk_tile_bounds(tl.cdiv(input_features, block_k), pid_k, split_k)
+    k_tile_start, k_tile_end = splitk_tile_bounds(tl.cdiv(packed_k, block_k // 2), pid_k, split_k)
 
-    acc = tl.zeros((block_n,), dtype=tl.float32)
+    block_scale_k: tl.constexpr = block_k // _NVFP4_BLOCK_SIZE_TL
+    acc = tl.zeros((block_n, block_scale_k), dtype=tl.float32)
     for k_tile in range(k_tile_start, k_tile_end):
         k_base = k_tile * block_k
         w_even, w_odd, scales = _load_nvfp4_tile(
@@ -217,14 +227,16 @@ def nvfp4_moe_m1_gemv_kernel(
             scale_column_blocks,
             block_k,
             high_first,
+            use_sm120_e2m1x2,
         )
         k_elem_offs = k_base + tl.arange(0, block_k)
         k_elem_valid = k_elem_offs < input_features
         x_vec = tl.load(slot_input_ptr + k_elem_offs, mask=k_elem_valid, other=0.0).to(tl.float32)
         if has_global_scale:
             x_vec = x_vec * pre_scale
-        acc += _accumulate_scaled_row(x_vec, w_even, w_odd, scales, block_n, block_k)
+        acc += _accumulate_scaled_row_blocks(x_vec, w_even, w_odd, scales, block_n, block_k)
 
+    acc = tl.sum(acc, axis=1)
     if has_global_scale and not is_splitk:
         acc *= post_scale
     row_idx = pid_k.to(tl.int64) * top_k + k_idx if is_splitk else k_idx.to(tl.int64)
@@ -302,8 +314,7 @@ def moe_bucket_tokens_kernel(
 def _accumulate_nvfp4_batched_nodot(
     acc,
     input_ptr,
-    tile_pair_ids_ptr,
-    tile_idx,
+    tile_pair_base,
     k_elem_offs,
     k_elem_valid,
     k_stride,
@@ -323,10 +334,8 @@ def _accumulate_nvfp4_batched_nodot(
     # Triton's typing does not declare static_range iterable.
     for row_idx in tl.static_range(block_m):  # pyright: ignore[reportGeneralTypeIssues]
         if row_idx < tile_len:
-            pair_id = tl.load(tile_pair_ids_ptr + tile_idx.to(tl.int64) * block_m + row_idx).to(
-                tl.int64
-            )
-            src_row = pair_id if per_expert_input else pair_id // top_k
+            pair_id = tl.load(tile_pair_base + row_idx)
+            src_row = (pair_id if per_expert_input else pair_id // top_k).to(tl.int64)
             x_vec = tl.load(
                 input_ptr + src_row * k_stride + k_elem_offs,
                 mask=k_elem_valid,
@@ -343,35 +352,54 @@ def _accumulate_nvfp4_batched_nodot(
 def _accumulate_nvfp4_batched_dot(
     acc,
     input_ptr,
+    weight_ptr,
+    weight_scale_ptr,
+    n_offs_i64,
+    n_valid,
+    k_base,
+    packed_k,
+    scale_k,
+    scale_column_blocks,
     src_row_offsets,
     init_valid,
-    k_elem_offs,
-    k_elem_valid,
     pre_scale,
-    w_even,
-    w_odd,
-    scales,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
+    high_first: tl.constexpr,
     pre_scale_in_gemv: tl.constexpr,
     cast_fp32_to_bf16: tl.constexpr,
     force_fp32_dot: tl.constexpr = False,
     half_scales: tl.constexpr = False,
+    use_sm120_e2m1x2: tl.constexpr = False,
+    single_dot: tl.constexpr = False,
 ):
     dot_dtype = (
         tl.float32
         if force_fp32_dot
         else (tl.bfloat16 if cast_fp32_to_bf16 else input_ptr.dtype.element_ty)
     )
-    if half_scales and not force_fp32_dot:
-        scales_expanded = _expand_nvfp4_scales(scales.to(dot_dtype), block_n, block_k)
-        w_even_d = w_even.to(dot_dtype)
-        w_odd_d = w_odd.to(dot_dtype)
-    else:
-        scales_expanded = _expand_nvfp4_scales(scales, block_n, block_k)
-        w_even_d = w_even
-        w_odd_d = w_odd
+    # Every finite (E2M1, E4M3FN) product fits in FP16, halving live weight registers on SM120.
+    pair_dtype = tl.float16 if (use_sm120_e2m1x2 and force_fp32_dot) else dot_dtype
+    w_e, w_o = _load_scaled_nvfp4_pairs(
+        weight_ptr,
+        weight_scale_ptr,
+        n_offs_i64,
+        n_valid,
+        k_base,
+        packed_k,
+        scale_k,
+        scale_column_blocks,
+        block_n,
+        block_k,
+        high_first,
+        tl.constexpr(pair_dtype),
+        use_sm120_e2m1x2,
+        half_scales and not force_fp32_dot,
+    )
+    input_features = packed_k * 2
+    k_elem_offs = k_base + tl.arange(0, block_k)
+    k_elem_valid = k_elem_offs < input_features
     x_tile = tl.load(
         input_ptr + src_row_offsets[:, None] + k_elem_offs[None, :],
         mask=init_valid[:, None] & k_elem_valid[None, :],
@@ -381,16 +409,20 @@ def _accumulate_nvfp4_batched_dot(
         x_tile = (x_tile.to(tl.float32) * pre_scale).to(dot_dtype)
     elif cast_fp32_to_bf16 or force_fp32_dot:
         x_tile = x_tile.to(dot_dtype)
-    x_even, x_odd = tl.split(tl.reshape(x_tile, (block_m, block_k // 2, 2)))
-    w_e = (w_even_d * scales_expanded).to(dot_dtype)
-    if force_fp32_dot:
-        acc = tl.dot(x_even, tl.trans(w_e), acc, input_precision="ieee")
+    if single_dot:
+        w_full = tl.reshape(tl.join(w_e, w_o), (block_n, block_k))
+        if force_fp32_dot:
+            return tl.dot(x_tile, tl.trans(w_full.to(tl.float32)), acc, input_precision="ieee")
+        else:
+            return tl.dot(x_tile, tl.trans(w_full), acc)
     else:
-        acc = tl.dot(x_even, tl.trans(w_e), acc)
-    w_o = (w_odd_d * scales_expanded).to(dot_dtype)
-    if force_fp32_dot:
-        return tl.dot(x_odd, tl.trans(w_o), acc, input_precision="ieee")
-    return tl.dot(x_odd, tl.trans(w_o), acc)
+        x_even, x_odd = tl.split(tl.reshape(x_tile, (block_m, block_k // 2, 2)))
+        if force_fp32_dot:
+            acc = tl.dot(x_even, tl.trans(w_e.to(tl.float32)), acc, input_precision="ieee")
+            return tl.dot(x_odd, tl.trans(w_o.to(tl.float32)), acc, input_precision="ieee")
+        else:
+            acc = tl.dot(x_even, tl.trans(w_e), acc)
+            return tl.dot(x_odd, tl.trans(w_o), acc)
 
 
 @triton.jit(do_not_specialize=["split_k"])
@@ -403,7 +435,7 @@ def nvfp4_moe_batched_gemv_kernel(
     tile_pair_ids_ptr,
     output_ptr,
     out_features,
-    input_features,
+    packed_k,
     scale_column_blocks,
     expert_scale_stride,
     num_pairs,
@@ -418,6 +450,8 @@ def nvfp4_moe_batched_gemv_kernel(
     is_splitk: tl.constexpr,
     use_dot: tl.constexpr,
     cast_fp32_to_bf16: tl.constexpr = False,
+    use_sm120_e2m1x2: tl.constexpr = False,
+    single_dot: tl.constexpr = False,
 ):
     """Slot-batched NVFP4 W4A16 projection across ``(N, bucket_tile, split_k)``."""
     pid_n = tl.program_id(0)
@@ -434,6 +468,9 @@ def nvfp4_moe_batched_gemv_kernel(
     tile_pair_base = tile_pair_ids_ptr + tile_idx.to(tl.int64) * block_m
     init_pair_ids = tl.load(tile_pair_base + m_offs)
     init_valid = init_pair_ids >= 0
+    # Pass packed_k so Triton keeps 16-byte divisibility for vectorized weight loads.
+    input_features = packed_k * 2
+    scale_k = packed_k // _NVFP4_QDATA_BLOCK_SIZE_TL
     k_stride = tl.full((), input_features, tl.int64)
     if use_dot:
         src_pairs = tl.where(
@@ -443,7 +480,6 @@ def nvfp4_moe_batched_gemv_kernel(
     else:
         tile_len = tl.sum(init_valid.to(tl.int32))
 
-    packed_k = input_features // 2
     slot_weight_ptr = weight_ptr + slot * out_features.to(tl.int64) * packed_k
     slot_scale_ptr = weight_scale_ptr + slot * expert_scale_stride
 
@@ -460,49 +496,55 @@ def nvfp4_moe_batched_gemv_kernel(
         pre_scale = 1.0
         epilogue_scale = 1.0
 
-    k_tile_start, k_tile_end = splitk_tile_bounds(tl.cdiv(input_features, block_k), pid_k, split_k)
+    k_tile_start, k_tile_end = splitk_tile_bounds(tl.cdiv(packed_k, block_k // 2), pid_k, split_k)
     acc = tl.zeros((block_m, block_n), dtype=tl.float32)
 
     for k_tile in range(k_tile_start, k_tile_end):
         k_base = k_tile * block_k
-        w_even, w_odd, scales = _load_nvfp4_tile(
-            slot_weight_ptr,
-            slot_scale_ptr,
-            n_offs_i64,
-            n_valid,
-            k_base,
-            packed_k,
-            input_features // _NVFP4_BLOCK_SIZE_TL,
-            scale_column_blocks,
-            block_k,
-            high_first,
-        )
-        k_elem_offs = k_base + tl.arange(0, block_k)
-        k_elem_valid = k_elem_offs < input_features
         if use_dot:
             acc = _accumulate_nvfp4_batched_dot(
                 acc,
                 input_ptr,
+                slot_weight_ptr,
+                slot_scale_ptr,
+                n_offs_i64,
+                n_valid,
+                k_base,
+                packed_k,
+                scale_k,
+                scale_column_blocks,
                 src_row_offsets,  # pyright: ignore[reportPossiblyUnboundVariable]
                 init_valid,
-                k_elem_offs,
-                k_elem_valid,
                 pre_scale,
-                w_even,
-                w_odd,
-                scales,
                 block_m,
                 block_n,
                 block_k,
+                high_first,
                 pre_scale_in_gemv,
                 cast_fp32_to_bf16,
+                use_sm120_e2m1x2=use_sm120_e2m1x2,
+                single_dot=single_dot,
             )
         else:
+            w_even, w_odd, scales = _load_nvfp4_tile(
+                slot_weight_ptr,
+                slot_scale_ptr,
+                n_offs_i64,
+                n_valid,
+                k_base,
+                packed_k,
+                scale_k,
+                scale_column_blocks,
+                block_k,
+                high_first,
+                use_sm120_e2m1x2,
+            )
+            k_elem_offs = k_base + tl.arange(0, block_k)
+            k_elem_valid = k_elem_offs < input_features
             acc = _accumulate_nvfp4_batched_nodot(
                 acc,
                 input_ptr,
-                tile_pair_ids_ptr,
-                tile_idx,
+                tile_pair_base,
                 k_elem_offs,
                 k_elem_valid,
                 k_stride,
@@ -1150,7 +1192,7 @@ def nvfp4_moe_grouped_gemm_kernel(
     output_ptr,
     max_tiles,
     out_features,
-    in_features,
+    packed_k,
     scale_column_blocks,
     expert_scale_stride,
     block_m: tl.constexpr,
@@ -1162,6 +1204,8 @@ def nvfp4_moe_grouped_gemm_kernel(
     cast_fp32_to_bf16: tl.constexpr,
     force_fp32_dot: tl.constexpr,
     half_scales: tl.constexpr,
+    use_sm120_e2m1x2: tl.constexpr = False,
+    single_dot: tl.constexpr = False,
 ):
     """Grouped NVFP4 W4A16 GEMM over contiguous slot-compacted tiles."""
     num_pid_n = tl.cdiv(out_features, block_n)
@@ -1179,9 +1223,10 @@ def nvfp4_moe_grouped_gemm_kernel(
     n_offs_i64 = n_offs.to(tl.int64)
     n_valid = n_offs < out_features
 
+    # Pass packed_k so Triton keeps 16-byte divisibility for vectorized weight loads.
+    in_features = packed_k * 2
     k_stride = in_features.to(tl.int64)
-    packed_k = in_features // 2
-    scale_k = in_features // _NVFP4_BLOCK_SIZE_TL
+    scale_k = packed_k // _NVFP4_QDATA_BLOCK_SIZE_TL
     slot_input_ptr = input_ptr + m_start * k_stride
     slot_weight_ptr = weight_ptr + slot * out_features.to(tl.int64) * packed_k
     slot_scale_ptr = weight_scale_ptr + slot * expert_scale_stride
@@ -1203,10 +1248,12 @@ def nvfp4_moe_grouped_gemm_kernel(
         epilogue_scale = 1.0
 
     acc = tl.zeros((block_m, block_n), dtype=tl.float32)
-    num_k_tiles = tl.cdiv(in_features, block_k)
+    num_k_tiles = tl.cdiv(packed_k, block_k // 2)
     for k_tile in range(num_k_tiles):
         k_base = k_tile * block_k
-        w_even, w_odd, scales = _load_nvfp4_tile(
+        acc = _accumulate_nvfp4_batched_dot(
+            acc,
+            slot_input_ptr,
             slot_weight_ptr,
             slot_scale_ptr,
             n_offs_i64,
@@ -1215,29 +1262,19 @@ def nvfp4_moe_grouped_gemm_kernel(
             packed_k,
             scale_k,
             scale_column_blocks,
-            block_k,
-            high_first,
-        )
-        k_elem_offs = k_base + tl.arange(0, block_k)
-        k_elem_valid = k_elem_offs < in_features
-        acc = _accumulate_nvfp4_batched_dot(
-            acc,
-            slot_input_ptr,
             src_row_offsets,
             m_valid,
-            k_elem_offs,
-            k_elem_valid,
             pre_scale,
-            w_even,
-            w_odd,
-            scales,
             block_m,
             block_n,
             block_k,
+            high_first,
             pre_scale_in_gemm,
             cast_fp32_to_bf16,
             force_fp32_dot,
             half_scales,
+            use_sm120_e2m1x2,
+            single_dot,
         )
 
     if has_global_scale:
@@ -1553,6 +1590,7 @@ def _select_nvfp4_split_k(
     *,
     block_n: int = _NVFP4_GEMV_BLOCK_N,
     block_k: int = _NVFP4_GEMV_BLOCK_K,
+    cta_multiplier: int = 8,
 ) -> int:
     return select_split_k(
         device_sm_count(device),
@@ -1561,11 +1599,23 @@ def _select_nvfp4_split_k(
         weight_bytes=active_tiles * out_features * (in_features // 2),
         min_weight_bytes=_NVFP4_MIN_SPLITK_WEIGHT_BYTES,
         max_split_k=_NVFP4_MAX_SPLIT_K,
-        cta_multiplier=8,
+        cta_multiplier=cta_multiplier,
         min_k_tiles=8,
         min_tiles_per_split=4,
         round_up=True,
     )
+
+
+def _nvfp4_m1_config(target: AcceleratorTarget) -> tuple[int, int, int, int]:
+    """Return ``(block_n, block_k, num_warps, splitk_cta_multiplier)``."""
+    if target.is_cuda_capability(12):
+        return (
+            _NVFP4_GEMV_BLOCK_N,
+            _NVFP4_SM120_GEMV_BLOCK_K,
+            _NVFP4_GEMV_NUM_WARPS,
+            _NVFP4_SM120_M1_SPLITK_CTA_MULT,
+        )
+    return _NVFP4_GEMV_BLOCK_N, _NVFP4_GEMV_BLOCK_K, _NVFP4_GEMV_NUM_WARPS, 8
 
 
 def _max_bucket_tiles(num_pairs: int, num_slots: int, block_m: int = _BATCH_BLOCK_M) -> int:
@@ -1651,8 +1701,8 @@ def _nvfp4_prefill_config(
     active_slots_hint: int,
     active_dtype: torch.dtype,
     logical_dtype: torch.dtype,
-) -> tuple[bool, bool, bool, int, int, int, int]:
-    """Return ``(cast_fp32_to_bf16, force_fp32_dot, half_scales, bm, bn, bk, warps)``."""
+) -> tuple[bool, bool, bool, int, int, int, int, bool]:
+    """Return ``(cast_bf16, force_fp32_dot, half_scales, bm, bn, bk, warps, single_dot)``."""
     sm75_bf16 = (
         target.is_nvidia_cuda
         and not target.cuda_capability_at_least(8)
@@ -1671,6 +1721,17 @@ def _nvfp4_prefill_config(
         sparse_m=_PREFILL_NVFP4_SPARSE_BLOCK_M,
         dense_m=_PREFILL_NVFP4_DENSE_BLOCK_M,
     )
+    if target.is_cuda_capability(12) and not force_fp32_dot:
+        return (
+            cast_fp32_to_bf16,
+            False,
+            half_scales,
+            block_m,
+            _NVFP4_DOT_BLOCK_N,
+            _NVFP4_SM120_PREFILL_BLOCK_K,
+            _NVFP4_SM120_DOT_NUM_WARPS,
+            True,
+        )
     is_wave64 = target.is_amd_hip and target.is_architecture("gfx942")
     if block_m == _PREFILL_NVFP4_SPARSE_BLOCK_M:
         block_n = _PREFILL_NVFP4_SPARSE_BLOCK_N
@@ -1690,6 +1751,7 @@ def _nvfp4_prefill_config(
         block_n,
         _PREFILL_NVFP4_BLOCK_K,
         num_warps,
+        False,
     )
 
 
@@ -1872,13 +1934,10 @@ def _nvfp4_batched_config(
     rows: int,
     active_dtype: torch.dtype,
     logical_dtype: torch.dtype,
-) -> tuple[bool, bool, bool, int, int, int]:
-    """Return ``(use_dot, cast_fp32_to_bf16, post_scale_only, block_n, block_k, num_warps)``."""
-    sm75_bf16 = (
-        target.is_nvidia_cuda
-        and not target.cuda_capability_at_least(8)
-        and logical_dtype is torch.bfloat16
-    )
+) -> tuple[bool, bool, bool, int, int, int, bool]:
+    """Return ``(use_dot, cast_bf16, post_scale_only, block_n, block_k, num_warps, single_dot)``."""
+    is_sm75 = target.is_nvidia_cuda and not target.cuda_capability_at_least(8)
+    sm75_bf16 = is_sm75 and logical_dtype is torch.bfloat16
     use_dot = (
         rows > 4
         and not sm75_bf16
@@ -1889,21 +1948,40 @@ def _nvfp4_batched_config(
     )
     cast_fp32_to_bf16 = use_dot and active_dtype is torch.float32
     post_scale_only = not (use_dot and active_dtype is torch.float16)
+    is_sm120 = target.is_cuda_capability(12)
     if use_dot:
         block_k = (
             _NVFP4_DOT_BLOCK_K_RDNA4
             if target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201")
             else _NVFP4_DOT_BLOCK_K
         )
-        num_warps = _NVFP4_DOT_NUM_WARPS_CUDA if target.is_nvidia_cuda else _NVFP4_GEMV_NUM_WARPS
-        return True, cast_fp32_to_bf16, post_scale_only, _NVFP4_DOT_BLOCK_N, block_k, num_warps
+        num_warps = (
+            _NVFP4_SM120_DOT_NUM_WARPS
+            if is_sm120
+            else (_NVFP4_DOT_NUM_WARPS_CUDA if target.is_nvidia_cuda else _NVFP4_GEMV_NUM_WARPS)
+        )
+        return (
+            True,
+            cast_fp32_to_bf16,
+            post_scale_only,
+            _NVFP4_DOT_BLOCK_N,
+            block_k,
+            num_warps,
+            is_sm120,
+        )
+    block_k = (
+        _NVFP4_SM120_GEMV_BLOCK_K
+        if is_sm120
+        else (_NVFP4_SM75_SCALAR_BLOCK_K if is_sm75 else _NVFP4_GEMV_BLOCK_K)
+    )
     return (
         False,
         False,
         post_scale_only,
         _NVFP4_GEMV_BLOCK_N,
-        _NVFP4_GEMV_BLOCK_K,
+        block_k,
         _NVFP4_GEMV_NUM_WARPS,
+        False,
     )
 
 
@@ -1986,8 +2064,11 @@ def _launch_nvfp4_proj(
     is_splitk: bool,
     use_dot: bool,
     cast_fp32_to_bf16: bool,
+    use_sm120_e2m1x2: bool = False,
+    single_dot: bool = False,
 ) -> None:
     scale_u8 = scale.view(torch.uint8)
+    packed_k = in_features // 2
     n_tiles = triton.cdiv(out_features, block_n)
     with device_context(x.device):
         if routing.tile_slots is not None:
@@ -2001,7 +2082,7 @@ def _launch_nvfp4_proj(
                 routing.tile_pair_ids,
                 output,
                 out_features,
-                in_features,
+                packed_k,
                 scale_cols,
                 scale_stride,
                 routing.num_pairs,
@@ -2016,6 +2097,8 @@ def _launch_nvfp4_proj(
                 is_splitk=is_splitk,
                 use_dot=use_dot,
                 cast_fp32_to_bf16=cast_fp32_to_bf16,
+                use_sm120_e2m1x2=use_sm120_e2m1x2,
+                single_dot=single_dot,
                 num_warps=num_warps,
                 num_stages=1,
             )
@@ -2029,7 +2112,7 @@ def _launch_nvfp4_proj(
                 routing.expert_to_slot,
                 output,
                 out_features,
-                in_features,
+                packed_k,
                 scale_cols,
                 scale_stride,
                 routing.num_experts,
@@ -2043,6 +2126,7 @@ def _launch_nvfp4_proj(
                 has_global_scale=has_global_scale,
                 per_expert_input=per_expert_input,
                 is_splitk=is_splitk,
+                use_sm120_e2m1x2=use_sm120_e2m1x2,
                 num_warps=num_warps,
             )
 
@@ -2500,6 +2584,8 @@ def _launch_nvfp4_grouped_gemm(
     cast_fp32_to_bf16: bool,
     force_fp32_dot: bool,
     half_scales: bool,
+    use_sm120_e2m1x2: bool = False,
+    single_dot: bool = False,
 ) -> None:
     grid = (max_tiles * triton.cdiv(out_features, block_n),)
     with device_context(x.device):
@@ -2514,7 +2600,7 @@ def _launch_nvfp4_grouped_gemm(
             output,
             max_tiles,
             out_features,
-            in_features,
+            in_features // 2,
             scale_cols,
             scale_stride,
             block_m=block_m,
@@ -2526,6 +2612,8 @@ def _launch_nvfp4_grouped_gemm(
             cast_fp32_to_bf16=cast_fp32_to_bf16,
             force_fp32_dot=force_fp32_dot,
             half_scales=half_scales,
+            use_sm120_e2m1x2=use_sm120_e2m1x2,
+            single_dot=single_dot,
             num_warps=num_warps,
             num_stages=1,
         )
@@ -2563,7 +2651,7 @@ def _run_nvfp4_prefill_chunk(
     num_slots, hidden_size, packed_inter = down_qdata.shape
     intermediate_size = 2 * packed_inter
     up_gate_out = up_gate_qdata.shape[1]
-    cast_bf16, force_fp32_dot, half_scales, block_m, block_n, block_k, num_warps = (
+    cast_bf16, force_fp32_dot, half_scales, block_m, block_n, block_k, num_warps, single_dot = (
         _nvfp4_prefill_config(
             target,
             chunk_rows=chunk_rows,
@@ -2590,6 +2678,7 @@ def _run_nvfp4_prefill_chunk(
         top_k,
         has_scale=False,
     )
+    use_sm120_e2m1x2 = target.is_cuda_capability(12)
     _launch_nvfp4_grouped_gemm(
         x_compact,
         up_gate_qdata,
@@ -2613,6 +2702,8 @@ def _run_nvfp4_prefill_chunk(
         cast_fp32_to_bf16=cast_bf16,
         force_fp32_dot=force_fp32_dot,
         half_scales=half_scales,
+        use_sm120_e2m1x2=use_sm120_e2m1x2,
+        single_dot=single_dot,
     )
     del x_compact
     act_dtype = torch.float32 if group_size > 0 else out_chunk.dtype
@@ -2662,6 +2753,8 @@ def _run_nvfp4_prefill_chunk(
         cast_fp32_to_bf16=cast_bf16,
         force_fp32_dot=force_fp32_dot,
         half_scales=half_scales,
+        use_sm120_e2m1x2=use_sm120_e2m1x2,
+        single_dot=single_dot,
     )
     del act
     _launch_moe_prefill_weighted_reduce(
@@ -3400,25 +3493,38 @@ def _dispatch_nvfp4_moe(
         return
 
     batched = regime == "batched"
+    use_sm120_e2m1x2 = resolved_target.is_cuda_capability(12)
     split_k_up = split_k_down = 1
-    use_dot = cast_fp32_to_bf16 = False
+    use_dot = cast_fp32_to_bf16 = single_dot = False
     post_scale_only = True
-    block_n, block_k, num_warps = (
-        _NVFP4_GEMV_BLOCK_N,
-        _NVFP4_GEMV_BLOCK_K,
-        _NVFP4_GEMV_NUM_WARPS,
-    )
+    block_n, block_k, num_warps, m1_cta_mult = _nvfp4_m1_config(resolved_target)
     if not batched:
         active_slots = _expected_bucket_tiles(top_k, num_slots, active_slots_hint, batched=False)
-        split_k_up = _select_nvfp4_split_k(device, active_slots, up_gate_out, hidden_size)
-        split_k_down = _select_nvfp4_split_k(device, active_slots, hidden_size, intermediate_size)
+        split_k_up = _select_nvfp4_split_k(
+            device,
+            active_slots,
+            up_gate_out,
+            hidden_size,
+            block_n=block_n,
+            block_k=block_k,
+            cta_multiplier=m1_cta_mult,
+        )
+        split_k_down = _select_nvfp4_split_k(
+            device,
+            active_slots,
+            hidden_size,
+            intermediate_size,
+            block_n=block_n,
+            block_k=block_k,
+            cta_multiplier=m1_cta_mult,
+        )
 
     for active_chunk, ids_chunk, weights_chunk, out_chunk in _iter_a16_chunks(
         input_2d, ids_2d, weights_2d, out_2d, prepared_data, group_size, chunk_rows
     ):
         if batched:
             chunk_n = active_chunk.shape[0]
-            use_dot, cast_fp32_to_bf16, post_scale_only, block_n, block_k, num_warps = (
+            use_dot, cast_fp32_to_bf16, post_scale_only, block_n, block_k, num_warps, single_dot = (
                 _nvfp4_batched_config(
                     resolved_target,
                     rows=chunk_n,
@@ -3448,6 +3554,8 @@ def _dispatch_nvfp4_moe(
             _nw: int = num_warps,
             _ud: bool = use_dot,
             _bf16: bool = cast_fp32_to_bf16,
+            _sm120_e2m1x2: bool = use_sm120_e2m1x2,
+            _sd: bool = single_dot,
         ) -> None:
             if not per_expert_input:
                 q, s, gs = up_gate_qdata, up_gate_scale, up_gate_global_scale
@@ -3482,6 +3590,8 @@ def _dispatch_nvfp4_moe(
                 is_splitk=per_expert_input or split_k > 1,
                 use_dot=_ud,
                 cast_fp32_to_bf16=_bf16,
+                use_sm120_e2m1x2=_sm120_e2m1x2,
+                single_dot=_sd,
             )
 
         _run_a16_chunk(
@@ -3986,6 +4096,23 @@ def _bind_opt_ptrs(
             sig[name] = ptr_type
 
 
+def _nvfp4_aligned_attrs(
+    arg_names: Sequence[str],
+    signature: dict[str, str],
+    *,
+    out_features: int,
+    in_features: int,
+) -> dict[tuple[int, ...], list[list[object]]]:
+    """Attach runtime pointer and packed-stride divisibility hints for offline compile."""
+    aligned = [name for name, ty in signature.items() if ty.startswith("*")]
+    aligned.append("expert_scale_stride")
+    if out_features % 16 == 0:
+        aligned.append("out_features")
+    if (in_features // 2) % 16 == 0:
+        aligned.append("packed_k")
+    return {(arg_names.index(name),): [["tt.divisibility", 16]] for name in aligned}
+
+
 def _compile_bucket_kernel(
     target: GPUTarget,
     *,
@@ -4470,6 +4597,8 @@ def _compile_nvfp4_prefill_kernels(
     top_k: int,
     num_slots: int,
     active_slots_hint: int,
+    hidden_size: int,
+    intermediate_size: int,
     logical_dtype: torch.dtype,
     out_ty: str,
     group_size: int,
@@ -4483,7 +4612,7 @@ def _compile_nvfp4_prefill_kernels(
 ) -> dict[str, triton.compiler.CompiledKernel]:
     active_dtype = torch.float32 if group_size > 0 else logical_dtype
     active_ty = TRITON_FLOAT_POINTER_TYPES[active_dtype]
-    cast_bf16, force_fp32_dot, half_scales, block_m, block_n, block_k, num_warps = (
+    cast_bf16, force_fp32_dot, half_scales, block_m, block_n, block_k, num_warps, single_dot = (
         _nvfp4_prefill_config(
             accel,
             chunk_rows=rows,
@@ -4494,6 +4623,7 @@ def _compile_nvfp4_prefill_kernels(
             logical_dtype=logical_dtype,
         )
     )
+    use_sm120_e2m1x2 = accel.is_cuda_capability(12)
     sig: dict[str, str] = {
         "input_ptr": active_ty,
         "weight_ptr": "*u8",
@@ -4504,7 +4634,7 @@ def _compile_nvfp4_prefill_kernels(
         "output_ptr": "*fp32",
         "max_tiles": "i32",
         "out_features": "i32",
-        "in_features": "i32",
+        "packed_k": "i32",
         "scale_column_blocks": "i32",
         "expert_scale_stride": "i32",
     }
@@ -4518,6 +4648,8 @@ def _compile_nvfp4_prefill_kernels(
         "cast_fp32_to_bf16": cast_bf16,
         "force_fp32_dot": force_fp32_dot,
         "half_scales": half_scales,
+        "use_sm120_e2m1x2": use_sm120_e2m1x2,
+        "single_dot": single_dot,
     }
     _bind_opt_ptrs(
         sig,
@@ -4535,8 +4667,17 @@ def _compile_nvfp4_prefill_kernels(
         accumulate=accumulate,
         compile_fn=compile_fn,
     )
+    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    grouped_attrs = _nvfp4_aligned_attrs(
+        nvfp4_moe_grouped_gemm_kernel.arg_names,
+        sig,
+        out_features=math.gcd(up_gate_out, hidden_size),
+        in_features=math.gcd(hidden_size, intermediate_size),
+    )
     compiled["nvfp4_grouped"] = compile_fn(
-        ASTSource(nvfp4_moe_grouped_gemm_kernel, sig, constexprs), target, opts
+        ASTSource(nvfp4_moe_grouped_gemm_kernel, sig, constexprs, attrs=grouped_attrs),
+        target,
+        opts,
     )
     compiled["activate_rotate"] = _compile_activate_rotate(
         target,
@@ -4766,6 +4907,8 @@ def _compile_nvfp4_kernels(
     *,
     batched: bool,
     rows: int,
+    hidden_size: int,
+    intermediate_size: int,
     logical_dtype: torch.dtype,
     out_ty: str,
     group_size: int,
@@ -4780,9 +4923,10 @@ def _compile_nvfp4_kernels(
 ) -> dict[str, triton.compiler.CompiledKernel]:
     active_dtype = torch.float32 if group_size > 0 else logical_dtype
     active_ty = TRITON_FLOAT_POINTER_TYPES[active_dtype]
+    use_sm120_e2m1x2 = accel.is_cuda_capability(12)
     is_splitk = split_k > 1
     if batched:
-        use_dot, cast_fp32_to_bf16, post_scale_only, block_n, block_k, num_warps = (
+        use_dot, cast_fp32_to_bf16, post_scale_only, block_n, block_k, num_warps, single_dot = (
             _nvfp4_batched_config(
                 accel,
                 rows=rows,
@@ -4798,7 +4942,7 @@ def _compile_nvfp4_kernels(
             "tile_pair_ids_ptr": "*i32",
             "output_ptr": "*fp32",
             "out_features": "i32",
-            "input_features": "i32",
+            "packed_k": "i32",
             "scale_column_blocks": "i32",
             "expert_scale_stride": "i32",
             "num_pairs": "i32",
@@ -4812,9 +4956,11 @@ def _compile_nvfp4_kernels(
             "block_k": block_k,
             "use_dot": use_dot,
             "cast_fp32_to_bf16": cast_fp32_to_bf16,
+            "single_dot": single_dot,
         }
         gemv_opts: dict[str, object] = {"num_warps": num_warps, "num_stages": 1}
     else:
+        block_n, block_k, num_warps, _ = _nvfp4_m1_config(accel)
         post_scale_only = True
         nvfp4_signature = {
             "input_ptr": active_ty,
@@ -4823,7 +4969,7 @@ def _compile_nvfp4_kernels(
             "topk_ids_ptr": "*i64",
             "output_ptr": "*fp32",
             "out_features": "i32",
-            "input_features": "i32",
+            "packed_k": "i32",
             "scale_column_blocks": "i32",
             "expert_scale_stride": "i32",
             "num_experts": "i32",
@@ -4833,8 +4979,8 @@ def _compile_nvfp4_kernels(
         }
         kernel_fn = nvfp4_moe_m1_gemv_kernel
         mode_constexprs = {
-            "block_n": _NVFP4_GEMV_BLOCK_N,
-            "block_k": _NVFP4_GEMV_BLOCK_K,
+            "block_n": block_n,
+            "block_k": block_k,
             "has_slot_map": has_slot_map,
         }
         _bind_opt_ptrs(
@@ -4842,13 +4988,26 @@ def _compile_nvfp4_kernels(
             mode_constexprs,
             expert_to_slot_ptr="*i64" if has_slot_map else None,
         )
-        gemv_opts = {"num_warps": _NVFP4_GEMV_NUM_WARPS}
+        gemv_opts = {"num_warps": num_warps}
     _bind_opt_ptrs(
         nvfp4_signature,
         mode_constexprs,
         weight_global_scale_ptr="*fp32" if has_global_scale else None,
     )
 
+    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_attrs = _nvfp4_aligned_attrs(
+        kernel_fn.arg_names,
+        nvfp4_signature,
+        out_features=up_gate_out,
+        in_features=hidden_size,
+    )
+    down_attrs = _nvfp4_aligned_attrs(
+        kernel_fn.arg_names,
+        nvfp4_signature,
+        out_features=hidden_size,
+        in_features=intermediate_size,
+    )
     compiled_nvfp4: dict[str, triton.compiler.CompiledKernel] = {
         "nvfp4_gemv_up": compile_fn(
             ASTSource(
@@ -4860,7 +5019,9 @@ def _compile_nvfp4_kernels(
                     "has_global_scale": has_global_scale,
                     "per_expert_input": False,
                     "is_splitk": is_splitk,
+                    "use_sm120_e2m1x2": use_sm120_e2m1x2,
                 },
+                attrs=up_attrs,
             ),
             target,
             gemv_opts,
@@ -4875,7 +5036,9 @@ def _compile_nvfp4_kernels(
                     "has_global_scale": has_global_scale,
                     "per_expert_input": True,
                     "is_splitk": True,
+                    "use_sm120_e2m1x2": use_sm120_e2m1x2,
                 },
+                attrs=down_attrs,
             ),
             target,
             gemv_opts,
@@ -5239,6 +5402,8 @@ def compile_moe_kernels(
             top_k=top_k,
             num_slots=num_slots,
             active_slots_hint=active_slots_hint,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
             logical_dtype=logical_dtype,
             out_ty=out_ty,
             group_size=group_size,
@@ -5299,6 +5464,8 @@ def compile_moe_kernels(
             accel,
             batched=batched,
             rows=chunk_rows,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
             logical_dtype=logical_dtype,
             out_ty=out_ty,
             group_size=group_size,

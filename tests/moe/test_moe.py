@@ -2135,6 +2135,16 @@ def test_offline_nvidia_compile_zero_spills(
     expected_prefix = "int8_matmul_" if weight_format == "convrot_int8" else "nvfp4_gemv_"
     assert f"{expected_prefix}up" in compiled
     assert f"{expected_prefix}down" in compiled
+    if weight_format != "convrot_int8":
+        is_sm12x = target.arch // 10 == 12
+        for key in ("nvfp4_gemv_up", "nvfp4_gemv_down"):
+            ptx = compiled[key].asm["ptx"]
+            if is_sm12x:
+                assert "cvt.rn.f16x2.e2m1x2" in ptx
+                assert "cvt.rn.bf16x2.e2m1x2" not in ptx
+                assert "ld.global.v4" in ptx or "cp.async.cg.shared.global" in ptx
+            else:
+                assert "e2m1x2" not in ptx
 
 
 @pytest.mark.parametrize("weight_format", ["nvfp4_w4a16", "convrot_nvfp4_w4a16"])
@@ -2571,10 +2581,10 @@ def test_gpu_launch_canary_nvfp4_and_int8() -> None:
     ids = torch.tensor([[0, 1]], device="cuda", dtype=torch.int64)
     wts = torch.tensor([[0.6, 0.4]], device="cuda", dtype=torch.bfloat16)
 
-    # Up-projection Split-K canary (H=16384, I=512, active_slots_hint=1).
+    # Up-projection Split-K canary (H=16384, I=256 for NVFP4; H=16384, I=512 for INT8).
     x_up = torch.randn((1, 16384), device="cuda", dtype=torch.bfloat16)
     w_nvfp4_up = _make_moe_weights(
-        2, 16384, 512, weight_format="nvfp4_w4a16", dtype=torch.bfloat16, device="cuda", seed=401
+        2, 16384, 256, weight_format="nvfp4_w4a16", dtype=torch.bfloat16, device="cuda", seed=401
     )
     ref_nvfp4_up = _reference_for_weights(x_up, w_nvfp4_up, ids, wts)
     nvfp4_first, nvfp4_launches = _record_triton_launches(
@@ -3290,6 +3300,25 @@ def test_offline_nvidia_small_batch_compile_zero_spills(
     expected_prefix = "int8_matmul_" if weight_format == "convrot_int8" else "nvfp4_gemv_"
     assert f"{expected_prefix}up" in compiled
     assert f"{expected_prefix}down" in compiled
+    if weight_format != "convrot_int8":
+        is_sm12x = target.arch // 10 == 12
+        expect_bf16_cvt = rows > 4 and logical_dtype is torch.bfloat16
+        expected_sm120_cvt = "cvt.rn.bf16x2.e2m1x2" if expect_bf16_cvt else "cvt.rn.f16x2.e2m1x2"
+        other_sm120_cvt = "cvt.rn.f16x2.e2m1x2" if expect_bf16_cvt else "cvt.rn.bf16x2.e2m1x2"
+        expect_single_dot = rows > 4 and (
+            logical_dtype is torch.bfloat16
+            or (weight_format == "nvfp4_w4a16" and logical_dtype is torch.float16)
+        )
+        for key in ("nvfp4_gemv_up", "nvfp4_gemv_down"):
+            ptx = compiled[key].asm["ptx"]
+            if is_sm12x:
+                assert expected_sm120_cvt in ptx
+                assert other_sm120_cvt not in ptx
+                assert "ld.global.v4" in ptx or "cp.async.cg.shared.global" in ptx
+                if expect_single_dot:
+                    assert len(re.findall(r"\btt\.dot\b", compiled[key].asm["ttir"])) == 1
+            else:
+                assert "e2m1x2" not in ptx
 
 
 @pytest.mark.parametrize("weight_format", ["nvfp4_w4a16", "convrot_nvfp4_w4a16"])
@@ -3534,25 +3563,47 @@ def test_gpu_small_batch_matches_reference(weight_format: MoEFormat, group_size:
         )
 
     if weight_format != "convrot_int8":
-        hf_up, hf_down = _make_dense_weights(
-            4, 256, 256, dtype=torch.bfloat16, device="cuda", seed=560
-        )
-        w_hf = MoEWeights.from_hp(
-            hf_up,
-            hf_down,
-            weight_format=weight_format,
-            group_size=group_size,
-            high_first=True,
-        )
-        x_hf = torch.randn((8, 256), device="cuda", dtype=torch.bfloat16)
-        ids_hf = torch.randint(0, 4, (8, 3), device="cuda", dtype=torch.int64)
-        wts_hf = torch.rand((8, 3), device="cuda", dtype=torch.bfloat16) + 0.1
-        _assert_matches_reference(
-            moe_ffn(x_hf, w_hf, ids_hf, wts_hf),
-            _reference_for_weights(x_hf, w_hf, ids_hf, wts_hf),
+        for hf_dtype in (torch.bfloat16, torch.float16):
+            hf_up, hf_down = _make_dense_weights(
+                4, 256, 256, dtype=hf_dtype, device="cuda", seed=560
+            )
+            w_hf = MoEWeights.from_hp(
+                hf_up,
+                hf_down,
+                weight_format=weight_format,
+                group_size=group_size,
+                high_first=True,
+            )
+            for hf_rows in (8,) if hf_dtype is torch.bfloat16 else (4, 8):
+                x_hf = torch.randn((hf_rows, 256), device="cuda", dtype=hf_dtype)
+                ids_hf = torch.randint(0, 4, (hf_rows, 3), device="cuda", dtype=torch.int64)
+                wts_hf = torch.rand((hf_rows, 3), device="cuda", dtype=hf_dtype) + 0.1
+                _assert_matches_reference(
+                    moe_ffn(x_hf, w_hf, ids_hf, wts_hf),
+                    _reference_for_weights(x_hf, w_hf, ids_hf, wts_hf),
+                    weight_format=weight_format,
+                    dtype=hf_dtype,
+                )
+    if weight_format == "nvfp4_w4a16":
+        w_unaligned = _make_moe_weights(
+            4,
+            80,
+            48,
             weight_format=weight_format,
             dtype=torch.bfloat16,
+            device="cuda",
+            seed=570,
         )
+        for u_rows in (4, 8):
+            x_u = torch.randn((u_rows, 80), device="cuda", dtype=torch.bfloat16)
+            ids_u = torch.randint(0, 4, (u_rows, 3), device="cuda", dtype=torch.int64)
+            wts_u = torch.rand((u_rows, 3), device="cuda", dtype=torch.bfloat16) + 0.1
+            _assert_matches_reference(
+                moe_ffn(x_u, w_unaligned, ids_u, wts_u),
+                _reference_for_weights(x_u, w_unaligned, ids_u, wts_u),
+                weight_format=weight_format,
+                dtype=torch.bfloat16,
+            )
 
 
 @pytest.mark.gpu
@@ -4135,6 +4186,23 @@ def test_offline_nvidia_prefill_compile_zero_spills(
     else:
         assert "nvfp4_grouped" in compiled
         assert "activate_rotate" in compiled
+        is_sm12x = target.arch // 10 == 12
+        expect_bf16_cvt = logical_dtype is torch.bfloat16
+        expected_sm120_cvt = "cvt.rn.bf16x2.e2m1x2" if expect_bf16_cvt else "cvt.rn.f16x2.e2m1x2"
+        other_sm120_cvt = "cvt.rn.f16x2.e2m1x2" if expect_bf16_cvt else "cvt.rn.bf16x2.e2m1x2"
+        expect_single_dot = logical_dtype is torch.bfloat16 or (
+            weight_format == "nvfp4_w4a16" and logical_dtype is torch.float16
+        )
+        ptx = compiled["nvfp4_grouped"].asm["ptx"]
+        if is_sm12x:
+            assert expected_sm120_cvt in ptx
+            assert other_sm120_cvt not in ptx
+            assert "ld.global.v4" in ptx or "cp.async.cg.shared.global" in ptx
+            assert len(re.findall(r"\btt\.dot\b", compiled["nvfp4_grouped"].asm["ttir"])) == (
+                1 if expect_single_dot else 2
+            )
+        else:
+            assert "e2m1x2" not in ptx
 
 
 @pytest.mark.parametrize("weight_format", ["nvfp4_w4a16", "convrot_nvfp4_w4a16"])
@@ -4379,19 +4447,19 @@ def test_gpu_prefill_matches_reference(weight_format: MoEFormat, group_size: int
         weight_format=weight_format,
         dtype=torch.float32,
     )
-    if weight_format == "convrot_nvfp4_w4a16":
-        hf_up, hf_dn = _make_dense_weights(
-            2, 256, 256, dtype=torch.float16, device="cuda", seed=835
-        )
+    if weight_format != "convrot_int8":
+        hf_dtype = torch.bfloat16 if weight_format == "nvfp4_w4a16" else torch.float16
+        hf_up, hf_dn = _make_dense_weights(2, 256, 256, dtype=hf_dtype, device="cuda", seed=835)
         w_hf = MoEWeights.from_hp(
-            hf_up, hf_dn, weight_format="convrot_nvfp4_w4a16", group_size=64, high_first=True
+            hf_up, hf_dn, weight_format=weight_format, group_size=group_size, high_first=True
         )
-        x_hf = torch.randn((24, 256), device="cuda", dtype=torch.float16)
+        x_hf = torch.randn((24, 256), device="cuda", dtype=hf_dtype)
+        wts_hf = wts_sp[:24] if hf_dtype is torch.bfloat16 else wts_sp[:24].half()
         _assert_matches_reference(
-            moe_ffn(x_hf, w_hf, ids_sp[:24] % 2, wts_sp[:24].half()),
-            _reference_for_weights(x_hf, w_hf, ids_sp[:24] % 2, wts_sp[:24].half()),
+            moe_ffn(x_hf, w_hf, ids_sp[:24] % 2, wts_hf),
+            _reference_for_weights(x_hf, w_hf, ids_sp[:24] % 2, wts_hf),
             weight_format=weight_format,
-            dtype=torch.float16,
+            dtype=hf_dtype,
         )
 
 
@@ -5917,14 +5985,14 @@ def test_gpu_m1_top_k_exceeds_cuda_grid_y_limit() -> None:
     if torch.cuda.get_device_properties(0).multi_processor_count >= 32:
         w_splitk = _make_moe_weights(
             2,
-            4096,
-            512,
+            8192,
+            256,
             weight_format="nvfp4_w4a16",
             dtype=torch.bfloat16,
             device="cuda",
             seed=1006,
         )
-        x_splitk = torch.randn((1, 4096), device="cuda", dtype=torch.bfloat16)
+        x_splitk = torch.randn((1, 8192), device="cuda", dtype=torch.bfloat16)
         actual_sk, launches_sk = _record_triton_launches(
             lambda: moe_ffn(x_splitk, w_splitk, ids, wts, active_slots_hint=2)
         )
