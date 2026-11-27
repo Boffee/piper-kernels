@@ -174,8 +174,9 @@ sizes (`up_gate_block_size`, `down_block_size`), and optional variable-row metad
 `slot_offsets`), so runtimes can wrap resident slabs or staging buffers zero-copy with
 `MoEWeights.from_quantized`.
 
-NVFP4 slabs use packed `uint8` nibbles and `SWIZZLE_32_4_4` `float8_e4m3fn` 16-value block scales
-on widths divisible by 16 (and `group_size` for ConvRot). ConvRot INT8 slabs use `int8` values,
+NVFP4 slabs use packed `uint8` nibbles and finite (`0x7F`/`0xFF` NaN bytes excluded)
+`SWIZZLE_32_4_4` `float8_e4m3fn` 16-value block scales on widths divisible by 16 (and
+`group_size` for ConvRot). ConvRot INT8 slabs use `int8` values,
 `float32` per-row scales (`[num_slots, out]` or `[num_slots, out, 1]`), `group_size` in
 `{16, 64, 256}`, and widths up to `131_071` so INT32 accumulators never wrap; GPU INT8 kernels
 target NVIDIA SM80+ and supported AMD ROCm GPUs, while earlier CUDA targets and CPU run the

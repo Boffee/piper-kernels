@@ -913,6 +913,7 @@ def _load_nvfp4_tile(
     scale_column_blocks,
     block_k: tl.constexpr,
     high_first: tl.constexpr,
+    use_sm120_e2m1x2: tl.constexpr = False,
 ):
     """Load one swizzled NVFP4 weight tile as decoded E2M1 pairs and FP32 block scales."""
     packed, scale_u8 = _load_nvfp4_raw_tile(
@@ -926,6 +927,10 @@ def _load_nvfp4_tile(
         scale_column_blocks,
         block_k,
     )
+    if use_sm120_e2m1x2:
+        w_even, w_odd = _decode_sm120_e2m1x2_f32(packed, high_first)
+        scales = scale_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        return w_even, w_odd, scales
     w_lo = _decode_fp4_code(packed & 0xF)
     w_hi = _decode_fp4_code(packed >> 4)
     w_even = w_hi if high_first else w_lo
@@ -1081,6 +1086,7 @@ def _load_scaled_nvfp4_pairs(
     high_first: tl.constexpr,
     out_dtype: tl.constexpr,
     use_sm120_e2m1x2: tl.constexpr,
+    half_scales: tl.constexpr = False,
 ):
     """Load, decode, and scale one NVFP4 K-tile into even/odd pairs."""
     if use_sm120_e2m1x2:
@@ -1119,6 +1125,9 @@ def _load_scaled_nvfp4_pairs(
         block_k,
         high_first,
     )
+    if half_scales:
+        scales_expanded = _expand_nvfp4_scales(scales.to(out_dtype), block_n, block_k)
+        return w_even.to(out_dtype) * scales_expanded, w_odd.to(out_dtype) * scales_expanded
     scales_expanded = _expand_nvfp4_scales(scales, block_n, block_k)
     return (w_even * scales_expanded).to(out_dtype), (w_odd * scales_expanded).to(out_dtype)
 
@@ -1207,33 +1216,19 @@ def _w4a16_accumulate_scalar_tile(
     use_sm120_e2m1x2: tl.constexpr,
 ):
     """Accumulate one NVFP4 K-tile via FP32 scalar decode and reduction."""
-    if use_sm120_e2m1x2:
-        packed, scale_u8 = _load_nvfp4_raw_tile(
-            weight_ptr,
-            weight_scale_ptr,
-            n_offs_i64,
-            n_valid,
-            k_base,
-            packed_k,
-            scale_k,
-            scale_column_blocks,
-            block_k,
-        )
-        w_even, w_odd = _decode_sm120_e2m1x2_f32(packed, high_first)
-        scales = scale_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    else:
-        w_even, w_odd, scales = _load_nvfp4_tile(
-            weight_ptr,
-            weight_scale_ptr,
-            n_offs_i64,
-            n_valid,
-            k_base,
-            packed_k,
-            scale_k,
-            scale_column_blocks,
-            block_k,
-            high_first,
-        )
+    w_even, w_odd, scales = _load_nvfp4_tile(
+        weight_ptr,
+        weight_scale_ptr,
+        n_offs_i64,
+        n_valid,
+        k_base,
+        packed_k,
+        scale_k,
+        scale_column_blocks,
+        block_k,
+        high_first,
+        use_sm120_e2m1x2,
+    )
 
     k_elem_offs = k_base + tl.arange(0, block_k)
     k_elem_valid = k_elem_offs < input_features
