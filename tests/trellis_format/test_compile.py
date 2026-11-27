@@ -39,6 +39,10 @@ def _assert_decode_compiles_zero_spills(
         "num_wide_steps": "i32",
         "bytes_per_block": "i32",
     }
+    is_rdna4 = target.backend == "hip" and target.arch in ("gfx1200", "gfx1201")
+    use_sad_u8 = is_rdna4
+    clamped_load = is_rdna4 and (not variable_rows) and ptr_aligned and (not has_tail_bytes)
+    num_warps = 1 if is_rdna4 else 2
     constexprs: dict[str, object] = {
         "tile_steps": tile_steps,
         "tile_blocks": 4,
@@ -50,6 +54,8 @@ def _assert_decode_compiles_zero_spills(
         "ptr_aligned": ptr_aligned,
         "q_u32_aligned": q_u32_aligned,
         "round_int8": round_int8,
+        "use_sad_u8": use_sad_u8,
+        "clamped_load": clamped_load,
     }
     if variable_rows:
         signature["row_widths"] = "*u8"
@@ -61,10 +67,11 @@ def _assert_decode_compiles_zero_spills(
         compiled = triton.compile(
             ASTSource(decode_int8_kernel, signature, constexprs=constexprs),
             target=target,
-            options={"num_warps": 2},
+            options={"num_warps": num_warps},
         )
         assert compiled.asm["hsaco"]
         amdgcn = compiled.asm["amdgcn"]
+        assert ("v_sad_u8" in amdgcn) is use_sad_u8
         vgpr_spills = re.search(r"\.vgpr_spill_count:\s*(\d+)", amdgcn)
         priv_size = re.search(r"\.private_segment_fixed_size:\s*(\d+)", amdgcn)
         assert vgpr_spills is not None
@@ -75,7 +82,7 @@ def _assert_decode_compiles_zero_spills(
     compiled, spills = compile_with_spill_stores(
         ASTSource(decode_int8_kernel, signature, constexprs=constexprs),
         target=target,
-        options={"num_warps": 2},
+        options={"num_warps": num_warps},
     )
     ptx = compiled.asm["ptx"]
     assert ptx
@@ -228,6 +235,32 @@ def test_decode_kernel_compiles(
             True,
             False,
             id="sm120-t256-var-q-unaligned",
+        ),
+        pytest.param(
+            GPUTarget("hip", "gfx942", 64),
+            256,
+            False,
+            True,
+            True,
+            False,
+            False,
+            True,
+            True,
+            marks=_HIP,
+            id="gfx942-t256-u-pow2-i8",
+        ),
+        pytest.param(
+            GPUTarget("hip", "gfx1201", 32),
+            256,
+            False,
+            True,
+            True,
+            False,
+            False,
+            True,
+            True,
+            marks=_HIP,
+            id="gfx1201-t256-u-pow2-i8-clamped",
         ),
         pytest.param(
             GPUTarget("hip", "gfx1201", 32),

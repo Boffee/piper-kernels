@@ -20,6 +20,7 @@ from triton.language.extra import libdevice
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 
+from ._amd.isa import sad_u8_lcg_numerator_i32
 from ._layout import (
     CODE_OFFSET,
     CODE_RECIPROCAL,
@@ -28,6 +29,7 @@ from ._layout import (
     WRAP_GUARD_BYTES,
     TrellisLayout,
 )
+from ._nvidia.isa import dp4a_lcg_numerator_i32
 
 _BLOCKS_PER_PROGRAM = 4
 _DEFAULT_DECODE_WARPS = 2
@@ -51,18 +53,17 @@ def _decode_e4m3(code):
 
 
 @triton.jit
-def _decode_lcg_numerator_i32(states, use_dp4a: tl.constexpr):
+def _decode_lcg_numerator_i32(
+    states,
+    use_dp4a: tl.constexpr,
+    use_sad_u8: tl.constexpr = False,
+):
     """Compute signed LCG byte-sum numerators from 16-bit trellis states."""
     x = states * _LCG_MULTIPLIER + _LCG_INCREMENT
     if use_dp4a:
-        return tl.inline_asm_elementwise(
-            asm="dp4a.s32.u32 $0, 0x01010101, $1, -510;",
-            constraints="=r,r",
-            args=[x],
-            dtype=tl.int32,
-            is_pure=True,
-            pack=1,
-        )
+        return dp4a_lcg_numerator_i32(x)
+    if use_sad_u8:
+        return sad_u8_lcg_numerator_i32(x)
     return ((x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + (x >> 24)).to(
         tl.int32
     ) - _CODE_OFFSET
@@ -79,9 +80,16 @@ def _load_u32_word(
     has_tail_bytes: tl.constexpr,
     ptr_aligned: tl.constexpr,
     evict_first: tl.constexpr = False,
+    clamped_load: tl.constexpr = False,
 ):
-    """Load one little-endian uint32 word safely within ``limit_bytes``."""
-    if ptr_aligned:
+    """Load an LE uint32 word within ``limit_bytes`` (clamping assumes ``full_words >= 1``)."""
+    if clamped_load and ptr_aligned and not has_tail_bytes:
+        safe_idx = tl.minimum(idx, full_words - 1)
+        if evict_first:
+            w = tl.load(u32_ptr + safe_idx, eviction_policy="evict_first")
+        else:
+            w = tl.load(u32_ptr + safe_idx)
+    elif ptr_aligned:
         if evict_first:
             w = tl.load(
                 u32_ptr + idx,
@@ -104,19 +112,20 @@ def _load_u32_word(
                 byte_ptr + base + 2, mask=is_tail & ((base + 2) < limit_bytes), other=0
             ).to(tl.uint32)
             w = tl.where(is_tail, b0 | (b1 << 8) | (b2 << 16), w)
-        return w
-    base = idx << 2
-    b0 = tl.load(byte_ptr + base, mask=valid & (base < limit_bytes), other=0).to(tl.uint32)
-    b1 = tl.load(byte_ptr + base + 1, mask=valid & ((base + 1) < limit_bytes), other=0).to(
-        tl.uint32
-    )
-    b2 = tl.load(byte_ptr + base + 2, mask=valid & ((base + 2) < limit_bytes), other=0).to(
-        tl.uint32
-    )
-    b3 = tl.load(byte_ptr + base + 3, mask=valid & ((base + 3) < limit_bytes), other=0).to(
-        tl.uint32
-    )
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    else:
+        base = idx << 2
+        b0 = tl.load(byte_ptr + base, mask=valid & (base < limit_bytes), other=0).to(tl.uint32)
+        b1 = tl.load(byte_ptr + base + 1, mask=valid & ((base + 1) < limit_bytes), other=0).to(
+            tl.uint32
+        )
+        b2 = tl.load(byte_ptr + base + 2, mask=valid & ((base + 2) < limit_bytes), other=0).to(
+            tl.uint32
+        )
+        b3 = tl.load(byte_ptr + base + 3, mask=valid & ((base + 3) < limit_bytes), other=0).to(
+            tl.uint32
+        )
+        w = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    return w
 
 
 @triton.jit
@@ -172,6 +181,7 @@ def _decode_words_4(
     has_tail_bytes: tl.constexpr,
     ptr_aligned: tl.constexpr,
     evict_first: tl.constexpr = False,
+    clamped_load: tl.constexpr = False,
 ):
     """Load LE uint32 words covering a 4-step group and return ``(w0, w1, w2, bit_bias)``."""
     blk_word_base = base_byte >> 2
@@ -182,16 +192,16 @@ def _decode_words_4(
     bit_bias = blk_align_bits - (first_word << 5)
     w0 = _load_u32_word(
         u32_ptr, byte_ptr, w0_idx, full_words, limit_bytes, valid, has_tail_bytes, ptr_aligned,
-        evict_first=evict_first,
+        evict_first=evict_first, clamped_load=clamped_load,
     )  # fmt: skip
     w1 = _load_u32_word(
         u32_ptr, byte_ptr, w0_idx + 1, full_words, limit_bytes, valid, has_tail_bytes, ptr_aligned,
-        evict_first=evict_first,
+        evict_first=evict_first, clamped_load=clamped_load,
     )  # fmt: skip
     if needs_w2:
         w2 = _load_u32_word(
             u32_ptr, byte_ptr, w0_idx + 2, full_words, limit_bytes, valid,
-            has_tail_bytes, ptr_aligned, evict_first=evict_first,
+            has_tail_bytes, ptr_aligned, evict_first=evict_first, clamped_load=clamped_load,
         )  # fmt: skip
     else:
         w2 = tl.zeros_like(w0)
@@ -209,6 +219,7 @@ def _decode_nums_from_words(
     rel3,
     needs_w2: tl.constexpr,
     use_dp4a: tl.constexpr,
+    use_sad_u8: tl.constexpr = False,
 ):
     """Extract 4 16-bit LE states from ``w0, w1[, w2]`` and return float32 numerators."""
     bits64 = (w1.to(tl.uint64) << 32) | w0.to(tl.uint64)
@@ -218,10 +229,10 @@ def _decode_nums_from_words(
     st2 = _extract_16_le_u64(bits64, rel2)
     st3 = _extract_16_le_3word(w0, w1, w2, rel3) if needs_w2 else _extract_16_le_u64(bits64, rel3)
     return (
-        _decode_lcg_numerator_i32(st0, use_dp4a).to(tl.float32),
-        _decode_lcg_numerator_i32(st1, use_dp4a).to(tl.float32),
-        _decode_lcg_numerator_i32(st2, use_dp4a).to(tl.float32),
-        _decode_lcg_numerator_i32(st3, use_dp4a).to(tl.float32),
+        _decode_lcg_numerator_i32(st0, use_dp4a, use_sad_u8).to(tl.float32),
+        _decode_lcg_numerator_i32(st1, use_dp4a, use_sad_u8).to(tl.float32),
+        _decode_lcg_numerator_i32(st2, use_dp4a, use_sad_u8).to(tl.float32),
+        _decode_lcg_numerator_i32(st3, use_dp4a, use_sad_u8).to(tl.float32),
     )
 
 
@@ -243,6 +254,7 @@ def _decode_group_4_nums(
     has_tail_bytes: tl.constexpr,
     ptr_aligned: tl.constexpr,
     evict_first: tl.constexpr = False,
+    use_sad_u8: tl.constexpr = False,
 ):
     """Load LE uint32 words for a 4-step group and return 4 float32 code numerators."""
     w0, w1, w2, bit_bias = _decode_words_4(
@@ -252,7 +264,7 @@ def _decode_group_4_nums(
     )  # fmt: skip
     return _decode_nums_from_words(
         w0, w1, w2, bit_bias + sbit0, bit_bias + sbit1, bit_bias + sbit2, bit_bias + sbit3,
-        needs_w2=needs_w2, use_dp4a=use_dp4a,
+        needs_w2=needs_w2, use_dp4a=use_dp4a, use_sad_u8=use_sad_u8,
     )  # fmt: skip
 
 
@@ -387,6 +399,8 @@ def _decode_blocks_le(
     ptr_aligned: tl.constexpr,
     q_u32_aligned: tl.constexpr,
     round_int8: tl.constexpr,
+    use_sad_u8: tl.constexpr = False,
+    clamped_load: tl.constexpr = False,
 ):
     blocks = tl.program_id(0) * tile_blocks + tl.arange(0, tile_blocks)
     block_mask = blocks < num_blocks
@@ -434,7 +448,7 @@ def _decode_blocks_le(
     w0, w1, w2, bit_bias = _decode_words_4(
         bitstreams.to(tl.pointer_type(tl.uint32)), bitstreams, base_bytes, first_byte,
         limit_bytes >> 2, limit_bytes, decode_valid, needs_w2=needs_w2,
-        has_tail_bytes=has_tail_bytes, ptr_aligned=ptr_aligned,
+        has_tail_bytes=has_tail_bytes, ptr_aligned=ptr_aligned, clamped_load=clamped_load,
     )  # fmt: skip
     sbit1 = _le_step_bit(
         (first_step + 1)[None, :], eff_step_bits, eff_wide_steps, denom, block_size, exact_pow2
@@ -447,7 +461,7 @@ def _decode_blocks_le(
     )
     n0, n1, n2, n3 = _decode_nums_from_words(
         w0, w1, w2, bit_bias + sbit0, bit_bias + sbit1, bit_bias + sbit2, bit_bias + sbit3,
-        needs_w2=needs_w2, use_dp4a=use_dp4a,
+        needs_w2=needs_w2, use_dp4a=use_dp4a, use_sad_u8=use_sad_u8,
     )  # fmt: skip
     sc = tl.load(block_scales + blocks.to(tl.int64), mask=block_mask, other=0)
     mult = (_decode_e4m3(sc.to(tl.uint32)) * _CODE_RECIPROCAL)[:, None]
@@ -491,6 +505,8 @@ def decode_int8_kernel(
     ptr_aligned: tl.constexpr,
     q_u32_aligned: tl.constexpr,
     round_int8: tl.constexpr = True,
+    use_sad_u8: tl.constexpr = False,
+    clamped_load: tl.constexpr = False,
 ):
     """Unified LE decode of uniform or variable-row trellis blocks into INT8 or FP32."""
     _decode_blocks_le(
@@ -500,6 +516,7 @@ def decode_int8_kernel(
         exact_pow2=exact_pow2, filter_active=False, has_slot_offsets=False, per_slot_2d=False,
         needs_w2=needs_w2, use_dp4a=use_dp4a, has_tail_bytes=has_tail_bytes,
         ptr_aligned=ptr_aligned, q_u32_aligned=q_u32_aligned, round_int8=round_int8,
+        use_sad_u8=use_sad_u8, clamped_load=clamped_load,
     )  # fmt: skip
 
 
@@ -545,6 +562,8 @@ def decode_slots_int8_kernel(
     has_tail_bytes: tl.constexpr,
     ptr_aligned: tl.constexpr,
     q_u32_aligned: tl.constexpr,
+    use_sad_u8: tl.constexpr = False,
+    clamped_load: tl.constexpr = False,
 ):
     """Unified LE decode of MoE slot-major uniform or variable-row trellis blocks into INT8."""
     _decode_blocks_le(
@@ -555,7 +574,40 @@ def decode_slots_int8_kernel(
         filter_active=filter_active, has_slot_offsets=has_slot_offsets, per_slot_2d=per_slot_2d,
         needs_w2=needs_w2, use_dp4a=use_dp4a, has_tail_bytes=has_tail_bytes,
         ptr_aligned=ptr_aligned, q_u32_aligned=q_u32_aligned, round_int8=True,
+        use_sad_u8=use_sad_u8, clamped_load=clamped_load,
     )  # fmt: skip
+
+
+def _decode_num_warps(target: AcceleratorTarget) -> int:
+    """Return the optimal warp count for Trellis block decoding on ``target``."""
+    return 1 if target.is_rdna4 else _DEFAULT_DECODE_WARPS
+
+
+def _decode_stream_flags(
+    target: AcceleratorTarget,
+    stream_bytes: int,
+    *,
+    variable_rows: bool = False,
+    ptr_aligned: bool = True,
+    per_slot_2d: bool = False,
+) -> tuple[bool, bool, bool, bool, int]:
+    """Return ``(use_dp4a, use_sad_u8, has_tail_bytes, clamped_load, num_warps)``."""
+    has_tail_bytes = per_slot_2d or (stream_bytes % 4 != 0)
+    use_sad_u8 = target.is_rdna4
+    clamped_load = (
+        target.is_rdna4
+        and (not variable_rows)
+        and ptr_aligned
+        and (not has_tail_bytes)
+        and stream_bytes >= 4
+    )
+    return (
+        target.is_nvidia_cuda,
+        use_sad_u8,
+        has_tail_bytes,
+        clamped_load,
+        _decode_num_warps(target),
+    )
 
 
 def _decode_launch_flags(
@@ -563,17 +615,31 @@ def _decode_launch_flags(
     out: torch.Tensor,
     block_size: int,
     *,
+    variable_rows: bool = False,
+    ptr_aligned: bool = True,
     per_slot_2d: bool = False,
     round_int8: bool = True,
-) -> tuple[bool, bool, bool, int]:
-    """Return ``(use_dp4a, has_tail_bytes, q_u32_aligned, num_warps)`` for decode launches."""
+) -> tuple[bool, bool, bool, bool, bool, int]:
+    """Return ``(use_dp4a, use_sad_u8, clamped_load, has_tail_bytes, q_u32_aligned, num_warps)``."""
     target = AcceleratorTarget.from_device(bitstreams.device)
-    use_dp4a = target.is_nvidia_cuda
-    has_tail_bytes = per_slot_2d or (bitstreams.numel() % 4 != 0)
+    use_dp4a, use_sad_u8, has_tail_bytes, clamped_load, num_warps = _decode_stream_flags(
+        target,
+        bitstreams.numel(),
+        variable_rows=variable_rows,
+        ptr_aligned=ptr_aligned,
+        per_slot_2d=per_slot_2d,
+    )
     q_u32_aligned = (
         round_int8 and block_size % 4 == 0 and out.is_contiguous() and out.data_ptr() % 4 == 0
     )
-    return use_dp4a, has_tail_bytes, q_u32_aligned, _DEFAULT_DECODE_WARPS
+    return (
+        use_dp4a,
+        use_sad_u8,
+        clamped_load,
+        has_tail_bytes,
+        q_u32_aligned,
+        num_warps,
+    )
 
 
 def _launch_uniform_decode(
@@ -591,8 +657,15 @@ def _launch_uniform_decode(
     grid = (triton.cdiv(num_blocks, _BLOCKS_PER_PROGRAM),)
     needs_w2 = layout.block_bits > 5 * layout.block_size
     ptr_aligned = bitstreams.is_contiguous() and bitstreams.data_ptr() % 4 == 0
-    use_dp4a, has_tail_bytes, q_u32_aligned, num_warps = _decode_launch_flags(
-        bitstreams, out, layout.block_size, round_int8=round_int8
+    use_dp4a, use_sad_u8, clamped_load, has_tail_bytes, q_u32_aligned, num_warps = (
+        _decode_launch_flags(
+            bitstreams,
+            out,
+            layout.block_size,
+            variable_rows=False,
+            ptr_aligned=ptr_aligned,
+            round_int8=round_int8,
+        )
     )
     with device_context(bitstreams.device):
         decode_int8_kernel[grid](
@@ -618,6 +691,8 @@ def _launch_uniform_decode(
             ptr_aligned=ptr_aligned,
             q_u32_aligned=q_u32_aligned,
             round_int8=round_int8,
+            use_sad_u8=use_sad_u8,
+            clamped_load=clamped_load,
             num_warps=num_warps,
         )
 
@@ -688,8 +763,15 @@ def _launch_variable_rows_decode(
     tile_steps = triton.next_power_of_2(block_size)
     grid = (triton.cdiv(num_blocks, _BLOCKS_PER_PROGRAM),)
     ptr_aligned = bitstreams.is_contiguous() and bitstreams.data_ptr() % 4 == 0
-    use_dp4a, has_tail_bytes, q_u32_aligned, num_warps = _decode_launch_flags(
-        bitstreams, out, block_size, round_int8=round_int8
+    use_dp4a, use_sad_u8, clamped_load, has_tail_bytes, q_u32_aligned, num_warps = (
+        _decode_launch_flags(
+            bitstreams,
+            out,
+            block_size,
+            variable_rows=True,
+            ptr_aligned=ptr_aligned,
+            round_int8=round_int8,
+        )
     )
     with device_context(bitstreams.device):
         resolved_row_offsets = (
@@ -718,6 +800,8 @@ def _launch_variable_rows_decode(
             ptr_aligned=ptr_aligned,
             q_u32_aligned=q_u32_aligned,
             round_int8=round_int8,
+            use_sad_u8=use_sad_u8,
+            clamped_load=clamped_load,
             num_warps=num_warps,
         )
 
@@ -810,8 +894,15 @@ def decode_slots_int8_out(
         row_widths_arg = None
 
     ptr_aligned = bitstreams.is_contiguous() and bitstreams.data_ptr() % 4 == 0
-    use_dp4a, has_tail_bytes, q_u32_aligned, num_warps = _decode_launch_flags(
-        bitstreams, q_out, resolved_block_size, per_slot_2d=per_slot_2d
+    use_dp4a, use_sad_u8, clamped_load, has_tail_bytes, q_u32_aligned, num_warps = (
+        _decode_launch_flags(
+            bitstreams,
+            q_out,
+            resolved_block_size,
+            variable_rows=variable_rows,
+            ptr_aligned=ptr_aligned,
+            per_slot_2d=per_slot_2d,
+        )
     )
 
     with device_context(bitstreams.device):
@@ -855,6 +946,8 @@ def decode_slots_int8_out(
             has_tail_bytes=has_tail_bytes,
             ptr_aligned=ptr_aligned,
             q_u32_aligned=q_u32_aligned,
+            use_sad_u8=use_sad_u8,
+            clamped_load=clamped_load,
             num_warps=num_warps,
         )
 

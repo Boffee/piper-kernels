@@ -71,23 +71,28 @@ and bytes `[code_bytes, code_bytes + 1]` duplicate bytes `[0, 1]` so every
 4. **Dequantization & INT8 decoding.** With `R` the FP32 value `0x1.bb688ep-8`
    nearest `1 / 147.800537109375`, execution uses one of two exact paths:
 
-   - **Continuous block-scaled FP32** (small-batch `M <= 4` linear A16, MoE A16,
-     and `ConvRotTrellisTensor.dequantize()`): skips per-weight INT8 rounding and
-     accumulates `x_t · n_t` per block before multiplying once by
-     `fp32(block_scale · R)` and applying `scale`.
-   - **Prescaled rounded INT8** (large-batch `M >= 5` W8A8 linear, MoE prefill,
-     and `ConvRotInt8Tensor.from_trellis` / `copy_from_trellis_`):
-     `q_t = clamp(round_half_even(fp32(n_t) · fp32(block_scale · R)), -127, 127)`
-     in the rotated basis, as for any ConvRot INT8 weight.
+   - **Continuous block-scaled FP32** (small-batch linear A16 with `M <= 4`, or
+     `M <= 8` on AMD RDNA4, all batches on targets without an optimized ConvRot
+     INT8 W8A8 backend such as CPU or SM70, MoE A16, and
+     `ConvRotTrellisTensor.dequantize()`): skips per-weight INT8 rounding and
+     accumulates `x_t · n_t` per block before multiplying once by `fp32(block_scale · R)`
+     and applying `scale`.
+   - **Prescaled rounded INT8** (large-batch W8A8 linear with an INT8 backend at
+     `M >= 5`, or `M >= 9` on AMD RDNA4, MoE prefill, and
+     `ConvRotInt8Tensor.from_trellis` / `copy_from_trellis_`):
+     `q_t = clamp(round_half_even(fp32(n_t) · fp32(block_scale · R)), -127, 127)` in
+     the rotated basis, as for any ConvRot INT8 weight.
 
 Products are single IEEE FP32 multiplies of exactly representable values, so CUDA,
 HIP, and the PyTorch reference match by construction. Tests verify little-endian
 bitstreams, decoding, `ConvRotTrellisTensor` linear execution, and
-`piper_kernels.moe` `"convrot_trellis"` execution live on NVIDIA RTX 5090 (`sm120`)
-and CPU, with offline zero-spill compile coverage across NVIDIA `sm70`, `sm75`,
-`sm80`, `sm86`, `sm89`, and `sm120` and AMD `gfx942`, `gfx1100`, `gfx1151`,
-`gfx1200`, and `gfx1201`. Live SM75/SM8x, AMD ROCm/RDNA4, multi-GPU, and Windows
-execution remain unexercised locally on this format.
+`piper_kernels.moe` `"convrot_trellis"` execution live on AMD Radeon RX 9070 XT
+(`gfx1201`) and CPU for the RDNA4 optimizations (with prior live verification on
+NVIDIA RTX 5090 `sm120` on the shared CUDA schedule) and offline zero-spill compile +
+PTX/AMDGCN inspection across NVIDIA `sm70`, `sm75`, `sm80`, `sm86`, `sm89`, and `sm120`
+and AMD `gfx942`, `gfx1100`, `gfx1151`, `gfx1200`, and `gfx1201`. Live NVIDIA (after
+the RDNA4 refactor), non-RDNA4 AMD GPUs, multi-GPU, and Windows execution remain
+unexercised locally on this branch.
 Scales must not be NaN encodings (`0x7F`, `0xFF`); this is a caller precondition, not
 a runtime check.
 
@@ -148,14 +153,17 @@ post-rotation outliers remain bounded by 1MAD's ~3.2σ tail range.
 
 ## Decode implementation
 
-[`triton.py`](triton.py) decodes a tile of 4 blocks per program (2 warps) via one
-unified little-endian kernel (`decode_int8_kernel` / `decode_slots_int8_kernel`).
-Each 4-step group aligns to 32-bit little-endian words (`w0`, `w1`, and `w2` only when
-`code_bytes > 5 · T / 8` or `variable_rows=True`), extracts 16-bit windows by pure
-shift-and-mask (2-word `uint64` shifts up to 5.0 code bpw, 3-word above), computes
-1MAD byte sums (`dp4a.s32.u32` on CUDA), and either rounds to packed 4x INT8 or writes
-unrounded block-scaled FP32. Power-of-2 block sizes specialize away runtime integer
-division, and one compiled kernel serves uniform rates (and one serves variable rows).
+[`triton.py`](triton.py) decodes a tile of 4 blocks per program (2 warps, or 1 warp
+on AMD RDNA4) via one unified little-endian kernel (`decode_int8_kernel` /
+`decode_slots_int8_kernel`). Each 4-step group aligns to 32-bit little-endian words
+(`w0`, `w1`, and `w2` only when `code_bytes > 5 · T / 8` or `variable_rows=True`),
+extracts 16-bit windows by pure shift-and-mask (2-word `uint64` shifts up to 5.0
+code bpw, 3-word above), computes 1MAD byte sums (`dp4a.s32.u32` via
+[`_nvidia/isa.py`](_nvidia/isa.py) on CUDA and `v_sad_u8` via [`_amd/isa.py`](_amd/isa.py)
+on AMD RDNA4, with pure-Triton byte masking on other targets), and either rounds to
+packed 4x INT8 or writes unrounded block-scaled FP32. Power-of-2 block sizes specialize away
+runtime integer division, and one compiled kernel serves uniform rates (and one serves
+variable rows).
 
 On an RTX 5090 (`sm120`, cold-L2), it decodes at **925–956 G weights/s** on uniform
 `14336×4096` 256-weight blocks and **538–819 G weights/s** on variable-row streams

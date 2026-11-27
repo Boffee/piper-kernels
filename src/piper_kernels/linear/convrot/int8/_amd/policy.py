@@ -29,7 +29,17 @@ from piper_kernels._triton.targets import (
     rdna4_int8_accumulator_seed,
 )
 
-from .._plan import LinearExecutionPlan
+from .._plan import (
+    TRELLIS_DEFAULT_GEMV_MAX_ROWS,
+    TRELLIS_DEFAULT_SCRATCH_DECODE_MAX_BYTES,
+    TRELLIS_LARGE_SCRATCH_DECODE_MAX_BYTES,
+    LinearExecutionPlan,
+    TrellisLinearSchedule,
+    default_trellis_w8a8_scratch_budget,
+    select_default_trellis_schedule,
+    select_generic_trellis_split_k,
+    trellis_block_m,
+)
 
 # gfx1201 has hardware correctness/performance coverage; the remaining targets
 # have offline compilation coverage. Unknown architectures use the reference.
@@ -287,4 +297,61 @@ def select_execution_plan(
         matmul_block_k=block_k,
         matmul_num_warps=matmul_warps,
         matmul_num_stages=2 if rdna4 else 1,
+    )
+
+
+_TRELLIS_RDNA4_GEMV_MAX_ROWS = 8
+_TRELLIS_RDNA4_LARGE_SCRATCH_MIN_ROWS = 256
+_TRELLIS_RDNA4_LARGE_SCRATCH_MIN_IN_FEATURES = 8192
+
+
+def trellis_gemv_max_rows(target: AcceleratorTarget) -> int:
+    """Return the small-batch continuous Trellis A16 row cutoff for AMD targets."""
+    return _TRELLIS_RDNA4_GEMV_MAX_ROWS if target.is_rdna4 else TRELLIS_DEFAULT_GEMV_MAX_ROWS
+
+
+def trellis_w8a8_scratch_budget(target: AcceleratorTarget, rows: int, in_features: int) -> int:
+    """Return bounded Trellis W8A8 INT8 scratch decode budget matching Infinity Cache size."""
+    if not target.is_rdna4:
+        return default_trellis_w8a8_scratch_budget(rows)
+    # gfx1201 carries 64 MB Infinity Cache (use 64 MiB for wide-K prefill); gfx1200 has 32 MB.
+    use_large = (
+        target.is_architecture("gfx1201")
+        and rows >= _TRELLIS_RDNA4_LARGE_SCRATCH_MIN_ROWS
+        and in_features > _TRELLIS_RDNA4_LARGE_SCRATCH_MIN_IN_FEATURES
+    )
+    return (
+        TRELLIS_LARGE_SCRATCH_DECODE_MAX_BYTES
+        if use_large
+        else TRELLIS_DEFAULT_SCRATCH_DECODE_MAX_BYTES
+    )
+
+
+def select_trellis_schedule(
+    target: AcceleratorTarget,
+    num_sms: int,
+    rows: int,
+    out_features: int,
+    blocks_per_row: int,
+    weight_bytes: int,
+) -> TrellisLinearSchedule:
+    """Resolve AMD Trellis A16 GEMV schedule (scoping RDNA4 tuning strictly to RDNA4)."""
+    if not target.is_rdna4:
+        return select_default_trellis_schedule(
+            num_sms, rows, out_features, blocks_per_row, weight_bytes, use_dp4a=False
+        )
+    block_m = trellis_block_m(rows)
+    block_n = 2 if block_m >= 2 else 1
+    split_k = select_generic_trellis_split_k(
+        num_sms, rows, out_features, blocks_per_row, weight_bytes, block_m, block_n=block_n
+    )
+    return TrellisLinearSchedule(
+        block_m=block_m,
+        num_warps=2 if block_m >= 8 else 1,
+        split_k=split_k,
+        unroll_k=1,
+        use_dp4a=False,
+        block_n=block_n,
+        use_sad_u8=True,
+        split_x_loads=True,
     )
