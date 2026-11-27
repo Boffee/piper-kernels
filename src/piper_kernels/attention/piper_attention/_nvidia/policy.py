@@ -239,15 +239,21 @@ def select_prefill_config(
     *,
     head_dim: int,
     is_tail: bool,
-) -> tuple[int, int, bool]:
-    """Return ``(block_m, num_warps, split_pv_head_dim)`` with zero ptxas spills."""
+    has_chunk_map: bool = True,
+) -> tuple[int, int, bool, int, int]:
+    """Return ``(block_m, num_warps, split_pv_head_dim, num_stages, loop_num_stages)``."""
+    if target.is_cuda_capability(12):
+        if head_dim == 64:
+            return 64, 4, False, 3, 3
+        loop_stages = 2 if (not is_tail and has_chunk_map) else 1
+        return 64, 4, True, 2, loop_stages
     if not is_tail:
         num_warps = 8 if head_dim == 128 else 4
-        return 64, num_warps, head_dim == 128 or target.is_cuda_capability(12)
-    if head_dim == 128 and not (target.is_cuda_capability(8, 0) or target.is_cuda_capability(12)):
-        return 32, 4, False
-    split_pv = head_dim == 128 or target.is_cuda_capability(12) or target.is_cuda_capability(8, 9)
-    return 64, 8, split_pv
+        return 64, num_warps, head_dim == 128, 1, 1
+    if head_dim == 128 and not target.is_cuda_capability(8, 0):
+        return 32, 4, False, 1, 1
+    split_pv = head_dim == 128 or target.is_cuda_capability(8, 9)
+    return 64, 8, split_pv, 1, 1
 
 
 def select_execution_plan(

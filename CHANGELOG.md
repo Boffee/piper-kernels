@@ -22,6 +22,19 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   (`gfx1201`), with offline `gfx1200` attention smoke coverage. Live NVIDIA hardware
   execution remains unexercised locally.
 
+### Changed
+
+- Tuned NVIDIA SM120 (`sm120`) execution schedules for `piper_attention_decode`:
+  Split-KV decode now uses 64-token K64-aligned blocks, 4 warps, 2 pipeline stages,
+  exact two-pass TF32 Q decomposition against INT8 keys (three-pass TF32 for BF16/FP16
+  tails, TF32 PV), and SM-scaled split counts; NVIDIA chunked prefill now enables
+  conservative bit-derived V log-scale bounds, SM120 `block_m=64` 4-warp pipelined
+  execution, and multi-split frozen chunk reduction in low-CTA regimes (`Q=64`),
+  preserving existing zero-spill schedules across SM75/SM8x and AMD RDNA4. Verified on
+  RTX 5090 (`sm120`) and offline across `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
+  `gfx1200`/`gfx1201`; live SM75/SM8x, RDNA4/ROCm, and Windows execution remain
+  unexercised locally.
+
 ### Fixed
 
 - `piper_attention`, `freeze_kv_chunks_`, and `piper_attention_decode`: guarded causal

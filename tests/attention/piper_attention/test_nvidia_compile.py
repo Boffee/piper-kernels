@@ -494,3 +494,43 @@ def test_kv_wide_pool_decode_compile_zero_spills(
         ),
         check_sgpr_spills=not (target.backend == "hip" and head_dim == 128),
     )
+
+
+@pytest.mark.parametrize("arch", [80, 86, 89, 120])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("has_chunk_map", [False, True])
+@pytest.mark.parametrize("wide_pool", [False, True])
+def test_kv_split_prefill_compile_zero_spills(
+    monkeypatch: pytest.MonkeyPatch,
+    arch: int,
+    head_dim: int,
+    has_chunk_map: bool,
+    wide_pool: bool,
+) -> None:
+    target = GPUTarget("cuda", arch, 32)
+    monkeypatch.setattr(
+        triton.knobs.runtime, "add_stages_inspection_hook", _MixedInt8StageHook(None)
+    )
+    compiled_out: list[object] = []
+
+    def _compile_and_record(
+        compile_fn: Callable[[object, object, dict[str, object]], object] | None,
+    ) -> tuple[object, ...]:
+        res = compile_kv_prefill_kernels(
+            target,
+            dtype=torch.bfloat16,
+            head_dim=head_dim,
+            has_chunk_map=has_chunk_map,
+            wide_pool=wide_pool,
+            has_chunk_splits=True,
+            compile_fn=compile_fn,
+        )
+        compiled_out.extend(res)
+        return res
+
+    _assert_zero_spill_kernels(target, 3, _compile_and_record)
+    for compiled in compiled_out[1:]:
+        ptx = compiled.asm["ptx"]  # type: ignore[attr-defined]
+        assert ".s32.s8.s8.s32" in ptx
+        assert ".s32.u8.s8.s32" in ptx
+        assert "piper_attention_u8s8_dot_marker" not in ptx
