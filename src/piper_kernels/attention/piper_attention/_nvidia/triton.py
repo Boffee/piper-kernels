@@ -1559,6 +1559,7 @@ def _piper_chunked_prefill_kernel(  # noqa: PLR0912, PLR0915
     stride_lh,
     split_chunks,
     partial_bias_ptr,
+    partial_log_denom_ptr,
     query_heads_per_kv_head: tl.constexpr,
     head_dim: tl.constexpr,
     grouped_qk: tl.constexpr,
@@ -1841,10 +1842,12 @@ def _piper_chunked_prefill_kernel(  # noqa: PLR0912, PLR0915
     out_batch64 = batch_split.to(tl.int64) if has_chunk_splits else batch.to(tl.int64)
     lse_off = out_batch64 * stride_lb + head.to(tl.int64) * stride_lh + output_rows
     if has_chunk_splits:
-        lse = tl.where(has_any, running_max + tl.math.log2(safe_denom), -float("inf"))
+        lse = tl.where(has_any, running_max, -float("inf"))
         bias = tl.where(has_any, running_bias, 0.0)
+        log_denom = tl.where(has_any, tl.math.log2(safe_denom), 0.0)
         tl.store(lse_ptr + lse_off, lse, mask=valid_queries)
         tl.store(partial_bias_ptr + lse_off, bias, mask=valid_queries)
+        tl.store(partial_log_denom_ptr + lse_off, log_denom, mask=valid_queries)
     else:
         lse = tl.where(
             has_any,
@@ -1886,6 +1889,7 @@ def launch_prefill_kernel(
     is_causal: bool,
     split_chunks: int = 1,
     partial_bias: torch.Tensor | None = None,
+    partial_log_denom: torch.Tensor | None = None,
     target: AcceleratorTarget | None = None,
 ) -> None:
     """Launch NVIDIA unified chunked prefill kernel with pre-assembled host arguments."""
@@ -1894,18 +1898,20 @@ def launch_prefill_kernel(
         resolved_target, head_dim=head_dim, is_tail=is_tail, has_chunk_map=has_chunk_map
     )
     has_chunk_splits = split_chunks > 1
-    if has_chunk_splits and partial_bias is None:
-        raise ValueError("partial_bias is required when split_chunks > 1")
+    if has_chunk_splits and (partial_bias is None or partial_log_denom is None):
+        raise ValueError("partial_bias and partial_log_denom are required when split_chunks > 1")
     if has_chunk_splits and not has_chunk_map and resolved_target.is_cuda_capability(12):
         # Free one pipeline buffer register when unmapped FP32 split partials spill at loop=2.
         loop_num_stages = 1
     bias_target = partial_bias if partial_bias is not None else common_args[11]
+    log_denom_target = partial_log_denom if partial_log_denom is not None else common_args[11]
     with device_context(device):
         install_uint8_int8_dot_hook()
         _piper_chunked_prefill_kernel[(triton.cdiv(seq_q, block_m), q_heads, batch * split_chunks)](
             *common_args,
             split_chunks,
             bias_target,
+            log_denom_target,
             query_heads_per_kv_head=gqa_group,
             head_dim=head_dim,
             grouped_qk=grouped_qk,
@@ -2031,6 +2037,7 @@ def compile_nvidia_prefill_kernels(
         wide = wide_pool and not tail_mode
         overrides = _quantization.frozen_pool_pointer_signature(triton_dtype, wide_pool=wide)
         overrides["partial_bias_ptr"] = "*fp32"
+        overrides["partial_log_denom_ptr"] = "*fp32"
         if chunk_splits:
             overrides["output_ptr"] = "*fp32"
         source = _quantization.build_kernel_source(

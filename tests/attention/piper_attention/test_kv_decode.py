@@ -3922,3 +3922,57 @@ def test_gpu_chunked_prefill_frozen_chunk_splits_two_term_lse(head_dim: int) -> 
     torch.testing.assert_close(o_two_inf, o_two_inf_unsplit, atol=1e-2, rtol=1e-2)
     assert (l_two_inf == l_two_inf_unsplit).all()
     assert (l_two_inf == float("inf")).all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_gpu_split_large_centered_max_preserves_denom(head_dim: int) -> None:
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    pool = _make_strided_pool(2, 1, head_dim, device=device, kv_dtype=torch.uint8)
+
+    k_slot0 = torch.cat(
+        [
+            torch.full((1, 1, 512, head_dim), 1.0, device=device, dtype=dtype),
+            torch.full((1, 1, 512, head_dim), -1.0, device=device, dtype=dtype),
+        ],
+        dim=2,
+    )
+    freeze_kv_chunks_(
+        k_slot0,
+        torch.zeros((1, 1, KV_CHUNK_TOKENS, head_dim), device=device, dtype=dtype),
+        pool,
+        torch.tensor([0], device=device, dtype=torch.int32),
+    )
+    k_slot1 = torch.cat(
+        [
+            torch.full((1, 1, 256, head_dim), 1.0, device=device, dtype=dtype),
+            torch.full((1, 1, 256, head_dim), -1.0, device=device, dtype=dtype),
+            torch.zeros((1, 1, 512, head_dim), device=device, dtype=dtype),
+        ],
+        dim=2,
+    )
+    freeze_kv_chunks_(
+        k_slot1,
+        torch.ones((1, 1, KV_CHUNK_TOKENS, head_dim), device=device, dtype=dtype),
+        pool,
+        torch.tensor([1], device=device, dtype=torch.int32),
+    )
+
+    c2s = torch.tensor([[0, 0, 1, 1]], device=device, dtype=torch.int32)
+    nc = torch.tensor([4], device=device, dtype=torch.int32)
+    q_prefill = torch.full((1, 1, 64, head_dim), 1e8, device=device, dtype=dtype)
+    expected = torch.full((1, 1, 64, head_dim), 1.0 / 3.0, device=device, dtype=dtype)
+
+    o_split, l_split = piper_attention_decode(q_prefill, pool, c2s, nc, return_lse=True)
+    o_unsplit, l_unsplit = piper_attention_decode(
+        q_prefill, pool, c2s, nc, active_chunks_hint=1, return_lse=True
+    )
+    torch.testing.assert_close(o_split, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(o_split, o_unsplit, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(l_split, l_unsplit, atol=1e-4, rtol=1e-4)
+
+    q_decode = torch.full((1, 1, 1, head_dim), 1e8, device=device, dtype=dtype)
+    o_decode, _ = piper_attention_decode(q_decode, pool, c2s, nc, return_lse=True)
+    torch.testing.assert_close(o_decode, expected[:, :, :1], atol=2e-2, rtol=2e-2)

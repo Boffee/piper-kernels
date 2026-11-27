@@ -227,6 +227,7 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
     partial_out_ptr,
     partial_lse_ptr,
     partial_bias_ptr,
+    partial_log_denom_ptr,
     scale,
     kv_heads,
     gqa_group,
@@ -428,10 +429,11 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
                 acc += tl.where(chunk_has_block[:, None], chunk_l[:, None] * v_mean[None, :], 0.0)
 
     has_any = m_i != -float("inf")
-    safe_l = tl.where(has_any, l_i, 1.0)
+    safe_l = tl.where(has_any & (l_i != 0.0), l_i, 1.0)
     out_split = tl.where(has_any[:, None], acc / safe_l[:, None], 0.0)
-    lse_split = tl.where(has_any, m_i + tl.math.log2(safe_l), -float("inf"))
+    lse_split = tl.where(has_any, m_i, -float("inf"))
     bias_split = tl.where(has_any, bias_i, 0.0)
+    log_denom_split = tl.where(has_any, tl.math.log2(safe_l), 0.0)
 
     qh_offs = q_tile * block_qh + tl.arange(0, block_qh)
     qh_valid = qh_offs < gqa_group * seq_q
@@ -455,6 +457,7 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
     )
     tl.store(partial_lse_ptr + pl_offsets, lse_split, mask=qh_valid)
     tl.store(partial_bias_ptr + pl_offsets, bias_split, mask=qh_valid)
+    tl.store(partial_log_denom_ptr + pl_offsets, log_denom_split, mask=qh_valid)
 
 
 @triton.jit(
@@ -476,6 +479,7 @@ def _piper_decode_tail_split_kernel(  # noqa: PLR0915
     partial_out_ptr,
     partial_lse_ptr,
     partial_bias_ptr,
+    partial_log_denom_ptr,
     scale,
     kv_heads,
     gqa_group,
@@ -620,9 +624,10 @@ def _piper_decode_tail_split_kernel(  # noqa: PLR0915
             m_i = m_new
 
     has_any = m_i != -float("inf")
-    safe_l = tl.where(has_any, l_i, 1.0)
+    safe_l = tl.where(has_any & (l_i != 0.0), l_i, 1.0)
     out_split = tl.where(has_any[:, None], acc / safe_l[:, None], 0.0)
-    lse_split = tl.where(has_any, m_i + tl.math.log2(safe_l), -float("inf"))
+    lse_split = tl.where(has_any, m_i, -float("inf"))
+    log_denom_split = tl.where(has_any, tl.math.log2(safe_l), 0.0)
 
     split64 = (int8_splits + tail_split_id).to(tl.int64)
     qh_offs = q_tile * block_qh + tl.arange(0, block_qh)
@@ -647,6 +652,29 @@ def _piper_decode_tail_split_kernel(  # noqa: PLR0915
     )
     tl.store(partial_lse_ptr + pl_offsets, lse_split, mask=qh_valid)
     tl.store(partial_bias_ptr + pl_offsets, 0.0, mask=qh_valid)
+    tl.store(partial_log_denom_ptr + pl_offsets, log_denom_split, mask=qh_valid)
+
+
+@triton.jit
+def _advance_split_max_safe(m_win, bias_win, ld_win, m_s, b_s, ld_s):
+    """Update 3-term winner-frame max/bias/log-denom state across partial splits."""
+    has_nan = ((m_s + b_s) + ld_s) != ((m_s + b_s) + ld_s)
+    m_clean = tl.where(has_nan, float("nan"), m_s)
+    has_split = ((m_clean != -float("inf")) & (b_s != -float("inf"))) | has_nan
+    has_running = m_win != -float("inf")
+    bias_diff = tl.where(b_s == bias_win, 0.0, b_s - bias_win)
+    max_diff = tl.where((m_clean == m_win) & (m_clean != float("inf")), 0.0, m_clean - m_win)
+    ld_diff = tl.where(ld_s == ld_win, 0.0, ld_s - ld_win)
+    raw_delta = ld_diff + (max_diff + bias_diff)
+    delta = tl.where(has_split, tl.where(has_running, raw_delta, float("inf")), -float("inf"))
+    split_wins = (delta > 0.0) | has_nan
+    next_m = tl.where(split_wins, m_clean, m_win)
+    next_bias = tl.where(split_wins, b_s, bias_win)
+    next_ld = tl.where(split_wins, ld_s, ld_win)
+    decay = tl.exp2(-tl.abs(delta))
+    old_w = tl.where(has_running, tl.where(split_wins, decay, 1.0), 0.0)
+    cur_w = tl.where(has_split, tl.where(split_wins, 1.0, decay), 0.0)
+    return next_m, next_bias, next_ld, old_w, cur_w, has_split, has_nan
 
 
 @triton.jit(do_not_specialize=["q_heads", "seq_q", "num_splits", "pl_split_stride"])
@@ -654,6 +682,7 @@ def _piper_decode_splitkv_reduce_kernel(
     partial_out_ptr,
     partial_lse_ptr,
     partial_bias_ptr,
+    partial_log_denom_ptr,
     output_ptr,
     lse_ptr,
     q_heads,
@@ -674,7 +703,7 @@ def _piper_decode_splitkv_reduce_kernel(
     stride_lh,
     head_dim: tl.constexpr,
 ):
-    """Merge partial Split-KV outputs and two-term base-2 LSE pairs into natural-log LSE."""
+    """Merge partial Split-KV outputs and three-term base-2 state into natural-log LSE."""
     pid = tl.program_id(0)
     q_idx = pid % seq_q
     pid_bh = pid // seq_q
@@ -691,6 +720,7 @@ def _piper_decode_splitkv_reduce_kernel(
 
     m_win = -float("inf")
     bias_win = 0.0
+    ld_win = 0.0
     denom = 0.0
     acc = tl.zeros((head_dim,), dtype=tl.float32)
 
@@ -699,12 +729,12 @@ def _piper_decode_splitkv_reduce_kernel(
         lse_off = pl_offset + s64 * split_lse_stride
         m_s = tl.load(partial_lse_ptr + lse_off)
         b_s = tl.load(partial_bias_ptr + lse_off)
-        m_win, bias_win, old_w, cur_w, has_s, safe_m_s = advance_tile_max_safe(
-            m_win, bias_win, m_s, b_s
+        ld_s = tl.load(partial_log_denom_ptr + lse_off)
+        m_win, bias_win, ld_win, old_w, cur_w, has_s, has_nan_s = _advance_split_max_safe(
+            m_win, bias_win, ld_win, m_s, b_s, ld_s
         )
 
         out_s = tl.load(po_base + s64 * stride_pop + offsets_d)
-        has_nan_s = safe_m_s != safe_m_s  # noqa: PLR0124
         safe_out_s = tl.where(has_nan_s, float("nan"), tl.where(has_s, out_s, 0.0))
         old_num = denom * old_w
         denom = old_num + cur_w
@@ -718,7 +748,9 @@ def _piper_decode_splitkv_reduce_kernel(
     safe_denom = tl.where(has_any, denom, 1.0)
     final_out = tl.where(has_any, acc, 0.0)
     final_lse = tl.where(
-        has_any, (m_win * _LN2 + bias_win * _LN2) + tl.math.log2(safe_denom) * _LN2, -float("inf")
+        has_any,
+        (m_win * _LN2 + bias_win * _LN2) + (ld_win + tl.math.log2(safe_denom)) * _LN2,
+        -float("inf"),
     )
 
     out_ptrs = output_ptr + b64 * stride_ob + qh64 * stride_oh + qi64 * stride_os + offsets_d
@@ -923,7 +955,9 @@ def _launch_frozen_pool_prefill(
     partial_out: torch.Tensor | None = None
     partial_lse: torch.Tensor | None = None
     partial_bias: torch.Tensor | None = None
+    partial_log_denom: torch.Tensor | None = None
     bias_target: torch.Tensor | None = None
+    log_denom_target: torch.Tensor | None = None
     if prefill_backend == "nvidia":
         sm_count = device_sm_count(query_int8.device)
         base_blocks = max(1, batch * q_heads * triton.cdiv(seq_q, 64))
@@ -942,9 +976,11 @@ def _launch_frozen_pool_prefill(
             dtype=torch.float32,
         )
         partial_bias = torch.empty_like(partial_lse)
+        partial_log_denom = torch.empty_like(partial_lse)
         out_target = partial_out.view(batch * frozen_splits, q_heads, seq_q, head_dim)
         lse_target = partial_lse.view(batch * frozen_splits, q_heads, seq_q)
         bias_target = partial_bias.view(batch * frozen_splits, q_heads, seq_q)
+        log_denom_target = partial_log_denom.view(batch * frozen_splits, q_heads, seq_q)
 
     common_args: tuple[object, ...] = (
         query_int8,
@@ -1009,17 +1045,25 @@ def _launch_frozen_pool_prefill(
             is_causal=False,
             split_chunks=frozen_splits,
             partial_bias=bias_target,
+            partial_log_denom=log_denom_target,
             target=target,
         )
-        if partial_out is not None and partial_lse is not None and partial_bias is not None:
+        if (
+            partial_out is not None
+            and partial_lse is not None
+            and partial_bias is not None
+            and partial_log_denom is not None
+        ):
             po_view = partial_out.permute(0, 2, 3, 1, 4)
             pl_view = partial_lse.permute(0, 2, 3, 1)
             pb_view = partial_bias.permute(0, 2, 3, 1)
+            pld_view = partial_log_denom.permute(0, 2, 3, 1)
             with device_context(output.device):
                 _piper_decode_splitkv_reduce_kernel[(batch * q_heads * seq_q,)](
                     po_view,
                     pl_view,
                     pb_view,
+                    pld_view,
                     output,
                     lse,
                     q_heads,
@@ -1329,6 +1373,7 @@ def piper_attention_decode_triton(
         dtype=torch.float32,
     )
     partial_bias = torch.empty_like(partial_lse)
+    partial_log_denom = torch.empty_like(partial_lse)
 
     q_tiles = triton.cdiv(gqa_group * seq_q, _BLOCK_QH)
     stride_qb = 0 if batch <= 1 else query.stride(0)
@@ -1374,6 +1419,7 @@ def piper_attention_decode_triton(
                 partial_out,
                 partial_lse,
                 partial_bias,
+                partial_log_denom,
                 scale,
                 kv_heads,
                 gqa_group,
@@ -1429,6 +1475,7 @@ def piper_attention_decode_triton(
                 partial_out,
                 partial_lse,
                 partial_bias,
+                partial_log_denom,
                 scale,
                 kv_heads,
                 gqa_group,
@@ -1468,6 +1515,7 @@ def piper_attention_decode_triton(
             partial_out,
             partial_lse,
             partial_bias,
+            partial_log_denom,
             output,
             lse,
             q_heads,
@@ -1523,6 +1571,7 @@ def compile_kv_decode_kernels(
         "partial_out_ptr": "*fp32",
         "partial_lse_ptr": "*fp32",
         "partial_bias_ptr": "*fp32",
+        "partial_log_denom_ptr": "*fp32",
         "scale": "fp32",
     }
     if wide_pool:
@@ -1588,6 +1637,7 @@ def compile_kv_decode_kernels(
             "partial_out_ptr": "*fp32",
             "partial_lse_ptr": "*fp32",
             "partial_bias_ptr": "*fp32",
+            "partial_log_denom_ptr": "*fp32",
             "scale": "fp32",
         },
         attrs=(
@@ -1618,6 +1668,7 @@ def compile_kv_decode_kernels(
             "partial_out_ptr": "*fp32",
             "partial_lse_ptr": "*fp32",
             "partial_bias_ptr": "*fp32",
+            "partial_log_denom_ptr": "*fp32",
             "output_ptr": f"*{triton_dtype}",
             "lse_ptr": "*fp32",
         },
