@@ -111,6 +111,47 @@ def test_sums_stay_unless_each_can_add_into_the_copied_input(monkeypatch, suppor
     assert sum(node.target is _aten.add.Tensor for node in graph.nodes) == 2
 
 
+@pytest.mark.parametrize(
+    ("alpha", "non_blocking", "expected_rewritten"),
+    [
+        (1, False, True),
+        (2, False, False),
+        (1, True, False),
+    ],
+    ids=["kwarg-valid", "kwarg-alpha-rejected", "kwarg-non-blocking-rejected"],
+)
+def test_rewrite_binds_positional_and_keyword_arguments_by_schema(
+    monkeypatch, alpha, non_blocking, expected_rewritten
+):
+    mock_triton_driver(monkeypatch, backend="cuda", arch=120)
+    graph = torch.fx.Graph()
+    with FakeTensorMode():
+        hidden = graph.placeholder("hidden")
+        gate = graph.placeholder("gate")
+        indices = graph.placeholder("indices")
+        update = graph.placeholder("update")
+        hidden.meta["val"] = _metadata(1, 8, 16)
+        gate.meta["val"] = _metadata(3, 16)
+        indices.meta["val"] = _metadata(8, dtype=torch.int64)
+        update.meta["val"] = _metadata(1, 8, 16)
+        selected = _node(graph, _aten.index_select.default, (gate, 0, indices), _metadata(8, 16))
+        product = _node(graph, _aten.mul.Tensor, (selected, update), _metadata(1, 8, 16))
+        total = graph.call_function(_aten.add.Tensor, (hidden,), {"other": product, "alpha": alpha})
+        total.meta["val"] = _metadata(1, 8, 16)
+        graph.call_function(
+            _aten.copy_.default, (hidden,), {"src": total, "non_blocking": non_blocking}
+        )
+        graph.output(None)
+
+    _run_residual_pass(graph)
+
+    if expected_rewritten:
+        assert len(_adds(graph)) == 1
+        assert not any(node.target is _aten.add.Tensor for node in graph.nodes)
+    else:
+        assert not _adds(graph)
+
+
 def test_cpu_block_keeps_its_sums_and_runs():
     def block(hidden, update, gate, indices):
         return hidden.copy_(hidden + gate[indices] * update)

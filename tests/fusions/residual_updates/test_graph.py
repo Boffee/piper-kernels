@@ -1,19 +1,10 @@
-"""Residual-update rewrites address operator arguments by schema name."""
+"""Functional residual-add FX graph emission helpers."""
 
 import operator
 
 import torch
 
 from piper_kernels.fusions.residual_updates import _graph
-
-
-def test_bind_arguments_names_positional_and_keyword_values():
-    graph = torch.fx.Graph()
-    left, right = graph.placeholder("left"), graph.placeholder("right")
-    node = graph.call_function(torch.ops.aten.add.Tensor, (left, right), {"alpha": 2})
-
-    assert _graph.linear_fx.bind_arguments(node) == {"self": left, "other": right, "alpha": 2}
-    assert not hasattr(_graph, "bind_arguments")
 
 
 def test_call_functional_returns_the_new_base_of_a_wrapped_mutation():
