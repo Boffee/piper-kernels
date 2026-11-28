@@ -16,7 +16,7 @@ from triton.experimental.gluon._runtime import GluonASTSource
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.fusions.convrot_int8_piper import key, query, value
 from piper_kernels.fusions.convrot_int8_piper import triton as projection
-from piper_kernels.fusions.convrot_int8_piper._nvidia import dispatch, gluon, policy
+from piper_kernels.fusions.convrot_int8_piper._nvidia import gluon, policy
 from piper_kernels.linear.convrot.int8._nvidia import gluon_tma
 
 _SM89_TARGET = AcceleratorTarget("cuda", "sm89")
@@ -86,18 +86,19 @@ def _launch(
     window=(64, 129),
     causal=False,
     target=_SM89_TARGET,
+    use_default_plan=False,
     **options,
 ):
     input_qdata, input_scale, weight_qdata, weight_scale, *_ = operands
-    if module in (dispatch, gluon) and "execution_plan" not in options:
+    if module is gluon and "execution_plan" not in options:
         metadata = {
             "operation": operation,
             "head_dim": out[0].shape[2 if operation == "value" else 3],
             "rotary_dim": 0 if operation == "value" else operands[5].shape[1],
         }
         options["execution_plan"] = (
-            dispatch.default_execution_plan(input_qdata, weight_qdata, target=target, **metadata)
-            if module is dispatch
+            gluon.default_execution_plan(input_qdata, weight_qdata, target=target, **metadata)
+            if use_default_plan
             else policy.select_execution_plan(
                 target, input_features=input_qdata.shape[2], operands_aligned=True, **metadata
             )
@@ -146,16 +147,16 @@ def _launch(
 def test_every_target_uses_gluon_only_for_supported_projections(
     monkeypatch, target, operation, head_dim, input_features, rotary_dim, supported
 ):
-    monkeypatch.setattr(dispatch.linear_gluon, "operands_aligned", lambda *operands: True)
+    monkeypatch.setattr(gluon.linear_gluon, "operands_aligned", lambda *operands: True)
     gluon_launch, triton_launch = Mock(), Mock()
-    monkeypatch.setattr(gluon, f"project_{operation}", gluon_launch)
+    monkeypatch.setattr(gluon, f"_project_{operation}_gluon", gluon_launch)
     monkeypatch.setattr(projection, f"project_{operation}", triton_launch)
     with FakeTensorMode():
         operands = _operands(
             "cuda:1", input_features=input_features, head_dim=head_dim, rotary_dim=rotary_dim
         )
         out = _outputs(operation, "cuda:1", rows=193, head_dim=head_dim)
-        _launch(dispatch, operation, operands, out, target=target)
+        _launch(gluon, operation, operands, out, target=target, use_default_plan=True)
     # V has no RoPE, so only its head and input widths matter.
     uses_gluon = supported or (
         operation == "value" and head_dim == 128 and input_features % 64 == 0
@@ -187,9 +188,9 @@ def test_execution_plan_requires_contiguous_operands(target, operand_index):
     operands = list(_operands("cpu", batch=1, sequence=192, heads=2))
     operands[0] = operands[0][:, ::2, :] if operand_index == 0 else operands[0]
     operands[2] = operands[2][::2, :] if operand_index == 2 else operands[2]
-    assert dispatch.linear_gluon.operands_aligned(operands[0], operands[2])
+    assert gluon.linear_gluon.operands_aligned(operands[0], operands[2])
     assert not operands[operand_index].is_contiguous()
-    plan = dispatch.default_execution_plan(
+    plan = gluon.default_execution_plan(
         operands[0],
         operands[2],
         target=target,
@@ -514,15 +515,15 @@ def test_sm120_tma_projections_match_async_copy(operation, granularity, input_fe
     window = (64, 129)
     rows = window[1] if operation == "query" else sequence
     allocation = {"rows": rows, "batch": batch, "heads": heads, "granularity": granularity}
-    plan = dispatch.default_execution_plan(
+    plan = gluon.default_execution_plan(
         operands[0], operands[2], operation=operation, head_dim=128, rotary_dim=96
     )
     assert plan.kernel == "gluon_tma"
     actual = _outputs(operation, "cuda", **allocation)
     expected = _outputs(operation, "cuda", **allocation)
-    _launch(dispatch, operation, operands, actual, window=window, execution_plan=plan)
+    _launch(gluon, operation, operands, actual, window=window, execution_plan=plan)
     _launch(
-        dispatch,
+        gluon,
         operation,
         operands,
         expected,

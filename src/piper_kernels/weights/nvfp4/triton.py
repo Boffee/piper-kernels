@@ -18,6 +18,8 @@ from piper_kernels.stochastic_quantization.triton import random_uniform
 from piper_kernels.weights.convrot.triton import rotate_hadamard_groups
 from piper_kernels.weights.nvfp4 import _layout
 
+from ._nvidia.isa import pack_e2m1_pairs
+
 _NVFP4_BLOCK_SIZE = _layout.BLOCK_SIZE
 _NVFP4_QDATA_BLOCK_SIZE = _layout.QDATA_BLOCK_SIZE
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(_NVFP4_BLOCK_SIZE)
@@ -57,24 +59,6 @@ def swizzled_scale_offsets(rows, scale_columns, column_blocks):
         ((row_block * column_blocks + column_block) * 32 + row_inner % 32) * 16
         + (row_inner // 32) * 4
         + scale_columns % 4
-    )
-
-
-@triton.jit
-def pack_e2m1_pairs(low, high):
-    return tl.inline_asm_elementwise(
-        asm="""
-        {
-            .reg .b8 packed;
-            cvt.rn.satfinite.e2m1x2.f32 packed, $2, $1;
-            cvt.u32.u8 $0, packed;
-        }
-        """,
-        constraints="=r,f,f",
-        args=[low, high],
-        dtype=tl.uint8,
-        is_pure=True,
-        pack=1,
     )
 
 

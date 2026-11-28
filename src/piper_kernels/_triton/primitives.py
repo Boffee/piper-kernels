@@ -1,5 +1,8 @@
 """Shared format-independent Triton primitives and compiler defaults."""
 
+# Triton's JIT DSL types are not fully represented in its Python typing surface.
+# pyright: reportAttributeAccessIssue=false
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -41,9 +44,22 @@ def splitk_tile_bounds(total_tiles, pid_k, split_k):
     return tile_start, tile_end
 
 
+@triton.jit
+def decode_e4m3(code):
+    """Exact FP32 value of FP8 E4M3FN byte bits without backend FP8 lowering quirks."""
+    sign = code >> 7
+    exponent = (code >> 3) & 15
+    mantissa = code & 7
+    normal = (((exponent + 120) << 23) | (mantissa << 20)).to(tl.float32, bitcast=True)
+    subnormal = mantissa.to(tl.float32) * 0.001953125
+    magnitude = tl.where(exponent == 0, subnormal, normal)
+    return tl.where(sign != 0, -magnitude, magnitude)
+
+
 __all__ = [
     "TRITON_FLOAT_POINTER_TYPES",
     "TritonCompileFn",
+    "decode_e4m3",
     "default_triton_compile",
     "splitk_tile_bounds",
 ]

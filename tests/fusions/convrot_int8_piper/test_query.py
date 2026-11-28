@@ -20,7 +20,8 @@ from triton.compiler import ASTSource
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import SIGNED_HADAMARD_MASK
 from piper_kernels.attention.piper_attention import _quantized_dispatch
-from piper_kernels.fusions.convrot_int8_piper import _backend, _kernels, query
+from piper_kernels.fusions.convrot_int8_piper import _backend, query
+from piper_kernels.fusions.convrot_int8_piper import triton as projection
 
 
 def _available():
@@ -323,9 +324,9 @@ def test_projection_selector_uses_validated_targets(monkeypatch, target, support
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("affine", [False, True])
 def test_production_query_launches_compile_for_rdna4(monkeypatch, head_dim, affine):
-    function = _kernels._project_query_kernel
+    function = projection._project_query_kernel
     kernel = MagicMock()
-    monkeypatch.setattr(_kernels, "_project_query_kernel", kernel)
+    monkeypatch.setattr(projection, "_project_query_kernel", kernel)
     mock_rocm_target(monkeypatch, "gfx1201")
     with FakeTensorMode():
         operands = _operands("cuda:0", sequence=193, head_dim=head_dim, affine=affine)

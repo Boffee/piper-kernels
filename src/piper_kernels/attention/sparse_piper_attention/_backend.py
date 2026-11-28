@@ -5,42 +5,20 @@ from functools import partial
 
 import torch
 
-from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarget
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, ValueFormat
 
+from ._amd import policy as amd_policy
 from ._contracts import (
     _MEAN_ROUTING,
     SUPPORTED_DTYPES,
     AttentionBackend,
     MinmaxScores,
-    MinmaxScoreSchedule,
     SelectRoutes,
     SequenceSummaries,
     build_portable_force_tile_bitmask,
 )
 from ._nvidia import policy as nvidia_policy
-
-_RDNA4_MINMAX_SMALL_QUERY_SCHEDULE = MinmaxScoreSchedule(32, 64, 16, lds_only_fences=True)
-_RDNA4_MINMAX_LARGE_QUERY_SCHEDULE = MinmaxScoreSchedule(64, 32, 16, lds_only_fences=True)
-_RDNA4_MINMAX_LARGE_QUERY_THRESHOLD = 128
-
-
-def supports_amd_target(target: AcceleratorTarget) -> bool:
-    """Return whether target runs the wave32 RDNA4 sparse-attention kernels."""
-    return target.is_hip_architecture(*GFX120X_ARCHITECTURES)
-
-
-def select_amd_minmax_score_schedule(query_blocks: int) -> MinmaxScoreSchedule:
-    """Return the measured FP32 min/max routing-score tile schedule for RDNA4.
-
-    All RDNA4 schedules enable LDS-only fences to omit global cache invalidations
-    at shared-memory barriers without changing output bits; 64x32x16 wins from
-    128 query blocks upward while 32x64x16 avoids idle waves on shorter chunks.
-    """
-    if query_blocks >= _RDNA4_MINMAX_LARGE_QUERY_THRESHOLD:
-        return _RDNA4_MINMAX_LARGE_QUERY_SCHEDULE
-    return _RDNA4_MINMAX_SMALL_QUERY_SCHEDULE
-
 
 try:
     from . import triton as preparation
@@ -154,7 +132,7 @@ def select_attention_backend(
     else:
         return (
             _amd_attention
-            if supports_amd_target(target) and head_dim in SUPPORTED_HEAD_DIMS
+            if amd_policy.supports_target(target) and head_dim in SUPPORTED_HEAD_DIMS
             else None
         )
     if backend is not None and nvidia_policy.skip_dense_routing(head_dim):
@@ -181,7 +159,7 @@ def select_route_selector(
     if _route_backend is None:
         return None
     target = AcceleratorTarget.from_device(routes.device) if target is None else target
-    if not (nvidia_policy.supports_target(target) or supports_amd_target(target)):
+    if not (nvidia_policy.supports_target(target) or amd_policy.supports_target(target)):
         return None
     return _route_backend.tiled_radix_select_packed_routes
 
@@ -221,8 +199,8 @@ def select_minmax_scores(
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
         return None
     target = AcceleratorTarget.from_device(query_summary.device) if target is None else target
-    if supports_amd_target(target):
-        schedule = select_amd_minmax_score_schedule(query_summary.shape[2])
+    if amd_policy.supports_target(target):
+        schedule = amd_policy.select_minmax_score_schedule(query_summary.shape[2])
     elif nvidia_policy.supports_minmax_scores(target):
         schedule = nvidia_policy.select_sm120_minmax_score_schedule(query_summary.shape[2])
     else:
@@ -269,7 +247,7 @@ def use_fused_operand_preparation(
     if nvidia_policy.uses_tensor_descriptors(target):
         return nvidia_policy.use_sm120_fused_preparation(query.shape[-1], query.shape[2])
     return nvidia_policy.uses_async_copies(target) or (
-        amd_gluon is not None and supports_amd_target(target)
+        amd_gluon is not None and amd_policy.supports_target(target)
     )
 
 
@@ -305,7 +283,7 @@ def select_sequence_summaries(
     ):
         return None
     target = AcceleratorTarget.from_device(query.device) if target is None else target
-    if not (nvidia_policy.supports_target(target) or supports_amd_target(target)):
+    if not (nvidia_policy.supports_target(target) or amd_policy.supports_target(target)):
         return None
     return _summary_backend.sequence_block_summaries
 

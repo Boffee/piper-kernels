@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from piper_kernels._triton.primitives import decode_e4m3
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarget
 
@@ -38,18 +39,6 @@ _LCG_MULTIPLIER = tl.constexpr(LCG_MULTIPLIER)
 _LCG_INCREMENT = tl.constexpr(LCG_INCREMENT)
 _CODE_OFFSET = tl.constexpr(CODE_OFFSET)
 _CODE_RECIPROCAL = tl.constexpr(CODE_RECIPROCAL)
-
-
-@triton.jit
-def _decode_e4m3(code):
-    """Exact FP32 value of FP8 E4M3 bits, without relying on backend FP8 support."""
-    sign = code >> 7
-    exponent = (code >> 3) & 15
-    mantissa = code & 7
-    normal = (((exponent + 120) << 23) | (mantissa << 20)).to(tl.float32, bitcast=True)
-    subnormal = mantissa.to(tl.float32) * 0.001953125  # mantissa · 2^-9
-    magnitude = tl.where(exponent == 0, subnormal, normal)
-    return tl.where(sign != 0, -magnitude, magnitude)
 
 
 @triton.jit
@@ -464,7 +453,7 @@ def _decode_blocks_le(
         needs_w2=needs_w2, use_dp4a=use_dp4a, use_sad_u8=use_sad_u8,
     )  # fmt: skip
     sc = tl.load(block_scales + blocks.to(tl.int64), mask=block_mask, other=0)
-    mult = (_decode_e4m3(sc.to(tl.uint32)) * _CODE_RECIPROCAL)[:, None]
+    mult = (decode_e4m3(sc.to(tl.uint32)) * _CODE_RECIPROCAL)[:, None]
     _store_decoded_group(
         out_ptr, blocks, g, first_step, block_mask, group_valid, n0, n1, n2, n3, mult,
         block_size, denom, exact_pow2, q_u32_aligned, round_int8,

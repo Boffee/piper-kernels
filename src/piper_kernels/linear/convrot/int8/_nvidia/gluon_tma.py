@@ -32,6 +32,13 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 from piper_kernels._residual import ResidualAdd
 from piper_kernels._triton.runtime import device_context
 
+from .gluon_async_copy import (
+    _build_store_layout,
+    _cta_tile_coordinates,
+    _dequantize_paired_tile,
+    _store_dequantized_tile,
+    _store_swiglu_epilogue,
+)
 from .policy import NvidiaExecutionPlan
 
 _BLOCK_M = 128
@@ -40,12 +47,10 @@ _BLOCK_K = 64
 _MMA_K = 64
 _SWIGLU_BLOCK_N = 128
 _SWIGLU_MMA_K = 32
-_SWIGLU_CHUNK_M = 32
 _WARPS_M = 2
 _WARPS_N = 4
 _NUM_WARPS = _WARPS_M * _WARPS_N
 _MAX_STAGES = 3
-_COPY_BYTES = 16
 # Process the rounded projection tile in 32-row SMEM-staged chunks in the residual
 # epilogue so two-update ReusableUpdate arithmetic stays free of register spills.
 _RESIDUAL_CHUNK_M = 32
@@ -56,12 +61,10 @@ _GL_BLOCK_K = gl.constexpr(_BLOCK_K)
 _GL_MMA_K = gl.constexpr(_MMA_K)
 _GL_SWIGLU_BLOCK_N = gl.constexpr(_SWIGLU_BLOCK_N)
 _GL_SWIGLU_MMA_K = gl.constexpr(_SWIGLU_MMA_K)
-_GL_SWIGLU_CHUNK_M = gl.constexpr(_SWIGLU_CHUNK_M)
 _GL_MAX_STAGES = gl.constexpr(_MAX_STAGES)
 _GL_WARPS_M = gl.constexpr(_WARPS_M)
 _GL_WARPS_N = gl.constexpr(_WARPS_N)
 _GL_NUM_WARPS = gl.constexpr(_NUM_WARPS)
-_GL_COPY_BYTES = gl.constexpr(_COPY_BYTES)
 _GL_RESIDUAL_CHUNK_M = gl.constexpr(_RESIDUAL_CHUNK_M)
 
 
@@ -384,26 +387,6 @@ def accumulate_tma(
 
 
 @gluon.jit
-def _cta_tile_coordinates(
-    m,
-    n,
-    block_n: gl.constexpr,
-    group_m: gl.constexpr,
-    paired: gl.constexpr,
-):
-    column_tiles = gl.cdiv(n, block_n)
-    num_pid_n = column_tiles * (2 if paired else 1)
-    group_rows: gl.constexpr = group_m if group_m else 1
-    group_size = group_rows * num_pid_n
-    pid = gl.program_id(0)
-    first_m = (pid // group_size) * group_rows
-    rows_in_group = gl.minimum(gl.cdiv(m, _GL_BLOCK_M) - first_m, group_rows)
-    pid_m = first_m + (pid % group_size) % rows_in_group
-    pid_n = (pid % group_size) // rows_in_group
-    return pid_m, pid_n, column_tiles
-
-
-@gluon.jit
 def _project_tma_tile(
     input_descriptor,
     weight_descriptor,
@@ -425,7 +408,9 @@ def _project_tma_tile(
     output_dtype: gl.constexpr,
 ):
     """Project and dequantize one cache-grouped 128x256 output tile."""
-    pid_m, pid_n, column_tiles = _cta_tile_coordinates(m, n, _GL_BLOCK_N, group_m, paired)
+    pid_m, pid_n, column_tiles = _cta_tile_coordinates(
+        m, n, _GL_BLOCK_M, _GL_BLOCK_N, group_m, paired
+    )
     second = pid_n >= column_tiles
     if paired:
         pid_n %= column_tiles
@@ -449,51 +434,26 @@ def _project_tma_tile(
         _GL_BLOCK_N,
         _GL_MMA_K,
     )
-
-    offsets_m = pid_m * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, mma_layout))
-    offsets_n = pid_n * _GL_BLOCK_N + gl.arange(0, _GL_BLOCK_N, gl.SliceLayout(0, mma_layout))
-    input_scale = gl.load(input_scale_ptr + offsets_m, mask=offsets_m < m, other=0.0)
-    weight_scale = gl.load(weight_scale_ptr + offsets_n, mask=offsets_n < n, other=0.0)
-    row_scaled = accumulator.to(gl.float32) * input_scale[:, None]
-    if paired and (has_bias or second_has_bias):
-        bias = gl.full([_GL_BLOCK_N], 0, gl.float32, gl.SliceLayout(0, mma_layout))
-        second_bias = gl.full([_GL_BLOCK_N], 0, gl.float32, gl.SliceLayout(0, mma_layout))
-        if has_bias:
-            bias = gl.load(bias_ptr + offsets_n, mask=(offsets_n < n) & ~second, other=0.0).to(
-                gl.float32
-            )
-        if second_has_bias:
-            second_bias = gl.load(
-                second_bias_ptr + offsets_n, mask=(offsets_n < n) & second, other=0.0
-            ).to(gl.float32)
-        result = gl.fma(
-            row_scaled, weight_scale[None, :], gl.where(second, second_bias, bias)[None, :]
-        )
-    elif has_bias:
-        bias = gl.load(bias_ptr + offsets_n, mask=offsets_n < n, other=0.0).to(gl.float32)
-        result = gl.fma(row_scaled, weight_scale[None, :], bias[None, :])
-    else:
-        result = row_scaled * weight_scale[None, :]
-    return pid_m, pid_n, second, result.to(output_dtype)
-
-
-@gluon.jit
-def _build_store_layout(
-    element_bitwidth: gl.constexpr,
-    block_n: gl.constexpr = _GL_BLOCK_N,
-):
-    """Return a row-major 16-byte vectorized store layout for ``block_n``-column tiles."""
-    store_width: gl.constexpr = 8 * _GL_COPY_BYTES // element_bitwidth
-    threads_n: gl.constexpr = block_n // store_width
-    # Clamp warp width along N to 32 threads (needed for 32-bit outputs across wide tiles).
-    warp_threads_n: gl.constexpr = 32 if threads_n > 32 else threads_n
-    warp_threads_m: gl.constexpr = 32 // warp_threads_n
-    return gl.BlockedLayout(
-        [1, store_width],
-        [warp_threads_m, warp_threads_n],
-        [_GL_NUM_WARPS, 1],
-        [1, 0],
+    result = _dequantize_paired_tile(
+        accumulator,
+        input_scale_ptr,
+        weight_scale_ptr,
+        bias_ptr,
+        second_bias_ptr,
+        pid_m,
+        pid_n,
+        m,
+        n,
+        second,
+        mma_layout,
+        _GL_BLOCK_M,
+        _GL_BLOCK_N,
+        has_bias,
+        paired,
+        second_has_bias,
+        output_dtype,
     )
+    return pid_m, pid_n, second, result
 
 
 @gluon.jit
@@ -558,16 +518,20 @@ def _int8_tma_matmul_kernel(
         second_has_bias,
         output_ptr.dtype.element_ty,
     )
-    store_layout: gl.constexpr = _build_store_layout(output_ptr.dtype.element_ty.primitive_bitwidth)
-    result = gl.convert_layout(result, store_layout)
-    offsets_m = pid_m * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, store_layout))
-    offsets_n = pid_n * _GL_BLOCK_N + gl.arange(0, _GL_BLOCK_N, gl.SliceLayout(0, store_layout))
-    output_pointers = (
-        output_ptr + offsets_m.to(gl.int64)[:, None] * output_row_stride + offsets_n[None, :]
+    _store_dequantized_tile(
+        result,
+        output_ptr,
+        pid_m,
+        pid_n,
+        m,
+        n,
+        output_row_stride,
+        second,
+        _GL_BLOCK_M,
+        _GL_BLOCK_N,
+        _GL_NUM_WARPS,
+        paired,
     )
-    if paired:
-        output_pointers += second.to(gl.int64) * n
-    gl.store(output_pointers, result, mask=(offsets_m[:, None] < m) & (offsets_n[None, :] < n))
 
 
 @gluon.jit(do_not_specialize=["m", "residual_row_offset"])
@@ -636,7 +600,9 @@ def _int8_tma_residual_matmul_kernel(
     projection_shared.store(projection)
     gl.barrier()
 
-    chunk_layout: gl.constexpr = _build_store_layout(output_ptr.dtype.element_ty.primitive_bitwidth)
+    chunk_layout: gl.constexpr = _build_store_layout(
+        output_ptr.dtype.element_ty.primitive_bitwidth, _GL_BLOCK_N, _GL_NUM_WARPS
+    )
     columns = pid_n * _GL_BLOCK_N + gl.arange(0, _GL_BLOCK_N, gl.SliceLayout(0, chunk_layout))
     column_valid = columns < n
     for chunk_row in gl.static_range(0, _GL_BLOCK_M, _GL_RESIDUAL_CHUNK_M):
@@ -682,27 +648,6 @@ def _int8_tma_residual_matmul_kernel(
         gl.store(output_ptr + offsets, final, mask=valid)
 
 
-@gluon.jit
-def _dequantize_tile(
-    accumulator,
-    input_scale,
-    weight_scale_ptr,
-    bias_ptr,
-    offsets_n,
-    n,
-    has_bias: gl.constexpr,
-    output_dtype: gl.constexpr,
-):
-    weight_scale = gl.load(weight_scale_ptr + offsets_n, mask=offsets_n < n, other=0.0)
-    row_scaled = accumulator.to(gl.float32) * input_scale[:, None]
-    if has_bias:
-        bias = gl.load(bias_ptr + offsets_n, mask=offsets_n < n, other=0.0).to(gl.float32)
-        result = gl.fma(row_scaled, weight_scale[None, :], bias[None, :])
-    else:
-        result = row_scaled * weight_scale[None, :]
-    return result.to(output_dtype)
-
-
 @gluon.jit(do_not_specialize=["m"])
 def _int8_tma_swiglu_matmul_kernel(
     input_descriptor,
@@ -730,7 +675,7 @@ def _int8_tma_swiglu_matmul_kernel(
     and stores the activated output in ``output_ptr.dtype.element_ty`` (matching
     eager 16-bit SwiGLU).
     """
-    pid_m, pid_n, _ = _cta_tile_coordinates(m, n, _GL_SWIGLU_BLOCK_N, group_m, False)
+    pid_m, pid_n, _ = _cta_tile_coordinates(m, n, _GL_BLOCK_M, _GL_SWIGLU_BLOCK_N, group_m, False)
     mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[2, 0], warps_per_cta=[_GL_WARPS_M, _GL_WARPS_N], instr_shape=[16, 8]
     )
@@ -750,79 +695,27 @@ def _int8_tma_swiglu_matmul_kernel(
         _GL_SWIGLU_MMA_K,
         True,
     )
-    offsets_m = pid_m * _GL_BLOCK_M + gl.arange(0, _GL_BLOCK_M, gl.SliceLayout(1, mma_layout))
-    offsets_n = pid_n * _GL_SWIGLU_BLOCK_N + gl.arange(
-        0, _GL_SWIGLU_BLOCK_N, gl.SliceLayout(0, mma_layout)
+    _store_swiglu_epilogue(
+        up_accumulator,
+        gate_accumulator,
+        output_ptr,
+        input_scale_ptr,
+        weight_scale_ptr,
+        bias_ptr,
+        second_scale_ptr,
+        second_bias_ptr,
+        pid_m,
+        pid_n,
+        m,
+        n,
+        output_row_stride,
+        mma_layout,
+        _GL_BLOCK_M,
+        _GL_SWIGLU_BLOCK_N,
+        _GL_NUM_WARPS,
+        has_bias,
+        second_has_bias,
     )
-    input_scale = gl.load(input_scale_ptr + offsets_m, mask=offsets_m < m, other=0.0)
-    # Store up before dequantizing gate so only one 128x128 FP32 tile is live at a time.
-    projection_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=1, max_phase=8, order=[1, 0]
-    )
-    up_shared = gl.allocate_shared_memory(
-        output_ptr.dtype.element_ty,
-        [_GL_BLOCK_M, _GL_SWIGLU_BLOCK_N],
-        projection_shared_layout,
-    )
-    gate_shared = gl.allocate_shared_memory(
-        output_ptr.dtype.element_ty,
-        [_GL_BLOCK_M, _GL_SWIGLU_BLOCK_N],
-        projection_shared_layout,
-    )
-    up_shared.store(
-        _dequantize_tile(
-            up_accumulator,
-            input_scale,
-            weight_scale_ptr,
-            bias_ptr,
-            offsets_n,
-            n,
-            has_bias,
-            output_ptr.dtype.element_ty,
-        )
-    )
-    gate_shared.store(
-        _dequantize_tile(
-            gate_accumulator,
-            input_scale,
-            second_scale_ptr,
-            second_bias_ptr,
-            offsets_n,
-            n,
-            second_has_bias,
-            output_ptr.dtype.element_ty,
-        )
-    )
-    gl.barrier()
-
-    chunk_layout: gl.constexpr = _build_store_layout(
-        output_ptr.dtype.element_ty.primitive_bitwidth, _GL_SWIGLU_BLOCK_N
-    )
-    columns = pid_n * _GL_SWIGLU_BLOCK_N + gl.arange(
-        0, _GL_SWIGLU_BLOCK_N, gl.SliceLayout(0, chunk_layout)
-    )
-    column_valid = columns < n
-    for chunk_row in gl.static_range(0, _GL_BLOCK_M, _GL_SWIGLU_CHUNK_M):
-        up_chunk = (
-            up_shared.slice(chunk_row, _GL_SWIGLU_CHUNK_M, dim=0).load(chunk_layout).to(gl.float32)
-        )
-        gate_chunk = (
-            gate_shared.slice(chunk_row, _GL_SWIGLU_CHUNK_M, dim=0)
-            .load(chunk_layout)
-            .to(gl.float32)
-        )
-        activated = (up_chunk * (gate_chunk / (1.0 + gl.exp(-gate_chunk)))).to(
-            output_ptr.dtype.element_ty
-        )
-        rows = (
-            pid_m * _GL_BLOCK_M
-            + chunk_row
-            + gl.arange(0, _GL_SWIGLU_CHUNK_M, gl.SliceLayout(1, chunk_layout))
-        )
-        output_pointers = (
-            output_ptr + rows.to(gl.int64)[:, None] * output_row_stride + columns[None, :]
-        )
-        gl.store(output_pointers, activated, mask=(rows[:, None] < m) & column_valid[None, :])
 
 
 def operands_aligned(*operands: torch.Tensor) -> bool:

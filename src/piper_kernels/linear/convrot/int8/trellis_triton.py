@@ -24,6 +24,7 @@ from triton.compiler import ASTSource
 from piper_kernels._triton.primitives import (
     TRITON_FLOAT_POINTER_TYPES,
     TritonCompileFn,
+    decode_e4m3,
     default_triton_compile,
     splitk_tile_bounds,
 )
@@ -39,7 +40,6 @@ from piper_kernels.trellis._layout import (
 )
 from piper_kernels.trellis.triton import (
     _CODE_RECIPROCAL,
-    _decode_e4m3,
     _decode_group_4_nums,
     _le_step_bits_4,
     compute_row_offsets,
@@ -182,7 +182,7 @@ def _decode_scaled_4(
         use_sad_u8=use_sad_u8,
     )  # fmt: skip
     sc = tl.load(block_scales_ptr + blk_idx, eviction_policy="evict_first")
-    mult = _decode_e4m3(sc.to(tl.uint32)) * _CODE_RECIPROCAL
+    mult = decode_e4m3(sc.to(tl.uint32)) * _CODE_RECIPROCAL
     return n0, n1, n2, n3, mult
 
 
