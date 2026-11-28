@@ -18,6 +18,8 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget, rdna4_int8_accumulator_seed
 from piper_kernels.linear._splitk import device_sm_count, select_split_k
 
+from ._plan import LinearExecutionPlan
+
 _INT8_SPLITK_MAX_ROWS = 16
 _INT8_MIN_SPLITK_WEIGHT_BYTES = 8 * 1024 * 1024
 _INT8_MAX_SPLIT_K = 16
@@ -490,6 +492,10 @@ def int8_matmul_kernel(
         paired,
         tile_aligned,
     )
+
+
+# A runtime M and per-tile tail branch keep one compiled kernel per schedule.
+dynamic_m_int8_matmul_kernel = triton.jit(do_not_specialize=["m"])(int8_matmul_kernel.fn)
 
 
 @triton.jit
@@ -981,3 +987,92 @@ def splitk_accumulator_seed(
     max_tiles_per_split = triton.cdiv(triton.cdiv(in_features, block_k), split_k)
     split_reduction = min(in_features, max_tiles_per_split * block_k)
     return rdna4_int8_accumulator_seed(target, split_reduction, output_tiles * split_k)
+
+
+def launch_int8_matmul(
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    output: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    second_weight: torch.Tensor,
+    second_scale: torch.Tensor,
+    second_bias: torch.Tensor | None,
+    *,
+    paired: bool,
+    execution_plan: LinearExecutionPlan,
+    group_m: int = 0,
+    specialize_m: bool = True,
+    explicit_bias_fma: bool = False,
+    target: AcceleratorTarget | None = None,
+    compiler_options: Mapping[str, Any] | None = None,
+) -> None:
+    """Launch the shared INT8 arithmetic (or Split-K when beneficial) for a validated plan."""
+    plan = execution_plan
+    m, k = input_qdata.shape
+    n = weight_qdata.shape[0]
+    if try_launch_int8_matmul_splitk(
+        input_qdata,
+        weight_qdata,
+        output,
+        input_scale,
+        weight_scale,
+        bias,
+        second_weight,
+        second_scale,
+        second_bias,
+        paired=paired,
+        block_m=plan.matmul_block_m,
+        block_n=plan.matmul_block_n,
+        block_k=plan.matmul_block_k,
+        group_m=group_m,
+        explicit_bias_fma=explicit_bias_fma,
+        num_warps=plan.matmul_num_warps,
+        num_stages=plan.matmul_num_stages,
+        target=target,
+        compiler_options=compiler_options,
+    ):
+        return
+    num_n_tiles = triton.cdiv(n, plan.matmul_block_n) * (2 if paired else 1)
+    row_block_count = triton.cdiv(m, plan.matmul_block_m)
+    output_tiles = row_block_count * num_n_tiles
+    grid = (output_tiles,) if group_m else (row_block_count, num_n_tiles)
+    kernel = int8_matmul_kernel if specialize_m else dynamic_m_int8_matmul_kernel
+    accumulator_seed = (
+        rdna4_int8_accumulator_seed(target, k, output_tiles)
+        if target is not None and target.is_amd_hip
+        else 0
+    )
+    extra_options = {} if compiler_options is None else dict(compiler_options)
+    with device_context(input_qdata.device):
+        kernel[grid](
+            input_qdata,
+            weight_qdata,
+            output,
+            input_scale,
+            weight_scale,
+            bias if bias is not None else output,
+            second_weight,
+            second_scale,
+            second_bias if second_bias is not None else output,
+            m,
+            n,
+            k,
+            output.stride(0),
+            block_m=plan.matmul_block_m,
+            block_n=plan.matmul_block_n,
+            block_k=plan.matmul_block_k,
+            has_bias=bias is not None,
+            paired=paired,
+            second_has_bias=second_bias is not None,
+            aligned_m=specialize_m and m % plan.matmul_block_m == 0,
+            aligned_nk=n % plan.matmul_block_n == 0 and k % plan.matmul_block_k == 0,
+            group_m=group_m,
+            explicit_bias_fma=explicit_bias_fma,
+            per_tile_tail=bool(group_m) or not specialize_m,
+            accumulator_seed=accumulator_seed,
+            **extra_options,
+            num_stages=plan.matmul_num_stages,
+            num_warps=plan.matmul_num_warps,
+        )

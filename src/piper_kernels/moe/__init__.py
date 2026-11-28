@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from torch._guards import detect_fake_mode
@@ -15,7 +15,7 @@ from piper_kernels.trellis._layout import (
     resolve_block_size,
     resolve_layout,
 )
-from piper_kernels.weights.convrot._rotation import rotate_groups, validate_group_size
+from piper_kernels.weights.convrot._rotation import rotate_groups
 
 from . import _ops
 from .reference import (
@@ -36,14 +36,6 @@ type MoEWeightFormat = Literal[
 ]
 
 _SUPPORTED_LOGICAL_DTYPES = _ops._SUPPORTED_LOGICAL_DTYPES
-_SUPPORTED_WEIGHT_FORMATS = (
-    "nvfp4",
-    "convrot_nvfp4",
-    "nvfp4_w4a16",
-    "convrot_nvfp4_w4a16",
-    "convrot_int8",
-    "convrot_trellis",
-)
 
 
 def _normalize_nvfp4_global_scale(
@@ -95,6 +87,31 @@ class MoEWeights:
     gate_bound: float | None = None
     up_bound: float | None = None
 
+    def _weight_storage(self) -> _ops._MoEWeightStorage:
+        return _ops._MoEWeightStorage(
+            up_gate_qdata=self.up_gate_qdata,
+            up_gate_scale=self.up_gate_scale,
+            down_qdata=self.down_qdata,
+            down_scale=self.down_scale,
+            up_gate_global_scale=self.up_gate_global_scale,
+            down_global_scale=self.down_global_scale,
+            group_size=self.group_size,
+            activation_fn=self.activation_fn,
+            gate_first=self.gate_first,
+            high_first=self.high_first,
+            up_gate_block_scales=self.up_gate_block_scales,
+            down_block_scales=self.down_block_scales,
+            up_gate_row_widths=self.up_gate_row_widths,
+            down_row_widths=self.down_row_widths,
+            up_gate_slot_offsets=self.up_gate_slot_offsets,
+            down_slot_offsets=self.down_slot_offsets,
+            up_gate_block_size=self.up_gate_block_size,
+            down_block_size=self.down_block_size,
+            act_quant=self.act_quant,
+            gate_bound=self.gate_bound,
+            up_bound=self.up_bound,
+        )
+
     def __post_init__(self) -> None:
         if self.logical_dtype not in _SUPPORTED_LOGICAL_DTYPES:
             raise ValueError(
@@ -105,7 +122,7 @@ class MoEWeights:
         )
         object.__setattr__(self, "gate_bound", resolved_gate_bound)
         object.__setattr__(self, "up_bound", resolved_up_bound)
-        _ops._validate_weight_storage(self)
+        _ops._validate_weight_storage(self._weight_storage())
 
     @property
     def weight_format(self) -> MoEWeightFormat:
@@ -257,41 +274,39 @@ class MoEWeights:
             gate_bound=gate_bound,
             up_bound=up_bound,
         )
+        up_src = up_gate_hp.detach()
+        down_src = down_hp.detach()
+        if not (bool(torch.isfinite(up_src).all()) and bool(torch.isfinite(down_src).all())):
+            raise ValueError("cannot quantize non-finite MoE weights")
+
         if weight_format == "convrot_trellis":
-            return _quantize_hp_trellis(
-                up_gate_hp,
-                down_hp,
+            storage_kwargs = _quantize_hp_trellis(
+                up_src,
+                down_src,
                 group_size=group_size,
-                activation_fn=activation_fn,
-                gate_first=gate_first,
-                high_first=high_first,
                 bits_per_weight=bits_per_weight,
                 bytes_per_block=bytes_per_block,
-                gate_bound=resolved_gate_bound,
-                up_bound=resolved_up_bound,
             )
-        if weight_format == "convrot_int8":
-            return _quantize_hp_int8(
-                up_gate_hp,
-                down_hp,
+        elif weight_format == "convrot_int8":
+            storage_kwargs = _quantize_hp_int8(up_src, down_src, group_size=group_size)
+        else:
+            storage_kwargs = _quantize_hp_nvfp4(
+                up_src,
+                down_src,
                 group_size=group_size,
-                activation_fn=activation_fn,
-                gate_first=gate_first,
                 high_first=high_first,
-                gate_bound=resolved_gate_bound,
-                up_bound=resolved_up_bound,
+                compute_per_tensor_scale=compute_per_tensor_scale,
+                act_quant="dynamic" if weight_format in ("nvfp4", "convrot_nvfp4") else None,
             )
-        return _quantize_hp_nvfp4(
-            up_gate_hp,
-            down_hp,
+        return cls(
+            logical_dtype=up_src.dtype,
             group_size=group_size,
             activation_fn=activation_fn,
             gate_first=gate_first,
             high_first=high_first,
-            compute_per_tensor_scale=compute_per_tensor_scale,
-            act_quant="dynamic" if weight_format in ("nvfp4", "convrot_nvfp4") else None,
             gate_bound=resolved_gate_bound,
             up_bound=resolved_up_bound,
+            **storage_kwargs,
         )
 
 
@@ -311,8 +326,6 @@ def _validate_from_hp_inputs(  # noqa: PLR0913 - validates all MoEWeights.from_h
     up_bound: float | None,
 ) -> tuple[float | None, float | None]:
     resolved_bounds = validate_moe_activation_bounds(activation_fn, gate_bound, up_bound)
-    if weight_format not in _SUPPORTED_WEIGHT_FORMATS:
-        raise ValueError(f"Unsupported MoE weight_format {weight_format!r}")
     if (
         not isinstance(gate_first, bool)
         or not isinstance(high_first, bool)
@@ -325,11 +338,6 @@ def _validate_from_hp_inputs(  # noqa: PLR0913 - validates all MoEWeights.from_h
         bits_per_weight is not None or bytes_per_block is not None
     ):
         raise ValueError("bits_per_weight and bytes_per_block apply only to convrot_trellis")
-    if weight_format in ("nvfp4", "nvfp4_w4a16") and group_size != 0:
-        suggested = "convrot_nvfp4" if weight_format == "nvfp4" else "convrot_nvfp4_w4a16"
-        raise ValueError(f"{weight_format} requires group_size=0; use {suggested}")
-    if weight_format in ("convrot_nvfp4", "convrot_nvfp4_w4a16") and group_size == 0:
-        raise ValueError(f"{weight_format} requires group_size in (16, 64, 256)")
     if up_gate_hp.layout is not torch.strided or down_hp.layout is not torch.strided:
         raise ValueError("MoE from_hp weights must use strided layout")
     if up_gate_hp.ndim != 3 or down_hp.ndim != 3:
@@ -348,39 +356,30 @@ def _validate_from_hp_inputs(  # noqa: PLR0913 - validates all MoEWeights.from_h
         or tuple(up_gate_hp.shape) != (num_slots, up_gate_out, hidden_size)
     ):
         raise ValueError("MoE from_hp up_gate_hp and down_hp shapes are incompatible")
+    _ops.validate_named_weight_format(
+        weight_format,
+        group_size=group_size,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        high_first=high_first,
+    )
+    if weight_format == "convrot_trellis" and (bits_per_weight is None) == (
+        bytes_per_block is None
+    ):
+        raise ValueError("specify exactly one of bits_per_weight or bytes_per_block")
     return resolved_bounds
 
 
 def _quantize_hp_trellis(
-    up_gate_hp: torch.Tensor,
-    down_hp: torch.Tensor,
+    up_src: torch.Tensor,
+    down_src: torch.Tensor,
     *,
     group_size: int,
-    activation_fn: MoEActivation,
-    gate_first: bool,
-    high_first: bool,
     bits_per_weight: float | None,
     bytes_per_block: int | None,
-    gate_bound: float | None,
-    up_bound: float | None,
-) -> MoEWeights:
-    if high_first:
-        raise ValueError("ConvRot Trellis MoE weights do not support high_first")
-    validate_group_size(group_size)
-    num_slots, hidden_size, intermediate_size = down_hp.shape
-    if hidden_size % group_size or intermediate_size % group_size:
-        raise ValueError(f"ConvRot Trellis MoE widths must be divisible by group_size {group_size}")
-    if (
-        hidden_size > _ops._INT8_MAX_REDUCTION_WIDTH
-        or intermediate_size > _ops._INT8_MAX_REDUCTION_WIDTH
-    ):
-        raise ValueError(
-            f"ConvRot Trellis MoE widths must not exceed {_ops._INT8_MAX_REDUCTION_WIDTH} "
-            f"for INT32 accumulation, got hidden_size={hidden_size}, "
-            f"intermediate_size={intermediate_size}"
-        )
-    if (bits_per_weight is None) == (bytes_per_block is None):
-        raise ValueError("specify exactly one of bits_per_weight or bytes_per_block")
+) -> dict[str, Any]:
+    num_slots, hidden_size, intermediate_size = down_src.shape
+    up_out = up_src.shape[1]
     if bits_per_weight is not None:
         up_layout = resolve_layout(hidden_size, bits_per_weight)
         down_layout = resolve_layout(intermediate_size, bits_per_weight)
@@ -390,143 +389,86 @@ def _quantize_hp_trellis(
         down_layout = TrellisLayout.from_storage(
             resolve_block_size(intermediate_size), bytes_per_block
         )
-
-    up_src = up_gate_hp.detach()
-    down_src = down_hp.detach()
-    if not (bool(torch.isfinite(up_src).all()) and bool(torch.isfinite(down_src).all())):
-        raise ValueError("cannot quantize non-finite MoE weights")
-    up_out = up_src.shape[1]
     up_blocks = hidden_size // up_layout.block_size
     down_blocks = intermediate_size // down_layout.block_size
     if num_slots == 0:
-        return MoEWeights(
-            up_gate_qdata=up_src.new_empty(
+        return {
+            "up_gate_qdata": up_src.new_empty(
                 (0, up_out, up_blocks, up_layout.bytes_per_block), dtype=torch.uint8
             ),
-            up_gate_scale=up_src.new_empty((0, up_out), dtype=torch.float32),
-            down_qdata=down_src.new_empty(
+            "up_gate_scale": up_src.new_empty((0, up_out), dtype=torch.float32),
+            "down_qdata": down_src.new_empty(
                 (0, hidden_size, down_blocks, down_layout.bytes_per_block), dtype=torch.uint8
             ),
-            down_scale=down_src.new_empty((0, hidden_size), dtype=torch.float32),
-            logical_dtype=up_src.dtype,
-            group_size=group_size,
-            activation_fn=activation_fn,
-            gate_first=gate_first,
-            up_gate_block_scales=up_src.new_empty(
+            "down_scale": down_src.new_empty((0, hidden_size), dtype=torch.float32),
+            "up_gate_block_scales": up_src.new_empty(
                 (0, up_out, up_blocks), dtype=torch.float8_e4m3fn
             ),
-            down_block_scales=down_src.new_empty(
+            "down_block_scales": down_src.new_empty(
                 (0, hidden_size, down_blocks), dtype=torch.float8_e4m3fn
             ),
-            up_gate_block_size=up_layout.block_size,
-            down_block_size=down_layout.block_size,
-            gate_bound=gate_bound,
-            up_bound=up_bound,
-        )
+            "up_gate_block_size": up_layout.block_size,
+            "down_block_size": down_layout.block_size,
+        }
     from piper_kernels.trellis import TrellisStorage  # noqa: PLC0415
 
     with _autocast_disabled(up_src.device):
-        up_items = [
-            TrellisStorage.from_hp(
-                up_src[s],
-                group_size=group_size,
-                bits_per_weight=bits_per_weight,
-                bytes_per_block=bytes_per_block,
-            )
-            for s in range(num_slots)
-        ]
-        down_items = [
-            TrellisStorage.from_hp(
-                down_src[s],
-                group_size=group_size,
-                bits_per_weight=bits_per_weight,
-                bytes_per_block=bytes_per_block,
-            )
-            for s in range(num_slots)
-        ]
-    return MoEWeights(
-        up_gate_qdata=torch.stack([item.bitstreams for item in up_items]).contiguous(),
-        up_gate_scale=torch.stack([item.scale for item in up_items]).squeeze(-1).contiguous(),
-        down_qdata=torch.stack([item.bitstreams for item in down_items]).contiguous(),
-        down_scale=torch.stack([item.scale for item in down_items]).squeeze(-1).contiguous(),
-        logical_dtype=up_src.dtype,
-        group_size=group_size,
-        activation_fn=activation_fn,
-        gate_first=gate_first,
-        up_gate_block_scales=torch.stack([item.block_scales for item in up_items]).contiguous(),
-        down_block_scales=torch.stack([item.block_scales for item in down_items]).contiguous(),
-        up_gate_block_size=up_layout.block_size,
-        down_block_size=down_layout.block_size,
-        gate_bound=gate_bound,
-        up_bound=up_bound,
-    )
+        up_items, down_items = (
+            [
+                TrellisStorage.from_hp(
+                    src[s],
+                    group_size=group_size,
+                    bits_per_weight=bits_per_weight,
+                    bytes_per_block=bytes_per_block,
+                )
+                for s in range(num_slots)
+            ]
+            for src in (up_src, down_src)
+        )
+    return {
+        "up_gate_qdata": torch.stack([item.bitstreams for item in up_items]).contiguous(),
+        "up_gate_scale": torch.stack([item.scale for item in up_items]).squeeze(-1).contiguous(),
+        "down_qdata": torch.stack([item.bitstreams for item in down_items]).contiguous(),
+        "down_scale": torch.stack([item.scale for item in down_items]).squeeze(-1).contiguous(),
+        "up_gate_block_scales": torch.stack([item.block_scales for item in up_items]).contiguous(),
+        "down_block_scales": torch.stack([item.block_scales for item in down_items]).contiguous(),
+        "up_gate_block_size": up_layout.block_size,
+        "down_block_size": down_layout.block_size,
+    }
 
 
 def _quantize_hp_int8(
-    up_gate_hp: torch.Tensor,
-    down_hp: torch.Tensor,
+    up_src: torch.Tensor,
+    down_src: torch.Tensor,
     *,
     group_size: int,
-    activation_fn: MoEActivation,
-    gate_first: bool,
-    high_first: bool,
-    gate_bound: float | None,
-    up_bound: float | None,
-) -> MoEWeights:
-    if high_first:
-        raise ValueError("ConvRot INT8 MoE weights do not support high_first")
-    validate_group_size(group_size)
-    num_slots, hidden_size, intermediate_size = down_hp.shape
-    if hidden_size % group_size or intermediate_size % group_size:
-        raise ValueError(f"ConvRot INT8 MoE widths must be divisible by group_size {group_size}")
-    if (
-        hidden_size > _ops._INT8_MAX_REDUCTION_WIDTH
-        or intermediate_size > _ops._INT8_MAX_REDUCTION_WIDTH
-    ):
-        raise ValueError(
-            f"ConvRot INT8 MoE widths must not exceed {_ops._INT8_MAX_REDUCTION_WIDTH} "
-            f"for INT32 accumulation, got hidden_size={hidden_size}, "
-            f"intermediate_size={intermediate_size}"
-        )
-    up_src = up_gate_hp.detach()
-    down_src = down_hp.detach()
-    if not (bool(torch.isfinite(up_src).all()) and bool(torch.isfinite(down_src).all())):
-        raise ValueError("cannot quantize non-finite MoE weights")
+) -> dict[str, Any]:
+    num_slots, hidden_size, intermediate_size = down_src.shape
+    up_out = up_src.shape[1]
     if num_slots == 0:
-        up_out = up_src.shape[1]
-        return MoEWeights(
-            up_gate_qdata=up_src.new_empty((0, up_out, hidden_size), dtype=torch.int8),
-            up_gate_scale=up_src.new_empty((0, up_out), dtype=torch.float32),
-            down_qdata=down_src.new_empty((0, hidden_size, intermediate_size), dtype=torch.int8),
-            down_scale=down_src.new_empty((0, hidden_size), dtype=torch.float32),
-            logical_dtype=up_src.dtype,
-            group_size=group_size,
-            activation_fn=activation_fn,
-            gate_first=gate_first,
-            gate_bound=gate_bound,
-            up_bound=up_bound,
-        )
+        return {
+            "up_gate_qdata": up_src.new_empty((0, up_out, hidden_size), dtype=torch.int8),
+            "up_gate_scale": up_src.new_empty((0, up_out), dtype=torch.float32),
+            "down_qdata": down_src.new_empty((0, hidden_size, intermediate_size), dtype=torch.int8),
+            "down_scale": down_src.new_empty((0, hidden_size), dtype=torch.float32),
+        }
     from piper_kernels.weights.convrot.int8._quantization import quantize_weight  # noqa: PLC0415
 
     with _autocast_disabled(up_src.device):
-        up_pairs = [quantize_weight(up_src[s], group_size) for s in range(num_slots)]
-        down_pairs = [quantize_weight(down_src[s], group_size) for s in range(num_slots)]
+        up_pairs, down_pairs = (
+            [quantize_weight(src[s], group_size) for s in range(num_slots)]
+            for src in (up_src, down_src)
+        )
         up_scale = torch.stack([pair[1] for pair in up_pairs]).squeeze(-1).contiguous()
         down_scale = torch.stack([pair[1] for pair in down_pairs]).squeeze(-1).contiguous()
     if not (bool(torch.isfinite(up_scale).all()) and bool(torch.isfinite(down_scale).all())):
         raise ValueError("ConvRot INT8 quantization produced non-finite scales")
-    return MoEWeights(
-        up_gate_qdata=torch.stack([pair[0] for pair in up_pairs]).contiguous(),
-        up_gate_scale=up_scale,
-        down_qdata=torch.stack([pair[0] for pair in down_pairs]).contiguous(),
-        down_scale=down_scale,
-        logical_dtype=up_src.dtype,
-        group_size=group_size,
-        activation_fn=activation_fn,
-        gate_first=gate_first,
-        gate_bound=gate_bound,
-        up_bound=up_bound,
-    )
+    return {
+        "up_gate_qdata": torch.stack([pair[0] for pair in up_pairs]).contiguous(),
+        "up_gate_scale": up_scale,
+        "down_qdata": torch.stack([pair[0] for pair in down_pairs]).contiguous(),
+        "down_scale": down_scale,
+    }
 
 
 def _quantize_nvfp4_batch(
@@ -590,31 +532,14 @@ def _quantize_nvfp4_batch(
 
 
 def _quantize_hp_nvfp4(
-    up_gate_hp: torch.Tensor,
-    down_hp: torch.Tensor,
+    up_src: torch.Tensor,
+    down_src: torch.Tensor,
     *,
     group_size: int,
-    activation_fn: MoEActivation,
-    gate_first: bool,
     high_first: bool,
     compute_per_tensor_scale: bool,
     act_quant: MoEActQuant | None = None,
-    gate_bound: float | None = None,
-    up_bound: float | None = None,
-) -> MoEWeights:
-    from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout  # noqa: PLC0415
-
-    hidden_size, intermediate_size = down_hp.shape[1], down_hp.shape[2]
-    if hidden_size % nvfp4_layout.BLOCK_SIZE or intermediate_size % nvfp4_layout.BLOCK_SIZE:
-        raise ValueError("NVFP4 MoE widths must be multiples of 16")
-    if group_size != 0:
-        validate_group_size(group_size)
-        if hidden_size % group_size or intermediate_size % group_size:
-            raise ValueError(f"ConvRot NVFP4 MoE widths must be divisible by {group_size}")
-    up_src = up_gate_hp.detach()
-    down_src = down_hp.detach()
-    if not (bool(torch.isfinite(up_src).all()) and bool(torch.isfinite(down_src).all())):
-        raise ValueError("cannot quantize non-finite MoE weights")
+) -> dict[str, Any]:
     up_q, up_s, up_gs = _quantize_nvfp4_batch(
         up_src,
         group_size=group_size,
@@ -627,22 +552,15 @@ def _quantize_hp_nvfp4(
         high_first=high_first,
         compute_per_tensor_scale=compute_per_tensor_scale,
     )
-    return MoEWeights(
-        up_gate_qdata=up_q,
-        up_gate_scale=up_s,
-        down_qdata=down_q,
-        down_scale=down_s,
-        logical_dtype=up_src.dtype,
-        up_gate_global_scale=up_gs,
-        down_global_scale=down_gs,
-        group_size=group_size,
-        activation_fn=activation_fn,
-        gate_first=gate_first,
-        high_first=high_first,
-        act_quant=act_quant,
-        gate_bound=gate_bound,
-        up_bound=up_bound,
-    )
+    return {
+        "up_gate_qdata": up_q,
+        "up_gate_scale": up_s,
+        "down_qdata": down_q,
+        "down_scale": down_s,
+        "up_gate_global_scale": up_gs,
+        "down_global_scale": down_gs,
+        "act_quant": act_quant,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -798,36 +716,16 @@ def moe_ffn(
 
     return _ops.dispatch_moe_ffn(
         _ops._MoEOperands(
-            input,
-            topk_ids,
-            topk_weights,
-            weights.up_gate_qdata,
-            weights.up_gate_scale,
-            weights.down_qdata,
-            weights.down_scale,
-            weights.up_gate_global_scale,
-            weights.down_global_scale,
-            expert_to_slot,
-            prepared_data,
-            prepared_scale,
-            out,
-            accumulate,
-            weights.group_size,
-            weights.activation_fn,
-            weights.gate_first,
-            weights.high_first,
-            hint,
-            weights.up_gate_block_scales,
-            weights.down_block_scales,
-            weights.up_gate_row_widths,
-            weights.down_row_widths,
-            weights.up_gate_slot_offsets,
-            weights.down_slot_offsets,
-            weights.up_gate_block_size,
-            weights.down_block_size,
-            weights.act_quant,
-            weights.gate_bound,
-            weights.up_bound,
+            input=input,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            weights=weights._weight_storage(),
+            expert_to_slot=expert_to_slot,
+            prepared_data=prepared_data,
+            prepared_scale=prepared_scale,
+            out=out,
+            accumulate=accumulate,
+            active_slots_hint=hint,
         )
     )
 

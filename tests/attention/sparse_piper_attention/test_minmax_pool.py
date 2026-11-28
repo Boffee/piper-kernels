@@ -21,8 +21,6 @@ from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_from_sequences,
     packed_routes_from_summaries,
     routing_scores,
-)
-from piper_kernels.attention.sparse_piper_attention._summaries import (
     sequence_block_summaries,
 )
 

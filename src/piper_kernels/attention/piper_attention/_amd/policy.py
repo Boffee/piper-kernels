@@ -3,7 +3,6 @@
 from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarget
 
 from .._decode_schedule import (
-    FAST_MAX_DECODE_SPLITS,
     DecodeSchedule,
     default_decode_schedule,
 )
@@ -113,13 +112,8 @@ def select_decode_schedule(target: AcceleratorTarget, head_dim: int) -> DecodeSc
         block_n=_RDNA4_BLOCK_N,
         num_warps=_RDNA4_NUM_WARPS,
         num_stages=_RDNA4_NUM_STAGES,
-        loop_num_stages=_RDNA4_NUM_STAGES,
-        frozen_qk_mode="ieee",
         tail_qk_precision="native",
         pv_precision="bf16x2",
-        max_splits=FAST_MAX_DECODE_SPLITS,
-        target_ctas_per_sm=0,
-        tiles_per_chunk_cap=1,
         max_tail_splits=_RDNA4_MAX_TAIL_SPLITS,
         compiler_options=(("llvm_fn_attrs", llvm_fn_attrs),),
     )

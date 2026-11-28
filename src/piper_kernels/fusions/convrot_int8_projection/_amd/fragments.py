@@ -17,6 +17,8 @@ the two N-waves via epilogue LDS.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -42,11 +44,15 @@ from piper_kernels.attention.kernels.piper._amd.quantization import (
     round_to_int8,
 )
 
+from .._plan import ProjectionExecutionPlan, resolve_row_block_launches
 from .policy import (
     GLUON_ACCUMULATOR_SEED,
     GLUON_ACCUMULATOR_SEED_MIN_K,
     GLUON_BLOCK_K,
     GLUON_BLOCK_M,
+    TILE_ROWS,
+    AmdExecutionPlan,
+    ProjectionOperation,
 )
 
 # ---------------------------------------------------------------------------
@@ -158,6 +164,114 @@ def operands_aligned(
         and heads_per_program * storage_sequence_length * head_dim * output_element_bytes
         < _BUFFER_OFFSET_LIMIT
     )
+
+
+def select_execution_plan(
+    select_plan: Callable[..., AmdExecutionPlan],
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    *,
+    operation: ProjectionOperation,
+    head_dim: int,
+    rotary_dim: int = 0,
+    storage_sequence_length: int | None = None,
+    allow_gluon: bool = True,
+    output_element_bytes: int = 1,
+    **policy_kwargs: object,
+) -> AmdExecutionPlan:
+    """Resolve operand metadata and select an RDNA4 Gluon or Triton plan."""
+    sequence_length = input_qdata.shape[1]
+    resolved_storage_sequence = (
+        (sequence_length + TILE_ROWS - 1) // TILE_ROWS * TILE_ROWS
+        if storage_sequence_length is None
+        else storage_sequence_length
+    )
+    heads = (
+        weight_qdata.shape[0] // head_dim
+        if head_dim > 0 and weight_qdata.shape[0] % head_dim == 0
+        else 0
+    )
+    return select_plan(
+        operation,
+        head_dim=head_dim,
+        input_features=input_qdata.shape[2],
+        heads=heads,
+        rotary_dim=rotary_dim,
+        operands_aligned=(
+            allow_gluon
+            and operands_aligned(
+                input_qdata,
+                weight_qdata,
+                storage_sequence_length=resolved_storage_sequence,
+                rotary_dim=rotary_dim,
+                head_dim=head_dim,
+                output_element_bytes=output_element_bytes,
+            )
+        ),
+        **policy_kwargs,
+    )
+
+
+def resolve_execution_plan(
+    select_plan: Callable[..., AmdExecutionPlan],
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    *,
+    operation: ProjectionOperation,
+    head_dim: int,
+    rotary_dim: int = 0,
+    storage_sequence_length: int | None = None,
+    execution_plan: ProjectionExecutionPlan | None = None,
+    allow_gluon: bool = True,
+    output_element_bytes: int = 1,
+    **policy_kwargs: object,
+) -> tuple[ProjectionExecutionPlan, AmdExecutionPlan | None]:
+    """Return ``(plan, gluon_plan)`` where ``gluon_plan`` is set iff RDNA4 Gluon applies."""
+    plan: ProjectionExecutionPlan = (
+        select_execution_plan(
+            select_plan,
+            input_qdata,
+            weight_qdata,
+            operation=operation,
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            storage_sequence_length=storage_sequence_length,
+            allow_gluon=allow_gluon,
+            output_element_bytes=output_element_bytes,
+            **policy_kwargs,
+        )
+        if execution_plan is None
+        else execution_plan
+    )
+    gluon_plan = (
+        plan if allow_gluon and isinstance(plan, AmdExecutionPlan) and plan.uses_gluon else None
+    )
+    return plan, gluon_plan
+
+
+def iter_row_block_launches(
+    sequence_rows: int,
+    heads: int,
+    head_dim: int,
+    *,
+    mask_full_tiles: bool = False,
+    start_row_block: int = 0,
+    num_row_blocks: int | None = None,
+) -> Iterator[tuple[int, int, int, bool]]:
+    """Yield ``(grid_x, row_blocks, row_block_offset, mask_rows)`` for RDNA4 128-col grids."""
+    col_blocks = (heads * head_dim) // 128
+    for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
+        sequence_rows,
+        GLUON_BLOCK_M,
+        start_row_block=start_row_block,
+        num_row_blocks=num_row_blocks,
+    ):
+        yield (
+            row_blocks * col_blocks,
+            row_blocks,
+            row_block_offset,
+            mask_full_tiles or not aligned_rows,
+        )
 
 
 @gluon.jit

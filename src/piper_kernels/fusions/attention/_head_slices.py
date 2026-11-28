@@ -23,7 +23,8 @@ from typing import cast
 import torch
 from torch.fx.node import Argument
 
-from piper_kernels.fusions.residual_updates._graph import bind_arguments, call_functional
+from piper_kernels.fusions.residual_updates._graph import call_functional
+from piper_kernels.linear import _compile_fx as linear_fx
 
 # Two slices halve K and V; more would save less, since other buffers then dominate.
 NUM_HEAD_SLICES = 2
@@ -117,53 +118,27 @@ def _find_producer(
     for target, names in producer.items():
         node = _find_exclusive_producer(operands, names, target, consumer)
         if node is not None:
-            return target, bind_arguments(node), names
+            bound = linear_fx.bind_arguments(node)
+            if bound is not None:
+                return target, bound, names
     return None
 
 
-def _metadata(value: Argument) -> object:
-    return value.meta.get("val") if isinstance(value, torch.fx.Node) else value
-
-
 def _rows(value: Argument) -> int | None:
-    metadata = _metadata(value)
+    metadata = linear_fx.argument_metadata(value)
     return metadata.shape[0] if isinstance(metadata, torch.Tensor) else None
-
-
-def _call(
-    graph: torch.fx.Graph, target: torch._ops.OpOverload, values: Mapping[str, Argument]
-) -> torch.fx.Node:
-    """Emit ``target`` with its fake result as the node's metadata.
-
-    Arguments go positionally in schema order, as in traced graphs, since Inductor passes
-    read some operators' arguments by position. Those after an omitted argument go by
-    name, so they keep their meaning.
-    """
-    args: list[Argument] = []
-    kwargs: dict[str, Argument] = {}
-    for index, argument in enumerate(target._schema.arguments):
-        if argument.name not in values:
-            continue
-        if argument.kwarg_only or len(args) < index:
-            kwargs[argument.name] = values[argument.name]
-        else:
-            args.append(values[argument.name])
-    node = graph.call_function(target, tuple(args), kwargs)
-    node.meta["val"] = target(
-        *(_metadata(value) for value in args),
-        **{name: _metadata(value) for name, value in kwargs.items()},
-    )
-    return node
 
 
 def _slice_share(graph: torch.fx.Graph, value: Argument, slice_index: int, dim: int) -> Argument:
     """Slice one head slice's share of ``value`` along ``dim``; None stays None."""
-    metadata = _metadata(value)
+    metadata = linear_fx.argument_metadata(value)
     if not isinstance(metadata, torch.Tensor):
         return None
     size = metadata.shape[dim] // NUM_HEAD_SLICES
     bounds = {"dim": dim, "start": slice_index * size, "end": (slice_index + 1) * size}
-    return _call(graph, torch.ops.aten.slice.Tensor, {"self": value, **bounds})
+    return linear_fx.call_in_schema_order(
+        graph, torch.ops.aten.slice.Tensor, {"self": value, **bounds}, compute_val=True
+    )
 
 
 def _head_dim(operands: Iterable[Mapping[str, Argument]]) -> int | None:
@@ -241,13 +216,14 @@ def add_in_head_slices(
                 if name in values
             },
             # The output GEMM needs each slice's input columns contiguous.
-            slicing.columns: _call(
+            slicing.columns: linear_fx.call_in_schema_order(
                 graph,
                 torch.ops.aten.clone.default,
                 {
                     "self": _slice_share(graph, values[slicing.columns], slice_index, 1),
                     "memory_format": torch.contiguous_format,
                 },
+                compute_val=True,
             ),
         }
         if slice_index:
@@ -261,7 +237,9 @@ def add_in_head_slices(
                 for name in slicing.producer_rows
                 if name in arguments
             }
-            produced = _call(graph, target, {**arguments, **sliced})
+            produced = linear_fx.call_in_schema_order(
+                graph, target, {**arguments, **sliced}, compute_val=True
+            )
             for index, name in enumerate(names):
                 item = graph.call_function(operator.getitem, (produced, index))
                 item.meta["val"] = produced.meta["val"][index]

@@ -327,6 +327,25 @@ def test_storage_boundary_rejects_invalid_inputs() -> None:
         )
 
 
+def test_stable_cache_key_covers_flattened_storage_across_formats() -> None:
+    int8 = _make_int8_2d(static_act=False)
+    nvfp4 = _make_nvfp4_2d(act_quant="dynamic")
+    convrot_nvfp4 = _make_nvfp4_2d(convrot=True, act_quant="dynamic")
+    trellis_uni = _make_trellis_uniform()
+    trellis_var = _make_trellis_variable_row()
+
+    keys = {
+        weight._stable_hash_for_caching()
+        for weight in (int8, nvfp4, convrot_nvfp4, trellis_uni, trellis_var)
+    }
+    assert len(keys) == 5
+    for weight in (int8, nvfp4, convrot_nvfp4, trellis_uni, trellis_var):
+        assert weight._stable_hash_for_caching() != weight.t()._stable_hash_for_caching()
+        assert (
+            weight._stable_hash_for_caching() != weight.to(torch.float16)._stable_hash_for_caching()
+        )
+
+
 def test_nvfp4_from_hp_scale_and_w4a16_linear_boundaries() -> None:
     with pytest.raises(ValueError, match="high-precision weight"):
         PiperNVFP4Tensor.from_hp(torch.randn(16, dtype=torch.bfloat16))

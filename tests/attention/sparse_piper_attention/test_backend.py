@@ -19,19 +19,12 @@ from piper_kernels.attention.sparse_piper_attention import (
     _backend,
     _contracts,
     _quantized_dispatch,
-    _routes,
     _routing,
-    _summaries,
     dispatch,
 )
 from piper_kernels.attention.sparse_piper_attention._budget import (
     _normalize_head_keep_ratios,
     _resolve_route_layout,
-)
-from piper_kernels.attention.sparse_piper_attention._contracts import (
-    AttentionBackend,
-    MinmaxScoreSchedule,
-    _SparsePiperRatioProfile,
 )
 from piper_kernels.attention.sparse_piper_attention._prepared import (
     _prepare_sparse_piper_context_from_quantized,
@@ -254,7 +247,7 @@ def test_score_selection_is_independent_and_uses_operand_target(target, supporte
         assert isinstance(selected, partial)
         assert selected.func is _backend._score_backend.minmax_scores
         schedule = selected.keywords["schedule"]
-        assert isinstance(schedule, MinmaxScoreSchedule)
+        assert isinstance(schedule, _contracts.MinmaxScoreSchedule)
         assert schedule.lds_only_fences is target.is_amd_hip
         assert schedule.block_m > 0
         assert schedule.block_m & (schedule.block_m - 1) == 0
@@ -280,7 +273,7 @@ def test_score_selection_accepts_large_query_chunks(target, query_heads_per_kv_h
         assert isinstance(selected, partial)
         assert selected.func is _backend._score_backend.minmax_scores
         schedule = selected.keywords["schedule"]
-        assert isinstance(schedule, MinmaxScoreSchedule)
+        assert isinstance(schedule, _contracts.MinmaxScoreSchedule)
         assert schedule.lds_only_fences is target.is_amd_hip
         block_ms.append(schedule.block_m)
     assert block_ms == sorted(block_ms)
@@ -606,7 +599,7 @@ def test_dense_orchestration_uses_selected_operations(
     prepare = Mock(return_value=operands)
     launch = Mock(side_effect=lambda prepared, output: output.fill_(3))
     state.launch = launch
-    backend = AttentionBackend(
+    backend = _contracts.AttentionBackend(
         value_format=ValueFormat.TRANSPOSED,
         prepare=prepare,
         bind=Mock(),
@@ -668,7 +661,7 @@ def test_route_builder_uses_selected_operation_once_and_preserves_offsets(monkey
     monkeypatch.setattr(_backend, "select_route_selector", select)
     monkeypatch.setattr(torch.Tensor, "cpu", Mock(side_effect=AssertionError("host readback")))
     monkeypatch.setattr(torch.Tensor, "tolist", Mock(side_effect=AssertionError("host readback")))
-    builder = _routes.PackedRouteBuilder(
+    builder = _routing.PackedRouteBuilder(
         layout, batch=1, heads=1, query_blocks=3, sparse_key_blocks=2, device=torch.device("cpu")
     )
     scores = torch.ones(1, 1, 1, 2)
@@ -692,11 +685,11 @@ def test_summaries_use_selected_operation_after_validation(monkeypatch):
     summarize = Mock(return_value=expected)
     select = Mock(return_value=summarize)
     monkeypatch.setattr(_backend, "select_sequence_summaries", select)
-    assert _summaries.sequence_block_summaries(query, query, _contracts._MINMAX_ROUTING) is expected
+    assert _routing.sequence_block_summaries(query, query, _contracts._MINMAX_ROUTING) is expected
     select.assert_called_once_with(query, query, None)
     summarize.assert_called_once_with(query, query, _contracts._MINMAX_ROUTING, None)
     with pytest.raises(ValueError, match="rank-four"):
-        _summaries.sequence_block_summaries(query[0], query, _contracts._MINMAX_ROUTING)
+        _routing.sequence_block_summaries(query[0], query, _contracts._MINMAX_ROUTING)
     select.assert_called_once()
 
 
@@ -716,7 +709,7 @@ def _quantized_context_arguments(head_dim=128, *, device="cpu"):
         "value": torch.zeros(1, 1, head_dim, 128, device=device, dtype=torch.int8),
         "value_scale_multiplier": torch.ones(1, 1, 2, 1, device=device),
         "value_mean": torch.zeros(1, 1, 2, head_dim, device=device, dtype=torch.bfloat16),
-        "ratio_profile": _SparsePiperRatioProfile(_normalize_head_keep_ratios((0.5,))),
+        "ratio_profile": _contracts._SparsePiperRatioProfile(_normalize_head_keep_ratios((0.5,))),
         "sparse_key_blocks": 2,
         "logical_sequence_length": 128,
         "routing_mode": _contracts._MINMAX_ROUTING,
@@ -730,7 +723,7 @@ def test_quantized_orchestration_uses_shared_state_and_selected_launcher(monkeyp
         arguments.update(coarse_scale=0.1, coarse_key_blocks=2)
     launch = Mock()
     select = Mock(
-        return_value=AttentionBackend(
+        return_value=_contracts.AttentionBackend(
             value_format=ValueFormat.TRANSPOSED,
             prepare=Mock(),
             bind=lambda context: _bind_mock(context, launch),
@@ -765,7 +758,9 @@ def test_quantized_orchestration_uses_shared_state_and_selected_launcher(monkeyp
 def test_backend_context_binding_is_once_per_context_not_per_query(monkeypatch):
     launch = Mock()
     bind = Mock(side_effect=lambda context: _bind_mock(context, launch))
-    backend = AttentionBackend(value_format=ValueFormat.TRANSPOSED, prepare=Mock(), bind=bind)
+    backend = _contracts.AttentionBackend(
+        value_format=ValueFormat.TRANSPOSED, prepare=Mock(), bind=bind
+    )
     select = Mock(return_value=backend)
     monkeypatch.setattr(_backend, "select_attention_backend", select)
     arguments = _quantized_context_arguments()
@@ -861,7 +856,7 @@ def test_context_requires_the_consumers_value_storage(monkeypatch, value_format,
         value = value.transpose(-1, -2).contiguous().transpose(-1, -2)
     arguments["value"] = value
     bind = Mock(side_effect=lambda context: Mock(context=context))
-    backend = AttentionBackend(value_format=value_format, prepare=Mock(), bind=bind)
+    backend = _contracts.AttentionBackend(value_format=value_format, prepare=Mock(), bind=bind)
     monkeypatch.setattr(_backend, "select_attention_backend", lambda query: backend)
     if defect is not None:
         with pytest.raises(ValueError, match=r"V must use|contiguous"):
@@ -894,7 +889,9 @@ def test_context_rejects_invalid_storage_before_binding(monkeypatch, defect, mes
     else:
         arguments["value_scale_multiplier"] = torch.ones(1, 1, 2, 2)
     bind = Mock(side_effect=AssertionError("invalid storage reached binding"))
-    backend = AttentionBackend(value_format=ValueFormat.TRANSPOSED, prepare=Mock(), bind=bind)
+    backend = _contracts.AttentionBackend(
+        value_format=ValueFormat.TRANSPOSED, prepare=Mock(), bind=bind
+    )
     monkeypatch.setattr(_backend, "select_attention_backend", lambda query: backend)
     with pytest.raises(ValueError, match=message):
         _quantized_dispatch._prepare_quantized_sparse_piper_context(**arguments)
@@ -940,7 +937,9 @@ def test_tma_reuses_context_descriptors_across_query_windows(monkeypatch):
 def test_backend_rejects_mismatched_producer_format_before_binding():
     prepared = _prepared_attention(128, 1)
     bind = Mock(side_effect=AssertionError("incompatible context reached backend"))
-    backend = AttentionBackend(value_format=ValueFormat.AMD_WMMA, prepare=Mock(), bind=bind)
+    backend = _contracts.AttentionBackend(
+        value_format=ValueFormat.AMD_WMMA, prepare=Mock(), bind=bind
+    )
     with pytest.raises(ValueError, match="requires AMD_WMMA"):
         backend.bind_context(prepared.context)
     bind.assert_not_called()
@@ -1071,16 +1070,14 @@ from piper_kernels.attention.sparse_piper_attention import (
     _contracts,
     _prepared,
     _quantized_dispatch,
-    _routes,
     _routing,
-    _summaries,
     dispatch,
 )
 from piper_kernels._triton.targets import AcceleratorTarget
 assert all(
     module is not None
     for module in (
-        dispatch, _quantized_dispatch, _routes, _routing, _summaries, _prepared, _contracts
+        dispatch, _quantized_dispatch, _routing, _prepared, _contracts
     )
 )
 # Shared orchestration imports without Triton or any vendor kernel modules.

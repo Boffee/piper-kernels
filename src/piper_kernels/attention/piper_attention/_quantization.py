@@ -25,15 +25,11 @@ Numerical boundaries:
 # Python call signature.
 # pyright: reportCallIssue=false
 
-from collections.abc import Callable, Mapping
-from typing import Any
-
 import torch
 import triton
 import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.piper.triton import pack_amd_wmma_token
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
@@ -149,9 +145,7 @@ def _quantize_key_k1024_body(
         "key_length",
         "storage_key_length",
         "scale_groups",
-        "chunk_count",
         "num_slots",
-        "heads",
     ]
 )
 def _quantize_key_k1024_kernel(
@@ -163,7 +157,6 @@ def _quantize_key_k1024_kernel(
     key_length,
     storage_key_length,
     scale_groups,
-    chunk_count,  # noqa: ARG001 - Triton launch signature
     num_slots,
     stride_kb,
     stride_kh,
@@ -177,7 +170,6 @@ def _quantize_key_k1024_kernel(
     stride_ch,
     grouped_qk: tl.constexpr,
     scatter_slots: tl.constexpr,
-    heads,  # noqa: ARG001 - Triton launch signature
     head_dim: tl.constexpr,
     has_key_lengths: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
@@ -320,7 +312,6 @@ def _quantize_value_k1024_body(
         "storage_key_length",
         "meta_storage_length",
         "num_slots",
-        "heads",
         "stride_od",
     ]
 )
@@ -351,7 +342,6 @@ def _quantize_value_k1024_kernel(
     pack_wmma: tl.constexpr,
     tile_layout: tl.constexpr,
     scatter_slots: tl.constexpr,
-    heads,  # noqa: ARG001 - Triton launch signature
     head_dim: tl.constexpr,
     has_key_lengths: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
@@ -460,7 +450,6 @@ def prepare_chunk_centered_key(
             key_length,
             storage_key_length,
             key_scale.shape[2],
-            chunk_count,
             0,
             stride_kb,
             stride_kh,
@@ -474,7 +463,6 @@ def prepare_chunk_centered_key(
             stride_ch,
             grouped_qk=grouped,
             scatter_slots=False,
-            heads=heads,
             head_dim=head_dim,
             has_key_lengths=key_lengths is not None,
             num_warps=4,
@@ -564,7 +552,6 @@ def prepare_chunk_centered_value(
             pack_wmma=pack_wmma,
             tile_layout=use_tile_layout,
             scatter_slots=False,
-            heads=heads,
             head_dim=head_dim,
             has_key_lengths=key_lengths is not None,
             num_warps=_value_quantize_num_warps(
@@ -624,7 +611,6 @@ def freeze_kv_chunks_triton(
             CENTER_CHUNK,
             CENTER_CHUNK,
             key_scale.shape[2],
-            1,
             num_slots,
             k_stride0,
             k_stride1,
@@ -638,7 +624,6 @@ def freeze_kv_chunks_triton(
             key_center_s1,
             grouped_qk=grouped_qk,
             scatter_slots=True,
-            heads=kv_heads,
             head_dim=head_dim,
             num_warps=4,
         )
@@ -669,267 +654,6 @@ def freeze_kv_chunks_triton(
             pack_wmma=pack_wmma,
             tile_layout=True,
             scatter_slots=True,
-            heads=kv_heads,
             head_dim=head_dim,
             num_warps=4,
         )
-
-
-def _div16_attrs(
-    arg_names: list[str], div16_names: frozenset[str]
-) -> dict[tuple[int, ...], list[list[object]]]:
-    return {
-        (idx,): [["tt.divisibility", 16]]
-        for idx, name in enumerate(arg_names)
-        if name in div16_names
-    }
-
-
-def compile_pointer_attrs(
-    arg_names: list[str],
-    signature: dict[str, str],
-    *,
-    div16_names: frozenset[str] = frozenset(),
-    all_strides_div16: bool = False,
-    pointer_range_32: bool = True,
-) -> dict[tuple[int, ...], list[list[object]]]:
-    """Attach live pointer divisibility/range attrs and selected stride attrs."""
-    ptr_attrs: list[list[object]] = [["tt.divisibility", 16]]
-    if pointer_range_32:
-        ptr_attrs.append(["tt.pointer_range", 32])
-    attrs: dict[tuple[int, ...], list[list[object]]] = {}
-    for idx, name in enumerate(arg_names):
-        ty = signature.get(name)
-        if isinstance(ty, str) and ty.startswith("*"):
-            attrs[(idx,)] = list(ptr_attrs)
-        elif ty is not None and (
-            name in div16_names or (all_strides_div16 and name.startswith("stride_"))
-        ):
-            attrs[(idx,)] = [["tt.divisibility", 16]]
-    return attrs
-
-
-POOL_SLOT_STRIDE_NAMES: tuple[str, ...] = (
-    "stride_ki_s",
-    "stride_ks_s",
-    "stride_kc_s",
-    "stride_vi_s",
-    "stride_vs_s",
-    "stride_vm_s",
-)
-
-
-def validate_kv_compile_args(dtype: torch.dtype, head_dim: int) -> str:
-    """Validate offline KV compile dtype/head_dim and return the Triton pointer dtype stem."""
-    if dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"dtype must be float16 or bfloat16, got {dtype}")
-    if head_dim not in (64, 128):
-        raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
-    return "bf16" if dtype is torch.bfloat16 else "fp16"
-
-
-def frozen_pool_pointer_signature(triton_dtype: str, *, wide_pool: bool = False) -> dict[str, str]:
-    """Return the shared frozen-pool prefill pointer signature (plus i64 slot strides)."""
-    sig = {
-        "query_ptr": "*i8",
-        "query_scale_ptr": "*fp32",
-        "key_int8_ptr": "*i8",
-        "key_scale_ptr": "*fp32",
-        "key_center_ptr": "*fp32",
-        "value_int8_ptr": "*i8",
-        "value_scale_ptr": "*fp32",
-        "value_mean_ptr": "*fp32",
-        "chunk_to_slot_ptr": "*i32",
-        "num_chunks_ptr": "*i32",
-        "output_ptr": f"*{triton_dtype}",
-        "lse_ptr": "*fp32",
-    }
-    if wide_pool:
-        sig.update(dict.fromkeys(POOL_SLOT_STRIDE_NAMES, "i64"))
-    return sig
-
-
-def build_kernel_source(
-    kernel: Any,
-    *,
-    constants: dict[str, object],
-    overrides: dict[str, str],
-    attrs: Mapping[tuple[int, ...], object] | None = None,
-    gluon: bool = False,
-    div16_names: frozenset[str] = frozenset(),
-    all_strides_div16: bool = False,
-    pointer_range_32: bool = True,
-) -> object:
-    """Construct a Triton ASTSource or GluonASTSource with i32 defaults and pointer attrs."""
-    arg_names: list[str] = list(kernel.arg_names)
-    sig: dict[str, str] = {name: "i32" for name in arg_names if name not in constants}
-    sig.update(overrides)
-    resolved_attrs: Any = (
-        compile_pointer_attrs(
-            arg_names,
-            sig,
-            div16_names=div16_names,
-            all_strides_div16=all_strides_div16,
-            pointer_range_32=pointer_range_32,
-        )
-        if attrs is None
-        else attrs
-    )
-    if gluon:
-        from triton.experimental.gluon._runtime import GluonASTSource  # noqa: PLC0415
-
-        return GluonASTSource(kernel, sig, constexprs=constants, attrs=resolved_attrs)
-    from triton.compiler import ASTSource  # noqa: PLC0415
-
-    return ASTSource(kernel, sig, constexprs=constants, attrs=resolved_attrs)
-
-
-_KEY_DIV16_BASE = frozenset(
-    {
-        "output_ptr",
-        "scale_ptr",
-        "center_ptr",
-        "stride_ob",
-        "stride_oh",
-        "stride_on",
-        "stride_ch",
-    }
-)
-_VALUE_DIV16_BASE = frozenset(
-    {
-        "output_ptr",
-        "scale_multiplier_ptr",
-        "log_scale_ptr",
-        "value_mean_ptr",
-        "stride_ob",
-        "stride_oh",
-        "stride_mh",
-        "stride_ch",
-    }
-)
-
-
-def _compile_quantize_pair(
-    target: object,
-    *,
-    dtype: torch.dtype,
-    head_dim: int,
-    scatter_slots: bool,
-    has_key_lengths: bool,
-    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
-) -> tuple[object, object]:
-    triton_dtype = validate_kv_compile_args(dtype, head_dim)
-
-    from . import _backend  # noqa: PLC0415 - avoid backend/triton import cycle
-
-    accel = AcceleratorTarget.from_compiler_target(target)
-    _, grouped_qk, pack_wmma = _backend.kv_chunk_layout(accel)
-
-    key_constants: dict[str, object] = {
-        "grouped_qk": grouped_qk,
-        "scatter_slots": scatter_slots,
-        "head_dim": head_dim,
-        "has_key_lengths": has_key_lengths,
-    }
-    key_overrides = {
-        "key_ptr": f"*{triton_dtype}",
-        "output_ptr": "*i8",
-        "scale_ptr": "*fp32",
-        "center_ptr": "*fp32",
-        "slot_ids_ptr": "*i32",
-    }
-    key_source = build_kernel_source(
-        _quantize_key_k1024_kernel,
-        constants=key_constants,
-        overrides=key_overrides,
-        attrs=(
-            _div16_attrs(_quantize_key_k1024_kernel.arg_names, _KEY_DIV16_BASE | {"stride_sh"})
-            if scatter_slots
-            else None
-        ),
-        div16_names=_KEY_DIV16_BASE | {"stride_cb", "stride_kb", "stride_kh", "stride_kn"},
-    )
-
-    store_log_scale = pack_wmma and not scatter_slots
-    scale_by_p_range = pack_wmma and not scatter_slots
-    use_tile_layout = True
-    value_constants: dict[str, object] = {
-        "stride_ok": 1,
-        "store_log_scale": store_log_scale,
-        "scale_by_p_range": scale_by_p_range,
-        "pack_wmma": pack_wmma,
-        "tile_layout": use_tile_layout,
-        "scatter_slots": scatter_slots,
-        "head_dim": head_dim,
-        "has_key_lengths": has_key_lengths,
-    }
-    value_overrides = {
-        "value_ptr": f"*{triton_dtype}",
-        "output_ptr": "*i8",
-        "scale_multiplier_ptr": "*fp32",
-        "log_scale_ptr": "*fp32",
-        "value_mean_ptr": "*fp32",
-        "slot_ids_ptr": "*i32",
-    }
-    value_source = build_kernel_source(
-        _quantize_value_k1024_kernel,
-        constants=value_constants,
-        overrides=value_overrides,
-        attrs=(
-            _div16_attrs(_quantize_value_k1024_kernel.arg_names, _VALUE_DIV16_BASE)
-            if scatter_slots
-            else None
-        ),
-        div16_names=_VALUE_DIV16_BASE
-        | {"stride_mb", "stride_cb", "stride_vb", "stride_vh", "stride_vn"},
-    )
-
-    value_options: dict[str, object] = {
-        "num_warps": _value_quantize_num_warps(
-            head_dim,
-            tile_layout=use_tile_layout,
-            pack_wmma=pack_wmma,
-            has_key_lengths=has_key_lengths,
-        )
-    }
-    compiler = triton.compile if compile_fn is None else compile_fn
-    return (
-        compiler(key_source, target, {"num_warps": 4}),
-        compiler(value_source, target, value_options),
-    )
-
-
-def compile_kv_freeze_kernels(
-    target: object,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-    head_dim: int = 128,
-    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
-) -> tuple[object, object]:
-    """Offline-compile K1024 and V1024 slot-scatter freeze kernels for ``target``."""
-    return _compile_quantize_pair(
-        target,
-        dtype=dtype,
-        head_dim=head_dim,
-        scatter_slots=True,
-        has_key_lengths=False,
-        compile_fn=compile_fn,
-    )
-
-
-def compile_kv_tail_quantize_kernels(
-    target: object,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-    head_dim: int = 128,
-    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
-) -> tuple[object, object]:
-    """Offline-compile K1024 and V1024 ragged tail quantization kernels for ``target``."""
-    return _compile_quantize_pair(
-        target,
-        dtype=dtype,
-        head_dim=head_dim,
-        scatter_slots=False,
-        has_key_lengths=True,
-        compile_fn=compile_fn,
-    )

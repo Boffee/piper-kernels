@@ -100,7 +100,7 @@ def _refill_(
     if weight.high_first:
         encoded_qdata = _layout.swap_packed_pairs(encoded_qdata)
     weight.qdata.copy_(encoded_qdata)
-    weight.scale.copy_(encoded.scale)
+    weight.scale.copy_(encoded.scale.view(weight.scale.shape))
     if weight.per_tensor_scale is not None:
         assert encoded.per_tensor_scale is not None
         weight.per_tensor_scale.copy_(encoded.per_tensor_scale)

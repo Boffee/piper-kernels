@@ -15,7 +15,6 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, reference
 from piper_kernels.linear.convrot.int8._amd import policy
-from piper_kernels.linear.convrot.int8._amd import triton as amd_triton
 from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -149,12 +148,6 @@ def test_gfx1201_short_batch_matmul_schedules():
     assert policy.select_execution_plan(
         gfx1200, in_features=5376, rows=32, out_features=5376
     ) == policy.select_execution_plan(gfx1200, in_features=5376)
-
-
-def test_optional_amd_compiler_option_compatibility(monkeypatch):
-    target = AcceleratorTarget("hip", "gfx1201")
-    monkeypatch.setattr(amd_triton.importlib, "import_module", Mock(return_value=object()))
-    assert amd_triton._amd_matmul_compiler_options(target) == {}
 
 
 def test_gfx1201_accumulator_seed_fits_every_int8_partial_sum():

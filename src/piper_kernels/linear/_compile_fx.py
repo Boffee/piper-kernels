@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import operator
+from collections.abc import Mapping, Sequence
 from typing import cast
 
 import torch
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.fx.node import Argument
 
 _aten = torch.ops.aten
@@ -186,6 +188,73 @@ def ordered_tuple_output_producer(
     return producer
 
 
+def argument_metadata(value: Argument) -> object:
+    """Resolve a node's ``val`` metadata or return a non-node argument unchanged."""
+    return value.meta.get("val") if isinstance(value, torch.fx.Node) else value
+
+
+def node_tensor_metadata(value: object) -> torch.Tensor | None:
+    """Return post-AOT tensor metadata when ``value`` is a metadata-bearing FX node."""
+    if not isinstance(value, torch.fx.Node):
+        return None
+    metadata = value.meta.get("val")
+    return metadata if isinstance(metadata, torch.Tensor) else None
+
+
+def require_node_metadata(node: torch.fx.Node) -> torch.Tensor | int | torch.SymInt:
+    """Return a node's tensor or integer metadata, raising ``ValueError`` if missing."""
+    value = node.meta.get("val")
+    if not isinstance(value, (torch.Tensor, int, torch.SymInt)):
+        raise ValueError("missing tensor or size metadata")
+    return value
+
+
+def same_dimension(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
+    """Compare two static or symbolic dimensions without adding shape guards."""
+    return bool(statically_known_true(left == right))
+
+
+def same_shape(
+    left: Sequence[int | torch.SymInt],
+    right: Sequence[int | torch.SymInt],
+) -> bool:
+    """Compare two static or symbolic shapes without adding shape guards."""
+    return len(left) == len(right) and all(
+        same_dimension(a, b) for a, b in zip(left, right, strict=True)
+    )
+
+
+def call_in_schema_order(
+    graph: torch.fx.Graph,
+    target: torch._ops.OpOverload,
+    values: Mapping[str, Argument],
+    *,
+    compute_val: bool = False,
+) -> torch.fx.Node:
+    """Emit ``target`` placing arguments by schema order and kwarg-only semantics.
+
+    Arguments go positionally in schema order until an omitted argument or kwarg-only
+    parameter forces keyword placement. With ``compute_val=True``, evaluates ``target``
+    on argument metadata values and stores the fake result on ``node.meta["val"]``.
+    """
+    args: list[Argument] = []
+    kwargs: dict[str, Argument] = {}
+    for index, argument in enumerate(target._schema.arguments):
+        if argument.name not in values:
+            continue
+        if argument.kwarg_only or len(args) < index:
+            kwargs[argument.name] = values[argument.name]
+        else:
+            args.append(values[argument.name])
+    node = graph.call_function(target, tuple(args), kwargs)
+    if compute_val:
+        node.meta["val"] = target(
+            *(argument_metadata(value) for value in args),
+            **{name: argument_metadata(value) for name, value in kwargs.items()},
+        )
+    return node
+
+
 def coalesce_input_casts(graph: torch.fx.Graph) -> bool:
     """Share identical input dtype casts consumed exclusively as semantic linear inputs.
 
@@ -223,16 +292,22 @@ def coalesce_input_casts(graph: torch.fx.Graph) -> bool:
 
 __all__ = [
     "SEMANTIC_LINEAR_NAMES",
+    "argument_metadata",
     "binary_args",
     "bind_arguments",
     "bind_call",
+    "call_in_schema_order",
     "coalesce_input_casts",
     "convert_dtype",
     "emit_tuple_result",
     "is_scalar",
     "match_node_and_scalar",
+    "node_tensor_metadata",
     "ordered_tuple_output_producer",
+    "require_node_metadata",
     "same_argument",
+    "same_dimension",
+    "same_shape",
     "schema_name",
     "unary_arg",
 ]

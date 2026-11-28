@@ -14,8 +14,8 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
     _MINMAX_ROUTING,
 )
-from piper_kernels.attention.sparse_piper_attention._routing import routing_scores
-from piper_kernels.attention.sparse_piper_attention._summaries import (
+from piper_kernels.attention.sparse_piper_attention._routing import (
+    routing_scores,
     sequence_block_summaries,
 )
 

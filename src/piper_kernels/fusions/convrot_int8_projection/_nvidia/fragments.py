@@ -31,9 +31,11 @@ from triton.experimental.gluon.language.nvidia.hopper import tma
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 from triton.language.extra import libdevice
 
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import (
     SIGNED_HADAMARD_MASK,
 )
+from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as linear_gluon
 from piper_kernels.linear.convrot.int8._nvidia import gluon_tma
 from piper_kernels.linear.convrot.int8._nvidia.gluon_async_copy import (
     _accumulate as _accumulate_tiles,
@@ -46,6 +48,7 @@ from .policy import (
     GLUON_NUM_STAGES,
     GLUON_NUM_WARPS,
     NvidiaExecutionPlan,
+    ProjectionOperation,
 )
 
 HEAD_DIM = 128
@@ -53,6 +56,37 @@ BLOCK_M = GLUON_BLOCK_M
 _BLOCK_K = GLUON_BLOCK_K
 _NUM_STAGES = GLUON_NUM_STAGES
 NUM_WARPS = GLUON_NUM_WARPS
+
+
+def resolve_execution_plan(
+    select_plan: Callable[..., NvidiaExecutionPlan],
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    *,
+    operation: ProjectionOperation,
+    head_dim: int,
+    rotary_dim: int = 0,
+    target: AcceleratorTarget | None = None,
+    execution_plan: NvidiaExecutionPlan | None = None,
+) -> NvidiaExecutionPlan:
+    """Return ``execution_plan`` or resolve an NVIDIA Gluon/Triton plan from operands."""
+    if execution_plan is not None:
+        return execution_plan
+    resolved_target = (
+        AcceleratorTarget.from_device(input_qdata.device) if target is None else target
+    )
+    return select_plan(
+        resolved_target,
+        operation=operation,
+        input_features=input_qdata.shape[2],
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        operands_aligned=(
+            linear_gluon.operands_aligned(input_qdata, weight_qdata)
+            and input_qdata.is_contiguous()
+            and weight_qdata.is_contiguous()
+        ),
+    )
 
 
 def resolve_operands(
@@ -495,9 +529,14 @@ def store_value_codes(
 
 
 def launch_row_blocks(
-    sequence_rows: int, launch: Callable[..., None], *, mask_full_tiles: bool
+    sequence_rows: int,
+    launch: Callable[..., None],
+    *,
+    mask_full_tiles: bool,
+    start_row_block: int = 0,
+    num_row_blocks: int | None = None,
 ) -> None:
-    """Launch full 128-row tiles, then one masked tile for the remainder.
+    """Launch full 128-row tiles (or a validated partial range), then one masked tail.
 
     ``launch(row_blocks, row_block_offset, mask_rows=...)`` runs one grid. Callers mask
     full tiles too when their validity can end inside a tile, as block lengths do.
@@ -506,6 +545,9 @@ def launch_row_blocks(
     do, measured 1-3% slower for the sparse projections.
     """
     for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
-        sequence_rows, BLOCK_M
+        sequence_rows,
+        BLOCK_M,
+        start_row_block=start_row_block,
+        num_row_blocks=num_row_blocks,
     ):
         launch(row_blocks, row_block_offset, mask_rows=mask_full_tiles or not aligned_rows)

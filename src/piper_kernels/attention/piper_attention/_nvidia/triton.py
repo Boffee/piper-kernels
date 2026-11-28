@@ -241,6 +241,105 @@ def _fold_chunk_value_mean(
 
 
 @triton.jit
+def _safe_softmax_probabilities(
+    scores,
+    safe_block_max,
+    value_log_scale,
+    active_mask=None,
+):
+    """Compute clamped base-2 probabilities without exp2 overflow on tiny V scales."""
+    score_delta = scores - safe_block_max[:, None]
+    max_delta = tl.minimum(-value_log_scale[None, :], 100.0)
+    probabilities = tl.exp2(tl.where(score_delta > max_delta, max_delta, score_delta))
+    if active_mask is not None:
+        probabilities = tl.where(active_mask, probabilities, 0.0)
+    return probabilities
+
+
+@triton.jit
+def _quantize_probabilities_u8(
+    probabilities,
+    value_scale_multiplier,
+    use_packed_probability_conversion: tl.constexpr,
+    active_mask=None,
+):
+    """Scale FP32 probabilities by per-key V multipliers and round to UINT8 codes."""
+    scaled = probabilities * value_scale_multiplier[None, :]
+    if active_mask is not None:
+        scaled = tl.where(active_mask, scaled, 0.0)
+    probability_values = scaled + 0.5
+    if use_packed_probability_conversion:
+        return _ptx_float32_to_uint8x4(probability_values)
+    else:
+        probability_codes = tl.minimum(_P_UINT8_RANGE, probability_values).to(tl.int32)
+        return probability_codes.to(tl.uint8)
+
+
+@triton.jit
+def _accumulate_pv_tile(
+    numerator,
+    probability_uint8,
+    value_tile,
+    old_weight,
+    current_weight,
+    split_pv_head_dim: tl.constexpr,
+):
+    """Update single or split-head-dim FP32 PV accumulators from UINT8xINT8 MMA."""
+    if split_pv_head_dim:
+        accumulator_low, accumulator_high = numerator
+        value_low, value_high = value_tile
+        partial_low = uint8_int8_dot(probability_uint8, value_low)
+        partial_high = uint8_int8_dot(probability_uint8, value_high)
+        accumulator_low = (
+            accumulator_low * old_weight[:, None]
+            + partial_low.to(tl.float32) * current_weight[:, None]
+        )
+        accumulator_high = (
+            accumulator_high * old_weight[:, None]
+            + partial_high.to(tl.float32) * current_weight[:, None]
+        )
+        return (accumulator_low, accumulator_high)
+    else:
+        partial = uint8_int8_dot(probability_uint8, value_tile)
+        return numerator * old_weight[:, None] + partial.to(tl.float32) * current_weight[:, None]
+
+
+@triton.jit
+def _store_pv_output(
+    output_base,
+    numerator,
+    denominator_code_units,
+    offsets_d,
+    offsets_vd,
+    valid_queries,
+    has_any,
+    split_pv_head_dim: tl.constexpr,
+    head_dim: tl.constexpr,
+    mask_empty: tl.constexpr,
+):
+    """Normalize single or split-head-dim PV accumulators and store output rows."""
+    if split_pv_head_dim:
+        half_head_dim: tl.constexpr = head_dim // 2
+        accumulator_low, accumulator_high = numerator
+        output_low = accumulator_low / denominator_code_units
+        output_high = accumulator_high / denominator_code_units
+        if mask_empty:
+            output_low = tl.where(has_any[:, None], output_low, 0.0)
+            output_high = tl.where(has_any[:, None], output_high, 0.0)
+        tl.store(output_base + offsets_vd[None, :], output_low, mask=valid_queries[:, None])
+        tl.store(
+            output_base + half_head_dim + offsets_vd[None, :],
+            output_high,
+            mask=valid_queries[:, None],
+        )
+    else:
+        output = numerator / denominator_code_units
+        if mask_empty:
+            output = tl.where(has_any[:, None], output, 0.0)
+        tl.store(output_base + offsets_d[None, :], output, mask=valid_queries[:, None])
+
+
+@triton.jit
 def _advance_tile_max(running_max, running_bias, block_max, k_bias, valid_queries):
     """Update winner-frame running maximum across chunks without round-tripping."""
     has_block = block_max != -float("inf")
@@ -397,10 +496,11 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
                 valid_queries,
             )
         )
-        probabilities = tl.where(
-            (valid_queries & has_block)[:, None] & valid_keys,
-            tl.exp2(scores - safe_block_max[:, None]),  # pyright: ignore[reportArgumentType]
-            0.0,
+        probabilities = _safe_softmax_probabilities(
+            scores,
+            safe_block_max,
+            value_log_scale,
+            active_mask=(valid_queries & has_block)[:, None] & valid_keys,
         )
         row_sum = tl.where(has_block, tl.sum(probabilities, axis=1) * current_weight, 0.0)
     else:
@@ -427,18 +527,13 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             mask=current_n < key_length,
             other=0.0,
         )
-    probability_values = probabilities * value_scale_multiplier[None, :] + 0.5  # pyright: ignore[reportPossiblyUnboundVariable]
-    if use_packed_probability_conversion:
-        probability_uint8 = _ptx_float32_to_uint8x4(probability_values)
-    else:
-        probability_codes = tl.minimum(
-            _P_UINT8_RANGE,
-            probability_values,
-        ).to(tl.int32)
-        probability_uint8 = probability_codes.to(tl.uint8)
+    probability_uint8 = _quantize_probabilities_u8(
+        probabilities,
+        value_scale_multiplier,  # pyright: ignore[reportPossiblyUnboundVariable]
+        use_packed_probability_conversion=use_packed_probability_conversion,
+    )
 
     if split_pv_head_dim:
-        accumulator_low, accumulator_high = numerator
         half_head_dim: tl.constexpr = head_dim // 2
         offsets_vd = tl.arange(0, half_head_dim)
         value_low = _load_value_tile(
@@ -469,19 +564,8 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             use_tensor_descriptors,
             padded_kv=padded_kv,
         )
-        partial_low = uint8_int8_dot(probability_uint8, value_low)
-        partial_high = uint8_int8_dot(probability_uint8, value_high)
-        accumulator_low = (
-            accumulator_low * old_weight[:, None]
-            + partial_low.to(tl.float32) * current_weight[:, None]
-        )
-        accumulator_high = (
-            accumulator_high * old_weight[:, None]
-            + partial_high.to(tl.float32) * current_weight[:, None]
-        )
-        numerator = (accumulator_low, accumulator_high)
+        value_tile = (value_low, value_high)
     else:
-        accumulator = numerator
         value_tile = _load_value_tile(
             value_ptr,
             batch_head,
@@ -496,11 +580,14 @@ def _attention_tile(  # noqa: PLR0912, PLR0915
             use_tensor_descriptors,
             padded_kv=padded_kv,
         )
-        partial = uint8_int8_dot(probability_uint8, value_tile)
-        accumulator = (
-            accumulator * old_weight[:, None] + partial.to(tl.float32) * current_weight[:, None]
-        )
-        numerator = accumulator
+    numerator = _accumulate_pv_tile(
+        numerator,
+        probability_uint8,
+        value_tile,
+        old_weight,
+        current_weight,
+        split_pv_head_dim=split_pv_head_dim,
+    )
     return numerator, denominator, next_max, next_bias, chunk_denom
 
 
@@ -611,12 +698,7 @@ def _attention_chunk(
     query_storage_length,
     query_tile_start,
     kv_batch_head,
-    chunk_idx,
     key_chunks,
-    prefix_start,
-    prefix_stop,
-    boundary_start,
-    boundary_stop,
     global_rows,
     offsets_n,
     offsets_d,
@@ -625,8 +707,11 @@ def _attention_chunk(
     key_length,
     window_left,
     window_right,
-    prefix_mask_keys: tl.constexpr,
-    has_boundary: tl.constexpr,
+    chunk_idx,
+    prefix_start,
+    prefix_stop,
+    boundary_start,
+    boundary_stop,
     window_mode: tl.constexpr,
     grouped_qk: tl.constexpr,
     split_pv_head_dim: tl.constexpr,
@@ -641,6 +726,8 @@ def _attention_chunk(
     loop_licm: tl.constexpr,
     safe_softmax: tl.constexpr,
     padded_kv: tl.constexpr,
+    prefix_mask_keys: tl.constexpr,
+    has_boundary: tl.constexpr,
 ):
     """Evaluate one K1024+V1024 chunk: compute K bias, run K64 tiles, and fold V mean."""
     k_bias = _compute_chunk_k_bias(
@@ -868,6 +955,51 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
         end_n = tl.minimum(key_length, global_query_start + (query_block + 1) * block_m)
 
     query_tile_start = query_start + query_block * block_m
+    chunk_inputs = (
+        query,
+        raw_query_ptr,
+        query_scale,
+        key_ptr,
+        value_ptr,
+        key_scale_ptr,
+        key_center_ptr,
+        value_scale_multiplier_ptr,
+        value_log_scale_ptr,
+        value_mean_ptr,
+    )
+    chunk_meta = (
+        batch_head,
+        query_storage_length,
+        query_tile_start,
+        kv_batch_head,
+        key_chunks,
+        global_rows,
+        offsets_n,
+        offsets_d,
+        offsets_vd,
+        valid_queries,
+        key_length,
+        window_left,
+        window_right,
+    )
+    chunk_options = tl.constexpr(
+        (
+            window_mode,
+            grouped_qk,
+            split_pv_head_dim,
+            unmasked_query_tiles,
+            head_dim,
+            block_m,
+            block_n,
+            use_tensor_descriptors,
+            use_packed_probability_conversion,
+            derive_value_log_bound,
+            loop_num_stages,
+            loop_licm,
+            safe_softmax,
+            padded_kv,
+        )
+    )
 
     if is_causal_mode and optimize_causal_traversal:
         # Chunks strictly before the diagonal run fully unmasked; chunks from
@@ -881,54 +1013,20 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
             chunk_idx = chunk_start // _TL_CENTER_CHUNK
             chunk_end = chunk_start + _TL_CENTER_CHUNK
             numerator, denominator, running_max, running_bias = _attention_chunk(
-                query,
-                raw_query_ptr,
-                query_scale,
-                key_ptr,
-                value_ptr,
-                key_scale_ptr,
-                key_center_ptr,
-                value_scale_multiplier_ptr,
-                value_log_scale_ptr,
-                value_mean_ptr,
+                *chunk_inputs,
                 numerator,
                 denominator,
                 running_max,
                 running_bias,
-                batch_head,
-                query_storage_length,
-                query_tile_start,
-                kv_batch_head,
+                *chunk_meta,
                 chunk_idx,
-                key_chunks,
                 chunk_start,
                 chunk_end,
                 chunk_end,
                 chunk_end,
-                global_rows,
-                offsets_n,
-                offsets_d,
-                offsets_vd,
-                valid_queries,
-                key_length,
-                window_left,
-                window_right,
+                *chunk_options,
                 prefix_mask_keys=tl.constexpr(False),
                 has_boundary=tl.constexpr(False),
-                window_mode=window_mode,
-                grouped_qk=grouped_qk,
-                split_pv_head_dim=split_pv_head_dim,
-                unmasked_query_tiles=unmasked_query_tiles,
-                head_dim=head_dim,
-                block_m=block_m,
-                block_n=block_n,
-                use_tensor_descriptors=use_tensor_descriptors,
-                use_packed_probability_conversion=use_packed_probability_conversion,
-                derive_value_log_bound=derive_value_log_bound,
-                loop_num_stages=loop_num_stages,
-                loop_licm=loop_licm,
-                safe_softmax=safe_softmax,
-                padded_kv=padded_kv,
             )
         for chunk_start in tl.range(mask_free_stop, end_n, _TL_CENTER_CHUNK, disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
             chunk_idx = chunk_start // _TL_CENTER_CHUNK
@@ -936,54 +1034,20 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
             prefix_stop = tl.minimum(chunk_end, prefix_end)
             boundary_start = tl.maximum(chunk_start, prefix_end)
             numerator, denominator, running_max, running_bias = _attention_chunk(
-                query,
-                raw_query_ptr,
-                query_scale,
-                key_ptr,
-                value_ptr,
-                key_scale_ptr,
-                key_center_ptr,
-                value_scale_multiplier_ptr,
-                value_log_scale_ptr,
-                value_mean_ptr,
+                *chunk_inputs,
                 numerator,
                 denominator,
                 running_max,
                 running_bias,
-                batch_head,
-                query_storage_length,
-                query_tile_start,
-                kv_batch_head,
+                *chunk_meta,
                 chunk_idx,
-                key_chunks,
                 chunk_start,
                 prefix_stop,
                 boundary_start,
                 chunk_end,
-                global_rows,
-                offsets_n,
-                offsets_d,
-                offsets_vd,
-                valid_queries,
-                key_length,
-                window_left,
-                window_right,
+                *chunk_options,
                 prefix_mask_keys=tl.constexpr(False),
                 has_boundary=tl.constexpr(True),
-                window_mode=window_mode,
-                grouped_qk=grouped_qk,
-                split_pv_head_dim=split_pv_head_dim,
-                unmasked_query_tiles=unmasked_query_tiles,
-                head_dim=head_dim,
-                block_m=block_m,
-                block_n=block_n,
-                use_tensor_descriptors=use_tensor_descriptors,
-                use_packed_probability_conversion=use_packed_probability_conversion,
-                derive_value_log_bound=derive_value_log_bound,
-                loop_num_stages=loop_num_stages,
-                loop_licm=loop_licm,
-                safe_softmax=safe_softmax,
-                padded_kv=padded_kv,
             )
     elif is_windowed_mode:
         eff_wl = tl.minimum(
@@ -1009,108 +1073,40 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 chunk_lo = tl.maximum(chunk_start, first_tile_start)
                 chunk_hi = tl.minimum(chunk_start + _TL_CENTER_CHUNK, vis_k_end32)
                 numerator, denominator, running_max, running_bias = _attention_chunk(
-                    query,
-                    raw_query_ptr,
-                    query_scale,
-                    key_ptr,
-                    value_ptr,
-                    key_scale_ptr,
-                    key_center_ptr,
-                    value_scale_multiplier_ptr,
-                    value_log_scale_ptr,
-                    value_mean_ptr,
+                    *chunk_inputs,
                     numerator,
                     denominator,
                     running_max,
                     running_bias,
-                    batch_head,
-                    query_storage_length,
-                    query_tile_start,
-                    kv_batch_head,
+                    *chunk_meta,
                     chunk_idx,
-                    key_chunks,
                     chunk_lo,
                     chunk_hi,
                     chunk_hi,
                     chunk_hi,
-                    global_rows,
-                    offsets_n,
-                    offsets_d,
-                    offsets_vd,
-                    valid_queries,
-                    key_length,
-                    window_left,
-                    window_right,
+                    *chunk_options,
                     prefix_mask_keys=tl.constexpr(True),
                     has_boundary=tl.constexpr(False),
-                    window_mode=window_mode,
-                    grouped_qk=grouped_qk,
-                    split_pv_head_dim=split_pv_head_dim,
-                    unmasked_query_tiles=unmasked_query_tiles,
-                    head_dim=head_dim,
-                    block_m=block_m,
-                    block_n=block_n,
-                    use_tensor_descriptors=use_tensor_descriptors,
-                    use_packed_probability_conversion=use_packed_probability_conversion,
-                    derive_value_log_bound=derive_value_log_bound,
-                    loop_num_stages=loop_num_stages,
-                    loop_licm=loop_licm,
-                    safe_softmax=safe_softmax,
-                    padded_kv=padded_kv,
                 )
     else:
         for chunk_start in tl.range(0, end_n, _TL_CENTER_CHUNK, disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
             chunk_idx = chunk_start // _TL_CENTER_CHUNK
             chunk_end = tl.minimum(chunk_start + _TL_CENTER_CHUNK, end_n)
             numerator, denominator, running_max, running_bias = _attention_chunk(
-                query,
-                raw_query_ptr,
-                query_scale,
-                key_ptr,
-                value_ptr,
-                key_scale_ptr,
-                key_center_ptr,
-                value_scale_multiplier_ptr,
-                value_log_scale_ptr,
-                value_mean_ptr,
+                *chunk_inputs,
                 numerator,
                 denominator,
                 running_max,
                 running_bias,
-                batch_head,
-                query_storage_length,
-                query_tile_start,
-                kv_batch_head,
+                *chunk_meta,
                 chunk_idx,
-                key_chunks,
                 chunk_start,
                 chunk_end,
                 chunk_end,
                 chunk_end,
-                global_rows,
-                offsets_n,
-                offsets_d,
-                offsets_vd,
-                valid_queries,
-                key_length,
-                window_left,
-                window_right,
+                *chunk_options,
                 prefix_mask_keys=tl.constexpr(not unmasked_key_tiles),
                 has_boundary=tl.constexpr(False),
-                window_mode=window_mode,
-                grouped_qk=grouped_qk,
-                split_pv_head_dim=split_pv_head_dim,
-                unmasked_query_tiles=unmasked_query_tiles,
-                head_dim=head_dim,
-                block_m=block_m,
-                block_n=block_n,
-                use_tensor_descriptors=use_tensor_descriptors,
-                use_packed_probability_conversion=use_packed_probability_conversion,
-                derive_value_log_bound=derive_value_log_bound,
-                loop_num_stages=loop_num_stages,
-                loop_licm=loop_licm,
-                safe_softmax=safe_softmax,
-                padded_kv=padded_kv,
             )
 
     if safe_softmax:
@@ -1132,6 +1128,7 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
                 mask=valid_queries,
             )
     else:
+        has_any = tl.full((block_m,), True, dtype=tl.int1)
         denominator_safe = tl.maximum(denominator, 1e-30)[:, None]
         denominator_code_units = denominator_safe * _P_UINT8_RANGE
 
@@ -1146,32 +1143,18 @@ def _piper_attention_query_tile(  # noqa: PLR0912, PLR0915
             + head.to(tl.int64) * stride_oh
             + output_rows[:, None].to(tl.int64) * stride_om
         )
-    if split_pv_head_dim:
-        accumulator_low, accumulator_high = numerator
-        output_low = accumulator_low / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
-        output_high = accumulator_high / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
-        if safe_softmax:
-            output_low = tl.where(has_any[:, None], output_low, 0.0)  # pyright: ignore[reportPossiblyUnboundVariable]
-            output_high = tl.where(has_any[:, None], output_high, 0.0)  # pyright: ignore[reportPossiblyUnboundVariable]
-        tl.store(
-            output_base + offsets_vd[None, :],  # pyright: ignore[reportPossiblyUnboundVariable]
-            output_low,
-            mask=valid_queries[:, None],
-        )
-        tl.store(
-            output_base + half_head_dim + offsets_vd[None, :],  # pyright: ignore[reportPossiblyUnboundVariable]
-            output_high,
-            mask=valid_queries[:, None],
-        )
-    else:
-        output = numerator / denominator_code_units  # pyright: ignore[reportPossiblyUnboundVariable]
-        if safe_softmax:
-            output = tl.where(has_any[:, None], output, 0.0)  # pyright: ignore[reportPossiblyUnboundVariable]
-        tl.store(
-            output_base + offsets_d[None, :],
-            output,
-            mask=valid_queries[:, None],
-        )
+    _store_pv_output(
+        output_base,
+        numerator,
+        denominator_code_units,  # pyright: ignore[reportPossiblyUnboundVariable]
+        offsets_d,
+        offsets_vd,
+        valid_queries,
+        has_any,
+        split_pv_head_dim=split_pv_head_dim,
+        head_dim=head_dim,
+        mask_empty=safe_softmax,
+    )
 
 
 @triton.jit(

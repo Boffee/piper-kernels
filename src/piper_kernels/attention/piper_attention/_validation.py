@@ -65,6 +65,142 @@ class PreparedAttention:
     output: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class KVWindowModes:
+    """Resolved frozen-pool and live-tail window modes and sentinel bounds (``-1`` = unlimited)."""
+
+    frozen_mode: WindowMode
+    frozen_left: int
+    frozen_right: int
+    tail_mode: WindowMode
+    tail_left: int
+    tail_right: int
+
+
+@dataclass(frozen=True, slots=True)
+class PoolSlotLayout:
+    """Signed pool views, chunk-map metadata, and zeroed slot/batch strides."""
+
+    key_int8: torch.Tensor
+    value_int8: torch.Tensor
+    chunk_to_slot: torch.Tensor
+    has_chunk_map: bool
+    max_chunks: int
+    stride_ki_s: int
+    stride_ks_s: int
+    stride_kc_s: int
+    stride_vi_s: int
+    stride_vs_s: int
+    stride_vm_s: int
+    stride_cs_b: int
+    stride_cs_c: int
+
+
+@dataclass(frozen=True, slots=True)
+class PrefillKernelOperands:
+    """Typed tensor and stride operands for frozen-pool and quantized-tail prefill kernels."""
+
+    query_int8: torch.Tensor
+    query_scale: torch.Tensor
+    key_int8: torch.Tensor
+    key_scale: torch.Tensor
+    key_center: torch.Tensor
+    value_int8: torch.Tensor
+    value_scale: torch.Tensor
+    value_mean: torch.Tensor
+    chunk_to_slot: torch.Tensor
+    num_chunks: torch.Tensor
+    output: torch.Tensor
+    lse: torch.Tensor
+    seq_q: int
+    query_storage: int
+    q_heads: int
+    num_slots: int
+    max_chunks: int
+    stride_ki_s: int = 0
+    stride_ks_s: int = 0
+    stride_kc_s: int = 0
+    stride_vi_s: int = 0
+    stride_vs_s: int = 0
+    stride_vm_s: int = 0
+    stride_cs_b: int = 0
+    stride_cs_c: int = 1
+
+    def kernel_args(self) -> tuple[object, ...]:
+        """Return positional Triton/Gluon launch arguments in canonical kernel parameter order."""
+        return (
+            self.query_int8,
+            self.query_scale,
+            self.key_int8,
+            self.key_scale,
+            self.key_center,
+            self.value_int8,
+            self.value_scale,
+            self.value_mean,
+            self.chunk_to_slot,
+            self.num_chunks,
+            self.output,
+            self.lse,
+            self.seq_q,
+            self.query_storage,
+            self.q_heads,
+            self.num_slots,
+            self.max_chunks,
+            self.stride_ki_s,
+            self.stride_ks_s,
+            self.stride_kc_s,
+            self.stride_vi_s,
+            self.stride_vs_s,
+            self.stride_vm_s,
+            self.stride_cs_b,
+            self.stride_cs_c,
+            self.output.stride(0),
+            self.output.stride(1),
+            self.output.stride(2),
+            self.lse.stride(0),
+            self.lse.stride(1),
+        )
+
+
+def resolve_window_mode(is_causal: bool, window_mode: WindowMode | None) -> WindowMode:
+    """Return explicit ``window_mode`` or infer ``'causal'``/``'none'`` from ``is_causal``."""
+    return ("causal" if is_causal else "none") if window_mode is None else window_mode
+
+
+def resolve_kv_window_modes(
+    *,
+    is_causal: bool,
+    window_left: int,
+    window_right: int,
+) -> KVWindowModes:
+    """Resolve frozen-pool and live-tail window modes and bounds from decode/prefill args."""
+    has_explicit_window = window_left >= 0 or window_right >= 0
+    eff_left = window_left
+    eff_right = 0 if is_causal else window_right
+    frozen_left = eff_left if has_explicit_window else -1
+    frozen_right = eff_right if has_explicit_window else -1
+    frozen_mode: WindowMode = (
+        "none"
+        if not has_explicit_window
+        else ("causal" if (frozen_left < 0 and frozen_right == 0) else "windowed")
+    )
+    tail_left = eff_left if has_explicit_window else -1
+    tail_right = eff_right if has_explicit_window else (0 if is_causal else -1)
+    tail_mode: WindowMode = (
+        "none"
+        if (tail_left < 0 and tail_right < 0)
+        else ("causal" if (tail_left < 0 and tail_right == 0) else "windowed")
+    )
+    return KVWindowModes(
+        frozen_mode=frozen_mode,
+        frozen_left=frozen_left,
+        frozen_right=frozen_right,
+        tail_mode=tail_mode,
+        tail_left=tail_left,
+        tail_right=tail_right,
+    )
+
+
 def normalize_window_bounds(
     is_causal: bool,
     window_left: int | None,

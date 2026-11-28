@@ -69,9 +69,9 @@ def validate_block_lengths(
     device: torch.device,
     context: str,
     require_contiguous: bool = True,
-    check_values: bool = True,
+    check_values: bool = False,
 ) -> int:
-    """Validate one valid-prefix length per physical K64 block."""
+    """Validate metadata (and optionally value range) for one length per K64 block."""
     if (
         block_lengths.ndim != 1
         or block_lengths.numel() < 1

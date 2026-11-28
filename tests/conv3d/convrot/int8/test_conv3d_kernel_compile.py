@@ -274,6 +274,7 @@ def test_amd_preparation_compiles_without_intermediate_rounding(channels, dtype,
         "group_size": 64,
         "accelerator_backend": "hip",
         "block_m": schedule.block_m,
+        "has_group_norm_silu": fused,
     }
     if fused:
         signature.update(
@@ -288,8 +289,22 @@ def test_amd_preparation_compiles_without_intermediate_rounding(channels, dtype,
                 "channels_per_group": channels // 32,
             }
         )
+    else:
+        constants.update(
+            {
+                "affine_weight_ptr": None,
+                "affine_bias_ptr": None,
+                "mean_ptr": None,
+                "rstd_ptr": None,
+                "affine_weight_stride": 1,
+                "affine_bias_stride": 1,
+                "frames": 1,
+                "groups": 1,
+                "channels_per_group": 1,
+            }
+        )
     source = ASTSource(
-        kernels._prepare_group_norm_silu_kernel if fused else kernels._prepare_channelwise_kernel,
+        kernels._prepare_channelwise_kernel,
         signature,
         constexprs=constants,
     )
@@ -298,3 +313,4 @@ def test_amd_preparation_compiles_without_intermediate_rounding(channels, dtype,
     )
     assert compiled.asm["hsaco"]
     assert "arith.truncf" not in compiled.asm["ttir"]
+    assert ".vgpr_spill_count: 0" in compiled.asm["amdgcn"]

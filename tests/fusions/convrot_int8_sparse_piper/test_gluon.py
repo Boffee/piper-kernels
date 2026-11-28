@@ -690,3 +690,88 @@ def test_sm120_tma_graph_capture_and_replay(operation):
     _launch(gluon, operation, operands, expected, window=(0, sequence), execution_plan=plan)
     for left, right in zip(actual, expected, strict=True):
         assert torch.equal(left.view(torch.uint8), right.view(torch.uint8))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _MMA_V2_AVAILABLE, reason="requires NVIDIA SM80 or newer")
+@pytest.mark.parametrize("operation", ["key", "value"])
+@pytest.mark.parametrize("kernel", ["gluon_tma", "gluon_async_copy"])
+@pytest.mark.parametrize("with_block_lengths", [False, True])
+def test_gluon_partial_row_block_launches_match_full_and_preserve_guards(
+    operation, kernel, with_block_lengths
+):
+    if kernel == "gluon_tma" and not exact_sm120_available():
+        pytest.skip("requires exact NVIDIA SM120")
+    torch.manual_seed(2027)
+    batch, sequence, heads = 2, 512, 3
+    operands = _operands("cuda", batch=batch, sequence=sequence, heads=heads, input_features=256)
+    lengths = (
+        torch.randint(1, 65, (sequence // 64,), device="cuda", dtype=torch.int32)
+        if with_block_lengths
+        else None
+    )
+    bias = torch.randn(heads * 128, device="cuda").bfloat16()
+    plan = gluon.default_execution_plan(
+        operands[0], operands[2], operation=operation, head_dim=128, rotary_dim=96
+    )
+    assert plan.uses_gluon
+    execution_plan = replace(plan, kernel=kernel)
+    assert (
+        gluon.partial_row_block_size(
+            operands[0], operands[2], operation=operation, head_dim=128, rotary_dim=96
+        )
+        == 128
+    )
+
+    expected = _outputs(operation, "cuda", storage=sequence, batch=batch, heads=heads)
+    partial = _outputs(operation, "cuda", storage=sequence, batch=batch, heads=heads)
+    sentinels = tuple(tensor.clone() for tensor in partial)
+    _launch(
+        gluon,
+        operation,
+        operands,
+        expected,
+        block_lengths=lengths,
+        bias=bias,
+        execution_plan=execution_plan,
+    )
+    # Launch only middle blocks [1, 3) (rows [128, 384)) and check guard blocks stay untouched.
+    _launch(
+        gluon,
+        operation,
+        operands,
+        partial,
+        block_lengths=lengths,
+        bias=bias,
+        execution_plan=execution_plan,
+        start_row_block=1,
+        num_row_blocks=2,
+    )
+    for index, (actual_t, expected_t, sentinel_t) in enumerate(
+        zip(partial, expected, sentinels, strict=True)
+    ):
+        if operation == "value" and index == 0:
+            assert torch.equal(actual_t[..., 128:384], expected_t[..., 128:384])
+            assert torch.equal(actual_t[..., :128], sentinel_t[..., :128])
+            assert torch.equal(actual_t[..., 384:], sentinel_t[..., 384:])
+        else:
+            stride = 128 if index == 0 else 2
+            lo, hi = stride, 3 * stride
+            assert torch.equal(actual_t[:, :, lo:hi], expected_t[:, :, lo:hi])
+            assert torch.equal(actual_t[:, :, :lo], sentinel_t[:, :, :lo])
+            assert torch.equal(actual_t[:, :, hi:], sentinel_t[:, :, hi:])
+    # Finish the remaining prefix and suffix blocks; the full buffer must match bit-for-bit.
+    for start, count in ((0, 1), (3, 1)):
+        _launch(
+            gluon,
+            operation,
+            operands,
+            partial,
+            block_lengths=lengths,
+            bias=bias,
+            execution_plan=execution_plan,
+            start_row_block=start,
+            num_row_blocks=count,
+        )
+    for actual_t, expected_t in zip(partial, expected, strict=True):
+        assert torch.equal(actual_t.view(torch.uint8), expected_t.view(torch.uint8))

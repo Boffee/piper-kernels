@@ -719,7 +719,7 @@ def _int8_tma_swiglu_matmul_kernel(
 
 
 def operands_aligned(*operands: torch.Tensor) -> bool:
-    """Return whether 2-D INT8 GEMM operands satisfy TMA contiguity and 16-byte alignment."""
+    """Return whether 2-D INT8 GEMM operands satisfy 16-byte Gluon contiguity and alignment."""
     return all(
         operand.ndim == 2
         and operand.is_contiguous()

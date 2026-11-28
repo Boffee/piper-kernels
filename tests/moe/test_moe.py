@@ -2473,6 +2473,94 @@ def test_offline_compile_validation_and_sm120_routing() -> None:
         )
         assert smoke
 
+    # Asymmetric NVFP4 prefill widths compile distinct up/down packed_k alignment specializations.
+    asym_nvfp4 = _compile_nvidia_and_assert_clean(
+        sm120,
+        weight_format="nvfp4_w4a16",
+        logical_dtype=torch.bfloat16,
+        rows=64,
+        top_k=2,
+        hidden_size=48,
+        intermediate_size=64,
+        group_size=0,
+    )
+    sym48_nvfp4 = moe_triton.compile_moe_kernels(
+        sm120,
+        weight_format="nvfp4_w4a16",
+        logical_dtype=torch.bfloat16,
+        rows=64,
+        top_k=2,
+        hidden_size=48,
+        intermediate_size=48,
+        group_size=0,
+    )
+    sym64_nvfp4 = moe_triton.compile_moe_kernels(
+        sm120,
+        weight_format="nvfp4_w4a16",
+        logical_dtype=torch.bfloat16,
+        rows=64,
+        top_k=2,
+        hidden_size=64,
+        intermediate_size=64,
+        group_size=0,
+    )
+    assert asym_nvfp4["nvfp4_grouped_up"].hash == sym48_nvfp4["nvfp4_grouped"].hash
+    assert asym_nvfp4["nvfp4_grouped_down"].hash == sym64_nvfp4["nvfp4_grouped"].hash
+    assert asym_nvfp4["nvfp4_grouped_up"].hash != asym_nvfp4["nvfp4_grouped_down"].hash
+
+    if sys.platform == "linux":
+        gfx1201 = GPUTarget("hip", "gfx1201", 32)
+        # m1 RDNA4 INT8 seed tracks expected_bucket_tiles(top_k, ...) rather than a fixed 1 tile.
+        m1_seeded = moe_triton.compile_moe_kernels(
+            gfx1201,
+            weight_format="convrot_int8",
+            logical_dtype=torch.bfloat16,
+            rows=1,
+            top_k=4,
+            num_slots=64,
+            hidden_size=4096,
+            intermediate_size=1024,
+            group_size=256,
+        )
+        m1_unseeded = moe_triton.compile_moe_kernels(
+            gfx1201,
+            weight_format="convrot_int8",
+            logical_dtype=torch.bfloat16,
+            rows=1,
+            top_k=4,
+            num_slots=64,
+            active_slots_hint=1,
+            hidden_size=4096,
+            intermediate_size=1024,
+            group_size=256,
+        )
+        assert m1_seeded["int8_matmul_up"].hash != m1_unseeded["int8_matmul_up"].hash
+
+        # Batched RDNA4 INT8 seed tracks expected_bucket_tiles(num_pairs, num_slots, ...).
+        batched_few_slots = moe_triton.compile_moe_kernels(
+            gfx1201,
+            weight_format="convrot_int8",
+            logical_dtype=torch.bfloat16,
+            rows=8,
+            top_k=4,
+            num_slots=2,
+            hidden_size=4096,
+            intermediate_size=512,
+            group_size=256,
+        )
+        batched_many_slots = moe_triton.compile_moe_kernels(
+            gfx1201,
+            weight_format="convrot_int8",
+            logical_dtype=torch.bfloat16,
+            rows=8,
+            top_k=4,
+            num_slots=64,
+            hidden_size=4096,
+            intermediate_size=512,
+            group_size=256,
+        )
+        assert batched_few_slots["int8_matmul_up"].hash != batched_many_slots["int8_matmul_up"].hash
+
 
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm HIP compiler is Linux-only")
 @pytest.mark.parametrize(("arch", "warp_size"), _AMD_TARGETS)
@@ -4878,9 +4966,8 @@ def _assert_prefill_launch_counts(launches: list[str], weight_format: MoEFormat)
     ):
         assert launches.count(k_name) == 1
     if weight_format in ("nvfp4", "convrot_nvfp4"):
-        assert launches.count("nvfp4_moe_row_quant_kernel") == 1
+        assert launches.count("nvfp4_moe_row_quant_kernel") == 2
         assert launches.count("nvfp4_moe_gather_kernel") == 1
-        assert launches.count("nvfp4_moe_activate_quant_kernel") == 1
         assert launches.count("nvfp4_w4a4_moe_grouped_gemm_kernel") == 2
         assert "nvfp4_moe_grouped_gemm_kernel" not in launches
         assert "nvfp4_moe_batched_gemv_kernel" not in launches
@@ -7656,3 +7743,55 @@ def test_gpu_int8_decoupled_wide_tiled_misses_splitk_compile_and_cuda_graph() ->
             weight_format="convrot_int8",
             dtype=torch.bfloat16,
         )
+
+
+def _assert_moe_custom_ops_pass_opcheck(device: str) -> None:
+    w = _make_moe_weights(
+        3,
+        64,
+        64,
+        weight_format="convrot_int8",
+        group_size=16,
+        activation_fn="swiglu_clamped",
+        gate_first=True,
+        gate_bound=3.0,
+        up_bound=4.0,
+        dtype=torch.bfloat16,
+        device=device,
+        seed=1330,
+    )
+    x = torch.randn((3, 64), device=device, dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 1], [1, 2], [2, 0]], device=device, dtype=torch.int32)
+    wts = torch.tensor([[0.6, 0.4], [0.5, 0.5], [0.7, 0.3]], device=device, dtype=torch.float32)
+    base_args = (x, ids, wts, w.up_gate_qdata, w.up_gate_scale, w.down_qdata, w.down_scale)
+    min_kwargs = {"group_size": w.group_size}
+    full_kwargs = {
+        "group_size": w.group_size,
+        "activation_fn": "swiglu_clamped",
+        "gate_first": True,
+        "active_slots_hint": 2,
+        "gate_bound": 3.0,
+        "up_bound": 4.0,
+    }
+    for kwargs in (min_kwargs, full_kwargs):
+        res = torch.library.opcheck(torch.ops.piper_kernels.moe_ffn.default, base_args, kwargs)
+        assert set(res.values()) == {"SUCCESS"}
+        out = torch.zeros_like(x)
+        res_inplace = torch.library.opcheck(
+            torch.ops.piper_kernels.moe_ffn_.default,
+            (*base_args, out),
+            {**kwargs, "accumulate": True},
+        )
+        assert set(res_inplace.values()) == {"SUCCESS"}
+
+
+def test_moe_custom_ops_pass_opcheck() -> None:
+    _assert_moe_custom_ops_pass_opcheck("cpu")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not _INT8_MOE_GPU_AVAILABLE, reason="requires supported ConvRot INT8 GPU target"
+)
+def test_gpu_moe_custom_ops_pass_opcheck() -> None:
+    _assert_moe_custom_ops_pass_opcheck("cuda")

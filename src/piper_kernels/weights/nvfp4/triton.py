@@ -24,7 +24,6 @@ _NVFP4_BLOCK_SIZE = _layout.BLOCK_SIZE
 _NVFP4_QDATA_BLOCK_SIZE = _layout.QDATA_BLOCK_SIZE
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(_NVFP4_BLOCK_SIZE)
 _NVFP4_QDATA_BLOCK_SIZE_TL = tl.constexpr(_NVFP4_QDATA_BLOCK_SIZE)
-_MIN_WEIGHT_GLOBAL_SCALE = tl.constexpr(_layout.MIN_WEIGHT_GLOBAL_SCALE)
 _AMAX_REDUCTION_BLOCK_SIZE = 1_024
 # Preserve the existing one-CTA final reduction for small inputs.
 _AMAX_FINAL_REDUCTION_SIZE = 8_192
@@ -334,14 +333,6 @@ def _update_kernel(  # noqa: PLR0915
         )
 
 
-@triton.jit
-def _global_scale_kernel(partial_ptr, output_ptr, count, block_size: tl.constexpr):
-    offsets = tl.arange(0, block_size)
-    values = tl.load(partial_ptr + offsets, mask=offsets < count, other=0.0)
-    scale = tl.max(values, axis=0) * (1.0 / (448.0 * 6.0))  # pyright: ignore[reportOperatorIssue]
-    tl.store(output_ptr, tl.maximum(scale, _MIN_WEIGHT_GLOBAL_SCALE))
-
-
 def _update_(
     qdata: torch.Tensor,
     scale: torch.Tensor,
@@ -408,24 +399,8 @@ def _update_(
         if two_level:
             _update_kernel[grid](*arguments, amax_only=True, **options)  # pyright: ignore[reportArgumentType]
             assert partial is not None
-            while partial.numel() > 1024:
-                count = (partial.numel() + 1023) // 1024
-                reduced = torch.empty(count, device=qdata.device, dtype=torch.float32)
-                _amax_partial_kernel[(count,)](
-                    partial,
-                    reduced,
-                    partial.numel(),
-                    block_size=1024,
-                    num_warps=4,
-                )
-                partial = reduced
-            _global_scale_kernel[(1,)](
-                partial,
-                new_global,
-                partial.numel(),
-                block_size=triton.next_power_of_2(partial.numel()),
-                num_warps=4,
-            )
+            assert new_global is not None
+            dynamic_scale(partial, out=new_global).clamp_min_(_layout.MIN_WEIGHT_GLOBAL_SCALE)
         _update_kernel[grid](*arguments, amax_only=False, **options)  # pyright: ignore[reportArgumentType]
         if per_tensor_scale is not None:
             assert new_global is not None

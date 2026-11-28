@@ -23,6 +23,7 @@ from typing import cast
 import torch
 from torch._C._nn import pad as torch_pad
 from torch.fx.experimental.symbolic_shapes import statically_known_true
+from torch.fx.node import Argument
 from torch.nn import functional
 
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -177,6 +178,15 @@ def fp16_cast_source(node: object) -> torch.fx.Node | None:
     )
 
 
+def _bind_conv(node: torch.fx.Node) -> dict[str, Argument] | None:
+    if node.target is not _CONV:
+        return None
+    # Keep Conv3D compile-option imports decoupled from piper_kernels.linear.
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
+    return linear_fx.bind_call(node, _CONV)
+
+
 def fuse_padding(graph: torch.fx.Graph) -> None:
     """Absorb exclusive, representable pad chains; leave all other graphs intact.
 
@@ -189,24 +199,32 @@ def fuse_padding(graph: torch.fx.Graph) -> None:
     lower_standard_convolutions(graph)
     changed = False
     for node in list(graph.nodes):
-        if node.target != _CONV or node.kwargs or len(node.args) != 10:
+        bound = _bind_conv(node)
+        if bound is None:
             continue
-        args = list(node.args)
         while True:
-            cast_source = fp16_cast_source(args[0])
-            previous_pad = cast_source if cast_source is not None else args[0]
+            input_arg = bound["input"]
+            cast_source = fp16_cast_source(input_arg)
+            previous_pad = cast_source if cast_source is not None else input_arg
             matched = _pad(previous_pad)
             if matched is None:
                 break
             source, pads, reflection = matched
-            existing, existing_reflection = args[7:9]
-            assert isinstance(existing, (tuple, list))
-            assert isinstance(existing_reflection, bool)
-            if any(pads[:4]) and any(existing[:4]) and (reflection or existing_reflection):
+            existing = bound["padding"]
+            existing_reflection = bound["spatial_reflection"]
+            if (
+                not isinstance(existing, (tuple, list))
+                or len(existing) != 6
+                or any(type(value) is not int for value in existing)
+                or not isinstance(existing_reflection, bool)
+            ):
                 break
-            merged = [a + b for a, b in zip(existing, pads, strict=True)]
+            existing_pads = cast(list[int], list(existing))
+            if any(pads[:4]) and any(existing_pads[:4]) and (reflection or existing_reflection):
+                break
+            merged = [a + b for a, b in zip(existing_pads, pads, strict=True)]
             use_reflection = (reflection and any(pads[:4])) or (
-                existing_reflection and any(existing[:4])
+                existing_reflection and any(existing_pads[:4])
             )
             source_value = get_tensor_metadata(source)
             if source_value is None or source_value.ndim != 5:
@@ -217,16 +235,17 @@ def fuse_padding(graph: torch.fx.Graph) -> None:
             ):
                 break
             if cast_source is not None:
-                cast_node = args[0]
-                assert isinstance(cast_node, torch.fx.Node)
-                cast_node.args = (source,)
-                cast_node.meta["example_value"] = source_value.to(dtype=torch.float16)
+                assert isinstance(input_arg, torch.fx.Node)
+                input_arg.args = (source,)
+                input_arg.meta["example_value"] = source_value.to(dtype=torch.float16)
                 # Casting commutes with zero/reflection padding. Keep the cast
                 # so padding-only fusion preserves ordinary autocast rounding.
             else:
-                args[0] = source
-            args[7], args[8] = merged, use_reflection
-            node.args = tuple(args)
+                bound["input"] = source
+            bound["padding"] = merged
+            bound["spatial_reflection"] = use_reflection
+            node.args = tuple(bound[arg.name] for arg in _CONV._schema.arguments)
+            node.kwargs = {}
             node.meta.pop("eager_input_vals", None)
             assert isinstance(previous_pad, torch.fx.Node)
             graph.erase_node(previous_pad)

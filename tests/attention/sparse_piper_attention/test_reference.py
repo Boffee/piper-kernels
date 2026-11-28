@@ -9,10 +9,10 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MINMAX_ROUTING,
 )
-from piper_kernels.attention.sparse_piper_attention._routes import (
+from piper_kernels.attention.sparse_piper_attention._routing import (
     PackedRoutes,
+    packed_routes_from_sequences,
 )
-from piper_kernels.attention.sparse_piper_attention._routing import packed_routes_from_sequences
 from piper_kernels.attention.sparse_piper_attention.reference import (
     reference_exact_sparse_attention,
     reference_sparse_piper_attention,

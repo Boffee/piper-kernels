@@ -11,7 +11,6 @@ import torch
 import triton
 import triton.language as tl
 
-from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._triton.primitives import splitk_tile_bounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.linear.nvfp4._w4a16_triton import (
@@ -27,16 +26,19 @@ from piper_kernels.weights.nvfp4.triton import encode_nvfp4_blocks, swizzled_sca
 
 from . import _schedule
 from ._routing_triton import (
-    A16ChunkRouting,
+    ChunkRouting,
+    PrefillBuckets,
+    _load_activate_rotate_tile,
     _resolve_slot,
     _swizzle_grouped_pid,
     _unpack_2d_tile_pid,
     moe_2d_tile_grid,
 )
-from .reference import is_gated_activation
+from .reference import _ActivationConfig
 
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(nvfp4_layout.BLOCK_SIZE)
 _NVFP4_QDATA_BLOCK_SIZE_TL = tl.constexpr(nvfp4_layout.QDATA_BLOCK_SIZE)
+_NVFP4_ROW_SCALE_RECIP_TL = tl.constexpr(1.0 / (nvfp4_layout.E4M3_MAX * nvfp4_layout.E2M1_MAX))
 
 
 @triton.jit(do_not_specialize=["split_k"])
@@ -496,7 +498,7 @@ def launch_nvfp4_proj(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     global_scale: torch.Tensor | None,
-    routing: A16ChunkRouting,
+    routing: ChunkRouting,
     output: torch.Tensor,
     *,
     out_features: int,
@@ -505,23 +507,19 @@ def launch_nvfp4_proj(
     scale_stride: int,
     num_slots: int,
     split_k: int,
-    block_n: int,
-    block_k: int,
-    num_warps: int,
+    schedule: _schedule.Nvfp4M1Schedule | _schedule.Nvfp4BatchedSchedule,
     high_first: bool,
-    has_global_scale: bool,
     per_expert_input: bool,
     is_splitk: bool,
-    use_dot: bool,
-    cast_fp32_to_bf16: bool,
-    single_dot: bool = False,
 ) -> None:
     scale_u8 = scale.view(torch.uint8)
     packed_k = in_features // 2
-    n_tiles = triton.cdiv(out_features, block_n)
+    n_tiles = triton.cdiv(out_features, schedule.block_n)
+    has_global_scale = global_scale is not None
     with device_context(x.device):
         if routing.tile_slots is not None:
             assert routing.tile_pair_ids is not None
+            assert isinstance(schedule, _schedule.Nvfp4BatchedSchedule)
             nvfp4_moe_batched_gemv_kernel[(n_tiles, routing.tile_slots.shape[0], split_k)](
                 x,
                 qdata,
@@ -538,23 +536,23 @@ def launch_nvfp4_proj(
                 routing.top_k,
                 split_k,
                 block_m=_schedule.BATCH_BLOCK_M,
-                block_n=block_n,
-                block_k=block_k,
+                block_n=schedule.block_n,
+                block_k=schedule.block_k,
                 high_first=high_first,
                 has_global_scale=has_global_scale,
                 per_expert_input=per_expert_input,
                 is_splitk=is_splitk,
-                use_dot=use_dot,
-                cast_fp32_to_bf16=cast_fp32_to_bf16,
-                single_dot=single_dot,
-                num_warps=num_warps,
+                use_dot=schedule.use_dot,
+                cast_fp32_to_bf16=schedule.cast_fp32_to_bf16,
+                single_dot=schedule.single_dot,
+                num_warps=schedule.num_warps,
                 num_stages=1,
             )
         else:
             grid = moe_2d_tile_grid(
                 n_tiles,
                 routing.top_k,
-                num_warps=num_warps,
+                num_warps=schedule.num_warps,
                 is_amd_hip=False,
                 split_k=split_k,
             )
@@ -574,14 +572,14 @@ def launch_nvfp4_proj(
                 num_slots,
                 routing.top_k,
                 split_k,
-                block_n=block_n,
-                block_k=block_k,
+                block_n=schedule.block_n,
+                block_k=schedule.block_k,
                 high_first=high_first,
                 has_slot_map=routing.has_slot_map,
                 has_global_scale=has_global_scale,
                 per_expert_input=per_expert_input,
                 is_splitk=is_splitk,
-                num_warps=num_warps,
+                num_warps=schedule.num_warps,
             )
 
 
@@ -590,107 +588,85 @@ def launch_nvfp4_grouped_gemm(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     global_scale: torch.Tensor | None,
-    tile_slots: torch.Tensor,
-    tile_m_start: torch.Tensor,
-    tile_m_len: torch.Tensor,
+    buckets: PrefillBuckets,
     output: torch.Tensor,
     *,
-    max_tiles: int,
     out_features: int,
     in_features: int,
     scale_cols: int,
     scale_stride: int,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    num_warps: int,
+    schedule: _schedule.Nvfp4PrefillSchedule,
     high_first: bool,
-    has_global_scale: bool,
-    cast_fp32_to_bf16: bool,
-    force_fp32_dot: bool,
-    single_dot: bool = False,
 ) -> None:
-    grid = (max_tiles * triton.cdiv(out_features, block_n),)
+    grid = (buckets.max_tiles * triton.cdiv(out_features, schedule.block_n),)
     with device_context(x.device):
         nvfp4_moe_grouped_gemm_kernel[grid](
             x,
             qdata,
             scale.view(torch.uint8),
             global_scale,
-            tile_slots,
-            tile_m_start,
-            tile_m_len,
+            buckets.tile_slots,
+            buckets.tile_m_start,
+            buckets.tile_m_len,
             output,
-            max_tiles,
+            buckets.max_tiles,
             out_features,
             in_features // 2,
             scale_cols,
             scale_stride,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
+            block_m=schedule.block_m,
+            block_n=schedule.block_n,
+            block_k=schedule.block_k,
             group_m=_schedule.PREFILL_GROUP_M,
             high_first=high_first,
-            has_global_scale=has_global_scale,
-            cast_fp32_to_bf16=cast_fp32_to_bf16,
-            force_fp32_dot=force_fp32_dot,
-            single_dot=single_dot,
-            num_warps=num_warps,
+            has_global_scale=global_scale is not None,
+            cast_fp32_to_bf16=schedule.cast_fp32_to_bf16,
+            force_fp32_dot=schedule.force_fp32_dot,
+            single_dot=schedule.single_dot,
+            num_warps=schedule.num_warps,
             num_stages=1,
         )
 
 
 @triton.jit
-def _load_rotated_row_tile(
-    x_ptr,
+def _load_nvfp4_quant_tile(
+    src_ptr,
+    row,
     row_offset,
     k_offs,
     k_valid,
-    group_size: tl.constexpr,
-    block_k: tl.constexpr,
-):
-    vals = tl.load(x_ptr + row_offset + k_offs, mask=k_valid, other=0.0).to(tl.float32)
-    if group_size > 0:
-        vals = rotate_hadamard_groups(vals, block_k, group_size, normalize=True)
-    return vals
-
-
-@triton.jit
-def _load_activated_pair_tile(
-    mid_ptr,
-    pair_idx,
-    k_offs,
-    k_valid,
-    intermediate_size,
+    width,
     gate_bound,
     up_bound,
+    block_k: tl.constexpr,
     group_size: tl.constexpr,
+    activate: tl.constexpr,
     is_gated: tl.constexpr,
     gate_first: tl.constexpr,
     has_gate_bound: tl.constexpr,
     has_up_bound: tl.constexpr,
     accelerator_backend: tl.constexpr,
-    block_k: tl.constexpr,
 ):
-    if is_gated:
-        base = pair_idx * (intermediate_size.to(tl.int64) * 2) + k_offs
-        first = tl.load(mid_ptr + base, mask=k_valid, other=0.0).to(tl.float32)
-        second = tl.load(mid_ptr + base + intermediate_size, mask=k_valid, other=0.0).to(tl.float32)
-        gate = first if gate_first else second
-        up = second if gate_first else first
-        if has_gate_bound:
-            gate = tl.minimum(gate, gate_bound)
-        if has_up_bound:
-            up = tl.clamp(up, -up_bound, up_bound)
-        vals = swiglu(up, gate)
-    else:
-        vals = tl.load(
-            mid_ptr + pair_idx * intermediate_size.to(tl.int64) + k_offs,
-            mask=k_valid,
-            other=0.0,
-        ).to(tl.float32)
-        vals = gelu_tanh(vals, accelerator_backend)
-    vals = tl.where(k_valid, vals, 0.0)
+    if activate:
+        return _load_activate_rotate_tile(
+            src_ptr,
+            row,
+            k_offs,
+            k_valid,
+            width,
+            gate_bound,
+            up_bound,
+            block_k=block_k,
+            group_size=group_size,
+            is_gated=is_gated,
+            gate_first=gate_first,
+            has_gate_bound=has_gate_bound,
+            has_up_bound=has_up_bound,
+            accelerator_backend=accelerator_backend,
+        )
+    vals = tl.load(src_ptr + row_offset + k_offs.to(tl.int64), mask=k_valid, other=0.0).to(
+        tl.float32
+    )
     if group_size > 0:
         vals = rotate_hadamard_groups(vals, block_k, group_size, normalize=True)
     return vals
@@ -731,36 +707,87 @@ def _store_encoded_nvfp4_tile(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["gate_bound", "up_bound"])
 def nvfp4_moe_row_quant_kernel(
-    x_ptr,
+    src_ptr,
+    compact_to_pair_ptr,
     q_out_ptr,
     sc_out_ptr,
     row_scale_ptr,
-    hidden_size,
-    x_row_stride,
+    width,
+    src_row_stride,
+    gate_bound,
+    up_bound,
     block_k: tl.constexpr,
     group_size: tl.constexpr,
     high_first: tl.constexpr,
+    activate: tl.constexpr = False,
+    is_gated: tl.constexpr = False,
+    gate_first: tl.constexpr = True,
+    has_gate_bound: tl.constexpr = False,
+    has_up_bound: tl.constexpr = False,
+    accelerator_backend: tl.constexpr = "cuda",
 ):
-    """Per-row dynamic NVFP4 quantization with optional fused ConvRot Hadamard rotation."""
+    """Per-row dynamic NVFP4 encode with optional fused activation and ConvRot rotation."""
     row = tl.program_id(0).to(tl.int64)
-    row_offset = row * x_row_stride.to(tl.int64)
+    if activate:
+        orig_pair = tl.load(compact_to_pair_ptr + row)
+        if orig_pair < 0:
+            tl.store(row_scale_ptr + row, 0.0)
+            return
+        row_offset = tl.full((), 0, tl.int64)
+    else:
+        row_offset = row * src_row_stride.to(tl.int64)
+
     row_amax = tl.full((), 0.0, dtype=tl.float32)
-    for k_base in range(0, hidden_size, block_k):
+    for k_base in range(0, width, block_k):
         k_offs = k_base + tl.arange(0, block_k)
-        k_valid = k_offs < hidden_size
-        vals = _load_rotated_row_tile(x_ptr, row_offset, k_offs, k_valid, group_size, block_k)
+        k_valid = k_offs < width
+        vals = _load_nvfp4_quant_tile(
+            src_ptr,
+            row,
+            row_offset,
+            k_offs,
+            k_valid,
+            width,
+            gate_bound,
+            up_bound,
+            block_k,
+            group_size,
+            activate,
+            is_gated,
+            gate_first,
+            has_gate_bound,
+            has_up_bound,
+            accelerator_backend,
+        )
         row_amax = tl.maximum(row_amax, tl.max(tl.abs(vals), axis=0))
 
-    row_scale = row_amax * (1.0 / (448.0 * 6.0))
+    row_scale = row_amax * _NVFP4_ROW_SCALE_RECIP_TL
     tl.store(row_scale_ptr + row, row_scale)
-    packed_k = (hidden_size // 2).to(tl.int64)
-    scale_k = (hidden_size // _NVFP4_BLOCK_SIZE_TL).to(tl.int64)
-    for k_base in range(0, hidden_size, block_k):
+    packed_k = (width // 2).to(tl.int64)
+    scale_k = (width // _NVFP4_BLOCK_SIZE_TL).to(tl.int64)
+    for k_base in range(0, width, block_k):
         k_offs = k_base + tl.arange(0, block_k)
-        k_valid = k_offs < hidden_size
-        vals = _load_rotated_row_tile(x_ptr, row_offset, k_offs, k_valid, group_size, block_k)
+        k_valid = k_offs < width
+        vals = _load_nvfp4_quant_tile(
+            src_ptr,
+            row,
+            row_offset,
+            k_offs,
+            k_valid,
+            width,
+            gate_bound,
+            up_bound,
+            block_k,
+            group_size,
+            activate,
+            is_gated,
+            gate_first,
+            has_gate_bound,
+            has_up_bound,
+            accelerator_backend,
+        )
         _store_encoded_nvfp4_tile(
             vals,
             row_scale,
@@ -814,91 +841,6 @@ def nvfp4_moe_gather_kernel(
 
     if pid_k == 0:
         tl.store(out_rs_ptr + compact_idx, tl.load(in_rs_ptr + src_row))
-
-
-@triton.jit(do_not_specialize=["gate_bound", "up_bound"])
-def nvfp4_moe_activate_quant_kernel(
-    mid_ptr,
-    compact_to_pair_ptr,
-    q_out_ptr,
-    sc_out_ptr,
-    row_scale_ptr,
-    intermediate_size,
-    gate_bound,
-    up_bound,
-    block_k: tl.constexpr,
-    group_size: tl.constexpr,
-    is_gated: tl.constexpr,
-    gate_first: tl.constexpr,
-    high_first: tl.constexpr,
-    has_gate_bound: tl.constexpr,
-    has_up_bound: tl.constexpr,
-    accelerator_backend: tl.constexpr,
-):
-    """Apply SwiGLU/GeLU-tanh, optional ConvRot rotation, and per-row dynamic NVFP4 encode."""
-    pair = tl.program_id(0).to(tl.int64)
-    orig_pair = tl.load(compact_to_pair_ptr + pair)
-    if orig_pair < 0:
-        tl.store(row_scale_ptr + pair, 0.0)
-        return
-
-    row_amax = tl.full((), 0.0, dtype=tl.float32)
-    for k_base in range(0, intermediate_size, block_k):
-        k_offs = k_base + tl.arange(0, block_k)
-        k_valid = k_offs < intermediate_size
-        vals = _load_activated_pair_tile(
-            mid_ptr,
-            pair,
-            k_offs,
-            k_valid,
-            intermediate_size,
-            gate_bound,
-            up_bound,
-            group_size,
-            is_gated,
-            gate_first,
-            has_gate_bound,
-            has_up_bound,
-            accelerator_backend,
-            block_k,
-        )
-        row_amax = tl.maximum(row_amax, tl.max(tl.abs(vals), axis=0))
-
-    row_scale = row_amax * (1.0 / (448.0 * 6.0))
-    tl.store(row_scale_ptr + pair, row_scale)
-    packed_k = (intermediate_size // 2).to(tl.int64)
-    scale_k = (intermediate_size // _NVFP4_BLOCK_SIZE_TL).to(tl.int64)
-    for k_base in range(0, intermediate_size, block_k):
-        k_offs = k_base + tl.arange(0, block_k)
-        k_valid = k_offs < intermediate_size
-        vals = _load_activated_pair_tile(
-            mid_ptr,
-            pair,
-            k_offs,
-            k_valid,
-            intermediate_size,
-            gate_bound,
-            up_bound,
-            group_size,
-            is_gated,
-            gate_first,
-            has_gate_bound,
-            has_up_bound,
-            accelerator_backend,
-            block_k,
-        )
-        _store_encoded_nvfp4_tile(
-            vals,
-            row_scale,
-            pair,
-            k_base,
-            packed_k,
-            scale_k,
-            q_out_ptr,
-            sc_out_ptr,
-            block_k,
-            high_first,
-        )
 
 
 @triton.jit(do_not_specialize=["max_tiles"])
@@ -1007,27 +949,41 @@ def nvfp4_w4a4_moe_grouped_gemm_kernel(
     )
 
 
-def launch_nvfp4_row_quant(
-    x: torch.Tensor,
+def launch_nvfp4_quant(
+    src: torch.Tensor,
     q_out: torch.Tensor,
     sc_out: torch.Tensor,
     rs_out: torch.Tensor,
     *,
+    width: int,
     group_size: int,
     high_first: bool,
+    compact_to_pair: torch.Tensor | None = None,
+    activation: _ActivationConfig | None = None,
+    accelerator_backend: str = "cuda",
 ) -> None:
-    rows, hidden_size = x.shape
-    with device_context(x.device):
-        nvfp4_moe_row_quant_kernel[(rows,)](
-            x,
+    activate = activation is not None
+    act = activation or _ActivationConfig()
+    with device_context(src.device):
+        nvfp4_moe_row_quant_kernel[(src.shape[0],)](
+            src,
+            compact_to_pair,
             q_out,
             sc_out,
             rs_out,
-            hidden_size,
-            x.stride(0),
+            width,
+            0 if activate else src.stride(0),
+            act.gate_bound_value,
+            act.up_bound_value,
             block_k=_schedule.NVFP4_W4A4_QUANT_BLOCK_K,
             group_size=group_size,
             high_first=high_first,
+            activate=activate,
+            is_gated=act.is_gated if activate else False,
+            gate_first=act.gate_first if activate else True,
+            has_gate_bound=activate and act.gate_bound is not None,
+            has_up_bound=activate and act.up_bound is not None,
+            accelerator_backend=accelerator_backend,
             num_warps=4,
         )
 
@@ -1062,45 +1018,6 @@ def launch_nvfp4_gather(
         )
 
 
-def launch_nvfp4_activate_quant(
-    mid: torch.Tensor,
-    compact_to_pair: torch.Tensor,
-    q_out: torch.Tensor,
-    sc_out: torch.Tensor,
-    rs_out: torch.Tensor,
-    *,
-    intermediate_size: int,
-    group_size: int,
-    activation_fn: str,
-    gate_first: bool,
-    high_first: bool,
-    accelerator_backend: str,
-    gate_bound: float | None = None,
-    up_bound: float | None = None,
-) -> None:
-    num_pairs = mid.shape[0]
-    with device_context(mid.device):
-        nvfp4_moe_activate_quant_kernel[(num_pairs,)](
-            mid,
-            compact_to_pair,
-            q_out,
-            sc_out,
-            rs_out,
-            intermediate_size,
-            0.0 if gate_bound is None else float(gate_bound),
-            0.0 if up_bound is None else float(up_bound),
-            block_k=_schedule.NVFP4_W4A4_QUANT_BLOCK_K,
-            group_size=group_size,
-            is_gated=is_gated_activation(activation_fn),
-            gate_first=gate_first,
-            high_first=high_first,
-            has_gate_bound=gate_bound is not None,
-            has_up_bound=up_bound is not None,
-            accelerator_backend=accelerator_backend,
-            num_warps=4,
-        )
-
-
 def launch_nvfp4_w4a4_grouped_gemm(
     a_q: torch.Tensor,
     a_sc: torch.Tensor,
@@ -1108,24 +1025,16 @@ def launch_nvfp4_w4a4_grouped_gemm(
     b_q: torch.Tensor,
     b_sc: torch.Tensor,
     b_gs: torch.Tensor | None,
-    tile_slots: torch.Tensor,
-    tile_m_start: torch.Tensor,
-    tile_m_len: torch.Tensor,
+    buckets: PrefillBuckets,
     output: torch.Tensor,
     *,
-    max_tiles: int,
     out_features: int,
     in_features: int,
     scale_cols: int,
     scale_stride: int,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    num_warps: int,
-    num_stages: int,
-    has_global_scale: bool,
+    schedule: _schedule.Nvfp4W4A4PrefillSchedule,
 ) -> None:
-    grid = (max_tiles * triton.cdiv(out_features, block_n),)
+    grid = (buckets.max_tiles * triton.cdiv(out_features, schedule.block_n),)
     with device_context(a_q.device):
         nvfp4_w4a4_moe_grouped_gemm_kernel[grid](
             a_q,
@@ -1134,20 +1043,20 @@ def launch_nvfp4_w4a4_grouped_gemm(
             b_q,
             b_sc,
             b_gs,
-            tile_slots,
-            tile_m_start,
-            tile_m_len,
+            buckets.tile_slots,
+            buckets.tile_m_start,
+            buckets.tile_m_len,
             output,
-            max_tiles,
+            buckets.max_tiles,
             out_features,
             in_features // 2,
             scale_cols,
             scale_stride,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
+            block_m=schedule.block_m,
+            block_n=schedule.block_n,
+            block_k=schedule.block_k,
             group_m=_schedule.PREFILL_GROUP_M,
-            has_global_scale=has_global_scale,
-            num_warps=num_warps,
-            num_stages=num_stages,
+            has_global_scale=b_gs is not None,
+            num_warps=schedule.num_warps,
+            num_stages=schedule.num_stages,
         )

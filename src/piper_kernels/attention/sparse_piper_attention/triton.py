@@ -31,13 +31,9 @@ _BLOCK_N = 64
 _FUSED_DO_NOT_SPECIALIZE = (
     "logical_sequence_length",
     "storage_sequence_length",
-    "sparse_key_blocks",
     "stride_qb",
     "stride_qh",
     "stride_qn",
-    "stride_kb",
-    "stride_kh",
-    "stride_kn",
     "heads",
     "heads_inner",
 )
@@ -245,99 +241,6 @@ def _quantize_query_with_summary_kernel(
     )
 
 
-@triton.jit(do_not_specialize=_FUSED_DO_NOT_SPECIALIZE)
-def _quantize_key_with_summary_kernel(
-    key_ptr,
-    key_int8_ptr,
-    key_scale_ptr,
-    key_center_ptr,
-    key_center_scale_ptr,
-    key_summary_ptr,
-    key_aux_ptr,
-    block_lengths_ptr,
-    logical_sequence_length,
-    storage_sequence_length,
-    sparse_key_blocks,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    heads,
-    heads_inner,
-    mask_block_lengths: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_n: tl.constexpr,
-):
-    """Quantize one K64-centered tile and emit min/max routing summaries of the raw tile."""
-    pid0 = tl.program_id(0)
-    pid1 = tl.program_id(1)
-    key_block = tl.where(heads_inner != 0, pid1, pid0).to(tl.int64)
-    head = tl.where(heads_inner != 0, pid0, pid1)
-    batch = tl.program_id(2)
-    values, valid_rows, sequence_offsets, features = _load_row_tile(
-        key_ptr,
-        key_block,
-        head,
-        batch,
-        stride_kb,
-        stride_kh,
-        stride_kn,
-        block_lengths_ptr,
-        logical_sequence_length,
-        mask_block_lengths,
-        head_dim,
-        block_n,
-    )
-    head_block = (batch * heads + head).to(tl.int64)
-
-    # Only the sparse prefix needs routing summaries; the dense suffix still
-    # needs quantization, but every query attends to it without routing.
-    if key_block < sparse_key_blocks:
-        summary, auxiliary = sparse_piper_kernels.summarize_block_tiles(
-            tl.reshape(values, (1, 1, block_n, head_dim)),
-            tl.reshape(valid_rows, (1, block_n)),
-            tl.constexpr(False),
-            tl.constexpr(False),
-        )
-        summary_offsets = (head_block * sparse_key_blocks + key_block) * head_dim + features
-        tl.store(key_summary_ptr + summary_offsets, tl.reshape(summary, (head_dim,)))
-        tl.store(key_aux_ptr + summary_offsets, tl.reshape(auxiliary, (head_dim,)))
-
-    quantized, key_scale, center_0, center_1, center_scale_0, center_scale_1 = (
-        qk_quantization.quantize_tile_centered_key_tile(
-            tl.reshape(values, (block_n, 1, head_dim)),
-            tl.reshape(valid_rows, (1, block_n)),
-            tl.constexpr(1),
-            head_dim,
-            block_n,
-            block_n,
-        )
-    )
-    tl.store(
-        key_int8_ptr
-        + head_block * storage_sequence_length * head_dim
-        + sequence_offsets[:, None].to(tl.int64) * head_dim
-        + features[None, :],
-        tl.reshape(quantized, (block_n, head_dim)),
-    )
-    tile_count = storage_sequence_length // block_n
-    tile_offset = head_block * tile_count + key_block
-    tl.store(
-        key_scale_ptr + tile_offset,
-        tl.reshape(key_scale, ()),
-    )
-    qk_quantization.store_key_center_tile(
-        key_center_ptr,
-        key_center_scale_ptr,
-        tile_offset,
-        center_0,
-        center_1,
-        center_scale_0,
-        center_scale_1,
-        features,
-        head_dim,
-    )
-
-
 _LaunchPreparationKernels = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, float, _PreparedSparsePiperOperands],
     None,
@@ -385,26 +288,33 @@ def _launch_triton_fused_qk(
             scale_rows=QUERY_SCALE_ROWS,
             num_warps=_FUSED_QK_WARPS[head_dim],
         )
-        _quantize_key_with_summary_kernel[key_grid](
+        qk_quantization.quantize_key_tile_centered_per_block_kernel[key_grid](
             key,
             operands.key,
             operands.key_scale,
             operands.key_center,
             operands.key_center_scale,
-            operands.key_summary,
-            operands.key_aux,
             lengths_or_placeholder,
             sequence_length,
             storage_sequence_length,
-            operands.sparse_key_blocks,
+            blocks,
             key.stride(0),
             key.stride(1),
             key.stride(2),
+            operands.key.stride(0),
+            operands.key.stride(1),
+            operands.key.stride(2),
+            operands.key_scale.stride(0),
+            operands.key_scale.stride(1),
             kv_heads,
             key_heads_inner,
             mask_block_lengths=block_lengths is not None,
             head_dim=head_dim,
             block_n=_BLOCK_N,
+            key_summary_ptr=operands.key_summary,
+            key_aux_ptr=operands.key_aux,
+            sparse_key_blocks=operands.sparse_key_blocks,
+            emit_summaries=True,
             num_warps=_FUSED_QK_WARPS[head_dim],
         )
 

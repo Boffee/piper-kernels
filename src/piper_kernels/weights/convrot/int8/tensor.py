@@ -5,11 +5,11 @@ from typing import Any, ClassVar, Self
 
 import torch
 
-from piper_kernels.weights._dispatch import (
-    QuantizedWeight,
-    register_quantized_weight_ops,
-    require_untransposed,
-)
+from piper_kernels.weights._dispatch import QuantizedWeight, require_untransposed
+from piper_kernels.weights._fsdp import FSDPWeightMixin, register_fsdp_ops
+from piper_kernels.weights._matmul import register_matrix_ops
+from piper_kernels.weights._update import UpdatableWeightMixin, register_update_ops
+from piper_kernels.weights._views import register_view_ops
 from piper_kernels.weights.convrot.int8._quantization import (
     dequantize_weight,
     quantize_weight,
@@ -18,7 +18,7 @@ from piper_kernels.weights.convrot.int8._quantization import (
 )
 
 
-class ConvRotInt8Tensor(QuantizedWeight):  # pyright: ignore[reportIncompatibleMethodOverride]
+class ConvRotInt8Tensor(FSDPWeightMixin, UpdatableWeightMixin, QuantizedWeight):  # pyright: ignore[reportIncompatibleMethodOverride]
     """INT8 rotated weight with per-output scale and logical floating dtype.
 
     Use :meth:`from_quantized` for existing quantized storage or :meth:`from_hp`
@@ -37,6 +37,7 @@ class ConvRotInt8Tensor(QuantizedWeight):  # pyright: ignore[reportIncompatibleM
     _format_name: ClassVar[str] = "ConvRot INT8"
     _update_format_name: ClassVar[str] = "ConvRot"
     _contiguous_memory_format_only: ClassVar[bool] = True
+    _validates_storage_in_new: ClassVar[bool] = True
 
     tensor_data_names: ClassVar[list[str]] = ["qdata", "scale"]
     tensor_attribute_names: ClassVar[list[str]] = ["group_size", "dtype"]
@@ -304,10 +305,13 @@ class ConvRotInt8Tensor(QuantizedWeight):  # pyright: ignore[reportIncompatibleM
             raise BypassAOTAutogradCache(
                 "ConvRot INT8 static input scales may alias across weights"
             )
-        return self._stable_cache_key(self.group_size, self.transposed)
+        return self._stable_cache_key()
 
 
-register_quantized_weight_ops(ConvRotInt8Tensor)
+register_view_ops(ConvRotInt8Tensor)
+register_fsdp_ops(ConvRotInt8Tensor)
+register_matrix_ops(ConvRotInt8Tensor)
+register_update_ops(ConvRotInt8Tensor, format_name=ConvRotInt8Tensor._update_format_name)
 
 
 @ConvRotInt8Tensor.implements(torch.ops.aten.embedding.default)

@@ -181,7 +181,7 @@ non-negative finite required for `act_quant="dynamic"` because Blackwell `.ue4m3
 ignore the sign bit) `SWIZZLE_32_4_4` `float8_e4m3fn` 16-value block scales on widths divisible
 by 16 (and `group_size` for ConvRot). `"nvfp4"` and `"convrot_nvfp4"` share the exact same packed
 weight storage as `"nvfp4_w4a16"` / `"convrot_nvfp4_w4a16"`, keeping high-precision W4A16 execution
-for single-token (`M = 1`) and small-batch (`M <= 16` and `M * top_k <= 512`) decode while
+for single-token (`M = 1`) and small-batch (`M <= 16` and `M * top_k <= 1024`) decode while
 switching prefill onto native SM12x Blackwell FP4 (`tl.dot_scaled`) W4A4 grouped GEMMs with
 per-row dynamic activation quantization (fusing optional ConvRot rotation and `swiglu`,
 `swiglu_clamped`, or `gelu_tanh` activation). GPU NVFP4 MoE execution targets NVIDIA SM12x (`ValueError` on other GPUs), while CPU

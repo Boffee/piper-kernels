@@ -10,29 +10,17 @@ from __future__ import annotations
 import logging
 import operator
 from collections.abc import Callable, Mapping
-from typing import cast
 
 import torch
 from torch.fx.node import Argument
+
+from piper_kernels.linear import _compile_fx as linear_fx
 
 from . import _ops  # noqa: F401 - registers residual_add_
 
 _log = logging.getLogger(__name__)
 _AUTO_FUNCTIONALIZED = torch.ops.higher_order.auto_functionalized
 RESIDUAL_ADD = torch.ops.piper_kernels.residual_add_.default
-
-
-def bind_arguments(node: torch.fx.Node) -> dict[str, Argument]:
-    """Name an operator call's arguments by its schema, independent of position.
-
-    ``node`` must call an ``OpOverload``.
-    """
-    schema = cast(torch._ops.OpOverload, node.target)._schema
-    values: dict[str, Argument] = {
-        argument.name: value for argument, value in zip(schema.arguments, node.args, strict=False)
-    }
-    values.update(node.kwargs)
-    return values
 
 
 def call_functional(
@@ -55,9 +43,8 @@ def call_functional(
     call = graph.call_function(_AUTO_FUNCTIONALIZED, (target,), dict(values))
     # The call returns the operator's result (None) followed by the mutated tensor.
     result = graph.call_function(operator.getitem, (call, 1))
-    mutated_node = values[mutated]
-    value = mutated_node.meta.get("val") if isinstance(mutated_node, torch.fx.Node) else None
-    if isinstance(value, torch.Tensor):
+    value = linear_fx.node_tensor_metadata(values[mutated])
+    if value is not None:
         result.meta["val"] = value.clone()
         call.meta["val"] = (None, result.meta["val"])
     return result
@@ -107,7 +94,6 @@ def compute_inside_adds(
 __all__ = [
     "RESIDUAL_ADD",
     "ComputeInside",
-    "bind_arguments",
     "call_functional",
     "compute_inside_adds",
 ]

@@ -20,22 +20,14 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import cdna3
 
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.layout import (
-    TILE_ROWS,
-    ValueFormat,
-    padded_sequence_length,
-)
+from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS, ValueFormat
 from piper_kernels.attention.sparse_piper_attention._contracts import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_projection._amd import fragments
-from piper_kernels.fusions.convrot_int8_projection._plan import (
-    ProjectionExecutionPlan,
-    resolve_row_block_launches,
-)
+from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 
 from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 from . import policy
-from .policy import GLUON_BLOCK_M
 
 # One-barrier cross-M-warp column reduction layouts (distributes 128 columns across warps/lanes).
 _MINMAX_REDUCE_LAYOUT = gl.constexpr(
@@ -726,29 +718,14 @@ def default_execution_plan(
     value_format: ValueFormat = ValueFormat.AMD_WMMA,
 ) -> policy.AmdExecutionPlan:
     """Resolve operand metadata and select RDNA4 Gluon or Triton execution."""
-    resolved_storage_sequence = (
-        padded_sequence_length(input_qdata.shape[1])
-        if storage_sequence_length is None
-        else storage_sequence_length
-    )
-    heads = (
-        weight_qdata.shape[0] // head_dim
-        if head_dim > 0 and weight_qdata.shape[0] % head_dim == 0
-        else 0
-    )
-    return policy.select_execution_plan(
-        operation,
+    return fragments.select_execution_plan(
+        policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation=operation,
         head_dim=head_dim,
-        input_features=input_qdata.shape[2],
-        heads=heads,
         rotary_dim=rotary_dim,
-        operands_aligned=operands_aligned(
-            input_qdata,
-            weight_qdata,
-            storage_sequence_length=resolved_storage_sequence,
-            rotary_dim=rotary_dim,
-            head_dim=head_dim,
-        ),
+        storage_sequence_length=storage_sequence_length,
         value_format=value_format,
     )
 
@@ -769,7 +746,6 @@ def partial_row_block_size(
         operation=operation,
         head_dim=head_dim,
         rotary_dim=rotary_dim,
-        storage_sequence_length=padded_sequence_length(input_qdata.shape[1]),
         value_format=value_format,
     ).block_m
 
@@ -796,19 +772,17 @@ def project_query(
     """Fill Q32 INT8 queries, scales, and Q64 summaries via RDNA4 Gluon or Triton fallback."""
     query, query_scale, query_summary = out
     batch, heads, storage_sequence_length, head_dim = query.shape
-    plan = (
-        default_execution_plan(
-            input_qdata,
-            weight_qdata,
-            operation="query",
-            head_dim=head_dim,
-            rotary_dim=cos.shape[1],
-            storage_sequence_length=storage_sequence_length,
-        )
-        if execution_plan is None
-        else execution_plan
+    plan, gluon_plan = fragments.resolve_execution_plan(
+        policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation="query",
+        head_dim=head_dim,
+        rotary_dim=cos.shape[1],
+        storage_sequence_length=storage_sequence_length,
+        execution_plan=execution_plan,
     )
-    if not (isinstance(plan, policy.AmdExecutionPlan) and plan.uses_gluon):
+    if gluon_plan is None:
         projection.project_query(
             input_qdata,
             input_scale,
@@ -831,14 +805,13 @@ def project_query(
     if batch == 0 or chunk_rows == 0:
         return
     mask_block_lengths = block_lengths is not None
-    col_blocks = (heads * head_dim) // 128
     options = _build_kernel_options()
 
     with device_context(input_qdata.device):
-        for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
-            chunk_rows, GLUON_BLOCK_M
+        for grid_x, row_blocks, row_block_offset, mask_rows in fragments.iter_row_block_launches(
+            chunk_rows, heads, head_dim, mask_full_tiles=mask_block_lengths
         ):
-            _query_kernel[(row_blocks * col_blocks, batch)](
+            _query_kernel[(grid_x, batch)](
                 input_qdata,
                 input_scale,
                 weight_qdata,
@@ -865,9 +838,9 @@ def project_query(
                 softmax_scale=softmax_scale,
                 mean_pool_summary=routing_mode == _MEAN_ROUTING,
                 mask_block_lengths=mask_block_lengths,
-                mask_rows=(not aligned_rows) or mask_block_lengths,
-                group_m=plan.group_m,
-                num_warps=plan.num_warps,
+                mask_rows=mask_rows,
+                group_m=gluon_plan.group_m,
+                num_warps=gluon_plan.num_warps,
                 **options,
             )
 
@@ -893,19 +866,17 @@ def project_key(
     """Fill K64-centered INT8 keys, scales, centers, and summaries via RDNA4 Gluon or Triton."""
     key, key_scale, key_center, key_center_scale, key_summary, key_aux = out
     batch, heads, storage_sequence_length, head_dim = key.shape
-    plan = (
-        default_execution_plan(
-            input_qdata,
-            weight_qdata,
-            operation="key",
-            head_dim=head_dim,
-            rotary_dim=cos.shape[1],
-            storage_sequence_length=storage_sequence_length,
-        )
-        if execution_plan is None
-        else execution_plan
+    plan, gluon_plan = fragments.resolve_execution_plan(
+        policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation="key",
+        head_dim=head_dim,
+        rotary_dim=cos.shape[1],
+        storage_sequence_length=storage_sequence_length,
+        execution_plan=execution_plan,
     )
-    if not (isinstance(plan, policy.AmdExecutionPlan) and plan.uses_gluon):
+    if gluon_plan is None:
         projection.project_key(
             input_qdata,
             input_scale,
@@ -928,18 +899,18 @@ def project_key(
     if batch == 0 or sequence_length == 0:
         return
     mask_block_lengths = block_lengths is not None
-    col_blocks = (heads * head_dim) // 128
     rotary_dim = cos.shape[1]
     mean_pool_summary = routing_mode == _MEAN_ROUTING
 
     with device_context(input_qdata.device):
-        for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
+        for grid_x, row_blocks, row_block_offset, mask_rows in fragments.iter_row_block_launches(
             sequence_length,
-            GLUON_BLOCK_M,
+            heads,
+            head_dim,
+            mask_full_tiles=mask_block_lengths,
             start_row_block=start_row_block,
             num_row_blocks=num_row_blocks,
         ):
-            mask_rows = (not aligned_rows) or mask_block_lengths
             options = _build_key_kernel_options(
                 head_dim,
                 rotary_dim,
@@ -947,7 +918,7 @@ def project_key(
                 mask_block_lengths=mask_block_lengths,
                 mean_pool_summary=mean_pool_summary,
             )
-            _key_kernel[(row_blocks * col_blocks, batch)](
+            _key_kernel[(grid_x, batch)](
                 input_qdata,
                 input_scale,
                 weight_qdata,
@@ -975,8 +946,8 @@ def project_key(
                 mean_pool_summary=mean_pool_summary,
                 mask_block_lengths=mask_block_lengths,
                 mask_rows=mask_rows,
-                group_m=plan.group_m,
-                num_warps=plan.num_warps,
+                group_m=gluon_plan.group_m,
+                num_warps=gluon_plan.num_warps,
                 **options,
             )
 
@@ -998,23 +969,18 @@ def project_value(
     """Fill K64 tile-centered INT8 values, multipliers, and BF16 means via RDNA4 Gluon or Triton."""
     value, value_scale_multiplier, value_mean = out
     batch, heads, storage_tiles, head_dim = value_mean.shape
-    plan = (
-        default_execution_plan(
-            input_qdata,
-            weight_qdata,
-            operation="value",
-            head_dim=head_dim,
-            storage_sequence_length=storage_tiles * TILE_ROWS,
-            value_format=value_format,
-        )
-        if execution_plan is None
-        else execution_plan
+    plan, gluon_plan = fragments.resolve_execution_plan(
+        policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation="value",
+        head_dim=head_dim,
+        storage_sequence_length=storage_tiles * TILE_ROWS,
+        execution_plan=execution_plan,
+        allow_gluon=value_format is ValueFormat.AMD_WMMA,
+        value_format=value_format,
     )
-    if not (
-        isinstance(plan, policy.AmdExecutionPlan)
-        and plan.uses_gluon
-        and value_format is ValueFormat.AMD_WMMA
-    ):
+    if gluon_plan is None:
         projection.project_value(
             input_qdata,
             input_scale,
@@ -1033,17 +999,18 @@ def project_value(
     if batch == 0 or sequence_length == 0:
         return
     mask_block_lengths = block_lengths is not None
-    col_blocks = (heads * head_dim) // 128
     options = _build_kernel_options()
 
     with device_context(input_qdata.device):
-        for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
+        for grid_x, row_blocks, row_block_offset, mask_rows in fragments.iter_row_block_launches(
             sequence_length,
-            GLUON_BLOCK_M,
+            heads,
+            head_dim,
+            mask_full_tiles=mask_block_lengths,
             start_row_block=start_row_block,
             num_row_blocks=num_row_blocks,
         ):
-            _value_kernel[(row_blocks * col_blocks, batch)](
+            _value_kernel[(grid_x, batch)](
                 input_qdata,
                 input_scale,
                 weight_qdata,
@@ -1061,8 +1028,8 @@ def project_value(
                 heads=heads,
                 head_dim=head_dim,
                 mask_block_lengths=mask_block_lengths,
-                mask_rows=(not aligned_rows) or mask_block_lengths,
-                group_m=plan.group_m,
-                num_warps=plan.num_warps,
+                mask_rows=mask_rows,
+                group_m=gluon_plan.group_m,
+                num_warps=gluon_plan.num_warps,
                 **options,
             )

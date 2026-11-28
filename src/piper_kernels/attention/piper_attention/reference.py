@@ -18,6 +18,8 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
     quantize_centered_query_key,
 )
 
+from ._validation import normalize_window_bounds, resolve_kv_window_modes
+
 _CENTER_CHUNK = 1024
 _PV_BLOCK = 64
 _PV_TILES_PER_CHUNK = _CENTER_CHUNK // _PV_BLOCK
@@ -26,6 +28,52 @@ _V_INT8_RANGE = 127.0
 _SCALE_EPSILON = 1e-7
 # Keep per-chunk mean restoration finite when a constant chunk has tiny residual scale.
 _VALUE_MEAN_SCALE_FLOOR = 2.0**-80
+
+
+def _disable_autocast(device: torch.device) -> contextlib.AbstractContextManager[object]:
+    if torch.amp.is_autocast_available(device.type):
+        return torch.amp.autocast(device_type=device.type, enabled=False)
+    return contextlib.nullcontext()
+
+
+def _wmma_token_perm(device: torch.device) -> torch.Tensor:
+    tokens = torch.arange(_PV_BLOCK, device=device, dtype=torch.int64)
+    return (tokens & ~24) | ((tokens & 8) << 1) | ((tokens & 16) >> 1)
+
+
+def _advance_winner_frame(
+    running_max: torch.Tensor,
+    running_bias: torch.Tensor,
+    scores: torch.Tensor,
+    block_max: torch.Tensor,
+    block_bias: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    has_nan = torch.isnan(scores).any(dim=-1) | torch.isnan(block_max + block_bias)
+    m_clean = torch.where(has_nan, float("nan"), block_max)
+    has_block = ((m_clean != -float("inf")) & (block_bias != -float("inf"))) | has_nan
+    has_running = running_max != -float("inf")
+    bias_diff = torch.where(block_bias == running_bias, 0.0, block_bias - running_bias)
+    raw_delta = (m_clean - running_max) + bias_diff
+    delta = torch.where(
+        has_block,
+        torch.where(has_running, raw_delta, float("inf")),
+        -float("inf"),
+    )
+    tile_wins = (delta > 0.0) | has_nan
+    next_max = torch.where(tile_wins, m_clean, running_max)
+    next_bias = torch.where(tile_wins, block_bias, running_bias)
+    decay = torch.exp(-torch.abs(delta))
+    old_weight = torch.where(has_running, torch.where(tile_wins, decay, 1.0), 0.0)
+    current_weight = torch.where(has_block, torch.where(tile_wins, 1.0, decay), 0.0)
+    safe_block_max = torch.where(has_block, m_clean, 0.0)
+    return next_max, next_bias, old_weight, current_weight, has_block, safe_block_max
 
 
 def _quantize_value_per_key(
@@ -150,9 +198,8 @@ def reference_piper_attention(  # noqa: PLR0915
     running_bias = torch.zeros_like(denominator)
     query_positions = torch.arange(query_length, device=query.device) % query.shape[2]
 
-    eff_left = window_left
-    eff_right: int | None = 0 if is_causal else window_right
-    has_window = eff_left is not None or eff_right is not None
+    eff_left, eff_right, window_mode = normalize_window_bounds(is_causal, window_left, window_right)
+    has_window = window_mode != "none"
     if isinstance(eff_right, int):
         k_max_excl = min(key_length, (query.shape[2] - 1) + eff_right + 1)
     else:
@@ -196,25 +243,10 @@ def reference_piper_attention(  # noqa: PLR0915
                 -float("inf"),
             )
             block_max = shifted_scores.amax(dim=-1)
-            has_nan = torch.isnan(scores).any(dim=-1) | torch.isnan(block_max + chunk_bias)
-            m_clean = torch.where(has_nan, float("nan"), block_max)
             tile_bias = torch.where(block_max != -float("inf"), chunk_bias, 0.0)
-            has_block = ((m_clean != -float("inf")) & (tile_bias != -float("inf"))) | has_nan
-            has_running = running_max != -float("inf")
-            bias_diff = torch.where(tile_bias == running_bias, 0.0, tile_bias - running_bias)
-            raw_delta = (m_clean - running_max) + bias_diff
-            delta = torch.where(
-                has_block,
-                torch.where(has_running, raw_delta, float("inf")),
-                -float("inf"),
+            next_max, next_bias, old_weight, current_weight, has_block, safe_block_max = (
+                _advance_winner_frame(running_max, running_bias, scores, block_max, tile_bias)
             )
-            tile_wins = (delta > 0.0) | has_nan
-            next_max = torch.where(tile_wins, m_clean, running_max)
-            next_bias = torch.where(tile_wins, tile_bias, running_bias)
-            decay = torch.exp(-torch.abs(delta))
-            old_weight = torch.where(has_running, torch.where(tile_wins, decay, 1.0), 0.0)
-            current_weight = torch.where(has_block, torch.where(tile_wins, 1.0, decay), 0.0)
-            safe_block_max = torch.where(has_block, m_clean, 0.0)
             probabilities = torch.where(
                 has_block[..., None],
                 torch.exp(scores - safe_block_max[..., None]),
@@ -311,12 +343,7 @@ def freeze_kv_chunks_reference(
         return
 
     grouped_qk = key_scale.shape[2] == _PV_TILES_PER_CHUNK
-    autocast_ctx = (
-        torch.amp.autocast(device_type=key.device.type, enabled=False)
-        if torch.amp.is_autocast_available(key.device.type)
-        else contextlib.nullcontext()
-    )
-    with autocast_ctx:
+    with _disable_autocast(key.device):
         key_f = key.float()
         key_mean = key_f.mean(dim=2)
         src_key_center = rotate_signed_hadamard_heads(key_mean)
@@ -356,9 +383,7 @@ def freeze_kv_chunks_reference(
             .contiguous()
         )
         if pack_wmma:
-            tokens = torch.arange(_PV_BLOCK, device=value.device, dtype=torch.int64)
-            perm = (tokens & ~24) | ((tokens & 8) << 1) | ((tokens & 16) >> 1)
-            src_value_q = src_value_q.index_select(-1, perm)
+            src_value_q = src_value_q.index_select(-1, _wmma_token_perm(value.device))
 
         if key_int8.dtype is torch.uint8:
             src_key_q = src_key_q.view(torch.uint8)
@@ -389,25 +414,9 @@ def _online_softmax_update(
     *,
     chunk_mean: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    block_max = scores.amax(dim=-1)
-    has_nan = torch.isnan(scores).any(dim=-1) | torch.isnan(block_max + block_bias)
-    block_max = torch.where(has_nan, float("nan"), block_max)
-    has_block = ((block_max != -float("inf")) & (block_bias != -float("inf"))) | has_nan
-    has_running = running_max != -float("inf")
-    bias_diff = torch.where(block_bias == running_bias, 0.0, block_bias - running_bias)
-    raw_delta = (block_max - running_max) + bias_diff
-    delta = torch.where(
-        has_block,
-        torch.where(has_running, raw_delta, float("inf")),
-        -float("inf"),
+    next_max, next_bias, old_weight, current_weight, has_block, safe_block_max = (
+        _advance_winner_frame(running_max, running_bias, scores, scores.amax(dim=-1), block_bias)
     )
-    tile_wins = (delta > 0.0) | has_nan
-    next_max = torch.where(tile_wins, block_max, running_max)
-    next_bias = torch.where(tile_wins, block_bias, running_bias)
-    decay = torch.exp(-torch.abs(delta))
-    old_weight = torch.where(has_running, torch.where(tile_wins, decay, 1.0), 0.0)
-    current_weight = torch.where(has_block, torch.where(tile_wins, 1.0, decay), 0.0)
-    safe_block_max = torch.where(has_block, block_max, 0.0)
     probs = torch.where(
         has_block[..., None],
         torch.exp(scores - safe_block_max[..., None]) * current_weight[..., None],
@@ -461,10 +470,7 @@ def _decode_frozen_chunks_reference(  # noqa: PLR0913, PLR0915
 
     grouped_qk = key_scale.shape[2] == _PV_TILES_PER_CHUNK
     active_chunks = num_chunks.clamp(0, max_chunks)
-    wmma_perm: torch.Tensor | None = None
-    if pack_wmma:
-        tokens = torch.arange(_PV_BLOCK, device=q_rot.device, dtype=torch.int64)
-        wmma_perm = (tokens & ~24) | ((tokens & 8) << 1) | ((tokens & 16) >> 1)
+    wmma_perm = _wmma_token_perm(q_rot.device) if pack_wmma else None
 
     key_i8_signed = key_int8.view(torch.int8)
     val_i8_signed = value_int8.view(torch.int8)
@@ -638,20 +644,17 @@ def piper_attention_decode_reference(  # noqa: PLR0913
     kv_heads = key_int8.shape[1]
     gqa_group = q_heads // kv_heads
     gq = gqa_group * seq_q
-    has_explicit_window = window_left >= 0 or window_right >= 0
-    eff_left: int | None = None if window_left < 0 else window_left
-    eff_right: int | None = 0 if is_causal else (None if window_right < 0 else window_right)
-    frozen_left = eff_left if has_explicit_window else None
-    frozen_right = eff_right if has_explicit_window else None
-    tail_left = eff_left if has_explicit_window else None
-    tail_right = eff_right if has_explicit_window else (0 if is_causal else None)
-
-    autocast_ctx = (
-        torch.amp.autocast(device_type=query.device.type, enabled=False)
-        if torch.amp.is_autocast_available(query.device.type)
-        else contextlib.nullcontext()
+    windows = resolve_kv_window_modes(
+        is_causal=is_causal,
+        window_left=window_left,
+        window_right=window_right,
     )
-    with autocast_ctx:
+    frozen_left = None if windows.frozen_left < 0 else windows.frozen_left
+    frozen_right = None if windows.frozen_right < 0 else windows.frozen_right
+    tail_left = None if windows.tail_left < 0 else windows.tail_left
+    tail_right = None if windows.tail_right < 0 else windows.tail_right
+
+    with _disable_autocast(query.device):
         q_grouped = query.float().reshape(batch, kv_heads, gqa_group, seq_q, head_dim)
         q_flat = q_grouped.reshape(batch, kv_heads, gq, head_dim)
         running_max = torch.full(

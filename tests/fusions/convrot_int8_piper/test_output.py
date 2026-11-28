@@ -189,3 +189,35 @@ def test_output_reuses_bounded_query_storage(monkeypatch, chunk_rows, sequence, 
     assert len({buffers[1].data_ptr() for _, _, buffers in calls}) == 1
     monkeypatch.setattr(backend, "project_query", project)
     _assert_output_close(actual, _reference(args, 64))
+
+
+def test_dense_output_ops_carry_cudagraph_unsafe_tag():
+    for op in (
+        torch.ops.piper_kernels.convrot_int8_piper_projected_query_attention_output.default,
+        torch.ops.piper_kernels.convrot_int8_piper_projected_query_attention_residual_add_.default,
+    ):
+        assert torch.Tag.cudagraph_unsafe in op.tags
+
+
+@pytest.mark.gpu
+@_NATIVE
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_compiled_multichunk_dense_output_with_cudagraphs_enabled(head_dim):
+    # Multi-chunk dense output overlaps side streams and therefore opts out of automatic
+    # Inductor CUDAGraph capture while keeping triton.cudagraphs=True models safe to run.
+    args = list(_arguments(head_dim=head_dim, sequence=513, causal=True, output_features=80))
+
+    def run(*operands):
+        return torch.ops.piper_kernels.convrot_int8_piper_projected_query_attention_output.default(
+            *operands, head_dim=head_dim, query_chunk_rows=128
+        )
+
+    torch._dynamo.reset()
+    compiled = torch.compile(run, fullgraph=True, options={"triton.cudagraphs": True})
+    with torch.no_grad():
+        for step in range(3):
+            if step > 0:
+                args[0].random_(-100, 100)
+            torch.compiler.cudagraph_mark_step_begin()
+            actual = compiled(*args)
+            _assert_output_close(actual, _reference(args, head_dim))

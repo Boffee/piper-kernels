@@ -11,11 +11,11 @@ import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels._grid import select_block_grid
 from piper_kernels.attention.kernels.piper._amd import quantization as amd_quantization
 from piper_kernels.attention.kernels.piper._amd.fragments import (
+    ATTENTION_LLVM_FN_ATTRS,
     MMA_LAYOUT,
     accumulate_chunk_value_means,
     compute_chunk_key_biases,
@@ -23,6 +23,8 @@ from piper_kernels.attention.kernels.piper._amd.fragments import (
     pv_tiles,
     qk_tiles,
     query_fragments,
+    requires_64bit_context_offsets,
+    requires_64bit_query_offsets,
     rescale_numerator,
     softmax_fragment,
     split_columns,
@@ -34,22 +36,20 @@ from piper_kernels.attention.kernels.piper.gluon import (
 from piper_kernels.attention.kernels.sparse_piper.gluon import tile_offset
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS
 
-from .._launch import _DO_NOT_SPECIALIZE_ARGUMENTS, _ContextLauncher, _ValidatedAttentionLaunch
 from .._prepared import (
+    _DO_NOT_SPECIALIZE_ARGUMENTS,
+    _ContextLauncher,
     _PreparedSparsePiperContext,
     _PreparedSparsePiperOperands,
     _PreparedSparsePiperQuery,
+    _ValidatedAttentionLaunch,
 )
 
 # Re-exported for offline compiler diagnostics and test verification.
 _prepare_query_kernel = amd_quantization._prepare_query_kernel
-
-# Launch attributes shared by every sparse RDNA4 kernel compile.
-_LLVM_FN_ATTRS = (
-    ("target-features", "-cumode"),
-    *amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS,
-    *amd_compiler_workarounds.LDS_ONLY_FENCE_ATTRS,
-)
+_LLVM_FN_ATTRS = ATTENTION_LLVM_FN_ATTRS
+_requires_64bit_query_offsets = requires_64bit_query_offsets
+_requires_64bit_context_offsets = requires_64bit_context_offsets
 _PAIRS_PER_CHUNK = gl.constexpr(8)
 _TILES_PER_CHUNK = gl.constexpr(16)
 
@@ -89,22 +89,6 @@ def prepare_parameters(context: _PreparedSparsePiperContext) -> torch.Tensor:
             context.key_scale, context.value_scale_multiplier, parameters, count, num_warps=4
         )
     return parameters
-
-
-def _requires_64bit_query_offsets(
-    query_storage_sequence_length: int,
-    head_dim: int,
-) -> bool:
-    """Return whether packed Q word offsets exceed signed 32-bit range."""
-    return query_storage_sequence_length * (head_dim // 8) > (1 << 31)
-
-
-def _requires_64bit_context_offsets(
-    storage_sequence_length: int,
-    head_dim: int,
-) -> bool:
-    """Return whether local K/V byte offsets exceed unsigned 32-bit range."""
-    return storage_sequence_length * head_dim > (1 << 32)
 
 
 @gluon.jit(do_not_specialize=_DO_NOT_SPECIALIZE_ARGUMENTS)

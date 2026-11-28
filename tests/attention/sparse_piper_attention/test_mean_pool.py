@@ -12,15 +12,11 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MEAN_ROUTING,
 )
-from piper_kernels.attention.sparse_piper_attention._routes import (
-    PackedRouteAndCoarseBuilder,
-)
 from piper_kernels.attention.sparse_piper_attention._routing import (
+    PackedRouteAndCoarseBuilder,
     packed_routes_and_coarse_from_summaries,
     packed_routes_from_sequences,
     packed_routes_from_summaries,
-)
-from piper_kernels.attention.sparse_piper_attention._summaries import (
     sequence_block_summaries,
 )
 from piper_kernels.attention.sparse_piper_attention.coarse import (

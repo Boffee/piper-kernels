@@ -66,6 +66,23 @@ def prefill_backend(target: AcceleratorTarget) -> Literal["amd", "nvidia"] | Non
     return None
 
 
+def validate_prefill_backend(
+    prefill_backend_name: Literal["amd", "nvidia"],
+    *,
+    grouped_qk: bool,
+    pack_wmma: bool,
+) -> None:
+    """Validate prefill backend compatibility with grouped QK scales and WMMA packing."""
+    if prefill_backend_name not in ("amd", "nvidia"):
+        raise ValueError(f"prefill_backend must be 'amd' or 'nvidia', got {prefill_backend_name!r}")
+    if pack_wmma != (prefill_backend_name == "amd"):
+        raise ValueError(
+            f"pack_wmma ({pack_wmma}) must match prefill_backend ({prefill_backend_name!r})"
+        )
+    if prefill_backend_name == "amd" and not grouped_qk:
+        raise ValueError("AMD chunked prefill requires grouped_qk=True")
+
+
 def select_backend(target: AcceleratorTarget) -> AttentionImplementation | None:
     """Return a native implementation or preserve the portable fallback."""
     if nvidia_policy.supports_target(target):

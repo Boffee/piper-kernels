@@ -24,14 +24,13 @@ from piper_kernels.attention.piper_attention import _quantization, _quantized_di
 from piper_kernels.attention.piper_attention._nvidia import gluon_async_copy as _gluon_async_copy
 from piper_kernels.attention.piper_attention._nvidia import policy as _policy
 from piper_kernels.attention.piper_attention._nvidia import triton as _backend
-from piper_kernels.attention.piper_attention._nvidia.triton import (
-    _launch_piper_attention,
-    _prepare_piper_attention,
-    _ptx_float32_to_uint8x4,
-    _run_piper_attention,
-    default_execution_plan,
-)
 from piper_kernels.attention.piper_attention.reference import reference_piper_attention
+
+_launch_piper_attention = _backend._launch_piper_attention
+_prepare_piper_attention = _backend._prepare_piper_attention
+_ptx_float32_to_uint8x4 = _backend._ptx_float32_to_uint8x4
+_run_piper_attention = _backend._run_piper_attention
+default_execution_plan = _backend.default_execution_plan
 
 
 def _piper_gpu_available() -> bool:
@@ -1449,3 +1448,54 @@ def test_sm89_gluon_dense_sliding_window_and_lse_matches_reference(
     assert torch.isfinite(actual_lse).all()
     torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
     torch.testing.assert_close(actual_lse, expected_lse, atol=0.05, rtol=0.03)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _piper_gpu_available(), reason="requires NVIDIA mixed-sign MMA")
+def test_nvidia_safe_softmax_clamps_tiny_value_scale_without_overflow() -> None:
+    """Guard dense safe_softmax against exp2 overflow when V scales are tiny."""
+    device = torch.device("cuda")
+    q = torch.ones((1, 1, 64, 64), device=device, dtype=torch.int8)
+    q_scale = torch.ones((1, 1, 2), device=device, dtype=torch.float32)
+    k = torch.ones((1, 1, 64, 64), device=device, dtype=torch.int8)
+    k_scale = torch.ones((1, 1, 1), device=device, dtype=torch.float32)
+    k_center = torch.zeros((1, 1, 1, 64), device=device, dtype=torch.float32)
+    v = torch.zeros((1, 1, 64, 64), device=device, dtype=torch.int8)
+    mult = torch.full((1, 1, 64), 2.0**-120, device=device, dtype=torch.float32)
+    log_s = torch.full((1, 1, 64), -128.0, device=device, dtype=torch.float32)
+    v_mean = torch.zeros((1, 1, 1, 64), device=device, dtype=torch.float32)
+
+    plan = _on_triton(
+        default_execution_plan(
+            torch.empty((1, 1, 64, 64), device=device, dtype=torch.bfloat16),
+            False,
+            key_length=64,
+        )
+    )
+    if not plan.grouped_qk:
+        q_scale = torch.ones((1, 1, 64), device=device, dtype=torch.float32)
+        k_scale = torch.ones((1, 1, 64), device=device, dtype=torch.float32)
+    ctx = _backend._PreparedPiperContext(
+        key=k,
+        value=v,
+        key_scale=k_scale,
+        key_center=k_center,
+        value_scale_multiplier=mult,
+        value_log_scale=log_s,
+        value_mean=v_mean,
+        key_length=64,
+        is_causal=False,
+        execution_plan=plan,
+        padded_kv=True,
+    )
+    pq = _backend._PreparedPiperQuery(
+        data=q, scale=q_scale, shape=(1, 1, 64, 64), dtype=torch.bfloat16
+    )
+    out = torch.empty((1, 1, 64, 64), device=device, dtype=torch.bfloat16)
+    lse = torch.empty((1, 1, 64), device=device, dtype=torch.float32)
+    with torch.no_grad():
+        _backend._launch_piper_attention_into(ctx, pq, out, lse=lse)
+
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(lse).all()
+    assert (out == 0.0).all()

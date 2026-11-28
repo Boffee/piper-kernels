@@ -1,32 +1,35 @@
-"""NVIDIA Triton chunked prefill kernel, launchers, and offline compiler."""
+"""NVIDIA Triton chunked prefill kernel and launchers."""
 
 # Triton JIT kernels do not use Python runtime type annotations or narrow signatures.
 # ruff: noqa: ANN001, ANN202, PLR0913, PLR0917
 # pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportIndexIssue=false
 
 import math
-from collections.abc import Callable
-from typing import Literal
 
 import torch
 import triton
 import triton.language as tl
 
-from piper_kernels._triton.mixed_int8 import (
-    install_uint8_int8_dot_hook,
-    uint8_int8_dot,
-)
+from piper_kernels._triton.mixed_int8 import install_uint8_int8_dot_hook
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.piper.triton import (
     advance_tile_max_safe,
+    clip_kv_window_tiles,
     conservative_value_log_scale_bound,
     max_propagate_nan,
 )
 
 from .. import _quantization
+from .._validation import PrefillKernelOperands, WindowMode, resolve_window_mode
 from . import policy as _policy
-from .triton import _fold_chunk_value_mean, _ptx_float32_to_uint8x4
+from .triton import (
+    _accumulate_pv_tile,
+    _fold_chunk_value_mean,
+    _quantize_probabilities_u8,
+    _safe_softmax_probabilities,
+    _store_pv_output,
+)
 
 _TL_CENTER_CHUNK = tl.constexpr(_quantization.CENTER_CHUNK)
 _TL_TILES_PER_CHUNK = tl.constexpr(_quantization._TILES_PER_CHUNK)
@@ -189,33 +192,24 @@ def _piper_chunked_prefill_kernel(  # noqa: PLR0912, PLR0915
         # For tail prefill: num_chunks_ptr holds tail_len, max_chunks is tail_cap,
         # and num_slots holds key_storage.
         active_len = active_count
-        eff_wl = tl.minimum(window_left.to(tl.int64), active_len.to(tl.int64))
-        eff_wr = tl.minimum(window_right.to(tl.int64), active_len.to(tl.int64) + seq_q.to(tl.int64))
-        q_start32 = active_len - seq_q
-        q_row_min32 = q_start32 + query_block * block_m
-        q_row_max32 = q_start32 + (tl.minimum(query_block * block_m + block_m, seq_q) - 1)
-        if is_windowed_mode and window_left >= 0:
-            k_min32 = tl.minimum(
-                active_len,
-                tl.maximum(0, q_row_min32.to(tl.int64) - eff_wl),
-            ).to(tl.int32)
-        else:
-            k_min32 = tl.zeros((), dtype=tl.int32)
-        if is_causal_mode:
-            k_max32 = tl.minimum(active_len, tl.maximum(0, q_row_max32 + 1))
-        elif is_windowed_mode and window_right >= 0:
-            k_max32 = tl.minimum(
-                active_len.to(tl.int64),
-                tl.maximum(0, q_row_max32.to(tl.int64) + eff_wr + 1),
-            ).to(tl.int32)
-        else:
-            k_max32 = active_len
-        tile_start = k_min32 // 64
-        tile_end = tl.maximum(tile_start, tl.cdiv(k_max32, 64))
+        global_query_start = active_len.to(tl.int64) - seq_q.to(tl.int64)
+        tile_start, tile_end, eff_wl, eff_wr = clip_kv_window_tiles(
+            query_block,
+            seq_q,
+            seq_q,
+            global_query_start,
+            active_len,
+            active_len,
+            window_left,
+            window_right,
+            block_m=block_m,
+            block_n=64,
+            packed_gqa=False,
+            window_mode=window_mode,
+        )
         has_work = tile_start < tile_end
         chunk_start = tl.where(has_work, tile_start // _TL_TILES_PER_CHUNK, 0)
         chunk_end = tl.where(has_work, (tile_end - 1) // _TL_TILES_PER_CHUNK + 1, 0)
-        global_query_start = q_start32.to(tl.int64)
         if is_windowed_mode:
             win_lo_base = (
                 global_query_start - eff_wl if window_left >= 0 else -seq_q.to(tl.int64) - 1
@@ -236,50 +230,23 @@ def _piper_chunked_prefill_kernel(  # noqa: PLR0912, PLR0915
         )
         frozen_tokens = active_count.to(tl.int64) * 1024
         total_kv = frozen_tokens + active_tail
-        eff_wl = tl.minimum(window_left.to(tl.int64), total_kv)
-        eff_wr = tl.minimum(window_right.to(tl.int64), total_kv + eff_seq_q.to(tl.int64))
         global_query_start = (
             total_kv - eff_seq_q.to(tl.int64) if has_window else tl.zeros((), dtype=tl.int64)
         )
-        total_tiles = active_count * _TL_TILES_PER_CHUNK
-        if has_window:
-            if per_row_query_scale:
-                q_tile_first = query_block.to(tl.int64) * block_m
-                q_tile_last = tl.minimum(q_tile_first + block_m, seq_q.to(tl.int64)) - 1
-                same_head = (q_tile_first // eff_logical_seq_q) == (
-                    q_tile_last // eff_logical_seq_q
-                )
-                q_idx_min = tl.where(same_head, q_tile_first % eff_logical_seq_q, 0)
-                q_idx_max = tl.where(
-                    same_head, q_tile_last % eff_logical_seq_q, eff_logical_seq_q - 1
-                )
-            else:
-                q_idx_min = query_block.to(tl.int64) * block_m
-                q_idx_max = tl.minimum(q_idx_min + block_m, seq_q.to(tl.int64)) - 1
-            q_row_min = global_query_start + q_idx_min
-            q_row_max = global_query_start + q_idx_max
-            k_min = (
-                tl.maximum(0, q_row_min - eff_wl)
-                if (is_windowed_mode and window_left >= 0)
-                else tl.zeros((), dtype=tl.int64)
-            )
-            if is_causal_mode:
-                k_max_excl = tl.minimum(frozen_tokens, tl.maximum(0, q_row_max + 1))
-            elif window_right >= 0:
-                k_max_excl = tl.minimum(
-                    frozen_tokens,
-                    tl.maximum(0, q_row_max + eff_wr + 1),
-                )
-            else:
-                k_max_excl = frozen_tokens
-            vis_t_start = tl.minimum(total_tiles.to(tl.int64), k_min // 64).to(tl.int32)
-            vis_t_end = tl.maximum(
-                vis_t_start,
-                tl.minimum(total_tiles.to(tl.int64), tl.cdiv(k_max_excl, 64)).to(tl.int32),
-            )
-        else:
-            vis_t_start = tl.zeros((), dtype=tl.int32)
-            vis_t_end = total_tiles
+        vis_t_start, vis_t_end, eff_wl, eff_wr = clip_kv_window_tiles(
+            query_block,
+            seq_q,
+            eff_seq_q,
+            global_query_start,
+            frozen_tokens,
+            total_kv,
+            window_left,
+            window_right,
+            block_m=block_m,
+            block_n=64,
+            packed_gqa=per_row_query_scale,
+            window_mode=window_mode,
+        )
         if has_chunk_splits:
             vis_tiles = vis_t_end - vis_t_start
             tiles_per_split = tl.cdiv(vis_tiles, split_chunks)
@@ -468,25 +435,23 @@ def _piper_chunked_prefill_kernel(  # noqa: PLR0912, PLR0915
                         valid_queries,
                     )
                 )
-                score_delta = scores - safe_block_max[:, None]
-                max_delta = tl.minimum(-value_log_scale[None, :], 100.0)
-                probabilities = tl.exp2(tl.where(score_delta > max_delta, max_delta, score_delta))
+                probabilities = _safe_softmax_probabilities(
+                    scores,
+                    safe_block_max,
+                    value_log_scale,
+                )
                 row_sum = tl.where(has_block, tl.sum(probabilities, axis=1) * current_weight, 0.0)
                 denominator = denominator * old_weight + row_sum
                 chunk_denom = chunk_denom * old_weight + row_sum
-                probability_values = (
-                    tl.where(
-                        (chunk_active & has_block)[:, None],
-                        probabilities * value_scale_multiplier[None, :],
-                        0.0,
-                    )
-                    + 0.5
+                probability_uint8 = _quantize_probabilities_u8(
+                    probabilities,
+                    value_scale_multiplier,
+                    use_packed_probability_conversion=tl.constexpr(True),
+                    active_mask=(chunk_active & has_block)[:, None],
                 )
-                probability_uint8 = _ptx_float32_to_uint8x4(probability_values)
 
                 v_tile_base = v_chunk_ptr + tile * (head_dim * 64)
                 if split_pv_head_dim:
-                    acc_lo, acc_hi = numerator
                     v_lo = tl.trans(
                         tl.load(v_tile_base + offsets_vd[:, None] * 64 + offsets_n[None, :])
                     )
@@ -497,24 +462,19 @@ def _piper_chunked_prefill_kernel(  # noqa: PLR0912, PLR0915
                             + offsets_n[None, :]
                         )
                     )
-                    p_lo = uint8_int8_dot(probability_uint8, v_lo)
-                    p_hi = uint8_int8_dot(probability_uint8, v_hi)
-                    acc_lo = (
-                        acc_lo * old_weight[:, None] + p_lo.to(tl.float32) * current_weight[:, None]
-                    )
-                    acc_hi = (
-                        acc_hi * old_weight[:, None] + p_hi.to(tl.float32) * current_weight[:, None]
-                    )
-                    numerator = (acc_lo, acc_hi)
+                    v_tile = (v_lo, v_hi)
                 else:
                     v_tile = tl.trans(
                         tl.load(v_tile_base + offsets_d[:, None] * 64 + offsets_n[None, :])
                     )
-                    partial = uint8_int8_dot(probability_uint8, v_tile)
-                    numerator = (
-                        numerator * old_weight[:, None]
-                        + partial.to(tl.float32) * current_weight[:, None]
-                    )
+                numerator = _accumulate_pv_tile(
+                    numerator,
+                    probability_uint8,
+                    v_tile,
+                    old_weight,
+                    current_weight,
+                    split_pv_head_dim=split_pv_head_dim,
+                )
                 running_max = next_max
                 running_bias = next_bias
 
@@ -562,26 +522,24 @@ def _piper_chunked_prefill_kernel(  # noqa: PLR0912, PLR0915
         + head.to(tl.int64) * stride_oh
         + output_rows[:, None].to(tl.int64) * stride_om
     )
-    if split_pv_head_dim:
-        acc_lo, acc_hi = numerator
-        out_lo = tl.where(has_any[:, None], acc_lo / denominator_code_units, 0.0)
-        out_hi = tl.where(has_any[:, None], acc_hi / denominator_code_units, 0.0)
-        tl.store(output_base + offsets_vd[None, :], out_lo, mask=valid_queries[:, None])
-        tl.store(
-            output_base + half_head_dim + offsets_vd[None, :], out_hi, mask=valid_queries[:, None]
-        )
-    else:
-        output = tl.where(has_any[:, None], numerator / denominator_code_units, 0.0)
-        tl.store(output_base + offsets_d[None, :], output, mask=valid_queries[:, None])
+    _store_pv_output(
+        output_base,
+        numerator,
+        denominator_code_units,
+        offsets_d,
+        offsets_vd,
+        valid_queries,
+        has_any,
+        split_pv_head_dim=split_pv_head_dim,
+        head_dim=head_dim,
+        mask_empty=tl.constexpr(True),
+    )
 
 
 def launch_prefill_kernel(
-    common_args: tuple[object, ...],
+    operands: PrefillKernelOperands,
     *,
-    device: torch.device,
     batch: int,
-    q_heads: int,
-    seq_q: int,
     gqa_group: int,
     head_dim: int,
     grouped_qk: bool,
@@ -597,20 +555,19 @@ def launch_prefill_kernel(
     target: AcceleratorTarget | None = None,
     tail_len: torch.Tensor | None = None,
     tail_cap: int = 0,
-    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    window_mode: WindowMode | None = None,
     window_left: int = -1,
     window_right: int = -1,
     logical_seq_q: int = 0,
 ) -> None:
-    """Launch NVIDIA unified chunked prefill kernel with pre-assembled host arguments."""
+    """Launch NVIDIA unified chunked prefill kernel with typed pre-assembled operands."""
+    device = operands.query_int8.device
     resolved_target = AcceleratorTarget.from_device(device) if target is None else target
     resolved_total = split_chunks if total_splits is None else total_splits
     resolved_chunk_splits = (resolved_total > 1) if has_chunk_splits is None else has_chunk_splits
     if resolved_chunk_splits and (partial_bias is None or partial_log_denom is None):
         raise ValueError("partial_bias and partial_log_denom are required when has_chunk_splits")
-    resolved_mode: Literal["none", "causal", "windowed"] = (
-        ("causal" if is_causal else "none") if window_mode is None else window_mode
-    )
+    resolved_mode = resolve_window_mode(is_causal, window_mode)
     block_m, num_warps, split_pv, num_stages, loop_num_stages = _policy.select_prefill_config(
         resolved_target,
         head_dim=head_dim,
@@ -619,12 +576,14 @@ def launch_prefill_kernel(
         has_chunk_splits=resolved_chunk_splits,
         window_mode=resolved_mode,
     )
-    bias_target = partial_bias if partial_bias is not None else common_args[11]
-    log_denom_target = partial_log_denom if partial_log_denom is not None else common_args[11]
+    bias_target = partial_bias if partial_bias is not None else operands.lse
+    log_denom_target = partial_log_denom if partial_log_denom is not None else operands.lse
     with device_context(device):
         install_uint8_int8_dot_hook()
-        _piper_chunked_prefill_kernel[(triton.cdiv(seq_q, block_m), q_heads, batch * split_chunks)](
-            *common_args,
+        _piper_chunked_prefill_kernel[
+            (triton.cdiv(operands.seq_q, block_m), operands.q_heads, batch * split_chunks)
+        ](
+            *operands.kernel_args(),
             split_chunks,
             bias_target,
             log_denom_target,
@@ -669,50 +628,34 @@ def launch_tail_prefill(
     is_causal: bool,
     grouped_qk: bool,
     target: AcceleratorTarget | None = None,
-    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    window_mode: WindowMode | None = None,
     window_left: int = -1,
     window_right: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch NVIDIA zero-spill offset-window quantized tail prefill returning output and LSE."""
     batch, q_heads, _, head_dim = output.shape
-    tail_args: tuple[object, ...] = (
-        query_int8,
-        query_scale,
-        tail_key_int8,
-        tail_key_scale,
-        tail_key_center,
-        tail_value_int8,
-        tail_value_scale,
-        tail_value_mean,
-        tail_len,
-        tail_len,
-        output,
-        lse,
-        seq_q,
-        query_int8.shape[2],
-        q_heads,
-        tail_key_int8.shape[2],
-        tail_cap,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1,
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        lse.stride(0),
-        lse.stride(1),
+    tail_operands = PrefillKernelOperands(
+        query_int8=query_int8,
+        query_scale=query_scale,
+        key_int8=tail_key_int8,
+        key_scale=tail_key_scale,
+        key_center=tail_key_center,
+        value_int8=tail_value_int8,
+        value_scale=tail_value_scale,
+        value_mean=tail_value_mean,
+        chunk_to_slot=tail_len,
+        num_chunks=tail_len,
+        output=output,
+        lse=lse,
+        seq_q=seq_q,
+        query_storage=query_int8.shape[2],
+        q_heads=q_heads,
+        num_slots=tail_key_int8.shape[2],
+        max_chunks=tail_cap,
     )
     launch_prefill_kernel(
-        tail_args,
-        device=query_int8.device,
+        tail_operands,
         batch=batch,
-        q_heads=q_heads,
-        seq_q=seq_q,
         gqa_group=q_heads // tail_key_int8.shape[1],
         head_dim=head_dim,
         grouped_qk=grouped_qk,
@@ -725,104 +668,3 @@ def launch_tail_prefill(
         window_right=window_right,
     )
     return output, lse
-
-
-def compile_nvidia_prefill_kernels(
-    target: object,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-    head_dim: int = 128,
-    has_chunk_map: bool = True,
-    is_causal: bool = True,
-    wide_pool: bool = False,
-    has_chunk_splits: bool = False,
-    per_row_query_scale: bool = False,
-    window_mode: Literal["none", "causal", "windowed"] | None = None,
-    has_tail: bool = False,
-    include_tail: bool = True,
-    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
-) -> tuple[object, ...]:
-    """Offline-compile unified NVIDIA frozen-pool and offset-window tail prefill kernels."""
-    accel = AcceleratorTarget.from_compiler_target(target)
-    triton_dtype = _quantization.validate_kv_compile_args(dtype, head_dim)
-    grouped_qk = _policy.groups_qk_scales(accel)
-    compiler = triton.compile if compile_fn is None else compile_fn
-    frozen_mode: Literal["none", "causal", "windowed"] = (
-        "none" if window_mode is None else window_mode
-    )
-    tail_mode: Literal["none", "causal", "windowed"] = (
-        ("causal" if is_causal else "none") if window_mode is None else window_mode
-    )
-
-    def _compile_variant(
-        *,
-        tail_mode_flag: bool,
-        variant_window_mode: Literal["none", "causal", "windowed"],
-        chunk_map: bool,
-        chunk_splits: bool,
-        per_row: bool,
-        with_tail: bool,
-    ) -> object:
-        block_m, num_warps, split_pv, num_stages, loop_num_stages = _policy.select_prefill_config(
-            accel,
-            head_dim=head_dim,
-            is_tail=tail_mode_flag,
-            has_chunk_map=chunk_map,
-            has_chunk_splits=chunk_splits,
-            window_mode=variant_window_mode,
-        )
-        constants: dict[str, object] = {
-            "query_heads_per_kv_head": 3,
-            "head_dim": head_dim,
-            "grouped_qk": grouped_qk,
-            "split_pv_head_dim": split_pv,
-            "has_chunk_map": chunk_map,
-            "is_tail": tail_mode_flag,
-            "window_mode": variant_window_mode,
-            "block_m": block_m,
-            "loop_num_stages": loop_num_stages,
-            "has_chunk_splits": chunk_splits,
-            "per_row_query_scale": per_row,
-            "has_tail": with_tail,
-        }
-        wide = wide_pool and not tail_mode_flag
-        overrides = _quantization.frozen_pool_pointer_signature(triton_dtype, wide_pool=wide)
-        overrides["partial_bias_ptr"] = "*fp32"
-        overrides["partial_log_denom_ptr"] = "*fp32"
-        overrides["window_left"] = "i64"
-        overrides["window_right"] = "i64"
-        overrides["logical_seq_q"] = "i32"
-        if with_tail:
-            overrides["tail_len_ptr"] = "*i32"
-        else:
-            constants["tail_len_ptr"] = None
-            overrides["tail_len_ptr"] = "constexpr"
-        if chunk_splits:
-            overrides["output_ptr"] = "*fp32"
-        source = _quantization.build_kernel_source(
-            _piper_chunked_prefill_kernel,
-            constants=constants,
-            overrides=overrides,
-            pointer_range_32=not wide,
-        )
-        return compiler(source, target, {"num_warps": num_warps, "num_stages": num_stages})
-
-    frozen_compiled = _compile_variant(
-        tail_mode_flag=False,
-        variant_window_mode=frozen_mode,
-        chunk_map=has_chunk_map,
-        chunk_splits=has_chunk_splits,
-        per_row=per_row_query_scale,
-        with_tail=has_tail,
-    )
-    if not include_tail:
-        return (frozen_compiled,)
-    tail_compiled = _compile_variant(
-        tail_mode_flag=True,
-        variant_window_mode=tail_mode,
-        chunk_map=False,
-        chunk_splits=False,
-        per_row=False,
-        with_tail=False,
-    )
-    return (frozen_compiled, tail_compiled)

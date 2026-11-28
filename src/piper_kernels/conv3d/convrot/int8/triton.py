@@ -20,7 +20,8 @@ Target schedules (selected in ``_policy.py``):
   move across targets without scale conversion.
 """
 
-# pyright: reportCallIssue=false
+# Triton specializes Python literals as constexpr arguments inside JIT functions.
+# pyright: reportArgumentType=false, reportCallIssue=false
 
 from __future__ import annotations
 
@@ -55,8 +56,18 @@ def _prepare_channelwise_kernel(
     input_scale,
     accelerator_backend: tl.constexpr,
     block_m: tl.constexpr,
+    has_group_norm_silu: tl.constexpr = False,
+    affine_weight_ptr=None,
+    affine_bias_ptr=None,
+    mean_ptr=None,
+    rstd_ptr=None,
+    affine_weight_stride: tl.constexpr = 1,
+    affine_bias_stride: tl.constexpr = 1,
+    frames: tl.constexpr = 1,
+    groups: tl.constexpr = 1,
+    channels_per_group: tl.constexpr = 1,
 ):
-    """Fuse NCTHW-to-NTHWC conversion, Hadamard rotation, and fixed quantization."""
+    """Fuse NCTHW-to-NTHWC conversion, optional GroupNorm+SiLU, rotation, and quantization."""
     token_offsets = tl.program_id(0) * block_m + tl.arange(0, block_m)
     channel_offsets = tl.arange(0, channels)
     batch = token_offsets // token_volume
@@ -74,6 +85,15 @@ def _prepare_channelwise_kernel(
     )
     valid = token_offsets < token_count
     values = tl.load(pointers, mask=valid[:, None], other=0.0).to(tl.float32)
+    if has_group_norm_silu:
+        group = channel_offsets // channels_per_group
+        stats_row = (batch[:, None] * frames + frame[:, None]) * groups + group[None, :]
+        mean = tl.load(mean_ptr + stats_row, mask=valid[:, None], other=0.0)
+        rstd = tl.load(rstd_ptr + stats_row, mask=valid[:, None], other=0.0)
+        affine_weight = tl.load(affine_weight_ptr + channel_offsets * affine_weight_stride)
+        affine_bias = tl.load(affine_bias_ptr + channel_offsets * affine_bias_stride)
+        values = (values - mean) * rstd * affine_weight[None, :] + affine_bias[None, :]
+        values = values * tl.sigmoid(values)
     values = tl.reshape(values, (block_m * channels,))
     values = rotation_backend.rotate_hadamard_groups(
         values,
@@ -162,76 +182,6 @@ def _group_norm_finalize_stats_kernel(
     variance = tl.sum(partial_m2 + delta * delta * counts, axis=0) / reduction_size
     tl.store(mean_ptr + stats_row, mean)
     tl.store(rstd_ptr + stats_row, tl.rsqrt(variance + epsilon))
-
-
-@triton.jit
-def _prepare_group_norm_silu_kernel(
-    input_ptr,
-    affine_weight_ptr,
-    affine_bias_ptr,
-    affine_weight_stride: tl.constexpr,
-    affine_bias_stride: tl.constexpr,
-    mean_ptr,
-    rstd_ptr,
-    output_ptr,
-    token_count,
-    token_volume: tl.constexpr,
-    frames: tl.constexpr,
-    input_height: tl.constexpr,
-    input_width: tl.constexpr,
-    stride_batch,
-    stride_channel,
-    stride_frame,
-    stride_height,
-    stride_width,
-    channels: tl.constexpr,
-    groups: tl.constexpr,
-    channels_per_group: tl.constexpr,
-    group_size: tl.constexpr,
-    input_scale,
-    accelerator_backend: tl.constexpr,
-    block_m: tl.constexpr,
-):
-    """Fuse isolated GroupNorm, SiLU, channel rotation, and fixed quantization."""
-    token_offsets = tl.program_id(0) * block_m + tl.arange(0, block_m)
-    channel_offsets = tl.arange(0, channels)
-    batch = token_offsets // token_volume
-    position = token_offsets % token_volume
-    frame = position // (input_height * input_width)
-    spatial = position % (input_height * input_width)
-    y = spatial // input_width
-    x = spatial % input_width
-    pointers = input_ptr + (
-        batch[:, None].to(tl.int64) * stride_batch
-        + channel_offsets[None, :].to(tl.int64) * stride_channel
-        + frame[:, None].to(tl.int64) * stride_frame
-        + y[:, None].to(tl.int64) * stride_height
-        + x[:, None].to(tl.int64) * stride_width
-    )
-    valid = token_offsets < token_count
-    values = tl.load(pointers, mask=valid[:, None], other=0.0).to(tl.float32)
-    group = channel_offsets // channels_per_group
-    stats_row = (batch[:, None] * frames + frame[:, None]) * groups + group[None, :]
-    mean = tl.load(mean_ptr + stats_row, mask=valid[:, None], other=0.0)
-    rstd = tl.load(rstd_ptr + stats_row, mask=valid[:, None], other=0.0)
-    affine_weight = tl.load(affine_weight_ptr + channel_offsets * affine_weight_stride)
-    affine_bias = tl.load(affine_bias_ptr + channel_offsets * affine_bias_stride)
-    values = (values - mean) * rstd * affine_weight[None, :] + affine_bias[None, :]
-    values = values * tl.sigmoid(values)
-    values = tl.reshape(values, (block_m * channels,))
-    values = rotation_backend.rotate_hadamard_groups(
-        values,
-        block_m * channels,
-        group_size,
-    )
-    values = tl.reshape(values, (block_m, channels))
-    values = values * (group_size**-0.5)
-    quantized = int8_kernels._quantize_int8(values, tl.load(input_scale), accelerator_backend)
-    tl.store(
-        output_ptr + token_offsets[:, None].to(tl.int64) * channels + channel_offsets[None, :],
-        quantized,
-        mask=valid[:, None],
-    )
 
 
 @triton.jit
@@ -400,6 +350,11 @@ def _prepare_input(
     *,
     schedule: PreparationSchedule,
     accelerator_backend: str,
+    norm_weight=None,
+    norm_bias=None,
+    mean=None,
+    rstd=None,
+    norm_groups: int = 1,
 ):
     batch, channels, frames, height, width = input.shape
     token_volume = frames * height * width
@@ -410,6 +365,7 @@ def _prepare_input(
         dtype=torch.int8,
     )
     block_m, num_warps = schedule
+    has_group_norm = norm_weight is not None and norm_bias is not None
     with device_context(input.device):
         _prepare_channelwise_kernel[(triton.cdiv(token_count, block_m),)](
             input,
@@ -428,6 +384,16 @@ def _prepare_input(
             input_scale=input_scale,
             accelerator_backend=accelerator_backend,
             block_m=block_m,
+            has_group_norm_silu=has_group_norm,
+            affine_weight_ptr=norm_weight,
+            affine_bias_ptr=norm_bias,
+            mean_ptr=mean,
+            rstd_ptr=rstd,
+            affine_weight_stride=norm_weight.stride(0) if norm_weight is not None else 1,
+            affine_bias_stride=norm_bias.stride(0) if norm_bias is not None else 1,
+            frames=frames if has_group_norm else 1,
+            groups=norm_groups if has_group_norm else 1,
+            channels_per_group=(channels // norm_groups) if has_group_norm else 1,
             num_warps=num_warps,
         )
     return qdata
@@ -490,43 +456,18 @@ def _prepare_group_norm_silu_input(
             epsilon=norm_epsilon,
             num_warps=4,
         )
-        token_volume = frames * height * width
-        token_count = batch * token_volume
-        qdata = torch.empty(
-            (batch, frames, height, width, channels),
-            device=input.device,
-            dtype=torch.int8,
-        )
-        block_m, num_warps = schedule
-        _prepare_group_norm_silu_kernel[(triton.cdiv(token_count, block_m),)](
-            input,
-            norm_weight,
-            norm_bias,
-            norm_weight.stride(0),
-            norm_bias.stride(0),
-            mean,
-            rstd,
-            qdata,
-            token_count,
-            token_volume=token_volume,
-            frames=frames,
-            input_height=height,
-            input_width=width,
-            stride_batch=input.stride(0),
-            stride_channel=input.stride(1),
-            stride_frame=input.stride(2),
-            stride_height=input.stride(3),
-            stride_width=input.stride(4),
-            channels=channels,
-            groups=norm_groups,
-            channels_per_group=channels_per_group,
-            group_size=group_size,
-            input_scale=input_scale,
-            accelerator_backend=accelerator_backend,
-            block_m=block_m,
-            num_warps=num_warps,
-        )
-    return qdata
+    return _prepare_input(
+        input,
+        group_size,
+        input_scale,
+        schedule=schedule,
+        accelerator_backend=accelerator_backend,
+        norm_weight=norm_weight,
+        norm_bias=norm_bias,
+        mean=mean,
+        rstd=rstd,
+        norm_groups=norm_groups,
+    )
 
 
 def _conv3d_prepared(

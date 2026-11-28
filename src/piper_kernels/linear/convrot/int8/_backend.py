@@ -77,6 +77,7 @@ class _LinearKernels(Protocol):
         *,
         input_scale: torch.Tensor | None = None,
         num_warps: int,
+        target: AcceleratorTarget | None = None,
     ) -> None: ...
 
     def launch_prepared_linear(  # noqa: PLR0913
@@ -299,6 +300,7 @@ class LinearBackend:
                 row_scales,
                 input_scale=input_scale,
                 num_warps=execution_plan.quantization_num_warps,
+                target=target,
             )
         return result
 

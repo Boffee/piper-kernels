@@ -21,17 +21,12 @@ from triton.experimental.gluon._runtime import GluonASTSource
 from piper_kernels._triton.mixed_int8 import _MixedInt8StageHook
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as sage_q
-from piper_kernels.attention.piper_attention import _quantization
+from piper_kernels.attention.piper_attention import _kv_compile, _quantization
 from piper_kernels.attention.piper_attention._nvidia.gluon_async_copy import (
     _dense_piper_attention_kernel,
 )
 from piper_kernels.attention.piper_attention._nvidia.policy import select_execution_plan
 from piper_kernels.attention.piper_attention._nvidia.triton import _piper_attention_kernel
-from piper_kernels.attention.piper_attention.triton import (
-    compile_kv_decode_kernels,
-    compile_kv_prefill_kernels,
-    compile_merge_attention_lse_kernel,
-)
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="offline compiler coverage on Linux"
@@ -345,7 +340,7 @@ def test_kv_freeze_8_target_compile_zero_spills(
     _assert_zero_spill_kernels(
         target,
         2,
-        lambda compile_fn: _quantization.compile_kv_freeze_kernels(
+        lambda compile_fn: _kv_compile.compile_kv_freeze_kernels(
             target, dtype=dtype, head_dim=head_dim, compile_fn=compile_fn
         ),
         check_sgpr_spills=False,
@@ -378,7 +373,7 @@ def _compile_kv_decode_zero_spill_checked(  # noqa: PLR0913
     def _compile_and_record(
         compile_fn: Callable[[object, object, dict[str, object]], object] | None,
     ) -> tuple[object, ...]:
-        res = compile_kv_decode_kernels(
+        res = _kv_compile.compile_kv_decode_kernels(
             target,
             dtype=dtype,
             head_dim=head_dim,
@@ -445,7 +440,7 @@ def test_kv_decode_vectorized_reduce_9_target_compile_zero_spills(
     _assert_zero_spill_kernels(
         target,
         3,
-        lambda compile_fn: compile_kv_decode_kernels(
+        lambda compile_fn: _kv_compile.compile_kv_decode_kernels(
             target,
             dtype=dtype,
             head_dim=head_dim,
@@ -482,7 +477,7 @@ def test_kv_prefill_fallback_targets_merge_zero_spills(
     _assert_zero_spill_kernels(
         target,
         1,
-        lambda compile_fn: compile_kv_prefill_kernels(
+        lambda compile_fn: _kv_compile.compile_kv_prefill_kernels(
             target,
             dtype=dtype,
             head_dim=head_dim,
@@ -512,7 +507,7 @@ def test_kv_prefill_native_cuda_compile_zero_spills(
     def _compile_and_record(
         compile_fn: Callable[[object, object, dict[str, object]], object] | None,
     ) -> tuple[object, ...]:
-        res = compile_kv_prefill_kernels(
+        res = _kv_compile.compile_kv_prefill_kernels(
             target,
             dtype=dtype,
             head_dim=head_dim,
@@ -545,7 +540,7 @@ def test_kv_prefill_amd_dispatch_compile_smoke(
     _assert_zero_spill_kernels(
         GPUTarget("hip", "gfx1201", 32),
         3,
-        lambda compile_fn: compile_kv_prefill_kernels(
+        lambda compile_fn: _kv_compile.compile_kv_prefill_kernels(
             GPUTarget("hip", "gfx1201", 32),
             dtype=dtype,
             head_dim=head_dim,
@@ -566,7 +561,7 @@ def test_kv_tail_quantize_prefill_compile_zero_spills(
     _assert_zero_spill_kernels(
         target,
         2,
-        lambda compile_fn: _quantization.compile_kv_tail_quantize_kernels(
+        lambda compile_fn: _kv_compile.compile_kv_tail_quantize_kernels(
             target, dtype=dtype, head_dim=head_dim, compile_fn=compile_fn
         ),
     )
@@ -577,7 +572,7 @@ def test_kv_freeze_and_decode_gfx1200_smoke() -> None:
     _assert_zero_spill_kernels(
         tgt,
         2,
-        lambda compile_fn: _quantization.compile_kv_freeze_kernels(
+        lambda compile_fn: _kv_compile.compile_kv_freeze_kernels(
             tgt, dtype=torch.bfloat16, head_dim=128, compile_fn=compile_fn
         ),
         check_sgpr_spills=False,
@@ -585,7 +580,7 @@ def test_kv_freeze_and_decode_gfx1200_smoke() -> None:
     _assert_zero_spill_kernels(
         tgt,
         3,
-        lambda compile_fn: compile_kv_decode_kernels(
+        lambda compile_fn: _kv_compile.compile_kv_decode_kernels(
             tgt, dtype=torch.bfloat16, head_dim=128, compile_fn=compile_fn
         ),
     )
@@ -611,7 +606,7 @@ def test_kv_wide_pool_prefill_compile_zero_spills(
     _assert_zero_spill_kernels(
         target,
         3,
-        lambda compile_fn: compile_kv_prefill_kernels(
+        lambda compile_fn: _kv_compile.compile_kv_prefill_kernels(
             target,
             dtype=torch.bfloat16,
             head_dim=head_dim,
@@ -646,8 +641,8 @@ def test_kv_per_row_query_quantize_compile_zero_spills(
     dtype: torch.dtype,
     head_dim: int,
 ) -> None:
-    triton_dtype = _quantization.validate_kv_compile_args(dtype, head_dim)
-    source = _quantization.build_kernel_source(
+    triton_dtype = _kv_compile.validate_kv_compile_args(dtype, head_dim)
+    source = _kv_compile.build_kernel_source(
         sage_q.quantize_query_per_thread_kernel,
         constants={"head_dim": head_dim, "per_row": True},
         overrides={
@@ -680,7 +675,7 @@ def _compile_kv_prefill_zero_spill_checked(
     def _compile_and_record(
         compile_fn: Callable[[object, object, dict[str, object]], object] | None,
     ) -> tuple[object, ...]:
-        res = compile_kv_prefill_kernels(
+        res = _kv_compile.compile_kv_prefill_kernels(
             target,
             dtype=torch.bfloat16,
             head_dim=head_dim,
@@ -778,7 +773,7 @@ def test_kv_prefill_windowed_with_tail_nvidia_compile_zero_spills(
     _assert_zero_spill_kernels(
         target,
         3,
-        lambda compile_fn: compile_kv_prefill_kernels(
+        lambda compile_fn: _kv_compile.compile_kv_prefill_kernels(
             target,
             dtype=torch.bfloat16,
             head_dim=head_dim,
@@ -804,7 +799,7 @@ def test_merge_attention_lse_9_target_compile_zero_spills(
         target,
         1,
         lambda compile_fn: (
-            compile_merge_attention_lse_kernel(
+            _kv_compile.compile_merge_attention_lse_kernel(
                 target,
                 dtype=torch.bfloat16,
                 head_dim=128 if is_contiguous else 96,

@@ -12,6 +12,7 @@ import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.attention.kernels._grid import select_block_grid
+from piper_kernels.attention.kernels.piper.triton import max_propagate_nan
 
 from ._rotation import SIGNED_HADAMARD_MASK
 
@@ -267,12 +268,6 @@ def quantize_tile_centered_key_tile(
     )
 
 
-@triton.jit
-def _max_propagate_nan(a, b):
-    """Max reducer that propagates NaNs across lanes."""
-    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
-
-
 # Per-row scale strides follow the sequence length; specializing on their
 # divisibility would compile a new variant per length class for no benefit.
 @triton.jit(do_not_specialize=["query_length", "stride_sb", "stride_sh"])
@@ -314,7 +309,7 @@ def quantize_query_per_thread_kernel(
     ).to(tl.float32)
     values = rotate_signed_hadamard_heads(values, head_dim)
     if per_row:
-        row_max = tl.reduce(tl.abs(values), 1, _max_propagate_nan)
+        row_max = tl.reduce(tl.abs(values), 1, max_propagate_nan)
         raw_scale = row_max / 127.0  # pyright: ignore[reportOperatorIssue]
         safe_div = tl.where(raw_scale == 0.0, 1.0, raw_scale)
         quantized = round_to_int8(values / safe_div[:, None])
@@ -400,7 +395,19 @@ def quantize_query_per_warp_kernel(
 
 
 @triton.jit(
-    do_not_specialize=["key_length", "heads", "tile_count", "storage_key_length", "heads_inner"]
+    do_not_specialize=[
+        "key_length",
+        "storage_key_length",
+        "tile_count",
+        "stride_kb",
+        "stride_kh",
+        "stride_kn",
+        "stride_sb",
+        "stride_sh",
+        "heads",
+        "heads_inner",
+        "sparse_key_blocks",
+    ]
 )
 def quantize_key_tile_centered_per_block_kernel(
     key_ptr,
@@ -425,8 +432,12 @@ def quantize_key_tile_centered_per_block_kernel(
     mask_block_lengths: tl.constexpr,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
+    key_summary_ptr=None,
+    key_aux_ptr=None,
+    sparse_key_blocks=0,
+    emit_summaries: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
-    """Quantize K with per-block (K64) tile centering and 2-term rotated midpoints."""
+    """Quantize K with per-block (K64) tile centering and optional min/max routing summaries."""
     pid0 = tl.program_id(0)
     pid1 = tl.program_id(1)
     scale_group = tl.where(heads_inner != 0, pid1, pid0).to(tl.int64)
@@ -449,6 +460,16 @@ def quantize_key_tile_centered_per_block_kernel(
         mask=valid_rows[:, None],
         other=0.0,
     ).to(tl.float32)
+    head_block = batch * heads + head
+    if emit_summaries:  # noqa: SIM102 - keep constexpr guard outer so LLVM strips prefix branch
+        # Only the sparse prefix needs routing summaries; the dense suffix still
+        # needs quantization, but every query attends to it without routing.
+        if scale_group < sparse_key_blocks:
+            summary_max = tl.max(tl.where(valid_rows[:, None], values, -float("inf")), axis=0)
+            summary_min = tl.min(tl.where(valid_rows[:, None], values, float("inf")), axis=0)
+            summary_offsets = (head_block * sparse_key_blocks + scale_group) * head_dim + offsets_d
+            tl.store(key_summary_ptr + summary_offsets, summary_max)
+            tl.store(key_aux_ptr + summary_offsets, summary_min)
     quantized, key_scale, center_0, center_1, center_scale_0, center_scale_1 = (
         quantize_tile_centered_key_tile(
             tl.reshape(values, (block_n, 1, head_dim)),
@@ -475,7 +496,7 @@ def quantize_key_tile_centered_per_block_kernel(
     store_key_center_tile(
         key_center_ptr,
         key_center_scale_ptr,
-        (batch * heads + head) * tile_count + scale_group,
+        head_block * tile_count + scale_group,
         center_0,
         center_1,
         center_scale_0,

@@ -13,8 +13,8 @@ from triton.backends.compiler import GPUTarget
 from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton import amd_compiler_workarounds
+from piper_kernels.attention.piper_attention import _kv_compile
 from piper_kernels.attention.piper_attention._amd import gluon as amd_gluon
-from piper_kernels.attention.piper_attention.triton import compile_kv_decode_kernels
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
 
@@ -224,7 +224,7 @@ def test_amd_prefill_compilation_zero_spills(
     has_chunk_splits: bool,
     per_row_query_scale: bool,
 ) -> None:
-    frozen, tail = amd_gluon.compile_amd_prefill_kernels(
+    frozen, tail = _kv_compile.compile_amd_prefill_kernels(
         GPUTarget("hip", "gfx1201", 32),
         dtype=dtype,
         head_dim=head_dim,
@@ -240,7 +240,7 @@ def test_amd_prefill_compilation_zero_spills(
 def test_amd_prefill_gfx1200_smoke() -> None:
     for wide_pool in (False, True):
         for has_chunk_splits in (False, True):
-            frozen, tail = amd_gluon.compile_amd_prefill_kernels(
+            frozen, tail = _kv_compile.compile_amd_prefill_kernels(
                 GPUTarget("hip", "gfx1200", 32),
                 dtype=torch.bfloat16,
                 head_dim=128,
@@ -263,7 +263,7 @@ def test_amd_kv_decode_compilation_zero_spills(
     wide_pool: bool,
     contiguous_inputs: bool,
 ) -> None:
-    frozen, tail, reduce_k = compile_kv_decode_kernels(
+    frozen, tail, reduce_k = _kv_compile.compile_kv_decode_kernels(
         GPUTarget("hip", "gfx1201", 32),
         dtype=dtype,
         head_dim=head_dim,
@@ -280,7 +280,7 @@ def test_amd_kv_decode_gfx1200_smoke() -> None:
     for head_dim in (64, 128):
         for wide_pool in (False, True):
             for reduce_vectorize_splits in (False, True):
-                frozen, tail, reduce_k = compile_kv_decode_kernels(
+                frozen, tail, reduce_k = _kv_compile.compile_kv_decode_kernels(
                     GPUTarget("hip", "gfx1200", 32),
                     dtype=torch.bfloat16,
                     head_dim=head_dim,
@@ -300,7 +300,7 @@ def test_amd_kv_decode_vectorized_reduce_zero_spills(
     dtype: torch.dtype,
     contiguous_inputs: bool,
 ) -> None:
-    _frozen, _tail, reduce_k = compile_kv_decode_kernels(
+    _frozen, _tail, reduce_k = _kv_compile.compile_kv_decode_kernels(
         GPUTarget("hip", "gfx1201", 32),
         dtype=dtype,
         head_dim=head_dim,
@@ -331,7 +331,7 @@ def test_dense_amd_windowed_compile_zero_spills(head_dim: int, store_lse: bool) 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_amd_prefill_windowed_with_tail_zero_spills(head_dim: int) -> None:
-    frozen, tail = amd_gluon.compile_amd_prefill_kernels(
+    frozen, tail = _kv_compile.compile_amd_prefill_kernels(
         GPUTarget("hip", "gfx1201", 32),
         dtype=torch.bfloat16,
         head_dim=head_dim,

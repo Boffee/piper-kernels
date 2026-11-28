@@ -128,6 +128,23 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- `ConvRotTrellisTensor`: stopped exposing FSDP2 (`fsdp_pre_all_gather` /
+  `fsdp_post_all_gather`) and in-place update methods via `hasattr` by moving those
+  protocols onto opt-in mixins for supported weight formats. Verified on CPU/`meta` and
+  live RTX 5090 (`sm120`); multi-GPU NCCL and Windows execution remain unexercised
+  locally.
+- `piper_attention` (NVIDIA): clamped `score_delta` in dense `safe_softmax` identically
+  to chunked prefill to prevent `exp2` overflow (`NaN` / `inf` LSE) on rows with tiny
+  `value_scale` values. Verified live on RTX 5090 (`sm120`), CPU/`meta`, and offline
+  NVIDIA/AMD compilation targets; live non-SM120 CUDA, live AMD ROCm/RDNA4, and Windows
+  execution remain unexercised locally.
+- Distributed attention fusions (NVIDIA): enabled partial row-block launches in NVIDIA
+  Gluon sparse K/V projections so K/V projection overlaps with sequence `all_gather`,
+  and marked dense multi-chunk `convrot_int8_piper` attention output ops
+  `cudagraph_unsafe` so `torch.compile` does not capture dynamic chunk-stream or
+  collective paths. Verified live on RTX 5090 (`sm120`), CPU/`meta`, and offline
+  NVIDIA/AMD compilation targets; live non-SM120 CUDA, live AMD ROCm/RDNA4, multi-GPU
+  NCCL, and Windows execution remain unexercised locally.
 - `piper_attention_decode` (AMD RDNA4 `gfx1200`/`gfx1201`): pre-scaled FP32 QK scores via
   unfused `v_mul_f32` before `block_max` and `exp2` subtraction in `_frozen_pool_piper_kernel`
   and the `safe_softmax` chunked-prefill tail path of `_dense_piper_kernel`, preventing

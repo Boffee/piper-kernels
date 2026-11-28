@@ -42,51 +42,13 @@ def _operation(weight: PiperNVFP4Tensor, name: str) -> str:
 
 
 def _validate_storage(weight: PiperNVFP4Tensor, *, operation: str) -> None:
-    if weight.device.type == "meta":
-        raise ValueError(f"{operation} cannot update a meta tensor without values")
-    if weight.ndim != 2:
-        raise ValueError(f"{operation} requires a 2-D weight")
-    rows, features = weight.shape
-    if rows == 0 or features == 0 or features % _layout.BLOCK_SIZE:
-        raise ValueError(f"{operation} requires nonempty block-16 storage")
-    expected_qdata_shape = _layout.qdata_shape(rows, features)
-    if weight.qdata.dtype is not torch.uint8 or tuple(weight.qdata.shape) != expected_qdata_shape:
-        raise ValueError(
-            f"{operation} requires packed uint8 qdata with shape "
-            f"{expected_qdata_shape}, got {weight.qdata.dtype} {tuple(weight.qdata.shape)}"
-        )
-    if weight.block_size != _layout.BLOCK_SIZE:
-        raise ValueError(
-            f"{operation} requires block size {_layout.BLOCK_SIZE}, got {weight.block_size}"
-        )
-    expected_scale_shape = (
-        _layout.scale_shape(rows, features)
-        if weight.is_swizzled_scales
-        else (rows, features // weight.block_size)
+    _layout.validate_nvfp4_weight(
+        weight,
+        allowed_ndims=(2,),
+        allow_empty=False,
+        allow_meta=False,
+        prefix=operation,
     )
-    if (
-        weight.scale.dtype is not torch.float8_e4m3fn
-        or tuple(weight.scale.shape) != expected_scale_shape
-    ):
-        raise ValueError(
-            f"{operation} requires canonical block-16 FP8 scales with shape "
-            f"{expected_scale_shape}, got {weight.scale.dtype} {tuple(weight.scale.shape)}"
-        )
-    if not weight.qdata.is_contiguous() or not weight.scale.is_contiguous():
-        raise ValueError(
-            f"{operation} requires contiguous packed storage; "
-            "a transposed weight cannot be updated in place"
-        )
-    if weight.per_tensor_scale is not None and weight.per_tensor_scale.numel() != 1:
-        raise ValueError(f"{operation} requires a scalar per-tensor weight scale")
-    storage = (
-        weight.qdata,
-        weight.scale,
-        weight.per_tensor_scale,
-        weight.act_per_tensor_scale,
-    )
-    if any(value is not None and value.device != weight.device for value in storage):
-        raise ValueError(f"{operation} storage tensors must share a device")
 
 
 def _validate_addmm(

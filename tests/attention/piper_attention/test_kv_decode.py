@@ -3693,75 +3693,56 @@ def test_gpu_chunked_prefill_layouts_scales_and_empty_edges() -> None:
     assert (o_t0 == 0.0).all()
     assert (l_t0 == -float("inf")).all()
 
-    # Exported piper_attention_decode_triton validates prefill flags across seq_q.
+    # Fallback Split-KV GPU path (piper_attention_decode_triton) stays self-contained
+    # without prefill forwarding and matches the portable reference across seq_q.
     from piper_kernels.attention.piper_attention.triton import (  # noqa: PLC0415 - lazy GPU import
         piper_attention_decode_triton,
     )
 
-    for q_bad in (q_mha[:, :, :1], q_mha):
-        with pytest.raises(ValueError, match="prefill_backend"):
-            piper_attention_decode_triton(
-                q_bad,
-                pool_mha.key_int8,
-                pool_mha.key_scale,
-                pool_mha.key_center,
-                pool_mha.value_int8,
-                pool_mha.value_scale,
-                pool_mha.value_mean,
-                c2s_mha,
-                nc_mha,
-                tail_key=None,
-                tail_value=None,
-                tail_len=None,
-                scale=64**-0.5,
-                is_causal=True,
-                grouped_qk=True,
-                pack_wmma=True,
-                active_chunks_hint=0,
-                prefill_backend="bogus",  # type: ignore[arg-type]
-            )
-        with pytest.raises(ValueError, match="pack_wmma"):
-            piper_attention_decode_triton(
-                q_bad,
-                pool_mha.key_int8,
-                pool_mha.key_scale,
-                pool_mha.key_center,
-                pool_mha.value_int8,
-                pool_mha.value_scale,
-                pool_mha.value_mean,
-                c2s_mha,
-                nc_mha,
-                tail_key=None,
-                tail_value=None,
-                tail_len=None,
-                scale=64**-0.5,
-                is_causal=True,
-                grouped_qk=True,
-                pack_wmma=False,
-                active_chunks_hint=0,
-                prefill_backend="amd",
-            )
-        with pytest.raises(ValueError, match="grouped_qk"):
-            piper_attention_decode_triton(
-                q_bad,
-                pool_mha.key_int8,
-                pool_mha.key_scale,
-                pool_mha.key_center,
-                pool_mha.value_int8,
-                pool_mha.value_scale,
-                pool_mha.value_mean,
-                c2s_mha,
-                nc_mha,
-                tail_key=None,
-                tail_value=None,
-                tail_len=None,
-                scale=64**-0.5,
-                is_causal=True,
-                grouped_qk=False,
-                pack_wmma=True,
-                active_chunks_hint=0,
-                prefill_backend="amd",
-            )
+    grouped_qk_mha = pool_mha.key_scales == 16
+    for q_fb in (q_mha[:, :, :1], q_mha):
+        fb_out, fb_lse = piper_attention_decode_triton(
+            q_fb,
+            pool_mha.key_int8,
+            pool_mha.key_scale,
+            pool_mha.key_center,
+            pool_mha.value_int8,
+            pool_mha.value_scale,
+            pool_mha.value_mean,
+            c2s_mha,
+            nc_mha,
+            tail_key=tk_mha,
+            tail_value=tv_mha,
+            tail_len=tl_mha,
+            scale=64**-0.5,
+            is_causal=True,
+            grouped_qk=grouped_qk_mha,
+            pack_wmma=False,
+            active_chunks_hint=0,
+            window_left=1500,
+            window_right=-1,
+        )
+        ref_out, ref_lse = piper_attention_decode_reference(
+            q_fb,
+            pool_mha.key_int8,
+            pool_mha.key_scale,
+            pool_mha.key_center,
+            pool_mha.value_int8,
+            pool_mha.value_scale,
+            pool_mha.value_mean,
+            c2s_mha,
+            nc_mha,
+            tail_key=tk_mha,
+            tail_value=tv_mha,
+            tail_len=tl_mha,
+            scale=64**-0.5,
+            is_causal=True,
+            pack_wmma=False,
+            window_left=1500,
+            window_right=-1,
+        )
+        torch.testing.assert_close(fb_out, ref_out, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(fb_lse, ref_lse, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.gpu

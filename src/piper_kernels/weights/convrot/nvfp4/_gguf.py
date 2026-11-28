@@ -43,10 +43,8 @@ def convert(
         raise ValueError("ConvRot NVFP4 GGUF conversion requires exact NVIDIA SM120")
 
     qdata_shape = (rows, features // 2)
-    scale_shape = (
-        tuple(nvfp4_layout.scale_shape(rows, features))
-        if is_swizzled_scales
-        else (rows, features // nvfp4_layout.BLOCK_SIZE)
+    scale_shape = tuple(
+        nvfp4_layout.canonical_scale_shape(rows, features, is_swizzled_scales=is_swizzled_scales)
     )
     if out is None:
         qdata = torch.empty(qdata_shape, device=raw.device, dtype=torch.uint8)
@@ -69,14 +67,11 @@ def convert(
 
     from . import triton as convrot_nvfp4  # noqa: PLC0415
 
+    scalar_scale = per_tensor_scale_out if compute_per_tensor_scale else per_tensor_scale
+    nvfp4_layout.validate_nvfp4_global_scales(
+        scalar_scale, None, device=raw.device, ndim=2, experts=0
+    )
     if compute_per_tensor_scale:
-        if per_tensor_scale_out is not None and (
-            per_tensor_scale_out.shape != ()
-            or per_tensor_scale_out.dtype is not torch.float32
-            or per_tensor_scale_out.device != raw.device
-            or not per_tensor_scale_out.is_contiguous()
-        ):
-            raise ValueError("NVFP4 per-tensor scale output must be a contiguous FP32 scalar")
         computed_scale = convrot_nvfp4._gguf_dynamic_scale(
             raw,
             int(normalized),
@@ -87,15 +82,6 @@ def convert(
         )
         computed_scale.clamp_min_(nvfp4_layout.MIN_WEIGHT_GLOBAL_SCALE)
         per_tensor_scale = computed_scale
-    elif per_tensor_scale is not None and (
-        per_tensor_scale.shape != ()
-        or per_tensor_scale.dtype is not torch.float32
-        or per_tensor_scale.device != raw.device
-        or not per_tensor_scale.is_contiguous()
-    ):
-        raise ValueError(
-            "NVFP4 per-tensor scale must be a contiguous FP32 scalar on the input device"
-        )
 
     convrot_nvfp4._gguf_prepare_out(
         raw,

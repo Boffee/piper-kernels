@@ -11,24 +11,19 @@ from torch.fx.node import Argument
 from piper_kernels._distributed import _fx as distributed_fx
 from piper_kernels.attention.kernels.sparse_piper.layout import ValueFormat
 from piper_kernels.fusions.attention import _distributed_fold as distributed_fold
-from piper_kernels.fusions.residual_updates import _graph as residual_graph
+from piper_kernels.linear import _compile_fx as linear_fx
 from piper_kernels.linear.convrot.int8 import _compile_fx
 
-from . import (
-    distributed_output as distributed_output_operators,  # noqa: F401 - registers distributed output ops
-)
 from . import kv_gather as kv_gather_operators  # noqa: F401 - registers distributed KV gather
+from . import output as output_operators  # noqa: F401 - registers attention output ops
 
 _ops = torch.ops.piper_kernels
 _PROJECT_KEY = _ops.convrot_int8_sparse_piper_project_key.default
 _PROJECT_VALUE = _ops.convrot_int8_sparse_piper_project_value.default
 _PREPARE_GATHER_PROJECT_KV = _ops.convrot_int8_sparse_piper_prepare_gather_project_kv.default
 _PROJECTED_QUERY_OUTPUT = _ops.convrot_int8_sparse_piper_projected_query_attention_output.default
-_PROJECTED_QUERY_RS_RESIDUAL_ADD = (
-    _ops.convrot_int8_sparse_piper_projected_query_attention_reduce_scatter_residual_add_.default
-)
-_PROJECTED_QUERY_RS = (
-    _ops.convrot_int8_sparse_piper_projected_query_attention_reduce_scatter.default
+_PROJECTED_QUERY_RESIDUAL_ADD = (
+    _ops.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default
 )
 
 
@@ -37,15 +32,14 @@ def fold_distributed_attention_output(graph: torch.fx.Graph) -> bool:
     return distributed_fold.fold_distributed_projected_output(
         graph,
         output_op=_PROJECTED_QUERY_OUTPUT,
-        reduce_scatter_op=_PROJECTED_QUERY_RS,
-        reduce_scatter_residual_op=_PROJECTED_QUERY_RS_RESIDUAL_ADD,
+        residual_op=_PROJECTED_QUERY_RESIDUAL_ADD,
     )
 
 
 def _find_exclusive_kv_pair(
     qdata_items: list[torch.fx.Node],
     scale_items: list[torch.fx.Node],
-) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+) -> tuple[torch.fx.Node, dict[str, Argument], torch.fx.Node, dict[str, Argument]] | None:
     qdata_set = set(qdata_items)
     scale_set = set(scale_items)
     key_nodes: list[torch.fx.Node] = []
@@ -69,8 +63,10 @@ def _find_exclusive_kv_pair(
                 and user not in (key_node, value_node)
             ):
                 return None
-    key_operands = residual_graph.bind_arguments(key_node)
-    value_operands = residual_graph.bind_arguments(value_node)
+    key_operands = linear_fx.bind_arguments(key_node)
+    value_operands = linear_fx.bind_arguments(value_node)
+    if key_operands is None or value_operands is None:
+        return None
     if (
         key_operands.get("input_qdata") not in qdata_set
         or key_operands.get("input_scale") not in scale_set
@@ -81,7 +77,7 @@ def _find_exclusive_kv_pair(
         or value_operands.get("input_scale") not in scale_set
     ):
         return None
-    return key_node, value_node
+    return key_node, key_operands, value_node, value_operands
 
 
 def _extract_kv_meta_vals(
@@ -113,7 +109,14 @@ def _match_prepare_kv_bundle(
         torch.fx.Node | None,
         list[torch.fx.Node],
         tuple[list[torch.fx.Node], list[torch.fx.Node]],
-        tuple[torch.fx.Node, list[list[torch.fx.Node]], torch.fx.Node, list[list[torch.fx.Node]]],
+        tuple[
+            torch.fx.Node,
+            dict[str, Argument],
+            list[list[torch.fx.Node]],
+            torch.fx.Node,
+            dict[str, Argument],
+            list[list[torch.fx.Node]],
+        ],
     ]
     | None
 ):
@@ -139,7 +142,7 @@ def _match_prepare_kv_bundle(
     assert sym_size_users is not None
     assert prep_outputs is not None
     qdata_items, scale_items = prep_outputs
-    key_node, value_node = kv_pair
+    key_node, key_operands, value_node, value_operands = kv_pair
     key_outputs = distributed_fx.collect_indexed_outputs(key_node, 6)
     value_outputs = distributed_fx.collect_indexed_outputs(value_node, 3)
     if key_outputs is None or value_outputs is None:
@@ -150,7 +153,7 @@ def _match_prepare_kv_bundle(
         input_scale,
         sym_size_users,
         (qdata_items, scale_items),
-        (key_node, key_outputs, value_node, value_outputs),
+        (key_node, key_operands, key_outputs, value_node, value_operands, value_outputs),
     )
 
 
@@ -170,10 +173,8 @@ def _fold_one_prepare_gather_project_kv(
         kv_tuple,
     ) = bundle
     qdata_items, scale_items = prep_tuple
-    key_node, key_outputs, value_node, value_outputs = kv_tuple
+    key_node, key_operands, key_outputs, value_node, value_operands, value_outputs = kv_tuple
 
-    key_operands = residual_graph.bind_arguments(key_node)
-    value_operands = residual_graph.bind_arguments(value_node)
     replaced = {key_node, value_node}
     external_consumers = [
         *(
@@ -231,7 +232,7 @@ def _fold_one_prepare_gather_project_kv(
 
     distributed_fx.rewrite_sym_size_users(graph, sym_size_users, all_gather_match)
     with graph.inserting_before(insert_point):
-        fused = distributed_fx.call_in_schema_order(graph, _PREPARE_GATHER_PROJECT_KV, values)
+        fused = linear_fx.call_in_schema_order(graph, _PREPARE_GATHER_PROJECT_KV, values)
         if meta_vals is not None:
             fused.meta["val"] = meta_vals
         for out_idx, old_items in enumerate(

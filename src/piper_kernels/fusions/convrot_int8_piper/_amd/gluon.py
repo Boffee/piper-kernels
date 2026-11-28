@@ -19,10 +19,7 @@ from piper_kernels.attention.piper_attention import _quantization as piper_quant
 from piper_kernels.fusions.convrot_int8_projection import triton as shared_projection
 from piper_kernels.fusions.convrot_int8_projection._amd import fragments
 from piper_kernels.fusions.convrot_int8_projection._amd import policy as amd_policy
-from piper_kernels.fusions.convrot_int8_projection._plan import (
-    ProjectionExecutionPlan,
-    resolve_row_block_launches,
-)
+from piper_kernels.fusions.convrot_int8_projection._plan import ProjectionExecutionPlan
 
 from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
@@ -464,34 +461,16 @@ def default_execution_plan(
     per_thread_scales: bool = False,
 ) -> amd_policy.AmdExecutionPlan:
     """Resolve operand metadata and select RDNA4 Gluon or Triton execution."""
-    sequence_length = input_qdata.shape[1]
-    resolved_storage_sequence = (
-        (sequence_length + amd_policy.TILE_ROWS - 1) // amd_policy.TILE_ROWS * amd_policy.TILE_ROWS
-        if storage_sequence_length is None
-        else storage_sequence_length
-    )
-    heads = (
-        weight_qdata.shape[0] // head_dim
-        if head_dim > 0 and weight_qdata.shape[0] % head_dim == 0
-        else 0
-    )
-    return amd_policy.select_execution_plan(
-        operation,
+    return fragments.select_execution_plan(
+        amd_policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation=operation,
         head_dim=head_dim,
-        input_features=input_qdata.shape[2],
-        heads=heads,
         rotary_dim=rotary_dim,
-        operands_aligned=(
-            not (operation == "query" and per_thread_scales)
-            and fragments.operands_aligned(
-                input_qdata,
-                weight_qdata,
-                storage_sequence_length=resolved_storage_sequence,
-                rotary_dim=rotary_dim,
-                head_dim=head_dim,
-                output_element_bytes=2 if operation == "key" else 1,
-            )
-        ),
+        storage_sequence_length=storage_sequence_length,
+        allow_gluon=not (operation == "query" and per_thread_scales),
+        output_element_bytes=2 if operation == "key" else 1,
     )
 
 
@@ -517,20 +496,18 @@ def project_query(
     batch, heads, storage_length, head_dim = query.shape
     per_thread_scales = resolve_qk_quantization(query_scale, storage_length) == "per_thread"
     resolved_chunk_rows = input_qdata.shape[1] if chunk_rows is None else chunk_rows
-    plan = (
-        default_execution_plan(
-            input_qdata,
-            weight_qdata,
-            operation="query",
-            head_dim=head_dim,
-            rotary_dim=cos.shape[1],
-            storage_sequence_length=storage_length,
-            per_thread_scales=per_thread_scales,
-        )
-        if execution_plan is None
-        else execution_plan
+    plan, gluon_plan = fragments.resolve_execution_plan(
+        amd_policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation="query",
+        head_dim=head_dim,
+        rotary_dim=cos.shape[1],
+        storage_sequence_length=storage_length,
+        execution_plan=execution_plan,
+        allow_gluon=not per_thread_scales,
     )
-    if per_thread_scales or not (isinstance(plan, amd_policy.AmdExecutionPlan) and plan.uses_gluon):
+    if gluon_plan is None:
         projection.project_query(
             input_qdata,
             input_scale,
@@ -550,13 +527,12 @@ def project_query(
         return
     if batch == 0 or resolved_chunk_rows == 0:
         return
-    col_blocks = (heads * head_dim) // 128
     options = _kernel_options("query")
     with device_context(input_qdata.device):
-        for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
-            resolved_chunk_rows, amd_policy.GLUON_BLOCK_M
+        for grid_x, row_blocks, row_block_offset, mask_rows in fragments.iter_row_block_launches(
+            resolved_chunk_rows, heads, head_dim
         ):
-            _query_kernel[(row_blocks * col_blocks, batch)](
+            _query_kernel[(grid_x, batch)](
                 input_qdata,
                 input_scale,
                 weight_qdata,
@@ -579,9 +555,9 @@ def project_query(
                 rotary_dim=cos.shape[1],
                 norm_epsilon=norm_epsilon,
                 softmax_scale=softmax_scale,
-                mask_rows=not aligned_rows,
-                group_m=plan.group_m,
-                num_warps=plan.num_warps,
+                mask_rows=mask_rows,
+                group_m=gluon_plan.group_m,
+                num_warps=gluon_plan.num_warps,
                 **options,
             )
 
@@ -603,19 +579,18 @@ def project_key(
     """Project K1024-centered keys using RDNA4 Gluon when supported, else shared Triton."""
     key_int8, key_scale, key_center = out
     batch, heads, storage_length, head_dim = key_int8.shape
-    plan = (
-        default_execution_plan(
-            input_qdata,
-            weight_qdata,
-            operation="key",
-            head_dim=head_dim,
-            rotary_dim=cos.shape[1],
-            storage_sequence_length=storage_length,
-        )
-        if execution_plan is None
-        else execution_plan
+    plan, gluon_plan = fragments.resolve_execution_plan(
+        amd_policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation="key",
+        head_dim=head_dim,
+        rotary_dim=cos.shape[1],
+        storage_sequence_length=storage_length,
+        execution_plan=execution_plan,
+        output_element_bytes=2,
     )
-    if not (isinstance(plan, amd_policy.AmdExecutionPlan) and plan.uses_gluon):
+    if gluon_plan is None:
         projection.project_key(
             input_qdata,
             input_scale,
@@ -634,13 +609,12 @@ def project_key(
     if batch == 0 or sequence_length == 0:
         return
     stored = input_qdata.new_empty((batch, heads, storage_length, head_dim), dtype=torch.bfloat16)
-    col_blocks = (heads * head_dim) // 128
     options = _kernel_options("key")
     with device_context(input_qdata.device):
-        for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
-            sequence_length, amd_policy.GLUON_BLOCK_M
+        for grid_x, row_blocks, row_block_offset, mask_rows in fragments.iter_row_block_launches(
+            sequence_length, heads, head_dim
         ):
-            _key_kernel[(row_blocks * col_blocks, batch)](
+            _key_kernel[(grid_x, batch)](
                 input_qdata,
                 input_scale,
                 weight_qdata,
@@ -659,9 +633,9 @@ def project_key(
                 head_dim=head_dim,
                 rotary_dim=cos.shape[1],
                 norm_epsilon=norm_epsilon,
-                mask_rows=not aligned_rows,
-                group_m=plan.group_m,
-                num_warps=plan.num_warps,
+                mask_rows=mask_rows,
+                group_m=gluon_plan.group_m,
+                num_warps=gluon_plan.num_warps,
                 **options,
             )
         piper_quantization.prepare_chunk_centered_key(
@@ -686,18 +660,16 @@ def project_value(
     """Project V1024-centered AMD-WMMA values using RDNA4 Gluon when supported, else Triton."""
     value, multiplier, log_scale, mean = out
     batch, heads, head_dim, storage_length = value.shape
-    plan = (
-        default_execution_plan(
-            input_qdata,
-            weight_qdata,
-            operation="value",
-            head_dim=head_dim,
-            storage_sequence_length=storage_length,
-        )
-        if execution_plan is None
-        else execution_plan
+    plan, gluon_plan = fragments.resolve_execution_plan(
+        amd_policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation="value",
+        head_dim=head_dim,
+        storage_sequence_length=storage_length,
+        execution_plan=execution_plan,
     )
-    if not (isinstance(plan, amd_policy.AmdExecutionPlan) and plan.uses_gluon):
+    if gluon_plan is None:
         projection.project_value(
             input_qdata,
             input_scale,
@@ -713,7 +685,6 @@ def project_value(
     sequence_length = input_qdata.shape[1]
     if batch == 0 or sequence_length == 0:
         return
-    col_blocks = (heads * head_dim) // 128
     options = _kernel_options("value")
     with device_context(input_qdata.device):
         shared_projection.project_value_chunk_means(
@@ -722,14 +693,14 @@ def project_value(
             weight_qdata,
             weight_scale,
             bias,
-            block_n=plan.resolve_value_mean_block_n(head_dim),
-            block_k=plan.block_k,
+            block_n=gluon_plan.resolve_value_mean_block_n(head_dim),
+            block_k=gluon_plan.block_k,
             out=mean,
         )
-        for row_blocks, row_block_offset, aligned_rows in resolve_row_block_launches(
-            sequence_length, amd_policy.GLUON_BLOCK_M
+        for grid_x, row_blocks, row_block_offset, mask_rows in fragments.iter_row_block_launches(
+            sequence_length, heads, head_dim
         ):
-            _value_kernel[(row_blocks * col_blocks, batch)](
+            _value_kernel[(grid_x, batch)](
                 input_qdata,
                 input_scale,
                 weight_qdata,
@@ -747,8 +718,8 @@ def project_value(
                 input_features=input_qdata.shape[2],
                 heads=heads,
                 head_dim=head_dim,
-                mask_rows=not aligned_rows,
-                group_m=plan.group_m,
-                num_warps=plan.num_warps,
+                mask_rows=mask_rows,
+                group_m=gluon_plan.group_m,
+                num_warps=gluon_plan.num_warps,
                 **options,
             )

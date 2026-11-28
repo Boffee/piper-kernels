@@ -49,16 +49,18 @@ from piper_kernels.attention.piper_attention import _quantized_dispatch as dense
 from piper_kernels.attention.sparse_piper_attention import _quantized_dispatch
 from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_piper import _backend as dense_fusion_backend
-from piper_kernels.fusions.convrot_int8_piper import distributed_output as dense_distributed_output
+from piper_kernels.fusions.convrot_int8_piper import output as dense_output
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend as fusion_backend,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    distributed_output,
+    key as key_ops,
+)
+from piper_kernels.fusions.convrot_int8_sparse_piper import (
     kv_gather,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
-    key as key_ops,
+    output as sparse_output,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     value as value_ops,
@@ -71,9 +73,7 @@ _ops = torch.ops.piper_kernels
 _c10d = torch.ops._c10d_functional
 _aten = torch.ops.aten
 _AUTO_FUNCTIONALIZED = torch.ops.higher_order.auto_functionalized
-_DENSE_RS_RESIDUAL_ADD = (
-    _ops.convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default
-)
+_DENSE_RESIDUAL_ADD = _ops.convrot_int8_piper_projected_query_attention_residual_add_.default
 
 _DEVICE = torch.device("cuda", 0)
 
@@ -283,6 +283,145 @@ def test_fold_quantized_all_gather_fx_shapes_and_symint(
         assert _ops.convrot_int8_prepare_input.default in targets
         # Wait count matches coalesced Q+S outputs only (original AG wait was erased).
         assert targets.count(_c10d.wait_tensor.default) == 2
+
+
+def test_distributed_all_gather_schema_binds_keyword_arguments(fake_triton_device: None) -> None:
+    """All-gather compiler rewrites bind aten/c10d arguments by schema, not position."""
+    with FakeTensorMode():
+        ag_graph = torch.fx.Graph()
+        x = ag_graph.placeholder("x")
+        x.meta["val"] = torch.empty((2, 64, 128), device=_DEVICE, dtype=torch.bfloat16)
+
+        ag = ag_graph.call_function(
+            _c10d.all_gather_into_tensor.default,
+            args=(x,),
+            kwargs={"group_size": 2, "group_name": "0"},
+        )
+        ag_val = torch.empty((4, 64, 128), device=_DEVICE, dtype=torch.bfloat16)
+        ag.meta["val"] = ag_val
+        wait_ag = ag_graph.call_function(_c10d.wait_tensor.default, kwargs={"tensor": ag})
+        wait_ag.meta["val"] = ag_val
+        split_ag = ag_graph.call_function(
+            _aten.split.Tensor, args=(wait_ag,), kwargs={"split_size": 2, "dim": 0}
+        )
+        chunks_ag = tuple(
+            torch.empty((2, 64, 128), device=_DEVICE, dtype=torch.bfloat16) for _ in range(2)
+        )
+        split_ag.meta["val"] = chunks_ag
+        g0 = ag_graph.call_function(operator.getitem, args=(split_ag, 0))
+        g1 = ag_graph.call_function(operator.getitem, args=(split_ag, 1))
+        g0.meta["val"], g1.meta["val"] = chunks_ag
+        cat_ag = ag_graph.call_function(_aten.cat.default, kwargs={"tensors": [g0, g1], "dim": 1})
+        cat_ag.meta["val"] = torch.empty((2, 128, 128), device=_DEVICE, dtype=torch.bfloat16)
+        prep = ag_graph.call_function(
+            _ops.convrot_int8_prepare_input.default,
+            args=(cat_ag, 64, None),
+        )
+        q_full = torch.empty((2, 128, 128), device=_DEVICE, dtype=torch.int8)
+        s_full = torch.empty((2, 128), device=_DEVICE, dtype=torch.float32)
+        prep.meta["val"] = (q_full, s_full)
+        q_item = ag_graph.call_function(operator.getitem, args=(prep, 0))
+        s_item = ag_graph.call_function(operator.getitem, args=(prep, 1))
+        q_item.meta["val"], s_item.meta["val"] = q_full, s_full
+        ag_graph.output((q_item, s_item))
+
+        _run_post_grad_pass(ag_graph, linear=True)
+        ag_graph.lint()
+        ag_targets = [n.target for n in ag_graph.nodes if n.op == "call_function"]
+        assert _c10d.all_gather_into_tensor.default not in ag_targets
+        assert _c10d.all_gather_into_tensor_coalesced.default in ag_targets
+        assert ag_targets.count(_c10d.wait_tensor.default) == 2
+
+
+def test_distributed_reduce_scatter_schema_binds_keyword_arguments(
+    fake_triton_device: None,
+) -> None:
+    """Reduce-scatter compiler rewrites bind aten/c10d arguments by schema, not position."""
+    with FakeTensorMode():
+        rs_graph = torch.fx.Graph()
+        names = (
+            "iq",
+            "isc",
+            "qw",
+            "qs",
+            "cos",
+            "sin",
+            "k0",
+            "k1",
+            "k2",
+            "v0",
+            "v1",
+            "v2",
+            "v3",
+            "ow",
+            "os",
+        )
+        p = {name: rs_graph.placeholder(name) for name in names}
+        attn_out = rs_graph.call_function(
+            _ops.convrot_int8_piper_projected_query_attention_output.default,
+            args=(
+                p["iq"],
+                p["isc"],
+                p["qw"],
+                p["qs"],
+                None,
+                p["cos"],
+                p["sin"],
+                1e-5,
+                0.088,
+                None,
+                p["k0"],
+                p["k1"],
+                p["k2"],
+                p["v0"],
+                p["v1"],
+                p["v2"],
+                p["v3"],
+                256,
+                False,
+                torch.bfloat16,
+                p["ow"],
+                p["os"],
+                None,
+                64,
+                None,
+            ),
+            kwargs={"head_dim": 64},
+        )
+        attn_out.meta["val"] = torch.empty((2, 256, 128), device=_DEVICE, dtype=torch.bfloat16)
+        split_rs = rs_graph.call_function(
+            _aten.split.Tensor, args=(attn_out,), kwargs={"split_size": 128, "dim": 1}
+        )
+        chunks_rs = tuple(
+            torch.empty((2, 128, 128), device=_DEVICE, dtype=torch.bfloat16) for _ in range(2)
+        )
+        split_rs.meta["val"] = chunks_rs
+        r0 = rs_graph.call_function(operator.getitem, args=(split_rs, 0))
+        r1 = rs_graph.call_function(operator.getitem, args=(split_rs, 1))
+        r0.meta["val"], r1.meta["val"] = chunks_rs
+        cat_rs = rs_graph.call_function(_aten.cat.default, kwargs={"tensors": [r0, r1], "dim": 0})
+        cat_rs.meta["val"] = torch.empty((4, 128, 128), device=_DEVICE, dtype=torch.bfloat16)
+        rs = rs_graph.call_function(
+            _c10d.reduce_scatter_tensor.default,
+            args=(cat_rs,),
+            kwargs={"reduce_op": "sum", "group_size": 2, "group_name": "0"},
+        )
+        rs_val = torch.empty((2, 128, 128), device=_DEVICE, dtype=torch.bfloat16)
+        rs.meta["val"] = rs_val
+        wait_rs = rs_graph.call_function(_c10d.wait_tensor.default, kwargs={"tensor": rs})
+        wait_rs.meta["val"] = rs_val
+        rs_graph.output(wait_rs)
+
+        _run_post_grad_pass(rs_graph, attention_output=True)
+        rs_graph.lint()
+        rs_targets = [n.target for n in rs_graph.nodes if n.op == "call_function"]
+        assert _c10d.reduce_scatter_tensor.default not in rs_targets
+        assert any(
+            n.target is _ops.convrot_int8_piper_projected_query_attention_output.default
+            and n.kwargs.get("comm_group_size") == 2
+            and n.kwargs.get("comm_group_name") == "0"
+            for n in rs_graph.nodes
+        )
 
 
 def test_fold_quantized_all_gather_fx_noop_and_shared(fake_triton_device: None) -> None:
@@ -839,8 +978,6 @@ def _make_distributed_output_meta_args(
         gate,
         gate_indices,
         False,
-        2,
-        "tp_0",
         query_input,
         query_scale,
         make((q_out_features, hidden), device=key_device, dtype=torch.int8),
@@ -887,35 +1024,43 @@ def test_distributed_output_validation_and_fake() -> None:
     with pytest.raises(ValueError, match="divide evenly"):
         peer_exchange.validate_distributed_sequence(131, 2, "tp_0")
 
+    comm_kw = {"comm_group_size": 2, "comm_group_name": "tp_0"}
     with FakeTensorMode():
         valid_args, valid_base = _make_distributed_output_meta_args()
         assert (
-            distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
-                *valid_args
-            )
+            sparse_output._projected_query_attention_residual_add_op_fake(*valid_args, **comm_kw)
             is None
         )
-        standalone_out = distributed_output._projected_query_attention_reduce_scatter_op_fake(
-            *valid_args[4:]
+        standalone_out = sparse_output._projected_query_attention_output_op_fake(
+            *valid_args[4:], **comm_kw
         )
         assert standalone_out.shape == (1, 64, 128)
         assert standalone_out.dtype is torch.bfloat16
 
         wrong_rows_args, _ = _make_distributed_output_meta_args(local_seq=128)
         with pytest.raises(ValueError, match="local rank share"):
-            distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
-                *wrong_rows_args
+            sparse_output._projected_query_attention_residual_add_op_fake(
+                *wrong_rows_args, **comm_kw
             )
 
         wrong_dev_args, _ = _make_distributed_output_meta_args(key_device="meta", base_device="cpu")
         with pytest.raises(ValueError, match="storage device"):
-            distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
-                *wrong_dev_args
+            sparse_output._projected_query_attention_residual_add_op_fake(
+                *wrong_dev_args, **comm_kw
             )
 
-        bad_rs_args = (1, "tp_0", *valid_args[6:])
         with pytest.raises(ValueError, match="comm_group_size >= 2"):
-            distributed_output._projected_query_attention_reduce_scatter_op_fake(*bad_rs_args)
+            sparse_output._projected_query_attention_output_op_fake(
+                *valid_args[4:], comm_group_size=1, comm_group_name="tp_0"
+            )
+        with pytest.raises(ValueError, match="both comm_group_size and comm_group_name"):
+            sparse_output._projected_query_attention_output_op_fake(
+                *valid_args[4:], comm_group_size=2
+            )
+        with pytest.raises(ValueError, match="does not support head slicing"):
+            sparse_output._projected_query_attention_residual_add_op_fake(
+                *valid_args, num_head_slices=2, **comm_kw
+            )
         assert valid_base.shape == (1, 64, 128)
 
 
@@ -976,9 +1121,11 @@ def test_distributed_output_pre_mutation_validation(monkeypatch: pytest.MonkeyPa
         before = base.clone()
         igs = overrides.get("input_group_size")
         with pytest.raises(ValueError, match=pattern):
-            distributed_output._projected_query_attention_reduce_scatter_residual_add_op(
+            sparse_output._projected_query_attention_residual_add_op(
                 *args,
                 input_group_size=igs,  # type: ignore[arg-type]
+                comm_group_size=2,
+                comm_group_name="tp_0",
             )
         assert comm_calls == 0
         assert torch.equal(base, before)
@@ -1179,7 +1326,7 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
         nvidia_dispatch.partial_row_block_size(
             qdata, weight, operation="key", head_dim=128, rotary_dim=64
         )
-        is None
+        == 128
     )
     assert (
         nvidia_dispatch.partial_row_block_size(
@@ -1189,9 +1336,9 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
             head_dim=128,
             value_format=ValueFormat.TRANSPOSED,
         )
-        is None
+        == 128
     )
-    # Non-transposed AMD_WMMA falls back to Triton so its partial row block is exposed.
+    # Non-transposed AMD_WMMA falls back to Triton with the same 128-row block height.
     assert (
         nvidia_dispatch.partial_row_block_size(
             qdata,
@@ -1202,7 +1349,8 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         == 128
     )
-    with FakeTensorMode(), pytest.raises(ValueError, match="Triton execution plan"):
+    # Out-of-bounds partial ranges on Gluon plans raise from resolve_row_block_launches.
+    with FakeTensorMode(), pytest.raises(ValueError, match="partial row-block range"):
         nvidia_dispatch.project_key(
             qdata,
             scale,
@@ -1219,7 +1367,7 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
             start_row_block=1,
             num_row_blocks=1,
         )
-    with FakeTensorMode(), pytest.raises(ValueError, match="Triton execution plan"):
+    with FakeTensorMode(), pytest.raises(ValueError, match="partial row-block range"):
         nvidia_dispatch.project_value(
             qdata,
             scale,
@@ -1574,16 +1722,23 @@ def test_fold_distributed_attention_output_fx(
                 _ops.convrot_int8_sparse_piper_projected_query_attention_output.default
                 not in targets
             )
-            op_prefix = "convrot_int8_sparse_piper_projected_query_attention"
-            expected_res_op = getattr(_ops, f"{op_prefix}_reduce_scatter_residual_add_").default
+            expected_res_op = (
+                _ops.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default
+            )
             assert any(
-                n.target is _AUTO_FUNCTIONALIZED and n.args and n.args[0] is expected_res_op
+                n.target is _AUTO_FUNCTIONALIZED
+                and n.args
+                and n.args[0] is expected_res_op
+                and n.kwargs.get("comm_group_size") == 2
+                and n.kwargs.get("comm_group_name") == "tp_0"
                 for n in graph.nodes
             )
         else:
-            assert (
-                _ops.convrot_int8_sparse_piper_projected_query_attention_reduce_scatter.default
-                in targets
+            assert any(
+                n.target is _ops.convrot_int8_sparse_piper_projected_query_attention_output.default
+                and n.kwargs.get("comm_group_size") == 2
+                and n.kwargs.get("comm_group_name") == "tp_0"
+                for n in graph.nodes
             )
 
 
@@ -1601,10 +1756,10 @@ def test_fold_distributed_attention_output_fx_shared_negative(fake_triton_device
         graph.output((wait_node, extra))
         _run_post_grad_pass(graph, attention=True)
         assert distributed_fx.has_c10d_collectives(graph)
-        targets = [n.target for n in graph.nodes if n.op == "call_function"]
-        assert (
-            _ops.convrot_int8_sparse_piper_projected_query_attention_reduce_scatter.default
-            not in targets
+        assert not any(
+            n.target is _ops.convrot_int8_sparse_piper_projected_query_attention_output.default
+            and n.kwargs.get("comm_group_size") is not None
+            for n in graph.nodes
         )
 
 
@@ -1640,8 +1795,6 @@ def _make_dense_distributed_output_meta_args(
         gate,
         gate_indices,
         False,
-        2,
-        "tp_0",
         input_qdata,
         input_scale,
         make((hidden, hidden), device=key_device, dtype=torch.int8),
@@ -1667,7 +1820,12 @@ def _make_dense_distributed_output_meta_args(
         64,
         None,
     )
-    kwargs = {"head_dim": head_dim, "query_chunk_rows": query_chunk_rows}
+    kwargs = {
+        "head_dim": head_dim,
+        "query_chunk_rows": query_chunk_rows,
+        "comm_group_size": 2,
+        "comm_group_name": "tp_0",
+    }
     return args, kwargs, base
 
 
@@ -1762,15 +1920,22 @@ def test_fold_dense_distributed_attention_output_fx(
         graph.lint()
         assert not distributed_fx.has_c10d_collectives(graph)
         targets = [n.target for n in graph.nodes if n.op == "call_function"]
-        assert _ops.convrot_int8_piper_projected_query_attention_output.default not in targets
         if residual:
+            assert _ops.convrot_int8_piper_projected_query_attention_output.default not in targets
             assert any(
-                n.target is _AUTO_FUNCTIONALIZED and n.args and n.args[0] is _DENSE_RS_RESIDUAL_ADD
+                n.target is _AUTO_FUNCTIONALIZED
+                and n.args
+                and n.args[0] is _DENSE_RESIDUAL_ADD
+                and n.kwargs.get("comm_group_size") == 2
+                and n.kwargs.get("comm_group_name") == "tp_0"
                 for n in graph.nodes
             )
         else:
-            assert (
-                _ops.convrot_int8_piper_projected_query_attention_reduce_scatter.default in targets
+            assert any(
+                n.target is _ops.convrot_int8_piper_projected_query_attention_output.default
+                and n.kwargs.get("comm_group_size") == 2
+                and n.kwargs.get("comm_group_name") == "tp_0"
+                for n in graph.nodes
             )
 
 
@@ -1792,9 +1957,11 @@ def test_fold_dense_distributed_attention_output_fx_negative(fake_triton_device:
         g_shared.output((wait_node, extra))
         _run_post_grad_pass(g_shared, attention_output=True)
         assert distributed_fx.has_c10d_collectives(g_shared)
-        assert _ops.convrot_int8_piper_projected_query_attention_output.default in [
-            n.target for n in g_shared.nodes if n.op == "call_function"
-        ]
+        assert not any(
+            n.target is _ops.convrot_int8_piper_projected_query_attention_output.default
+            and n.kwargs.get("comm_group_size") is not None
+            for n in g_shared.nodes
+        )
 
         # Residual dtype mismatch rejects folding into residual_add_.
         g_dtype = torch.fx.Graph()
@@ -1827,10 +1994,14 @@ def test_fold_dense_distributed_attention_output_fx_negative(fake_triton_device:
         # Residual fold skips on dtype mismatch, then standalone fold rewrites the reduce-scatter.
         _run_post_grad_pass(g_dtype, attention_output=True)
         assert not distributed_fx.has_c10d_collectives(g_dtype)
-        targets = [n.target for n in g_dtype.nodes if n.op == "call_function"]
-        assert _ops.convrot_int8_piper_projected_query_attention_reduce_scatter.default in targets
+        assert any(
+            n.target is _ops.convrot_int8_piper_projected_query_attention_output.default
+            and n.kwargs.get("comm_group_size") == 2
+            and n.kwargs.get("comm_group_name") == "tp_0"
+            for n in g_dtype.nodes
+        )
         assert not any(
-            n.target is _AUTO_FUNCTIONALIZED and n.args and n.args[0] is _DENSE_RS_RESIDUAL_ADD
+            n.target is _AUTO_FUNCTIONALIZED and n.args and n.args[0] is _DENSE_RESIDUAL_ADD
             for n in g_dtype.nodes
         )
 
@@ -1838,35 +2009,26 @@ def test_fold_dense_distributed_attention_output_fx_negative(fake_triton_device:
 def test_dense_distributed_output_validation_and_fake() -> None:
     with FakeTensorMode():
         args, kwargs, valid_base = _make_dense_distributed_output_meta_args()
-        assert (
-            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
-                *args, **kwargs
-            )
-            is None
-        )
-        rs_args = (*args[4:25], torch.bfloat16, *args[25:])
-        standalone = dense_distributed_output._projected_query_attention_reduce_scatter_op_fake(
-            *rs_args, **kwargs
-        )
+        assert dense_output._projected_query_attention_residual_add_op_fake(*args, **kwargs) is None
+        rs_args = (*args[4:23], torch.bfloat16, *args[23:])
+        standalone = dense_output._projected_query_attention_output_op_fake(*rs_args, **kwargs)
         assert standalone.shape == (1, 128, 128)
         assert standalone.dtype is torch.bfloat16
 
         # Batch == 0 validates metadata cleanly.
         empty_args, empty_kw, _ = _make_dense_distributed_output_meta_args(batch=0)
         assert (
-            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
-                *empty_args, **empty_kw
-            )
+            dense_output._projected_query_attention_residual_add_op_fake(*empty_args, **empty_kw)
             is None
         )
-        empty_rs = (*empty_args[4:25], torch.bfloat16, *empty_args[25:])
-        assert dense_distributed_output._projected_query_attention_reduce_scatter_op_fake(
+        empty_rs = (*empty_args[4:23], torch.bfloat16, *empty_args[23:])
+        assert dense_output._projected_query_attention_output_op_fake(
             *empty_rs, **empty_kw
         ).shape == (0, 128, 128)
 
         wrong_rows_args, wrong_kw, _ = _make_dense_distributed_output_meta_args(local_seq=256)
         with pytest.raises(ValueError, match="local rank share"):
-            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
+            dense_output._projected_query_attention_residual_add_op_fake(
                 *wrong_rows_args, **wrong_kw
             )
 
@@ -1874,28 +2036,27 @@ def test_dense_distributed_output_validation_and_fake() -> None:
             key_device="meta", base_device="cpu"
         )
         with pytest.raises(ValueError, match="storage device"):
-            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
-                *wrong_dev_args, **dev_kw
-            )
+            dense_output._projected_query_attention_residual_add_op_fake(*wrong_dev_args, **dev_kw)
 
         bad_chunk_args, bad_chunk_kw, _ = _make_dense_distributed_output_meta_args(
             query_chunk_rows=64
         )
         with pytest.raises(ValueError, match="multiples of 128"):
-            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
+            dense_output._projected_query_attention_residual_add_op_fake(
                 *bad_chunk_args, **bad_chunk_kw
             )
 
-        bad_rs_args = (1, "tp_0", *rs_args[2:])
         with pytest.raises(ValueError, match="comm_group_size >= 2"):
-            dense_distributed_output._projected_query_attention_reduce_scatter_op_fake(
-                *bad_rs_args, **kwargs
+            dense_output._projected_query_attention_output_op_fake(
+                *rs_args, **{**kwargs, "comm_group_size": 1}
+            )
+        with pytest.raises(ValueError, match="both comm_group_size and comm_group_name"):
+            dense_output._projected_query_attention_output_op_fake(
+                *rs_args, **{**kwargs, "comm_group_name": None}
             )
         odd_args, odd_kw, _ = _make_dense_distributed_output_meta_args(seq=257, local_seq=128)
         with pytest.raises(ValueError, match="divide evenly"):
-            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op_fake(
-                *odd_args, **odd_kw
-            )
+            dense_output._projected_query_attention_residual_add_op_fake(*odd_args, **odd_kw)
         assert valid_base.shape == (1, 128, 128)
 
 
@@ -1944,9 +2105,7 @@ def test_dense_distributed_output_pre_mutation_validation(monkeypatch: pytest.Mo
             base.copy_(torch.randn_like(base))
         before = base.clone()
         with pytest.raises(ValueError, match=pattern):
-            dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op(
-                *args, **kwargs
-            )
+            dense_output._projected_query_attention_residual_add_op(*args, **kwargs)
         assert comm_calls == 0
         assert torch.equal(base, before)
 
@@ -1957,8 +2116,8 @@ def test_dense_distributed_output_pre_mutation_validation(monkeypatch: pytest.Mo
     mismatch_base.copy_(torch.randn_like(mismatch_base))
     before_mismatch = mismatch_base.clone()
     with pytest.raises(ValueError, match="must match resolved group"):
-        dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op(
-            *mismatch_args[:4], 4, *mismatch_args[5:], **mismatch_kw
+        dense_output._projected_query_attention_residual_add_op(
+            *mismatch_args, **{**mismatch_kw, "comm_group_size": 4}
         )
     assert comm_calls == 0
     assert torch.equal(mismatch_base, before_mismatch)
@@ -1967,16 +2126,9 @@ def test_dense_distributed_output_pre_mutation_validation(monkeypatch: pytest.Mo
     empty_args, empty_kw, empty_base = _make_dense_distributed_output_meta_args(
         key_device="cpu", base_device="cpu", batch=0, fill_tensors=True
     )
-    assert (
-        dense_distributed_output._projected_query_attention_reduce_scatter_residual_add_op(
-            *empty_args, **empty_kw
-        )
-        is None
-    )
-    empty_rs_args = (*empty_args[4:25], torch.bfloat16, *empty_args[25:])
-    empty_out = dense_distributed_output._projected_query_attention_reduce_scatter_op(
-        *empty_rs_args, **empty_kw
-    )
+    assert dense_output._projected_query_attention_residual_add_op(*empty_args, **empty_kw) is None
+    empty_rs_args = (*empty_args[4:23], torch.bfloat16, *empty_args[23:])
+    empty_out = dense_output._projected_query_attention_output_op(*empty_rs_args, **empty_kw)
     assert empty_out.shape == (0, 128, 128)
     assert empty_base.shape == (0, 128, 128)
     assert comm_calls == 0
@@ -2228,12 +2380,9 @@ def _count_distributed_paths() -> Iterator[dict[str, int]]:
 
 
 _KV_GATHER_OP = "piper_kernels.convrot_int8_sparse_piper_prepare_gather_project_kv.default"
-_ATTN_RS_OP = (
-    "piper_kernels.convrot_int8_sparse_piper_projected_query_attention_reduce_scatter.default"
-)
+_ATTN_RS_OP = "piper_kernels.convrot_int8_sparse_piper_projected_query_attention_output.default"
 _ATTN_RS_RESIDUAL_OP = (
-    "piper_kernels."
-    "convrot_int8_sparse_piper_projected_query_attention_reduce_scatter_residual_add_.default"
+    "piper_kernels.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default"
 )
 
 
@@ -2917,8 +3066,14 @@ def _check_direct_multichunk_and_inplace_ownership(
     distributed_comm.start_peer_exchange = counted_exchange
     try:
         with _count_distributed_paths() as path_counts:
-            _ops.convrot_int8_sparse_piper_projected_query_attention_reduce_scatter_residual_add_.default(
-                local_base, gate, local_gi, False, world, pg.group_name, *common_args
+            _ops.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default(
+                local_base,
+                gate,
+                local_gi,
+                False,
+                *common_args,
+                comm_group_size=world,
+                comm_group_name=pg.group_name,
             )
     finally:
         distributed_comm.start_peer_exchange = orig_start
@@ -2968,8 +3123,14 @@ def _check_direct_multichunk_and_inplace_ownership(
     before_fail = local_base.clone()
     bad_args = (*common_args[:5], cos_seq[:-1], sin_seq[:-1], *common_args[7:])
     with pytest.raises(ValueError, match="RoPE"):
-        _ops.convrot_int8_sparse_piper_projected_query_attention_reduce_scatter_residual_add_.default(
-            local_base, gate, local_gi, False, world, pg.group_name, *bad_args
+        _ops.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default(
+            local_base,
+            gate,
+            local_gi,
+            False,
+            *bad_args,
+            comm_group_size=world,
+            comm_group_name=pg.group_name,
         )
     assert local_base.data_ptr() == base_ptr
     assert torch.equal(local_base, before_fail)
@@ -2977,12 +3138,9 @@ def _check_direct_multichunk_and_inplace_ownership(
 
 _DENSE_KEY_OP = "piper_kernels.convrot_int8_piper_project_key.default"
 _DENSE_VALUE_OP = "piper_kernels.convrot_int8_piper_project_value.default"
-_DENSE_ATTN_RS_OP = (
-    "piper_kernels.convrot_int8_piper_projected_query_attention_reduce_scatter.default"
-)
+_DENSE_ATTN_RS_OP = "piper_kernels.convrot_int8_piper_projected_query_attention_output.default"
 _DENSE_ATTN_RS_RESIDUAL_OP = (
-    "piper_kernels."
-    "convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default"
+    "piper_kernels.convrot_int8_piper_projected_query_attention_residual_add_.default"
 )
 
 
@@ -3407,16 +3565,16 @@ def _check_dense_direct_multichunk_and_ownership(
     distributed_comm.start_peer_exchange = counted_exchange
     try:
         with _count_distributed_paths() as path_counts:
-            _ops.convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default(
+            _ops.convrot_int8_piper_projected_query_attention_residual_add_.default(
                 local_base,
                 gate,
                 local_gi,
                 False,
-                world,
-                pg.group_name,
                 *common_args,
                 head_dim=_LIVE_HEAD_DIM,
                 query_chunk_rows=128,
+                comm_group_size=world,
+                comm_group_name=pg.group_name,
             )
     finally:
         distributed_comm.start_peer_exchange = orig_start
@@ -3477,18 +3635,18 @@ def _check_dense_direct_multichunk_and_ownership(
 
     before_fail = local_base.clone()
     with pytest.raises(ValueError, match="softmax scale"):
-        _ops.convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default(
+        _ops.convrot_int8_piper_projected_query_attention_residual_add_.default(
             local_base,
             gate,
             local_gi,
             False,
-            world,
-            pg.group_name,
             *common_args[:8],
             0.0,
             *common_args[9:],
             head_dim=_LIVE_HEAD_DIM,
             query_chunk_rows=128,
+            comm_group_size=world,
+            comm_group_name=pg.group_name,
         )
     assert local_base.data_ptr() == base_ptr
     assert torch.equal(local_base, before_fail)
@@ -3653,9 +3811,7 @@ def _check_dense_narrow_output(
     distributed_comm.start_peer_exchange = counted_exchange
     try:
         with _count_distributed_paths() as narrow_counts:
-            narrow_out = _ops.convrot_int8_piper_projected_query_attention_reduce_scatter.default(
-                world,
-                pg.group_name,
+            narrow_out = _ops.convrot_int8_piper_projected_query_attention_output.default(
                 full_qdata,
                 full_scale,
                 q_local.qdata,
@@ -3678,6 +3834,8 @@ def _check_dense_narrow_output(
                 None,
                 head_dim=_LIVE_HEAD_DIM,
                 query_chunk_rows=128,
+                comm_group_size=world,
+                comm_group_name=pg.group_name,
             )
     finally:
         distributed_comm.start_peer_exchange = orig_start
