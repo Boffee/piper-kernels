@@ -1,5 +1,6 @@
 """Tests for Triton hardware feature predicates."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,8 @@ def test_cpu_supports_no_nvidia_tensor_core_features() -> None:
     assert not target.is_nvidia_cuda
     assert not target.supports_uint8_int8_mma
     assert not target.supports_fp8_fp16_mma
+    assert not target.supports_nvfp4_w4a16
+    assert not target.supports_trellis_moe
 
 
 @pytest.mark.parametrize(
@@ -71,6 +74,25 @@ def test_cuda_capability_matching_distinguishes_family_and_exact_target() -> Non
     assert target.supports_fp8_fp16_mma
     assert not AcceleratorTarget(backend="hip").is_cuda_capability(12)
     assert not AcceleratorTarget(backend="hip").cuda_capability_at_least(7, 5)
+    assert not AcceleratorTarget(backend="hip", architecture="gfx942").supports_nvfp4_w4a16
+    assert not AcceleratorTarget(backend="hip", architecture="gfx1201").supports_nvfp4_w4a16
+    assert not AcceleratorTarget(backend="hip", architecture="gfx90a").supports_trellis_moe
+    assert AcceleratorTarget(backend="hip", architecture="gfx1201").supports_trellis_moe is (
+        sys.platform in ("linux", "win32")
+    )
+    for arch, nvfp4_expected, trellis_expected in (
+        ("sm70", False, False),
+        ("sm75", False, True),
+        ("sm80", False, True),
+        ("sm89", False, True),
+        ("sm90", False, True),
+        ("sm100", False, True),
+        ("sm120", True, True),
+        ("sm121", True, True),
+    ):
+        cuda_target = AcceleratorTarget(backend="cuda", architecture=arch)
+        assert cuda_target.supports_nvfp4_w4a16 is nvfp4_expected
+        assert cuda_target.supports_trellis_moe is trellis_expected
 
 
 def test_compiler_target_normalizes_architecture_identity() -> None:
@@ -119,3 +141,4 @@ def test_rocm_preserves_normalized_architecture_without_nvidia_features(
     assert target.cuda_capability is None
     assert not target.supports_uint8_int8_mma
     assert not target.supports_fp8_fp16_mma
+    assert not target.supports_nvfp4_w4a16

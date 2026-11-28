@@ -594,7 +594,7 @@ def test_nonfoldable_3d_activation_views_cuda(
     if requirement == "sm120" and not exact_sm120_available():
         pytest.skip("requires exact NVIDIA SM120")
     if requirement == "w4a16" and not w4a16_nvfp4_available():
-        pytest.skip("requires W4A16 NVFP4 support")
+        pytest.skip("requires NVIDIA SM12x")
     if requirement == "trellis_encode" and not trellis_encoder_available():
         pytest.skip("requires NVIDIA SM80+ Trellis encoding support")
     torch.manual_seed(31)

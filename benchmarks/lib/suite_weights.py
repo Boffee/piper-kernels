@@ -71,7 +71,7 @@ def _support(
             reason = "no native ConvRot INT8 backend for this accelerator"
     elif format_name in ("nvfp4_w4a16", "convrot_nvfp4_w4a16"):
         if not target.supports_nvfp4_w4a16:
-            reason = "native W4A16 NVFP4 execution requires NVIDIA SM75+ or supported ROCm"
+            reason = "native W4A16 NVFP4 execution requires NVIDIA SM12x"
     elif not target.is_cuda_capability(12, 0):
         reason = "native NVFP4 execution requires exact NVIDIA SM120"
     if reason is not None:

@@ -58,11 +58,7 @@ def supports_weight_only_linear(input: object, weight: PiperNVFP4Tensor) -> bool
     tensor_input = cast(torch.Tensor, input)
     if weight.act_quant is not None or weight.act_per_tensor_scale is not None:
         return False
-    if tensor_input.device.type == "meta":
-        return True
-    return tensor_input.device.type == "cuda" and (
-        AcceleratorTarget.from_device(tensor_input.device).supports_nvfp4_w4a16
-    )
+    return tensor_input.device.type in ("cuda", "meta")
 
 
 def linear_dispatch(
@@ -123,6 +119,14 @@ def linear_dispatch(
             )
         if converted_input.device != weight.device:
             raise ValueError("NVFP4 linear operands must share a device")
+        if (
+            converted_input.device.type == "cuda"
+            and not AcceleratorTarget.from_device(converted_input.device).supports_nvfp4_w4a16
+        ):
+            raise ValueError(
+                "NVFP4 linear requires NVIDIA SM12x "
+                "(use ConvRot INT8 or ConvRot Trellis on other GPUs)"
+            )
         if weight.is_swizzled_scales:
             from . import reference  # noqa: PLC0415
 
