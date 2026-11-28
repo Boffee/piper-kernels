@@ -292,7 +292,7 @@ def test_window_launch_keeps_local_query_and_global_causal_coordinates(
         1,
         *output.stride()[:3],
     )
-    assert kwargs["is_causal"] is True
+    assert kwargs["window_mode"] == "causal"
 
 
 @pytest.mark.parametrize(

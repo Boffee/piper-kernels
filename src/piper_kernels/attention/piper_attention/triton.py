@@ -2,7 +2,7 @@
 
 # Triton's JIT launcher accepts compile-time options not represented in its
 # Python call signature.
-# pyright: reportCallIssue=false, reportArgumentType=false
+# pyright: reportCallIssue=false, reportArgumentType=false, reportAttributeAccessIssue=false
 
 from __future__ import annotations
 
@@ -133,9 +133,12 @@ def _compute_chunk_bias(
         "num_slots",
         "max_chunks",
         "int8_splits",
+        "tail_cap",
+        "window_left",
+        "window_right",
     ]
 )
-def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
+def _piper_decode_frozen_split_kernel(  # noqa: PLR0912, PLR0915
     query_ptr,
     key_int8_ptr,
     key_scale_ptr,
@@ -184,8 +187,18 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
     qk_mode: tl.constexpr,
     pv_precision: tl.constexpr,
     loop_num_stages: tl.constexpr,
+    tail_len_ptr=None,
+    tail_cap=0,
+    window_left=-1,
+    window_right=-1,
+    has_tail: tl.constexpr = False,
+    window_mode: tl.constexpr = "none",
 ):
     """Evaluate one Split-KV slice of frozen INT8 chunks using two-term winner framing."""
+    is_causal_mode: tl.constexpr = window_mode == "causal"
+    is_windowed_mode: tl.constexpr = window_mode == "windowed"
+    has_window: tl.constexpr = is_causal_mode or is_windowed_mode
+
     pid_q = tl.program_id(0)
     split_id = tl.program_id(1)
     pid_bh = pid_q // q_tiles
@@ -206,21 +219,66 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
     subtiles_per_k64: tl.constexpr = _TL_VALUE_TILE_TOKENS // block_n
 
     nc = tl.load(num_chunks_ptr + b64)
-    active_chunks = tl.maximum(0, tl.minimum(nc, max_chunks)).to(tl.int64)
-    total_subtiles = active_chunks * subtiles_per_chunk
-    split64 = split_id.to(tl.int64)
-    subtiles_per_split = tl.cdiv(total_subtiles, int8_splits.to(tl.int64))
-    subtile_start = split64 * subtiles_per_split
-    subtile_end = tl.minimum(total_subtiles, subtile_start + subtiles_per_split)
+    active_chunks = tl.maximum(0, tl.minimum(nc, max_chunks))
+    if has_window:
+        active_tail = (
+            tl.maximum(0, tl.minimum(tl.load(tail_len_ptr + b64), tail_cap)).to(tl.int64)
+            if has_tail
+            else tl.zeros((), dtype=tl.int64)
+        )
+        frozen_tokens = active_chunks.to(tl.int64) * _TL_CENTER_CHUNK
+        total_kv = frozen_tokens + active_tail
+        eff_wl = tl.minimum(window_left.to(tl.int64), total_kv)
+        eff_wr = tl.minimum(window_right.to(tl.int64), total_kv + seq_q.to(tl.int64))
+        q_tile_first = q_tile * block_qh
+        q_tile_last = tl.minimum((q_tile + 1) * block_qh, gqa_group * seq_q) - 1
+        same_q_head = (q_tile_first // seq_q) == (q_tile_last // seq_q)
+        q_idx_min = tl.where(same_q_head, q_tile_first % seq_q, 0).to(tl.int64)
+        q_idx_max = tl.where(same_q_head, q_tile_last % seq_q, seq_q - 1).to(tl.int64)
+        q_min = (total_kv - seq_q.to(tl.int64)) + q_idx_min
+        q_max = (total_kv - seq_q.to(tl.int64)) + q_idx_max
+        k_min = (
+            tl.maximum(0, q_min - eff_wl)
+            if (is_windowed_mode and window_left >= 0)
+            else tl.zeros((), dtype=tl.int64)
+        )
+        if is_causal_mode:
+            k_max_excl = tl.minimum(frozen_tokens, tl.maximum(0, q_max + 1))
+        elif window_right >= 0:
+            k_max_excl = tl.minimum(frozen_tokens, tl.maximum(0, q_max + eff_wr + 1))
+        else:
+            k_max_excl = frozen_tokens
+        first_vis_chunk = tl.minimum(active_chunks.to(tl.int64), k_min // _TL_CENTER_CHUNK)
+        last_vis_chunk = tl.maximum(
+            first_vis_chunk,
+            tl.minimum(active_chunks.to(tl.int64), tl.cdiv(k_max_excl, _TL_CENTER_CHUNK)),
+        )
+        first_vis_subtile = tl.maximum(
+            first_vis_chunk * subtiles_per_chunk,
+            tl.minimum(last_vis_chunk * subtiles_per_chunk, k_min // block_n),
+        ).to(tl.int32)
+        last_vis_subtile = tl.maximum(
+            first_vis_subtile.to(tl.int64),
+            tl.minimum(last_vis_chunk * subtiles_per_chunk, tl.cdiv(k_max_excl, block_n)),
+        ).to(tl.int32)
+    else:
+        first_vis_subtile = tl.zeros((), dtype=tl.int32)
+        last_vis_subtile = active_chunks * subtiles_per_chunk
+        frozen_tokens = tl.zeros((), dtype=tl.int64)
+        total_kv = tl.zeros((), dtype=tl.int64)
+
+    visible_subtiles = last_vis_subtile - first_vis_subtile
+    subtiles_per_split = tl.cdiv(visible_subtiles, int8_splits)
+    subtile_start = first_vis_subtile + split_id * subtiles_per_split
+    subtile_end = tl.minimum(last_vis_subtile, subtile_start + subtiles_per_split)
 
     if subtile_start < subtile_end:
-        first_chunk = (subtile_start // subtiles_per_chunk).to(tl.int32)
-        last_chunk = ((subtile_end - 1) // subtiles_per_chunk).to(tl.int32)
-        first_inner = (subtile_start % subtiles_per_chunk).to(tl.int32)
-        last_inner = ((subtile_end - 1) % subtiles_per_chunk + 1).to(tl.int32)
+        first_chunk = subtile_start // subtiles_per_chunk
+        last_chunk = (subtile_end - 1) // subtiles_per_chunk
+        first_inner = subtile_start % subtiles_per_chunk
+        last_inner = (subtile_end - 1) % subtiles_per_chunk + 1
 
         qh_offs0 = q_tile * block_qh + tl.arange(0, block_qh)
-        qh_valid0 = qh_offs0 < gqa_group * seq_q
         q_idx0 = qh_offs0 % seq_q
         q_head0 = kv_head * gqa_group + qh_offs0 // seq_q
         q_ptrs = (
@@ -230,7 +288,9 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
             + q_idx0.to(tl.int64)[:, None] * stride_qs
             + offsets_d[None, :]
         )
-        q_f32 = tl.load(q_ptrs, mask=qh_valid0[:, None], other=0.0).to(tl.float32)
+        q_f32 = tl.load(q_ptrs, mask=(qh_offs0 < gqa_group * seq_q)[:, None], other=0.0).to(
+            tl.float32
+        )
         q_rot = qk_quantization.rotate_signed_hadamard_heads(q_f32, head_dim)
         offsets_d64 = tl.arange(0, 64)
         if head_dim == 128:
@@ -252,6 +312,20 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
         stride_kv_head = tl.constexpr(_TL_CENTER_CHUNK * head_dim)
         stride_ks_head = tl.constexpr(_TL_KEY_SCALES_GROUPED if grouped_qk else _TL_CENTER_CHUNK)
         stride_vi_t = tl.constexpr(head_dim * _TL_VALUE_TILE_TOKENS)
+        q_base_pos = total_kv - seq_q.to(tl.int64)
+        if is_causal_mode:
+            win_lo_base = tl.zeros((), dtype=tl.int64)
+            win_hi_base = q_base_pos
+        elif is_windowed_mode:
+            eff_wl_f = tl.minimum(window_left.to(tl.int64), total_kv)
+            eff_wr_f = tl.minimum(window_right.to(tl.int64), total_kv + seq_q.to(tl.int64))
+            win_lo_base = q_base_pos - eff_wl_f if window_left >= 0 else -seq_q.to(tl.int64) - 1
+            win_hi_base = (
+                q_base_pos + eff_wr_f if window_right >= 0 else frozen_tokens + _TL_CENTER_CHUNK
+            )
+        else:
+            win_lo_base = tl.zeros((), dtype=tl.int64)
+            win_hi_base = tl.zeros((), dtype=tl.int64)
 
         for chunk_idx in tl.range(first_chunk, last_chunk + 1, disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
             if has_chunk_map:
@@ -285,6 +359,26 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
 
                 inner_start = tl.where(chunk_idx == first_chunk, first_inner, 0)
                 inner_end = tl.where(chunk_idx == last_chunk, last_inner, subtiles_per_chunk)
+                if has_window:
+                    chunk_base64 = chunk_idx.to(tl.int64) * _TL_CENTER_CHUNK
+                    q_idx_cur = (q_tile * block_qh + tl.arange(0, block_qh)) % seq_q
+                    chunk_win_lo = tl.maximum(
+                        0,
+                        tl.minimum(
+                            _TL_CENTER_CHUNK,
+                            (win_lo_base + q_idx_cur.to(tl.int64)) - chunk_base64,
+                        ),
+                    ).to(tl.int32)
+                    chunk_win_hi = tl.maximum(
+                        -1,
+                        tl.minimum(
+                            _TL_CENTER_CHUNK,
+                            (win_hi_base + q_idx_cur.to(tl.int64)) - chunk_base64,
+                        ),
+                    ).to(tl.int32)
+                    chunk_win_packed = ((chunk_win_lo + 1) << 16) | (chunk_win_hi + 1)
+                else:
+                    chunk_win_packed = tl.zeros((block_qh,), dtype=tl.int32)
                 for local_subtile in tl.range(
                     inner_start, inner_end, num_stages=loop_num_stages, disable_licm=True
                 ):  # pyright: ignore[reportGeneralTypeIssues]
@@ -312,9 +406,39 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
                         k_scale = tl.load(ks_base + rows)
                         scores = qk * (k_scale[None, :] * scaled_log2)
 
+                    if has_window:
+                        qh_val_cur = (
+                            q_tile * block_qh + tl.arange(0, block_qh)
+                        ) < gqa_group * seq_q
+                        valid_mask = tl.broadcast_to(qh_val_cur[:, None], (block_qh, block_n))
+                        win_hi = (chunk_win_packed & 0xFFFF) - 1
+                        if is_causal_mode:
+                            valid_mask = valid_mask & (rows[None, :] <= win_hi[:, None])
+                        elif is_windowed_mode:
+                            win_lo = (chunk_win_packed >> 16) - 1
+                            valid_mask = (
+                                valid_mask
+                                & (rows[None, :] >= win_lo[:, None])
+                                & (rows[None, :] <= win_hi[:, None])
+                            )
+                        scores = tl.where(valid_mask, scores, -float("inf"))
+
                     m_block = tl.reduce(scores, 1, max_propagate_nan)
+                    subtile_k_bias = (
+                        tl.where(m_block != -float("inf"), chunk_bias, 0.0)
+                        if has_window
+                        else chunk_bias
+                    )
                     m_i, bias_i, old_weight, cur_weight, has_block, safe_m_block = (
-                        advance_tile_max_safe(m_i, bias_i, m_block, chunk_bias)
+                        advance_tile_max_safe(
+                            m_i,
+                            bias_i,
+                            m_block,
+                            subtile_k_bias,
+                            ((q_tile * block_qh + tl.arange(0, block_qh)) < gqa_group * seq_q)
+                            if has_window
+                            else None,
+                        )
                     )
                     chunk_has_block = chunk_has_block | has_block
                     p = tl.where(
@@ -360,6 +484,7 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
     qh_valid = qh_offs < gqa_group * seq_q
     q_idx = qh_offs % seq_q
     q_head = kv_head * gqa_group + qh_offs // seq_q
+    split64 = split_id.to(tl.int64)
     po_ptrs = (
         partial_out_ptr
         + b64 * stride_pob
@@ -402,6 +527,8 @@ def piper_attention_decode_triton(
     active_chunks_hint: int,
     prefill_backend: Literal["amd", "nvidia"] | None = None,
     target: AcceleratorTarget | None = None,
+    window_left: int = -1,
+    window_right: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute native INT8-Q/UINT8-P or fallback Split-KV decode and prefill on GPU."""
     if prefill_backend is not None:
@@ -425,10 +552,30 @@ def piper_attention_decode_triton(
             active_chunks_hint=active_chunks_hint,
             prefill_backend=prefill_backend,
             target=target,
+            window_left=window_left,
+            window_right=window_right,
         )
     batch, q_heads, seq_q, head_dim = query.shape
     num_slots, kv_heads, _, _ = key_int8.shape
     gqa_group = q_heads // kv_heads
+
+    has_explicit_window = window_left >= 0 or window_right >= 0
+    eff_left = window_left
+    eff_right = 0 if is_causal else window_right
+    frozen_left = eff_left if has_explicit_window else -1
+    frozen_right = eff_right if has_explicit_window else -1
+    frozen_mode: Literal["none", "causal", "windowed"] = (
+        "none"
+        if not has_explicit_window
+        else ("causal" if (frozen_left < 0 and frozen_right == 0) else "windowed")
+    )
+    tail_left = eff_left if has_explicit_window else -1
+    tail_right = eff_right if has_explicit_window else (0 if is_causal else -1)
+    tail_mode: Literal["none", "causal", "windowed"] = (
+        "none"
+        if (tail_left < 0 and tail_right < 0)
+        else ("causal" if (tail_left < 0 and tail_right == 0) else "windowed")
+    )
 
     max_chunks = num_slots if chunk_to_slot is None else chunk_to_slot.shape[1]
     tail_cap = 0 if tail_key is None else tail_key.shape[2]
@@ -448,6 +595,7 @@ def piper_attention_decode_triton(
         active_chunks_hint=active_chunks_hint,
         sm_count=sm_count,
         schedule=schedule,
+        window_left=frozen_left,
     )
     num_splits = int8_splits + tail_splits
     output = torch.empty((batch, q_heads, seq_q, head_dim), device=query.device, dtype=query.dtype)
@@ -551,7 +699,18 @@ def piper_attention_decode_triton(
                 block_n=schedule.block_n,
                 qk_mode=schedule.frozen_qk_mode,
                 pv_precision=schedule.pv_precision,
-                loop_num_stages=schedule.loop_num_stages,
+                # Free a pipeline buffer stage when windowed D=128 spills at loop=2.
+                loop_num_stages=(
+                    1
+                    if (frozen_mode == "windowed" and head_dim == 128)
+                    else schedule.loop_num_stages
+                ),
+                tail_len_ptr=tail_len,
+                tail_cap=tail_cap,
+                window_left=frozen_left,
+                window_right=frozen_right,
+                has_tail=tail_len is not None,
+                window_mode=frozen_mode,
                 num_warps=schedule.num_warps,
                 num_stages=schedule.num_stages,
                 **compiler_options,
@@ -581,6 +740,9 @@ def piper_attention_decode_triton(
                 is_causal=is_causal,
                 head_dim=head_dim,
                 schedule=schedule,
+                window_mode=tail_mode,
+                window_left=tail_left,
+                window_right=tail_right,
             )
 
         _launch_splitkv_reduce(
@@ -610,6 +772,8 @@ def compile_kv_decode_kernels(
     contiguous_inputs: bool = True,
     wide_pool: bool = False,
     reduce_vectorize_splits: bool = False,
+    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    has_tail: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, object, object]:
     """Compile frozen-split, tail-split, and reduce decode kernels offline."""
@@ -624,6 +788,8 @@ def compile_kv_decode_kernels(
         contiguous_inputs=contiguous_inputs,
         wide_pool=wide_pool,
         reduce_vectorize_splits=reduce_vectorize_splits,
+        window_mode=window_mode,
+        has_tail=has_tail,
         compile_fn=compile_fn,
     )
 
@@ -638,6 +804,8 @@ def compile_kv_prefill_kernels(
     wide_pool: bool = False,
     has_chunk_splits: bool = False,
     per_row_query_scale: bool = False,
+    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    has_tail: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, ...]:
     """Offline-compile two-wave merge and native chunked prefill kernels for ``target``."""
@@ -652,6 +820,32 @@ def compile_kv_prefill_kernels(
         wide_pool=wide_pool,
         has_chunk_splits=has_chunk_splits,
         per_row_query_scale=per_row_query_scale,
+        window_mode=window_mode,
+        has_tail=has_tail,
+        compile_fn=compile_fn,
+    )
+
+
+def compile_merge_attention_lse_kernel(
+    target: object,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 128,
+    num_waves: int = 2,
+    is_contiguous: bool = True,
+    in_place_0: bool = True,
+    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
+) -> object:
+    """Offline-compile the unified 1..8-wave LSE merge kernel for ``target``."""
+    from . import _kv_compile  # noqa: PLC0415
+
+    return _kv_compile.compile_merge_attention_lse_kernel(
+        target,
+        dtype=dtype,
+        head_dim=head_dim,
+        num_waves=num_waves,
+        is_contiguous=is_contiguous,
+        in_place_0=in_place_0,
         compile_fn=compile_fn,
     )
 
@@ -659,5 +853,6 @@ def compile_kv_prefill_kernels(
 __all__ = [
     "compile_kv_decode_kernels",
     "compile_kv_prefill_kernels",
+    "compile_merge_attention_lse_kernel",
     "piper_attention_decode_triton",
 ]

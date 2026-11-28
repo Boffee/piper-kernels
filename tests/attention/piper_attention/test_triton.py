@@ -1388,3 +1388,64 @@ def test_three_chunk_negligible_middle_bias_preserves_weights(
         atol=0.01,
         rtol=0.01,
     )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    ("seq_len", "is_causal", "window_left", "window_right"),
+    [
+        (193, True, 63, None),
+        (1089, True, 127, None),
+        (193, False, 16, 8),
+        (129, False, 0, 0),
+    ],
+)
+def test_sm89_gluon_dense_sliding_window_and_lse_matches_reference(
+    head_dim: int,
+    seq_len: int,
+    is_causal: bool,
+    window_left: int | None,
+    window_right: int | None,
+) -> None:
+    torch.manual_seed(1400 + head_dim + seq_len + (window_left or 0))
+    query = torch.randn((1, 4, seq_len, head_dim), device="cuda", dtype=torch.bfloat16)
+    key = torch.randn((1, 2, seq_len, head_dim), device="cuda", dtype=torch.bfloat16)
+    value = torch.randn((1, 2, seq_len, head_dim), device="cuda", dtype=torch.bfloat16)
+    target = AcceleratorTarget("cuda", "sm89")
+    plan = default_execution_plan(
+        query,
+        is_causal,
+        target=target,
+        window_mode="causal" if (window_left is None and is_causal) else "windowed",
+    )
+    assert plan.attention_kernel == "gluon_async_copy"
+    granularity = _quantized_dispatch.select_qk_quantization(target)
+
+    with torch.no_grad():
+        actual, actual_lse = _run_piper_attention(
+            query,
+            key,
+            value,
+            head_dim**-0.5,
+            is_causal,
+            window_left=window_left,
+            window_right=window_right,
+            return_lse=True,
+            execution_plan=plan,
+        )
+        expected, expected_lse = reference_piper_attention(
+            query,
+            key,
+            value,
+            head_dim**-0.5,
+            is_causal,
+            window_left=window_left,
+            window_right=window_right,
+            return_lse=True,
+            qk_quantization=granularity,
+        )
+
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(actual_lse).all()
+    torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=0.05, rtol=0.03)

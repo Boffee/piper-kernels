@@ -60,7 +60,7 @@ def default_decode_schedule(head_dim: int) -> DecodeSchedule:
     )
 
 
-def select_split_counts(
+def select_split_counts(  # noqa: PLR0913
     *,
     batch: int,
     kv_heads: int,
@@ -72,6 +72,7 @@ def select_split_counts(
     active_chunks_hint: int,
     sm_count: int,
     schedule: DecodeSchedule,
+    window_left: int = -1,
 ) -> tuple[int, int]:
     """Select frozen-chunk and live-tail Split-KV counts for one decode workload."""
     has_chunks = max_chunks > 0 and num_slots > 0
@@ -79,15 +80,16 @@ def select_split_counts(
     q_tiles = _cdiv(gqa_group * seq_q, BLOCK_QH)
     base_blocks = max(1, batch * kv_heads * q_tiles)
 
+    eff_tail_cap = tail_cap if window_left < 0 else min(tail_cap, seq_q + window_left)
     tail_splits = 0
     if has_tail:
         if (
             schedule.max_tail_splits > 2
-            and tail_cap >= 128
+            and eff_tail_cap >= 128
             and base_blocks <= max(16, sm_count // 4)
         ):
-            tail_splits = min(schedule.max_tail_splits, _cdiv(tail_cap, schedule.block_n))
-        elif schedule.max_tail_splits <= 2 and tail_cap >= 128 and base_blocks <= 16:
+            tail_splits = min(schedule.max_tail_splits, _cdiv(eff_tail_cap, schedule.block_n))
+        elif schedule.max_tail_splits <= 2 and eff_tail_cap >= 128 and base_blocks <= 16:
             tail_splits = schedule.max_tail_splits
         else:
             tail_splits = 1
@@ -95,6 +97,8 @@ def select_split_counts(
     int8_splits = 0
     if has_chunks:
         hint_chunks = max_chunks if active_chunks_hint <= 0 else min(max_chunks, active_chunks_hint)
+        if window_left >= 0:
+            hint_chunks = min(hint_chunks, _cdiv(seq_q + window_left, CENTER_CHUNK))
         target_ctas = max(TARGET_ACTIVE_CTAS, sm_count * schedule.target_ctas_per_sm)
         max_int8 = schedule.max_splits - tail_splits
         target_splits = max(1, target_ctas // base_blocks)

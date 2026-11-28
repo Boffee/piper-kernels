@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 if TYPE_CHECKING:
     from ._nvidia.policy import PiperAttentionExecutionPlan
+
+type WindowMode = Literal["none", "causal", "windowed"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +34,8 @@ class PreparedContext:
     is_causal: bool
     execution_plan: PiperAttentionExecutionPlan | None = None
     padded_kv: bool = False
+    window_left: int | None = None
+    window_right: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +63,26 @@ class PreparedAttention:
     context: PreparedContext
     query: PreparedQuery
     output: torch.Tensor
+
+
+def normalize_window_bounds(
+    is_causal: bool,
+    window_left: int | None,
+    window_right: int | None,
+) -> tuple[int | None, int | None, WindowMode]:
+    """Collapse ``(is_causal, window_left, window_right)`` into effective bounds and mode."""
+    eff_left = window_left
+    eff_right: int | None = 0 if is_causal else window_right
+    if eff_left is None and eff_right is None:
+        return None, None, "none"
+    right_is_zero = (
+        statically_known_true(eff_right == 0)
+        if isinstance(eff_right, torch.SymInt)
+        else eff_right == 0
+    )
+    if eff_left is None and right_is_zero:
+        return None, 0, "causal"
+    return eff_left, eff_right, "windowed"
 
 
 def validate_query_offset(offset: int, *, block_rows: int, name: str) -> None:
@@ -119,4 +144,30 @@ def validate_output_buffer(
                 raise ValueError(
                     "Piper Attention output must use nonoverlapping padded or permuted storage"
                 )
+            span = stride * (size - 1) + span
+
+
+def validate_lse_buffer(
+    lse: torch.Tensor,
+    *,
+    shape: tuple[int, int, int],
+    device: torch.device,
+) -> None:
+    """Validate float32 LSE storage with contiguous query rows."""
+    if (
+        lse.layout is not torch.strided
+        or lse.shape != shape
+        or lse.dtype is not torch.float32
+        or lse.device != device
+        or lse.stride(-1) != 1
+    ):
+        raise ValueError(
+            "Piper Attention lse must match [batch, heads, rows], float32, query device, "
+            "and contiguous query rows"
+        )
+    span = 1
+    for stride, size in sorted(zip(lse.stride(), shape, strict=True)):
+        if size > 1:
+            if stride < span:
+                raise ValueError("Piper Attention lse must use nonoverlapping storage")
             span = stride * (size - 1) + span

@@ -187,7 +187,9 @@ def test_benchmark_wrapper_allocates_output_during_preparation_and_reuses_it(mon
     assert backend.launch_attention(prepared) is prepared.output
     assert backend.launch_attention(prepared) is prepared.output
     assert launch_into.call_count == 2
-    prepare_context.assert_called_once_with(key, key, is_causal=False)
+    prepare_context.assert_called_once_with(
+        key, key, is_causal=False, window_left=None, window_right=None
+    )
     prepare_query.assert_called_once_with(input_query, 0.125)
 
 

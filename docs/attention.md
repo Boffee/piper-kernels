@@ -7,7 +7,7 @@ slow correctness paths, not exact PyTorch SDPA replacements.
 
 | Operator | Use when | Q/K/V layout | Input dtype |
 |---|---|---|---|
-| `piper_attention` | Every query attends all keys, or causal attention is needed | `[batch, heads, sequence, features]` | FP16, BF16 |
+| `piper_attention` | Every query attends all keys, or causal / sliding-window attention is needed | `[batch, heads, sequence, features]` | FP16, BF16 |
 | `piper_attention_decode` | Decoding, MTP verification, or offset-causal chunked prefill against a frozen `PiperKVChunkPool` plus live tail | Query `[batch, q_heads, seq_q, features]`; chunked pool + `[batch, kv_heads, tail_cap, features]` | FP16, BF16 |
 | `SparsePiperAttention` | The model supplies a block layout and per-head sparse budgets | `[batch, sequence, heads, features]` | FP16, BF16, FP32 |
 | `sage_attention_2pp` | You specifically want the canonical SageAttention2++ 8+8 algorithm | `[batch, heads, sequence, features]` | FP16, BF16 |
@@ -16,7 +16,8 @@ All four require head dimensions of 64 or 128, a contiguous final feature dimens
 (outer dimensions may be strided), matching operand devices, and are inference-only
 (use detached inputs or run under `torch.no_grad()` / `torch.inference_mode()`).
 `piper_attention`, `SparsePiperAttention`, and `sage_attention_2pp` require matching
-Q/K/V dtypes and return the query shape and dtype, whereas `piper_attention_decode`
+Q/K/V dtypes and return the query shape and dtype (`piper_attention` also returns
+optional FP32 natural-log `lse` when `return_lse=True`), whereas `piper_attention_decode`
 reads quantized `PiperKVChunkPool` buffers plus an optional query-dtype tail and can
 also return FP32 natural-log `lse` via `return_lse=True`.
 
@@ -36,14 +37,21 @@ v = torch.randn_like(k)
 with torch.inference_mode():
     output = piper_attention(q, k, v)  # [1, 4, 65, 64], grouped-query attention
     causal = piper_attention(q, q, q, is_causal=True)
+    windowed, lse = piper_attention(q, k, v, window_left=15, window_right=4, return_lse=True)
     sage = sage_attention_2pp(q, q, q)  # Sage requires equal Q/K/V head counts
 ```
 
 Non-causal calls allow different query and key lengths. K and V must have the same
 shape, and all sequences must be nonempty. Causal calls require equal query/key
-lengths; there is no offset-causal decoding mode. `scale` defaults to
-`head_dim**-0.5` and, when supplied, must be finite and positive. These entry points
-do not accept arbitrary attention masks or dropout.
+lengths; there is no offset-causal decoding mode. `piper_attention` accepts optional
+inclusive sliding-window bounds `window_left: int | None = None` and
+`window_right: int | None = None` (nonnegative integers or `None` for unlimited):
+query `i` attends key `j` iff `(window_left is None or j >= i - window_left)` and
+`(eff_right is None or j <= i + eff_right)` where `eff_right = 0` when
+`is_causal=True` (caps any positive `window_right` to `0`) and `eff_right = window_right`
+otherwise. Queries whose visible key set is empty return `0.0` output and `-inf` LSE.
+`scale` defaults to `head_dim**-0.5` and, when supplied, must be finite and positive.
+These entry points do not accept arbitrary attention masks or dropout.
 
 Piper infers grouped-query attention from the shapes: `Hq` must be an integer
 multiple of `Hkv`, and query head `h` reads KV head `h // (Hq // Hkv)`. This includes
@@ -253,7 +261,13 @@ Pool and operator contract:
   (including `seq_q == 1`, non-64-aligned offsets, and `seq_q > active_tail`); with
   `is_causal=False`, all active
   tail tokens up to `tail_len` are visible to every query token (`is_causal` is a no-op
-  without a tail). Pass `return_lse=True` to receive `(output, lse)` with FP32
+  when `tail_key` is `None` and both `window_left` and `window_right` are `None`).
+  Optional `window_left` and `window_right` (nonnegative integers or `None`) apply
+  inclusive position windows across frozen chunks (`[c * 1024, (c + 1) * 1024)`) and the
+  live tail (`active_chunks * 1024 + t`) with `q_pos = total_kv - seq_q + q_idx` and
+  `eff_right = 0` when `is_causal=True`, clipping invisible frozen chunks/tiles before
+  Split-KV partitioning and skipping out-of-window chunks with zero host readbacks.
+  Pass `return_lse=True` to receive `(output, lse)` with FP32
   natural-log `lse` (`[batch, q_heads, seq_q]`; `0.0` output and `-inf` LSE when zero
   valid tokens exist). As numerical preconditions, inputs should keep the rotated FP32
   dot product `q · k_center` finite (overflowing products yield `+inf` chunk bias and
@@ -268,7 +282,10 @@ Pool and operator contract:
   whose per-wave dtypes may vary independently within that set, returns `merged_out` in
   `outputs[0].dtype` and `merged_lse` in `float64` whenever any input uses `float64` (else
   `float32`), masks exact `-inf` waves, propagates `NaN` (`+inf` LSE yields `NaN`), and
-  supports differentiable autograd.
+  executes a single-launch fused Triton kernel on GPU for `1..8` waves (7-wave chunks
+  for `> 8` waves) across arbitrary `head_dim`, strided `[..., head_dim]` views, and
+  `torch.compile(fullgraph=True, dynamic=True)`, falling back to PyTorch for CPU,
+  autograd, `float64`, and negated/conjugated views.
 
 ```python
 import torch

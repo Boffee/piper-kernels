@@ -230,18 +230,47 @@ def _fold_query_projections(graph: torch.fx.Graph) -> bool:
         bound = linear_compile_fx.bind_call(node, torch.ops.piper_kernels.piper_attention.default)
         if bound is None:
             continue
+        is_causal = bound["is_causal"]
+        window_left = bound["window_left"]
+        window_right = bound["window_right"]
+        return_lse = bound["return_lse"]
+        if (
+            not isinstance(is_causal, bool)
+            or return_lse is not False
+            or type(window_left) is not int
+            or window_left != -1
+            or type(window_right) is not int
+            or (window_right != -1 and not (is_causal and window_right == 0))
+        ):
+            continue
+        output_users: list[torch.fx.Node] = []
+        valid_users = bool(node.users)
+        for user in node.users:
+            if (
+                user.op == "call_function"
+                and user.target is operator.getitem
+                and not user.kwargs
+                and len(user.args) == 2
+                and user.args[0] is node
+                and type(user.args[1]) is int
+                and user.args[1] == 0
+            ):
+                output_users.append(user)
+            else:
+                valid_users = False
+                break
+        if not valid_users:
+            continue
         query_match = _match_bhsd_projection(bound["query"], normalized=True)
         if query_match is None:
             continue
         key_arg = bound["key"]
         value_arg = bound["value"]
         softmax_scale = bound["scale"]
-        is_causal = bound["is_causal"]
         if not _valid_query_attention(query_match, key_arg, value_arg, softmax_scale, is_causal):
             continue
         assert isinstance(key_arg, torch.fx.Node)
         assert isinstance(value_arg, torch.fx.Node)
-        assert isinstance(is_causal, bool)
         input_value = preparation_sharing.tensor_metadata(query_match.projection_input)
         query_value = preparation_sharing.tensor_metadata(query_match.output_node)
         assert input_value is not None
@@ -288,9 +317,11 @@ def _fold_query_projections(graph: torch.fx.Graph) -> bool:
                 torch.ops.piper_kernels.piper_attention_from_quantized_query.default,
                 args=(query_data, query_scale, key_arg, value_arg, query_length, is_causal),
             )
-        replacement.meta = node.meta.copy()
+        replacement.meta = output_users[0].meta.copy()
         replacement.meta.pop("eager_input_vals", None)
-        node.replace_all_uses_with(replacement)
+        for user in output_users:
+            user.replace_all_uses_with(replacement)
+            graph.erase_node(user)
         graph.erase_node(node)
         changed = True
     return changed

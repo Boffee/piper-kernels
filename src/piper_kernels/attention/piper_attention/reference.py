@@ -102,31 +102,7 @@ def _prepare_reference_operands(
     return query_int8, key_int8, query_scale, key_scale, k_bias, value_int8, value_scale, value_mean
 
 
-def _advance_tile_max(
-    running_max: torch.Tensor,
-    running_bias: torch.Tensor,
-    block_max: torch.Tensor,
-    chunk_bias: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Update winner-frame running maximum across chunks without round-tripping."""
-    has_block = block_max != -float("inf")
-    has_running = running_max != -float("inf")
-    raw_delta = (block_max - running_max) + (chunk_bias - running_bias)
-    delta = torch.where(
-        has_block,
-        torch.where(has_running, raw_delta, float("inf")),
-        -float("inf"),
-    )
-    tile_wins = delta > 0.0
-    next_max = torch.where(tile_wins, block_max, running_max)
-    next_bias = torch.where(tile_wins, chunk_bias, running_bias)
-    decay = torch.exp(-torch.abs(delta))
-    old_weight = torch.where(tile_wins, decay, 1.0)
-    current_weight = torch.where(tile_wins, 1.0, decay)
-    return next_max, next_bias, old_weight, current_weight
-
-
-def reference_piper_attention(
+def reference_piper_attention(  # noqa: PLR0915
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -134,9 +110,19 @@ def reference_piper_attention(
     is_causal: bool,
     *,
     qk_quantization: QKQuantizationGranularity = "per_thread",
-) -> torch.Tensor:
+    window_left: int | None = None,
+    window_right: int | None = None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Evaluate Piper Attention with K1024 + V1024 chunk centering and INT8 Q/K/V."""
     output_dtype = query.dtype
+    if query.shape[0] == 0:
+        empty_out = torch.empty_like(query, memory_format=torch.contiguous_format)
+        if not return_lse:
+            return empty_out
+        empty_lse = torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
+        return empty_out, empty_lse
+
     (
         query_int8,
         key_int8,
@@ -164,9 +150,17 @@ def reference_piper_attention(
     running_bias = torch.zeros_like(denominator)
     query_positions = torch.arange(query_length, device=query.device) % query.shape[2]
 
-    for chunk_start in range(0, key_length, _CENTER_CHUNK):
+    eff_left = window_left
+    eff_right: int | None = 0 if is_causal else window_right
+    has_window = eff_left is not None or eff_right is not None
+    if isinstance(eff_right, int):
+        k_max_excl = min(key_length, (query.shape[2] - 1) + eff_right + 1)
+    else:
+        k_max_excl = key_length
+
+    for chunk_start in range(0, k_max_excl, _CENTER_CHUNK):
         chunk = chunk_start // _CENTER_CHUNK
-        chunk_end = min(chunk_start + _CENTER_CHUNK, key_length)
+        chunk_end = min(chunk_start + _CENTER_CHUNK, k_max_excl)
         chunk_bias = k_bias[:, :, :, chunk]
         chunk_denom = torch.zeros_like(denominator)
         for start in range(chunk_start, chunk_end, _PV_BLOCK):
@@ -182,23 +176,50 @@ def reference_piper_attention(
                 * key_scale[:, :, None, start:stop]
                 * scale
             )
-            if is_causal:
+            if has_window:
                 key_positions = torch.arange(start, stop, device=query.device)
-                scores = scores.masked_fill(
-                    key_positions[None, None, None, :] > query_positions[None, None, :, None],
-                    -float("inf"),
+                valid = torch.ones(
+                    (query_length, stop - start),
+                    dtype=torch.bool,
+                    device=query.device,
                 )
+                if eff_left is not None:
+                    valid &= (query_positions[:, None] - key_positions[None, :]) <= eff_left
+                if eff_right is not None:
+                    valid &= (key_positions[None, :] - query_positions[:, None]) <= eff_right
+                scores = scores.masked_fill(~valid[None, None, :, :], -float("inf"))
 
             block_value_scale = value_scale[:, :, start:stop]
-            shifted_scores = scores + torch.log(block_value_scale[:, :, None, :])
-            block_max = shifted_scores.amax(dim=-1)
-            next_max, next_bias, old_weight, current_weight = _advance_tile_max(
-                running_max,
-                running_bias,
-                block_max,
-                chunk_bias,
+            shifted_scores = torch.where(
+                scores != -float("inf"),
+                scores + torch.log(block_value_scale[:, :, None, :]),
+                -float("inf"),
             )
-            probabilities = torch.nan_to_num(torch.exp(scores - block_max[..., None]))
+            block_max = shifted_scores.amax(dim=-1)
+            has_nan = torch.isnan(scores).any(dim=-1) | torch.isnan(block_max + chunk_bias)
+            m_clean = torch.where(has_nan, float("nan"), block_max)
+            tile_bias = torch.where(block_max != -float("inf"), chunk_bias, 0.0)
+            has_block = ((m_clean != -float("inf")) & (tile_bias != -float("inf"))) | has_nan
+            has_running = running_max != -float("inf")
+            bias_diff = torch.where(tile_bias == running_bias, 0.0, tile_bias - running_bias)
+            raw_delta = (m_clean - running_max) + bias_diff
+            delta = torch.where(
+                has_block,
+                torch.where(has_running, raw_delta, float("inf")),
+                -float("inf"),
+            )
+            tile_wins = (delta > 0.0) | has_nan
+            next_max = torch.where(tile_wins, m_clean, running_max)
+            next_bias = torch.where(tile_wins, tile_bias, running_bias)
+            decay = torch.exp(-torch.abs(delta))
+            old_weight = torch.where(has_running, torch.where(tile_wins, decay, 1.0), 0.0)
+            current_weight = torch.where(has_block, torch.where(tile_wins, 1.0, decay), 0.0)
+            safe_block_max = torch.where(has_block, m_clean, 0.0)
+            probabilities = torch.where(
+                has_block[..., None],
+                torch.exp(scores - safe_block_max[..., None]),
+                0.0,
+            )
 
             row_sum = probabilities.sum(dim=-1) * current_weight
             numerator *= old_weight[..., None]
@@ -216,10 +237,31 @@ def reference_piper_attention(
             numerator += partial * current_weight[..., None]
             running_max = next_max
             running_bias = next_bias
-        numerator += (chunk_denom * _P_UINT8_RANGE)[..., None] * value_mean[:, :, chunk : chunk + 1]
+        numerator += torch.where(
+            (chunk_denom > 0.0)[..., None],
+            (chunk_denom * _P_UINT8_RANGE)[..., None] * value_mean[:, :, chunk : chunk + 1],
+            0.0,
+        )
 
-    output = numerator / (denominator.clamp_min(1e-30)[..., None] * _P_UINT8_RANGE)
-    return output.reshape(query.shape).to(output_dtype)
+    has_any = running_max != -float("inf")
+    safe_denom = torch.where(has_any & (denominator != 0.0), denominator, 1.0)
+    output = (
+        torch.where(
+            has_any[..., None],
+            numerator / (safe_denom[..., None] * _P_UINT8_RANGE),
+            0.0,
+        )
+        .reshape(query.shape)
+        .to(output_dtype)
+    )
+    if not return_lse:
+        return output
+    lse = torch.where(
+        has_any,
+        (running_max + running_bias) + torch.log(safe_denom),
+        -float("inf"),
+    ).reshape(query.shape[:3])
+    return output, lse
 
 
 def _round_to_int8(values: torch.Tensor) -> torch.Tensor:
@@ -387,7 +429,7 @@ def _online_softmax_update(
     return next_max, next_bias, next_sum, next_acc
 
 
-def _decode_frozen_chunks_reference(  # noqa: PLR0913
+def _decode_frozen_chunks_reference(  # noqa: PLR0913, PLR0915
     q_rot: torch.Tensor,
     running_max: torch.Tensor,
     running_bias: torch.Tensor,
@@ -402,11 +444,17 @@ def _decode_frozen_chunks_reference(  # noqa: PLR0913
     value_mean: torch.Tensor,
     chunk_to_slot: torch.Tensor | None,
     num_chunks: torch.Tensor,
+    active_tail: torch.Tensor | None,
+    seq_q: int,
     scale: float,
     pack_wmma: bool,
+    window_left: int | None,
+    window_right: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_slots, _, _, head_dim = key_int8.shape
+    num_slots, kv_heads, _, head_dim = key_int8.shape
     batch = q_rot.shape[0]
+    gq = q_rot.shape[2]
+    gqa_group = gq // seq_q
     max_chunks = num_slots if chunk_to_slot is None else chunk_to_slot.shape[1]
     if max_chunks == 0 or num_slots == 0:
         return running_max, running_bias, running_sum, acc
@@ -420,6 +468,21 @@ def _decode_frozen_chunks_reference(  # noqa: PLR0913
 
     key_i8_signed = key_int8.view(torch.int8)
     val_i8_signed = value_int8.view(torch.int8)
+
+    has_window = window_left is not None or window_right is not None
+    if has_window:
+        tail_tokens = (
+            active_tail.to(torch.int64)
+            if active_tail is not None
+            else torch.zeros(batch, device=q_rot.device, dtype=torch.int64)
+        )
+        total_kv = active_chunks.to(torch.int64) * _CENTER_CHUNK + tail_tokens
+        q_idx = torch.arange(seq_q, device=q_rot.device, dtype=torch.int64)
+        q_pos = total_kv[:, None] - seq_q + q_idx[None, :]
+        local_k = torch.arange(_CENTER_CHUNK, device=q_rot.device, dtype=torch.int64)
+    else:
+        q_pos = None
+        local_k = None
 
     for chunk_idx in range(max_chunks):
         slots = (
@@ -444,11 +507,34 @@ def _decode_frozen_chunks_reference(  # noqa: PLR0913
         k_tok_scale = k_s.repeat_interleave(_PV_BLOCK, dim=-1) if grouped_qk else k_s
         k_centered = k_q * k_tok_scale.unsqueeze(-1)
         scores_centered = torch.matmul(q_rot, k_centered.transpose(-1, -2))
-        scores = (scores_centered * scale).masked_fill(
-            ~slot_valid[:, None, None, None], -float("inf")
-        )
+        scores = scores_centered * scale
+        if has_window:
+            assert q_pos is not None
+            assert local_k is not None
+            k_pos = chunk_idx * _CENTER_CHUNK + local_k
+            win_mask = torch.ones(
+                (batch, seq_q, _CENTER_CHUNK),
+                dtype=torch.bool,
+                device=q_rot.device,
+            )
+            if window_left is not None:
+                win_mask &= (q_pos[:, :, None] - k_pos[None, None, :]) <= window_left
+            if window_right is not None:
+                win_mask &= (k_pos[None, None, :] - q_pos[:, :, None]) <= window_right
+            win_mask &= slot_valid[:, None, None]
+            full_mask = (
+                win_mask[:, None, None, :, :]
+                .expand(batch, kv_heads, gqa_group, seq_q, _CENTER_CHUNK)
+                .reshape(batch, kv_heads, gq, _CENTER_CHUNK)
+            )
+            scores = scores.masked_fill(~full_mask, -float("inf"))
+            row_has_valid = full_mask.any(dim=-1)
+        else:
+            scores = scores.masked_fill(~slot_valid[:, None, None, None], -float("inf"))
+            row_has_valid = slot_valid[:, None, None]
+
         k_bias = (q_rot * k_c.unsqueeze(2)).sum(dim=-1)
-        chunk_bias = torch.where(slot_valid[:, None, None], k_bias * scale, 0.0)
+        chunk_bias = torch.where(row_has_valid, k_bias * scale, 0.0)
 
         v_centered = torch.where(
             slot_valid[:, None, None, None],
@@ -481,7 +567,8 @@ def _decode_tail_reference(  # noqa: PLR0913
     tail_len: torch.Tensor,
     seq_q: int,
     scale: float,
-    is_causal: bool,
+    window_left: int | None,
+    window_right: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     tail_cap = tail_key.shape[2]
     if tail_cap == 0:
@@ -495,13 +582,19 @@ def _decode_tail_reference(  # noqa: PLR0913
     tail_v_f = torch.where(tail_valid[:, None, :, None], tail_value.float(), 0.0)
     scores = torch.matmul(q_flat, tail_k_f.transpose(-1, -2)) * scale
     scores = scores.masked_fill(~tail_valid[:, None, None, :], -float("inf"))
-    if is_causal:
+    if window_left is not None or window_right is not None:
         q_pos = torch.arange(seq_q, device=q_grouped.device, dtype=torch.int64)
-        # Reshape into [B, kv_heads, gqa_group, seq_q, tail_cap] for row-level causal mask.
+        # Reshape into [B, kv_heads, gqa_group, seq_q, tail_cap] for row-level window mask.
         scores_q = scores.reshape(batch, kv_heads, -1, seq_q, tail_cap)
-        cutoff = active_tail[:, None] - seq_q + q_pos[None, :]
-        causal_mask = k_pos[None, None, :] > cutoff[:, :, None]
-        scores = scores_q.masked_fill(causal_mask[:, None, None, :, :], -float("inf")).reshape(
+        q_tail_pos = active_tail[:, None].to(torch.int64) - seq_q + q_pos[None, :]
+        invalid_mask = torch.zeros(
+            (batch, seq_q, tail_cap), dtype=torch.bool, device=q_grouped.device
+        )
+        if window_left is not None:
+            invalid_mask |= (q_tail_pos[:, :, None] - k_pos[None, None, :]) > window_left
+        if window_right is not None:
+            invalid_mask |= (k_pos[None, None, :] - q_tail_pos[:, :, None]) > window_right
+        scores = scores_q.masked_fill(invalid_mask[:, None, None, :, :], -float("inf")).reshape(
             batch, kv_heads, -1, tail_cap
         )
     return _online_softmax_update(
@@ -532,6 +625,8 @@ def piper_attention_decode_reference(  # noqa: PLR0913
     scale: float,
     is_causal: bool = True,
     pack_wmma: bool = False,
+    window_left: int = -1,
+    window_right: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Portable FP32-accumulation reference for GQA chunked INT8 + BF16/FP16 tail decode."""
     batch, q_heads, seq_q, head_dim = query.shape
@@ -543,6 +638,13 @@ def piper_attention_decode_reference(  # noqa: PLR0913
     kv_heads = key_int8.shape[1]
     gqa_group = q_heads // kv_heads
     gq = gqa_group * seq_q
+    has_explicit_window = window_left >= 0 or window_right >= 0
+    eff_left: int | None = None if window_left < 0 else window_left
+    eff_right: int | None = 0 if is_causal else (None if window_right < 0 else window_right)
+    frozen_left = eff_left if has_explicit_window else None
+    frozen_right = eff_right if has_explicit_window else None
+    tail_left = eff_left if has_explicit_window else None
+    tail_right = eff_right if has_explicit_window else (0 if is_causal else None)
 
     autocast_ctx = (
         torch.amp.autocast(device_type=query.device.type, enabled=False)
@@ -566,6 +668,11 @@ def piper_attention_decode_reference(  # noqa: PLR0913
             dtype=torch.float32,
         )
 
+        active_tail = (
+            tail_len.clamp(0, tail_key.shape[2])
+            if tail_key is not None and tail_len is not None
+            else None
+        )
         max_chunks = key_int8.shape[0] if chunk_to_slot is None else chunk_to_slot.shape[1]
         if max_chunks > 0 and key_int8.shape[0] > 0:
             q_rot = rotate_signed_hadamard_heads(q_flat)
@@ -583,8 +690,12 @@ def piper_attention_decode_reference(  # noqa: PLR0913
                 value_mean=value_mean,
                 chunk_to_slot=chunk_to_slot,
                 num_chunks=num_chunks,
+                active_tail=active_tail,
+                seq_q=seq_q,
                 scale=scale,
                 pack_wmma=pack_wmma,
+                window_left=frozen_left,
+                window_right=frozen_right,
             )
 
         if tail_key is not None and tail_value is not None and tail_len is not None:
@@ -599,7 +710,8 @@ def piper_attention_decode_reference(  # noqa: PLR0913
                 tail_len=tail_len,
                 seq_q=seq_q,
                 scale=scale,
-                is_causal=is_causal,
+                window_left=tail_left,
+                window_right=tail_right,
             )
 
         has_any = running_max != -float("inf")

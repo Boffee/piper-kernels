@@ -187,6 +187,56 @@ def test_dense_attention_compiles_single_graph_and_rejects_invalid_dynamic_scale
             compiled(query, key, value, scale=bad_scale)
 
 
+def test_piper_attention_compiles_single_graph_with_dynamic_window_bounds_and_lse() -> None:
+    generator = torch.Generator().manual_seed(1209)
+    query = torch.randn(1, 2, 17, 64, dtype=torch.bfloat16, generator=generator)
+    key = torch.randn(1, 2, 17, 64, dtype=torch.bfloat16, generator=generator)
+    value = torch.randn(1, 2, 17, 64, dtype=torch.bfloat16, generator=generator)
+    for tensor in (query, key, value):
+        torch._dynamo.mark_static(tensor)
+
+    for bad_left in (-1, -5):
+        with pytest.raises(ValueError, match="nonnegative integer"):
+            piper_attention(query, key, value, window_left=bad_left)
+        torch._dynamo.reset()
+        cold = torch.compile(
+            lambda q, k, v, wl: piper_attention(q, k, v, window_left=wl, return_lse=True),
+            backend="eager",
+            fullgraph=True,
+            dynamic=True,
+        )
+        with pytest.raises(_COMPILED_REJECTION_ERRORS):
+            cold(query, key, value, bad_left)
+
+    torch._dynamo.reset()
+    graphs, capture = _capture_backend()
+    compiled = torch.compile(
+        lambda q, k, v, wl, wr: piper_attention(
+            q, k, v, window_left=wl, window_right=wr, return_lse=True
+        ),
+        backend=capture,
+        fullgraph=True,
+        dynamic=True,
+    )
+
+    outputs: list[torch.Tensor] = []
+    for wl, wr in ((0, 0), (2, 1), (8, 4)):
+        exp_out, exp_lse = piper_attention(
+            query, key, value, window_left=wl, window_right=wr, return_lse=True
+        )
+        act_out, act_lse = compiled(query, key, value, wl, wr)
+        torch.testing.assert_close(act_out, exp_out, atol=0, rtol=0)
+        torch.testing.assert_close(act_lse, exp_lse, atol=0, rtol=0)
+        outputs.append(act_out)
+
+    assert len(graphs) == 1
+    assert not torch.equal(outputs[0], outputs[1])
+
+    for bad_left in (-1, -3):
+        with pytest.raises(_COMPILED_REJECTION_ERRORS):
+            compiled(query, key, value, bad_left, 1)
+
+
 @pytest.mark.parametrize("routing", ["mean", "minmax"])
 def test_sparse_piper_attention_compiles_with_dynamic_scales(
     routing: Literal["mean", "minmax"],

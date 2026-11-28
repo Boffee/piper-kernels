@@ -30,6 +30,8 @@ class AttentionCase(Case):
     head_dim: int
     batch: int = 1
     causal: bool = False
+    window_left: int | None = None
+    window_right: int | None = None
     keep_ratio: float | None = None
 
     @property
@@ -184,6 +186,57 @@ def diagnostic_cases() -> tuple[BenchmarkCase, ...]:
     """Small and ragged workloads for regression checks, outside the standard suite."""
     return (
         AttentionCase(id="attention-small", sequence=257, heads=4, kv_heads=2, head_dim=64),
+        AttentionCase(
+            id="attention-decoder-low-causal",
+            sequence=10240,
+            heads=32,
+            kv_heads=32,
+            head_dim=64,
+            causal=True,
+        ),
+        AttentionCase(
+            id="attention-decoder-low-window1024",
+            sequence=10240,
+            heads=32,
+            kv_heads=32,
+            head_dim=64,
+            causal=True,
+            window_left=1023,
+        ),
+        AttentionCase(
+            id="attention-decoder-high-causal",
+            sequence=20480,
+            heads=32,
+            kv_heads=32,
+            head_dim=64,
+            causal=True,
+        ),
+        AttentionCase(
+            id="attention-decoder-high-window1024",
+            sequence=20480,
+            heads=32,
+            kv_heads=32,
+            head_dim=64,
+            causal=True,
+            window_left=1023,
+        ),
+        AttentionCase(
+            id="attention-image-high-causal",
+            sequence=16896,
+            heads=48,
+            kv_heads=12,
+            head_dim=128,
+            causal=True,
+        ),
+        AttentionCase(
+            id="attention-image-high-window1024",
+            sequence=16896,
+            heads=48,
+            kv_heads=12,
+            head_dim=128,
+            causal=True,
+            window_left=1023,
+        ),
         AttentionCase(
             id="sparse-attention-small",
             sequence=257,

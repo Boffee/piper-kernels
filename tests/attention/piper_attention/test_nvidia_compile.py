@@ -4,6 +4,7 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import replace
+from typing import Literal
 
 import pytest
 import torch
@@ -29,6 +30,7 @@ from piper_kernels.attention.piper_attention._nvidia.triton import _piper_attent
 from piper_kernels.attention.piper_attention.triton import (
     compile_kv_decode_kernels,
     compile_kv_prefill_kernels,
+    compile_merge_attention_lse_kernel,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -36,19 +38,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("architecture", [89, 120])
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("aligned_queries", [False, True])
-def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
-    monkeypatch, architecture, head_dim, causal, aligned_queries
-):
+def _compile_pointer_dense(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: int,
+    head_dim: int,
+    window_mode: str,
+    store_lse: bool,
+    aligned_queries: bool,
+) -> None:
+    causal = window_mode != "none"
     plan = replace(
         select_execution_plan(
             AcceleratorTarget("cuda", f"sm{architecture}"),
             head_dim=head_dim,
             is_causal=causal,
             query_length=128 if aligned_queries else 129,
+            window_mode=window_mode,
         ),
         use_tensor_descriptors=False,
     )
@@ -62,15 +67,18 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
     constants.update(
         query_heads_per_kv_head=3,
         head_dim=head_dim,
-        is_causal=causal,
+        window_mode=window_mode,
+        store_lse=store_lse,
         block_n=64,
         aligned_queries=aligned_queries,
-        unmasked_key_tiles=not causal,
+        unmasked_key_tiles=window_mode == "none",
         use_query_tensor_descriptor=False,
         full_query=False,
         contiguous_output=False,
         query_group_size=8 if architecture == 120 and head_dim == 64 and causal else 0,
     )
+    if not store_lse:
+        constants["lse_ptr"] = None
     signature = {name: "i32" for name in _piper_attention_kernel.arg_names if name not in constants}
     signature.update(
         query_ptr="*i8",
@@ -84,7 +92,10 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
         value_log_scale_ptr="*fp16",
         value_mean_ptr="*fp32",
         output_ptr="*fp16",
+        window_left="i64",
+        window_right="i64",
     )
+    signature["lse_ptr"] = "*fp32" if store_lse else "constexpr"
     # Install only the compiler-stage rewrite; no device/driver probe is needed.
     monkeypatch.setattr(
         triton.knobs.runtime, "add_stages_inspection_hook", _MixedInt8StageHook(None)
@@ -100,25 +111,29 @@ def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
     assert "piper_attention_u8s8_dot_marker" not in compiled.asm["ptx"]
 
 
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("full_launch", [False, True])
-@pytest.mark.parametrize("quantized_query", [False, True])
-def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(
-    monkeypatch, head_dim, causal, full_launch, quantized_query
-):
+def _compile_sm89_gluon_dense(
+    monkeypatch: pytest.MonkeyPatch,
+    head_dim: int,
+    window_mode: str,
+    store_lse: bool,
+    full_launch: bool,
+    quantized_query: bool,
+) -> None:
+    causal = window_mode != "none"
     plan = select_execution_plan(
         AcceleratorTarget("cuda", "sm89"),
         head_dim=head_dim,
         is_causal=causal,
         query_length=129,
         quantized_query=quantized_query,
+        window_mode=window_mode,
     )
     assert plan.attention_kernel == "gluon_async_copy"
     constants = {
         "query_heads_per_kv_head": 3,
         "head_dim": head_dim,
-        "is_causal": causal,
+        "window_mode": window_mode,
+        "store_lse": store_lse,
         "block_q": plan.block_m,
         "quantize_query": plan.fuse_query_quantization,
         "full_query": full_launch,
@@ -128,6 +143,8 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(
     }
     if plan.fuse_query_quantization:
         constants["query_scale_ptr"] = None
+    if not store_lse:
+        constants["lse_ptr"] = None
     signature = {
         name: "i32" for name in _dense_piper_attention_kernel.arg_names if name not in constants
     }
@@ -142,7 +159,10 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(
         value_mean_ptr="*fp32",
         output_ptr="*bf16",
         softmax_scale="fp32",
+        window_left="i64",
+        window_right="i64",
     )
+    signature["lse_ptr"] = "*fp32" if store_lse else "constexpr"
     # A launch specializes pointers, K64/Q64-padded storage lengths, and Q strides
     # as 16-byte aligned, which every cp.async copy requires. Window coordinates and
     # output strides stay unspecialized.
@@ -173,6 +193,58 @@ def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(
     assert "piper_attention_u8s8_dot_marker" not in compiled.asm["ptx"]
     # This is the exact SM89 production kernel, unlike the pointer variants above.
     assert stack_frame_bytes(compiled.asm["cubin"]) <= ATTENTION_STACK_BUDGET_BYTES
+
+
+@pytest.mark.parametrize("architecture", [89, 120])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    ("window_mode", "store_lse"),
+    [("none", False), ("causal", False), ("windowed", True)],
+)
+@pytest.mark.parametrize("aligned_queries", [False, True])
+def test_nvidia_pointer_kernel_retains_signed_and_mixed_mma(
+    monkeypatch, architecture, head_dim, window_mode, store_lse, aligned_queries
+):
+    _compile_pointer_dense(
+        monkeypatch, architecture, head_dim, window_mode, store_lse, aligned_queries
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    ("window_mode", "store_lse"),
+    [("none", False), ("causal", False), ("windowed", True)],
+)
+@pytest.mark.parametrize("full_launch", [False, True])
+@pytest.mark.parametrize("quantized_query", [False, True])
+def test_sm89_gluon_kernel_retains_signed_and_mixed_mma(
+    monkeypatch, head_dim, window_mode, store_lse, full_launch, quantized_query
+):
+    _compile_sm89_gluon_dense(
+        monkeypatch, head_dim, window_mode, store_lse, full_launch, quantized_query
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("window_mode", ["none", "causal"])
+def test_nvidia_dense_store_lse_non_windowed_compile(monkeypatch, head_dim, window_mode):
+    for architecture in (89, 120):
+        _compile_pointer_dense(
+            monkeypatch,
+            architecture,
+            head_dim,
+            window_mode,
+            store_lse=True,
+            aligned_queries=False,
+        )
+    _compile_sm89_gluon_dense(
+        monkeypatch,
+        head_dim,
+        window_mode,
+        store_lse=True,
+        full_launch=True,
+        quantized_query=False,
+    )
 
 
 @pytest.mark.parametrize("architecture", [89, 120])
@@ -280,7 +352,7 @@ def test_kv_freeze_8_target_compile_zero_spills(
     )
 
 
-def _compile_kv_decode_zero_spill_checked(
+def _compile_kv_decode_zero_spill_checked(  # noqa: PLR0913
     monkeypatch: pytest.MonkeyPatch,
     target: GPUTarget,
     *,
@@ -290,6 +362,9 @@ def _compile_kv_decode_zero_spill_checked(
     is_causal: bool = True,
     contiguous_inputs: bool = True,
     wide_pool: bool = False,
+    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    has_tail: bool = False,
+    check_sgpr_spills: bool = True,
 ) -> None:
     native_cuda = target.backend == "cuda" and (
         80 <= int(target.arch) < 90 or 120 <= int(target.arch) < 130
@@ -311,12 +386,14 @@ def _compile_kv_decode_zero_spill_checked(
             is_causal=is_causal,
             contiguous_inputs=contiguous_inputs,
             wide_pool=wide_pool,
+            window_mode=window_mode,
+            has_tail=has_tail,
             compile_fn=compile_fn,
         )
         compiled_out.extend(res)
         return res
 
-    _assert_zero_spill_kernels(target, 3, _compile_and_record, check_sgpr_spills=True)
+    _assert_zero_spill_kernels(target, 3, _compile_and_record, check_sgpr_spills=check_sgpr_spills)
     if native_cuda:
         ptx = compiled_out[0].asm["ptx"]  # type: ignore[attr-defined]
         assert ".s32.s8.s8.s32" in ptx
@@ -663,4 +740,79 @@ def test_kv_nonsplit_per_row_prefill_compile_zero_spills(
         wide_pool=False,
         has_chunk_splits=False,
         per_row_query_scale=True,
+    )
+
+
+@pytest.mark.parametrize("target", _KV_COMPILE_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_decode_windowed_with_tail_9_target_compile_zero_spills(
+    monkeypatch: pytest.MonkeyPatch,
+    target: GPUTarget,
+    head_dim: int,
+) -> None:
+    _compile_kv_decode_zero_spill_checked(
+        monkeypatch,
+        target,
+        dtype=torch.bfloat16,
+        head_dim=head_dim,
+        has_chunk_map=True,
+        is_causal=True,
+        contiguous_inputs=True,
+        window_mode="windowed",
+        has_tail=True,
+        # Windowed+tail scalar bounds overflow gfx1201's SGPR budget with 0 VGPR/scratch spills.
+        check_sgpr_spills=not (target.backend == "hip" and target.arch == "gfx1201"),
+    )
+
+
+@pytest.mark.parametrize("target", _NVIDIA_PREFILL_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_prefill_windowed_with_tail_nvidia_compile_zero_spills(
+    monkeypatch: pytest.MonkeyPatch,
+    target: GPUTarget,
+    head_dim: int,
+) -> None:
+    monkeypatch.setattr(
+        triton.knobs.runtime, "add_stages_inspection_hook", _MixedInt8StageHook(None)
+    )
+    _assert_zero_spill_kernels(
+        target,
+        3,
+        lambda compile_fn: compile_kv_prefill_kernels(
+            target,
+            dtype=torch.bfloat16,
+            head_dim=head_dim,
+            has_chunk_map=True,
+            is_causal=True,
+            window_mode="windowed",
+            has_tail=True,
+            compile_fn=compile_fn,
+        ),
+        check_sgpr_spills=True,
+    )
+
+
+@pytest.mark.parametrize("target", _KV_COMPILE_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("num_waves", [1, 2, 8])
+@pytest.mark.parametrize("is_contiguous", [True, False])
+def test_merge_attention_lse_9_target_compile_zero_spills(
+    target: GPUTarget,
+    num_waves: int,
+    is_contiguous: bool,
+) -> None:
+    _assert_zero_spill_kernels(
+        target,
+        1,
+        lambda compile_fn: (
+            compile_merge_attention_lse_kernel(
+                target,
+                dtype=torch.bfloat16,
+                head_dim=128 if is_contiguous else 96,
+                num_waves=num_waves,
+                is_contiguous=is_contiguous,
+                in_place_0=False,
+                compile_fn=compile_fn,
+            ),
+        ),
+        check_sgpr_spills=not (target.backend == "hip" and not is_contiguous and num_waves == 8),
     )
