@@ -349,6 +349,34 @@ def test_kv_decode_8_target_compile_zero_spills(
     )
 
 
+@pytest.mark.parametrize("target", _KV_COMPILE_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_kv_decode_vectorized_reduce_9_target_compile_zero_spills(
+    monkeypatch: pytest.MonkeyPatch,
+    target: GPUTarget,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> None:
+    native_cuda = target.backend == "cuda" and int(target.arch) >= 80
+    if native_cuda:
+        monkeypatch.setattr(
+            triton.knobs.runtime, "add_stages_inspection_hook", _MixedInt8StageHook(None)
+        )
+    _assert_zero_spill_kernels(
+        target,
+        3,
+        lambda compile_fn: compile_kv_decode_kernels(
+            target,
+            dtype=dtype,
+            head_dim=head_dim,
+            reduce_vectorize_splits=True,
+            compile_fn=compile_fn,
+        ),
+        check_sgpr_spills=True,
+    )
+
+
 _FALLBACK_PREFILL_TARGETS = (
     GPUTarget("cuda", 75, 32),
     GPUTarget("hip", "gfx942", 64),

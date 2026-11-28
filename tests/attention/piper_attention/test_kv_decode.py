@@ -1852,10 +1852,11 @@ def test_gpu_chunk_map_none_strided_and_tail_splits(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
-def test_gpu_splitkv_reduce_normalized_weights() -> None:
+@pytest.mark.parametrize("seq_q", [1, 9])
+def test_gpu_splitkv_reduce_normalized_weights(seq_q: int) -> None:
     device = torch.device("cuda")
     pool = PiperKVChunkPool.empty(0, 1, 64, device=device)
-    q = torch.zeros((1, 1, 1, 64), device=device, dtype=torch.bfloat16)
+    q = torch.zeros((1, 1, seq_q, 64), device=device, dtype=torch.bfloat16)
     q[..., 0] = 1.0
     tk = torch.zeros((1, 1, 128, 64), device=device, dtype=torch.bfloat16)
     tk[:, :, 0, 0] = 120.0
@@ -4126,3 +4127,161 @@ def test_gpu_split_large_centered_max_preserves_denom(head_dim: int) -> None:
     q_decode = torch.full((1, 1, 1, head_dim), 1e8, device=device, dtype=dtype)
     o_decode, _ = piper_attention_decode(q_decode, pool, c2s, nc, return_lse=True)
     torch.testing.assert_close(o_decode, expected[:, :, :1], atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("seq_q", [1, 8, 9, 32, 63, 64])
+def test_gpu_splitkv_reduce_tiled_and_multichunk_splits(head_dim: int, seq_q: int) -> None:
+    """Exercise multi-chunk split-vectorized (seq_q<=8) and row-tiled (seq_q>8) Split-KV reduce."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    kv_heads = 2
+    q_heads = 8
+    num_slots = 4
+    active_chunks = 16
+    pool = _make_strided_pool(num_slots, kv_heads, head_dim, device=device, kv_dtype=torch.uint8)
+    k_frozen, v_frozen = _populate_test_pool(
+        pool, list(range(num_slots)), device=device, dtype=dtype, seed=1700 + head_dim + seq_q
+    )
+    slot_keys = {i: (k_frozen[i], v_frozen[i]) for i in range(num_slots)}
+
+    torch.manual_seed(1800 + head_dim + seq_q)
+    q_backing = torch.randn((1, q_heads, seq_q, 2 * head_dim), device=device, dtype=dtype)
+    q = q_backing[..., :head_dim]  # non-contiguous outer stride
+    c2s = (
+        torch.arange(active_chunks, device=device, dtype=torch.int32)
+        .remainder(num_slots)
+        .view(1, -1)
+    )
+    nc = torch.tensor([active_chunks], device=device, dtype=torch.int32)
+    tk, tv, tl = _make_sentinel_tail(1, kv_heads, 128, head_dim, [95], device=device, dtype=dtype)
+
+    out, lse = piper_attention_decode(
+        q,
+        pool,
+        c2s,
+        nc,
+        tail_key=tk,
+        tail_value=tv,
+        tail_len=tl,
+        return_lse=True,
+    )
+    out_unsplit, lse_unsplit = piper_attention_decode(
+        q,
+        pool,
+        c2s,
+        nc,
+        tail_key=tk,
+        tail_value=tv,
+        tail_len=tl,
+        active_chunks_hint=1,
+        return_lse=True,
+    )
+    torch.testing.assert_close(out, out_unsplit, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, lse_unsplit, atol=2e-4, rtol=2e-4)
+
+    # Also test frozen-only path (seq_q <= 8 hits >16 splits via allow_subchunk_single).
+    out_f, lse_f = piper_attention_decode(q, pool, c2s, nc, return_lse=True)
+    out_f_ref, lse_f_ref = piper_attention_decode(
+        q, pool, c2s, nc, active_chunks_hint=1, return_lse=True
+    )
+    torch.testing.assert_close(out_f, out_f_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse_f, lse_f_ref, atol=2e-4, rtol=2e-4)
+
+    sdpa, sdpa_lse = _exact_fp32_attention(
+        q,
+        slot_keys,
+        c2s,
+        nc,
+        num_slots,
+        tail_key=tk,
+        tail_value=tv,
+        tail_len=tl,
+        scale=head_dim**-0.5,
+        is_causal=True,
+    )
+    _assert_prefill_quality(out, lse, sdpa, sdpa_lse)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+@pytest.mark.parametrize("seq_q", [1, 9])
+def test_gpu_splitkv_reduce_edge_semantics(seq_q: int) -> None:
+    """Verify -inf empty, 1e8 shared bias, +inf/+inf equivalence, and per-row NaN isolation."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    head_dim = 64
+    active_chunks = 16
+    pool = _make_strided_pool(2, 1, head_dim, device=device, kv_dtype=torch.uint8)
+    freeze_kv_chunks_(
+        torch.full((1, 1, KV_CHUNK_TOKENS, head_dim), 1e8, device=device, dtype=dtype),
+        torch.zeros((1, 1, KV_CHUNK_TOKENS, head_dim), device=device, dtype=dtype),
+        pool,
+        torch.tensor([0], device=device, dtype=torch.int32),
+    )
+    k_pm = torch.cat(
+        [
+            torch.full((1, 1, KV_CHUNK_TOKENS // 2, head_dim), 1.0, device=device, dtype=dtype),
+            torch.full((1, 1, KV_CHUNK_TOKENS // 2, head_dim), -1.0, device=device, dtype=dtype),
+        ],
+        dim=2,
+    )
+    freeze_kv_chunks_(
+        k_pm,
+        torch.ones((1, 1, KV_CHUNK_TOKENS, head_dim), device=device, dtype=dtype),
+        pool,
+        torch.tensor([1], device=device, dtype=torch.int32),
+    )
+    pool.key_center[1].copy_(pool.key_center[0])
+    c2s = torch.tensor([[0] * 8 + [1] * 8], device=device, dtype=torch.int32)
+    nc = torch.tensor([active_chunks], device=device, dtype=torch.int32)
+
+    q_nan = torch.ones((1, 1, seq_q, head_dim), device=device, dtype=dtype)
+    if seq_q > 1:
+        q_nan[:, :, -1].fill_(float("nan"))
+    out_b, lse_b = piper_attention_decode(q_nan, pool, c2s, nc, return_lse=True)
+    out_u, lse_u = piper_attention_decode(
+        q_nan, pool, c2s, nc, active_chunks_hint=1, return_lse=True
+    )
+    if seq_q > 1:
+        torch.testing.assert_close(out_b[:, :, :-1], out_u[:, :, :-1], atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(lse_b[:, :, :-1], lse_u[:, :, :-1], atol=2e-4, rtol=2e-4)
+        assert (out_b[:, :, :-1] > 0.99).all()
+        assert torch.isnan(out_b[:, :, -1]).all()
+        assert torch.isnan(lse_b[:, :, -1]).all()
+    else:
+        torch.testing.assert_close(out_b, out_u, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(lse_b, lse_u, atol=2e-4, rtol=2e-4)
+        assert (out_b > 0.99).all()
+        q_only_nan = torch.full((1, 1, 1, head_dim), float("nan"), device=device, dtype=dtype)
+        o_n, l_n = piper_attention_decode(q_only_nan, pool, c2s, nc, return_lse=True)
+        assert torch.isnan(o_n).all()
+        assert torch.isnan(l_n).all()
+
+    nc0 = torch.tensor([0], device=device, dtype=torch.int32)
+    o0, l0 = piper_attention_decode(
+        torch.ones((1, 1, seq_q, head_dim), device=device, dtype=dtype),
+        pool,
+        c2s,
+        nc0,
+        return_lse=True,
+    )
+    assert (o0 == 0.0).all()
+    assert (l0 == -float("inf")).all()
+
+    # Duplicate +inf biases across multi-chunk splits preserve +inf LSE semantics.
+    inf_pool = _make_strided_pool(2, 1, head_dim, device=device, kv_dtype=torch.uint8)
+    freeze_kv_chunks_(
+        torch.full((1, 1, KV_CHUNK_TOKENS, head_dim), 1e34, device=device, dtype=dtype),
+        torch.ones((1, 1, KV_CHUNK_TOKENS, head_dim), device=device, dtype=dtype),
+        inf_pool,
+        torch.tensor([0], device=device, dtype=torch.int32),
+    )
+    _populate_test_pool(inf_pool, [1], device=device, dtype=dtype, seed=1901)
+    q_med = torch.full((1, 1, seq_q, head_dim), 1e6, device=device, dtype=dtype)
+    c2s_inf = torch.tensor([[0, 1] * 8], device=device, dtype=torch.int32)
+    o_inf, l_inf = piper_attention_decode(q_med, inf_pool, c2s_inf, nc, return_lse=True)
+    torch.testing.assert_close(o_inf, torch.ones_like(o_inf), atol=1e-2, rtol=1e-2)
+    assert (l_inf == float("inf")).all()

@@ -934,6 +934,7 @@ def compile_kv_decode_kernels(
     is_causal: bool = True,
     contiguous_inputs: bool = True,
     wide_pool: bool = False,
+    reduce_vectorize_splits: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, object, object]:
     """Compile frozen-split, tail-split, and reduce decode kernels offline."""
@@ -947,6 +948,7 @@ def compile_kv_decode_kernels(
         is_causal=is_causal,
         contiguous_inputs=contiguous_inputs,
         wide_pool=wide_pool,
+        reduce_vectorize_splits=reduce_vectorize_splits,
         compile_fn=compile_fn,
     )
 

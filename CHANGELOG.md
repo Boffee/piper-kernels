@@ -47,7 +47,10 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   live tail (`_piper_decode_tail_split_kernel` with WGP `-cumode` and
   `LDS_ONLY_FENCE_ATTRS` on RDNA4), superseding the standalone RDNA4 BF16x2 frozen-split
   Gluon kernel; for `seq_q >= 64`, prefill pairs quantized INT8/UINT8 frozen slots with
-  K1024/V1024 chunk-centered live tails and LDS-precomputed value scales. Verified with
+  K1024/V1024 chunk-centered live tails and LDS-precomputed value scales. Optimized
+  `_piper_decode_splitkv_reduce_kernel` with row-tiled (`seq_q > 8`) and chunked
+  split-vectorized (`seq_q <= 8`, `LDS_ONLY_FENCE_ATTRS` on RDNA4) reductions plus
+  reduce-aware short-context RDNA4 split guards. Verified with
   zero VGPR/SGPR/scratch spills offline and live on AMD RX 9070 XT (`gfx1201`),
   offline on `gfx1200`, and offline compile checks on `gfx942`/`sm8x`/`sm120`; live
   NVIDIA, non-RDNA4 AMD, and Windows execution remain unexercised locally.

@@ -2,7 +2,7 @@
 
 # Triton JIT kernels do not use Python runtime type annotations or narrow signatures.
 # ruff: noqa: ANN001, ANN202, PLR0913, PLR0917
-# pyright: reportArgumentType=false, reportCallIssue=false, reportIndexIssue=false
+# pyright: reportArgumentType=false, reportCallIssue=false, reportGeneralTypeIssues=false, reportIndexIssue=false, reportOperatorIssue=false
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
@@ -52,6 +53,74 @@ def _advance_split_max_safe(m_win, bias_win, ld_win, m_s, b_s, ld_s):
     return next_m, next_bias, next_ld, old_w, cur_w, has_split, has_nan
 
 
+@triton.jit
+def _reduce_split_chunk_weights(m_s, b_s, ld_s, s_mask, s_arange):
+    """Compute exact 3-term softmax weights and chunk summary over a vector of splits."""
+    tot_s = (m_s + b_s) + ld_s
+    is_nan_s = s_mask & (tot_s != tot_s)  # noqa: PLR0124
+    chunk_nan = tl.max(is_nan_s.to(tl.int32), axis=0)
+    valid_s = s_mask & (m_s != -float("inf")) & (b_s != -float("inf")) & (~is_nan_s)
+    has_valid = tl.max(valid_s.to(tl.int32), axis=0) != 0
+
+    ref_idx = tl.argmax(tl.where(valid_s, tot_s, -float("inf")), axis=0)
+    is_ref = s_arange == ref_idx
+    m_ref = tl.sum(tl.where(is_ref, m_s, 0.0), axis=0)
+    b_ref = tl.sum(tl.where(is_ref, b_s, 0.0), axis=0)
+    ld_ref = tl.sum(tl.where(is_ref, ld_s, 0.0), axis=0)
+
+    b_diff = tl.where(is_ref | (b_s == b_ref), 0.0, b_s - b_ref)
+    m_diff = tl.where(is_ref | ((m_s == m_ref) & (m_s != float("inf"))), 0.0, m_s - m_ref)
+    ld_diff = tl.where(is_ref | (ld_s == ld_ref), 0.0, ld_s - ld_ref)
+    raw_delta = ld_diff + (m_diff + b_diff)
+    delta_nan = valid_s & (raw_delta != raw_delta)  # noqa: PLR0124
+    chunk_nan = chunk_nan | tl.max(delta_nan.to(tl.int32), axis=0)
+
+    delta_clean = tl.where(valid_s & (~delta_nan), raw_delta, -float("inf"))
+    max_delta = tl.max(delta_clean, axis=0)
+    safe_max = tl.where(
+        has_valid & (max_delta != -float("inf")) & (max_delta != float("inf")),
+        max_delta,
+        0.0,
+    )
+    w_s = tl.where(valid_s & (~delta_nan), tl.math.exp2(delta_clean - safe_max), 0.0)
+    sum_w = tl.sum(w_s, axis=0)
+    safe_sum = tl.where(has_valid & (sum_w != 0.0), sum_w, 1.0)
+    chunk_ld = tl.where(has_valid, ld_ref + safe_max + tl.math.log2(safe_sum), 0.0)
+    return w_s, valid_s, safe_sum, m_ref, b_ref, chunk_ld, has_valid, chunk_nan
+
+
+@triton.jit
+def _normalize_running_weights(denom, old_w, cur_w):
+    """Update running denominator and return normalized weights preventing intermediate overflow."""
+    old_num = denom * old_w
+    new_denom = old_num + cur_w
+    has_denom = new_denom != 0.0
+    safe_dn = tl.where(has_denom, new_denom, 1.0)
+    old_alpha = tl.where(has_denom, old_num / safe_dn, 0.0)
+    cur_alpha = tl.where(has_denom, cur_w / safe_dn, 0.0)
+    return new_denom, old_alpha, cur_alpha
+
+
+@triton.jit
+def _load_split_state(partial_lse_ptr, partial_bias_ptr, partial_log_denom_ptr, lse_off, mask):
+    """Load split LSE, center bias, and log-denominator tuple with safe inactive defaults."""
+    m_s = tl.load(partial_lse_ptr + lse_off, mask=mask, other=-float("inf"))
+    b_s = tl.load(partial_bias_ptr + lse_off, mask=mask, other=0.0)
+    ld_s = tl.load(partial_log_denom_ptr + lse_off, mask=mask, other=0.0)
+    return m_s, b_s, ld_s
+
+
+@triton.jit
+def _finalize_splitkv_lse(has_any, denom, m_win, bias_win, ld_win):
+    """Compute final natural-log LSE from three-term winner-frame state."""
+    safe_denom = tl.where(has_any & (denom != 0.0), denom, 1.0)
+    return tl.where(
+        has_any,
+        (m_win * _LN2 + bias_win * _LN2) + (ld_win + tl.math.log2(safe_denom)) * _LN2,
+        -float("inf"),
+    )
+
+
 @triton.jit(do_not_specialize=["q_heads", "seq_q", "num_splits", "pl_split_stride"])
 def _piper_decode_splitkv_reduce_kernel(
     partial_out_ptr,
@@ -77,60 +146,115 @@ def _piper_decode_splitkv_reduce_kernel(
     stride_lb,
     stride_lh,
     head_dim: tl.constexpr,
+    block_r: tl.constexpr = 8,
+    block_s: tl.constexpr = 1,
 ):
     """Merge partial Split-KV outputs and three-term base-2 state into natural-log LSE."""
-    pid = tl.program_id(0)
-    q_idx = pid % seq_q
-    pid_bh = pid // seq_q
-    b = pid_bh // q_heads
-    q_head = pid_bh % q_heads
-    b64 = b.to(tl.int64)
-    qh64 = q_head.to(tl.int64)
-    qi64 = q_idx.to(tl.int64)
-
+    grid_rows = seq_q if block_r == 1 else tl.cdiv(seq_q, block_r)
+    pid_s = tl.program_id(0) % grid_rows
+    pid_bh = tl.program_id(0) // grid_rows
+    b64, qh64 = (pid_bh // q_heads).to(tl.int64), (pid_bh % q_heads).to(tl.int64)
     offsets_d = tl.arange(0, head_dim).to(tl.int64)
-    pl_offset = b64 * stride_plb + qh64 * stride_plh + qi64 * stride_pls
-    po_base = partial_out_ptr + b64 * stride_pob + qh64 * stride_poh + qi64 * stride_pos
     split_lse_stride = pl_split_stride.to(tl.int64)
+    q_offs = pid_s if block_s > 1 else pid_s * block_r + tl.arange(0, block_r)
+    qi64 = q_offs.to(tl.int64)
+    pl_base = b64 * stride_plb + qh64 * stride_plh + qi64 * stride_pls
+    po_head = partial_out_ptr + b64 * stride_pob + qh64 * stride_poh
 
-    m_win = -float("inf")
-    bias_win = 0.0
-    ld_win = 0.0
-    denom = 0.0
-    acc = tl.zeros((head_dim,), dtype=tl.float32)
-
-    for split_idx in tl.range(0, num_splits, disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
-        s64 = split_idx.to(tl.int64)
-        lse_off = pl_offset + s64 * split_lse_stride
-        m_s = tl.load(partial_lse_ptr + lse_off)
-        b_s = tl.load(partial_bias_ptr + lse_off)
-        ld_s = tl.load(partial_log_denom_ptr + lse_off)
-        m_win, bias_win, ld_win, old_w, cur_w, has_s, has_nan_s = _advance_split_max_safe(
-            m_win, bias_win, ld_win, m_s, b_s, ld_s
+    if block_s > 1:
+        po_base = po_head + qi64 * stride_pos
+        m_win, bias_win, ld_win, denom, any_nan = -float("inf"), 0.0, 0.0, 0.0, 0
+        acc = tl.zeros((head_dim,), dtype=tl.float32)
+        s_arange = tl.arange(0, block_s)
+        for s_start in tl.range(0, num_splits, block_s):
+            s_offs = s_start + s_arange
+            s_mask = s_offs < num_splits
+            s64 = s_offs.to(tl.int64)
+            m_s, b_s, ld_s = _load_split_state(
+                partial_lse_ptr,
+                partial_bias_ptr,
+                partial_log_denom_ptr,
+                pl_base + s64 * split_lse_stride,
+                s_mask,
+            )
+            w_s, valid_s, safe_sum, m_ref, b_ref, chunk_ld, has_valid, chunk_nan = (
+                _reduce_split_chunk_weights(m_s, b_s, ld_s, s_mask, s_arange)
+            )
+            any_nan = any_nan | chunk_nan
+            out_s = tl.load(
+                po_base + s64[:, None] * stride_pop + offsets_d[None, :],
+                mask=s_mask[:, None],
+                other=0.0,
+            )
+            chunk_out = tl.sum(
+                tl.where(valid_s[:, None], out_s * (w_s / safe_sum)[:, None], 0.0), axis=0
+            )
+            m_win, bias_win, ld_win, old_w, cur_w, has_c, has_nan_c = _advance_split_max_safe(
+                m_win,
+                bias_win,
+                ld_win,
+                tl.where(any_nan != 0, float("nan"), tl.where(has_valid, m_ref, -float("inf"))),
+                tl.where(has_valid, b_ref, 0.0),
+                tl.where(has_valid, chunk_ld, 0.0),
+            )
+            denom, old_alpha, cur_alpha = _normalize_running_weights(denom, old_w, cur_w)
+            acc = acc * old_alpha + cur_alpha * tl.where(
+                has_nan_c, float("nan"), tl.where(has_c, chunk_out, 0.0)
+            )
+        has_any = (m_win != -float("inf")) | (any_nan != 0)
+        final_out = tl.where(any_nan != 0, float("nan"), tl.where(has_any, acc, 0.0))
+        tl.store(
+            output_ptr + b64 * stride_ob + qh64 * stride_oh + qi64 * stride_os + offsets_d,
+            final_out.to(output_ptr.dtype.element_ty),
         )
-
-        out_s = tl.load(po_base + s64 * stride_pop + offsets_d)
-        safe_out_s = tl.where(has_nan_s, float("nan"), tl.where(has_s, out_s, 0.0))
-        old_num = denom * old_w
-        denom = old_num + cur_w
-        has_denom = denom != 0.0
-        safe_dn = tl.where(has_denom, denom, 1.0)
-        old_alpha = tl.where(has_denom, old_num / safe_dn, 0.0)
-        cur_alpha = tl.where(has_denom, cur_w / safe_dn, 0.0)
-        acc = acc * old_alpha + cur_alpha * safe_out_s
-
-    has_any = m_win != -float("inf")
-    safe_denom = tl.where(has_any, denom, 1.0)
-    final_out = tl.where(has_any, acc, 0.0)
-    final_lse = tl.where(
-        has_any,
-        (m_win * _LN2 + bias_win * _LN2) + (ld_win + tl.math.log2(safe_denom)) * _LN2,
-        -float("inf"),
-    )
-
-    out_ptrs = output_ptr + b64 * stride_ob + qh64 * stride_oh + qi64 * stride_os + offsets_d
-    tl.store(out_ptrs, final_out.to(output_ptr.dtype.element_ty))
-    tl.store(lse_ptr + b64 * stride_lb + qh64 * stride_lh + qi64, final_lse)
+        tl.store(
+            lse_ptr + b64 * stride_lb + qh64 * stride_lh + qi64,
+            tl.where(
+                any_nan != 0,
+                float("nan"),
+                _finalize_splitkv_lse(has_any, denom, m_win, bias_win, ld_win),
+            ),
+        )
+    else:
+        q_mask = q_offs < seq_q
+        po_base = po_head + qi64[:, None] * stride_pos + offsets_d[None, :]
+        m_win = tl.full((block_r,), -float("inf"), dtype=tl.float32)
+        bias_win = tl.zeros((block_r,), dtype=tl.float32)
+        ld_win = tl.zeros((block_r,), dtype=tl.float32)
+        denom = tl.zeros((block_r,), dtype=tl.float32)
+        acc = tl.zeros((block_r, head_dim), dtype=tl.float32)
+        for split_idx in tl.range(0, num_splits):
+            s64 = split_idx.to(tl.int64)
+            m_s, b_s, ld_s = _load_split_state(
+                partial_lse_ptr,
+                partial_bias_ptr,
+                partial_log_denom_ptr,
+                pl_base + s64 * split_lse_stride,
+                q_mask,
+            )
+            m_win, bias_win, ld_win, old_w, cur_w, has_s, has_nan_s = _advance_split_max_safe(
+                m_win, bias_win, ld_win, m_s, b_s, ld_s
+            )
+            out_s = tl.load(po_base + s64 * stride_pop, mask=q_mask[:, None], other=0.0)
+            denom, old_alpha, cur_alpha = _normalize_running_weights(denom, old_w, cur_w)
+            acc = acc * old_alpha[:, None] + cur_alpha[:, None] * tl.where(
+                has_nan_s[:, None], float("nan"), tl.where(has_s[:, None], out_s, 0.0)
+            )
+        has_any = m_win != -float("inf")
+        tl.store(
+            output_ptr
+            + b64 * stride_ob
+            + qh64 * stride_oh
+            + qi64[:, None] * stride_os
+            + offsets_d[None, :],
+            tl.where(has_any[:, None], acc, 0.0).to(output_ptr.dtype.element_ty),
+            mask=q_mask[:, None],
+        )
+        tl.store(
+            lse_ptr + b64 * stride_lb + qh64 * stride_lh + qi64,
+            _finalize_splitkv_lse(has_any, denom, m_win, bias_win, ld_win),
+            mask=q_mask,
+        )
 
 
 @triton.jit
@@ -287,10 +411,20 @@ def _launch_splitkv_reduce(
     seq_q: int,
     num_splits: int,
     head_dim: int,
+    use_lds_only_fence: bool = False,
 ) -> None:
     """Reduce Split-KV partial tensors ordered as ``(B, H, S, split[, D])``."""
+    if seq_q <= 8:
+        block_r = 1
+        block_s = 16
+        grid_rows = seq_q
+    else:
+        block_r = 8
+        block_s = 1
+        grid_rows = triton.cdiv(seq_q, block_r)
+    extra_opts = amd_compiler_workarounds.lds_only_fence_options(block_s > 1 and use_lds_only_fence)
     with device_context(output.device):
-        _piper_decode_splitkv_reduce_kernel[(batch * q_heads * seq_q,)](
+        _piper_decode_splitkv_reduce_kernel[(batch * q_heads * grid_rows,)](
             po_view,
             pl_view,
             pb_view,
@@ -314,7 +448,10 @@ def _launch_splitkv_reduce(
             lse.stride(0),
             lse.stride(1),
             head_dim=head_dim,
+            block_r=block_r,
+            block_s=block_s,
             num_warps=REDUCE_NUM_WARPS,
+            **extra_opts,
         )
 
 
@@ -539,20 +676,20 @@ def _launch_frozen_pool_prefill(
         and partial_bias is not None
         and partial_log_denom is not None
     ):
-        with device_context(output.device):
-            _launch_splitkv_reduce(
-                partial_out.permute(0, 2, 3, 1, 4),
-                partial_lse.permute(0, 2, 3, 1),
-                partial_bias.permute(0, 2, 3, 1),
-                partial_log_denom.permute(0, 2, 3, 1),
-                output,
-                lse,
-                batch=batch,
-                q_heads=q_heads,
-                seq_q=seq_q,
-                num_splits=resolved_splits,
-                head_dim=head_dim,
-            )
+        _launch_splitkv_reduce(
+            partial_out.permute(0, 2, 3, 1, 4),
+            partial_lse.permute(0, 2, 3, 1),
+            partial_bias.permute(0, 2, 3, 1),
+            partial_log_denom.permute(0, 2, 3, 1),
+            output,
+            lse,
+            batch=batch,
+            q_heads=q_heads,
+            seq_q=seq_q,
+            num_splits=resolved_splits,
+            head_dim=head_dim,
+            use_lds_only_fence=(prefill_backend == "amd"),
+        )
 
 
 def _quantize_query(
@@ -780,6 +917,7 @@ def _run_small_q_decode(
         seq_q=seq_q,
         num_splits=total_splits,
         head_dim=head_dim,
+        use_lds_only_fence=(prefill_backend == "amd"),
     )
     return output, lse
 

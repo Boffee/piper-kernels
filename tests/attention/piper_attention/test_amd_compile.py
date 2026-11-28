@@ -271,12 +271,32 @@ def test_amd_kv_decode_compilation_zero_spills(
 def test_amd_kv_decode_gfx1200_smoke() -> None:
     for head_dim in (64, 128):
         for wide_pool in (False, True):
-            frozen, tail, reduce_k = compile_kv_decode_kernels(
-                GPUTarget("hip", "gfx1200", 32),
-                dtype=torch.bfloat16,
-                head_dim=head_dim,
-                wide_pool=wide_pool,
-            )
-            _assert_zero_spill_amd_prefill(frozen)
-            _assert_zero_spill_amd_decode(tail, expected_wmma="v_wmma_f32_16x16x16_bf16")
-            _assert_zero_spill_amd_decode(reduce_k)
+            for reduce_vectorize_splits in (False, True):
+                frozen, tail, reduce_k = compile_kv_decode_kernels(
+                    GPUTarget("hip", "gfx1200", 32),
+                    dtype=torch.bfloat16,
+                    head_dim=head_dim,
+                    wide_pool=wide_pool,
+                    reduce_vectorize_splits=reduce_vectorize_splits,
+                )
+                _assert_zero_spill_amd_prefill(frozen)
+                _assert_zero_spill_amd_decode(tail, expected_wmma="v_wmma_f32_16x16x16_bf16")
+                _assert_zero_spill_amd_decode(reduce_k)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("contiguous_inputs", [True, False])
+def test_amd_kv_decode_vectorized_reduce_zero_spills(
+    head_dim: int,
+    dtype: torch.dtype,
+    contiguous_inputs: bool,
+) -> None:
+    _frozen, _tail, reduce_k = compile_kv_decode_kernels(
+        GPUTarget("hip", "gfx1201", 32),
+        dtype=dtype,
+        head_dim=head_dim,
+        contiguous_inputs=contiguous_inputs,
+        reduce_vectorize_splits=True,
+    )
+    _assert_zero_spill_amd_decode(reduce_k)

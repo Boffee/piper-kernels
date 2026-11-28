@@ -7,7 +7,8 @@ from collections.abc import Callable
 import torch
 import triton
 
-from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels._triton import amd_compiler_workarounds
+from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarget
 
 from . import _backend, _quantization
 from ._decode_schedule import BLOCK_QH, REDUCE_NUM_WARPS
@@ -32,6 +33,7 @@ def compile_kv_decode_kernels(
     is_causal: bool = True,
     contiguous_inputs: bool = True,
     wide_pool: bool = False,
+    reduce_vectorize_splits: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, object, object]:
     """Compile frozen-split, tail-split, and reduce decode kernels offline."""
@@ -184,7 +186,11 @@ def compile_kv_decode_kernels(
     )
     reduce_source = _quantization.build_kernel_source(
         _piper_decode_splitkv_reduce_kernel,
-        constants={"head_dim": head_dim},
+        constants={
+            "head_dim": head_dim,
+            "block_r": 1 if reduce_vectorize_splits else 8,
+            "block_s": 16 if reduce_vectorize_splits else 1,
+        },
         overrides={
             "partial_out_ptr": "*fp32",
             "partial_lse_ptr": "*fp32",
@@ -200,11 +206,17 @@ def compile_kv_decode_kernels(
         ),
         all_strides_div16=True,
     )
+    reduce_options: dict[str, object] = {
+        "num_warps": REDUCE_NUM_WARPS,
+        **amd_compiler_workarounds.lds_only_fence_options(
+            reduce_vectorize_splits and accel.is_hip_architecture(*GFX120X_ARCHITECTURES)
+        ),
+    }
 
     return (
         frozen_compiled,
         compiler(tail_source, target, split_options),
-        compiler(reduce_source, target, {"num_warps": REDUCE_NUM_WARPS}),
+        compiler(reduce_source, target, reduce_options),
     )
 
 

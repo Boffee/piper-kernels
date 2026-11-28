@@ -17,6 +17,8 @@ _RDNA4_TARGET_CTAS_PER_SM = 8
 _RDNA4_TILES_PER_CHUNK_CAP = 4
 _RDNA4_MAX_TAIL_SPLITS = 4
 _RDNA4_PREFILL_CTAS_PER_SM = 6
+_RDNA4_MIN_WAVE_SPLIT_TILES = 128
+_RDNA4_SHORT_CTX_CTAS_PER_SM = 4
 _MAX_PREFILL_PARTIAL_OUT_BYTES = 64 * 1024 * 1024
 
 
@@ -64,7 +66,10 @@ def select_frozen_prefill_splits(
         total_tiles // 4,
         max(1, _MAX_PREFILL_PARTIAL_OUT_BYTES // max(1, bytes_per_split)),
     )
-    if max_splits <= 1:
+    if max_splits <= 1 or (
+        total_tiles < _RDNA4_MIN_WAVE_SPLIT_TILES
+        and base_blocks >= sm_count * _RDNA4_SHORT_CTX_CTAS_PER_SM
+    ):
         return 1
 
     if base_blocks < wave_cap:
@@ -83,7 +88,7 @@ def select_frozen_prefill_splits(
             0.10,
         )
 
-    if base_blocks < wave_cap * 2 and total_tiles >= 64:
+    if base_blocks < wave_cap * 2 and total_tiles >= _RDNA4_MIN_WAVE_SPLIT_TILES:
         base_fill = _wave_fill(base_blocks, wave_cap, 1)
         if base_fill < 0.80:
             chosen = _best_wave_split(
