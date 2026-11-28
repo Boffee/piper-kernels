@@ -183,8 +183,8 @@ by 16 (and `group_size` for ConvRot). `"nvfp4"` and `"convrot_nvfp4"` share the 
 weight storage as `"nvfp4_w4a16"` / `"convrot_nvfp4_w4a16"`, keeping high-precision W4A16 execution
 for single-token (`M = 1`) and small-batch (`M <= 16` and `M * top_k <= 512`) decode while
 switching prefill onto native SM12x Blackwell FP4 (`tl.dot_scaled`) W4A4 grouped GEMMs with
-per-row dynamic activation quantization (fusing optional ConvRot rotation and `swiglu`/`gelu_tanh`
-activation). GPU NVFP4 MoE execution targets NVIDIA SM12x (`ValueError` on other GPUs), while CPU
+per-row dynamic activation quantization (fusing optional ConvRot rotation and `swiglu`,
+`swiglu_clamped`, or `gelu_tanh` activation). GPU NVFP4 MoE execution targets NVIDIA SM12x (`ValueError` on other GPUs), while CPU
 and `meta` remain supported (evaluating per-row dynamic W4A4 reference semantics when
 `act_quant="dynamic"`). ConvRot INT8 slabs use `int8`
 values, `float32` per-row scales (`[num_slots, out]` or `[num_slots, out, 1]`),
@@ -257,8 +257,11 @@ assert torch.isfinite(output).all()
 ```
 
 Set `gate_first=False` when checkpoints pack `[up | gate]` halves (matching Piper's linear SwiGLU
-convention), and pass `activation_fn="gelu_tanh"` for `tanh`-GELU experts without a paired gate
-projection. `prepare_moe_input` returns an independent snapshot safe to reuse across waves
+convention), pass `activation_fn="gelu_tanh"` for `tanh`-GELU experts without a paired gate
+projection, or pass `activation_fn="swiglu_clamped"` with positive finite `gate_bound` and
+`up_bound` floats to evaluate `silu(min(gate, gate_bound)) * clamp(up, -up_bound, up_bound)` across
+all MoE formats and `gate_first` orders (passing bounds with `"swiglu"` or `"gelu_tanh"` raises
+`ValueError`). `prepare_moe_input` returns an independent snapshot safe to reuse across waves
 even when accumulating into `out=input` (storing FP32 rotated activations for
 `"convrot_nvfp4"`, `"convrot_nvfp4_w4a16"`, and `"convrot_trellis"` across FP16, BF16, and FP32
 inputs, avoiding redundant rotation during both W4A16 decode and W4A4 prefill). Calling

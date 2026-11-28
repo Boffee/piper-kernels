@@ -8,13 +8,56 @@ from __future__ import annotations
 import contextlib
 import math
 from collections.abc import Callable
+from typing import Literal, cast
 
 import torch
 
-from piper_kernels._input_activations import apply_input_activation, parse_input_activation
+from piper_kernels._input_activations import apply_input_activation
+from piper_kernels._validation import validate_positive_finite_float
 from piper_kernels.trellis._layout import TrellisLayout
 from piper_kernels.trellis._reference import decode_reference, decode_variable_rows_reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
+
+type MoEActivation = Literal["gelu_tanh", "swiglu", "swiglu_clamped"]
+
+_MOE_ACTIVATIONS = ("gelu_tanh", "swiglu", "swiglu_clamped")
+_GATED_MOE_ACTIVATIONS = ("swiglu", "swiglu_clamped")
+
+
+def is_gated_activation(activation_fn: str) -> bool:
+    """Return whether a MoE activation consumes paired ``[gate, up]`` projections."""
+    return activation_fn in _GATED_MOE_ACTIVATIONS
+
+
+def parse_moe_activation(activation_fn: str, *, name: str = "MoE") -> MoEActivation:
+    """Validate and narrow a MoE activation name."""
+    if activation_fn not in _MOE_ACTIVATIONS:
+        raise ValueError(
+            f"{name} activation_fn must be 'gelu_tanh', 'swiglu', or 'swiglu_clamped', "
+            f"got {activation_fn!r}"
+        )
+    return cast(MoEActivation, activation_fn)
+
+
+def validate_moe_activation_bounds(
+    activation_fn: str,
+    gate_bound: float | None,
+    up_bound: float | None,
+) -> tuple[float | None, float | None]:
+    """Validate ``activation_fn`` alongside optional bounded-SwiGLU bounds (SymFloat-safe)."""
+    parsed = parse_moe_activation(activation_fn, name="MoE")
+    if parsed == "swiglu_clamped":
+        if gate_bound is None or up_bound is None:
+            raise ValueError("MoE 'swiglu_clamped' requires both gate_bound and up_bound")
+        return (
+            validate_positive_finite_float(
+                gate_bound, "MoE gate_bound must be finite and positive"
+            ),
+            validate_positive_finite_float(up_bound, "MoE up_bound must be finite and positive"),
+        )
+    if gate_bound is not None or up_bound is not None:
+        raise ValueError(f"MoE activation_fn={parsed!r} does not accept gate_bound or up_bound")
+    return None, None
 
 
 def _autocast_disabled(device: torch.device) -> contextlib.AbstractContextManager[object]:
@@ -28,14 +71,19 @@ def _activate_intermediate(
     activation_fn: str,
     *,
     gate_first: bool,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> torch.Tensor:
-    activated_fn = parse_input_activation(activation_fn, name="MoE")
-    if activated_fn == "swiglu":
+    activated_fn = parse_moe_activation(activation_fn, name="MoE")
+    if is_gated_activation(activated_fn):
         first, second = values.float().chunk(2, dim=-1)
-        if gate_first:
-            return torch.nn.functional.silu(first) * second
-        return first * torch.nn.functional.silu(second)
-    return apply_input_activation(values, activated_fn)
+        gate, up = (first, second) if gate_first else (second, first)
+        if gate_bound is not None:
+            gate = torch.clamp(gate, max=gate_bound)
+        if up_bound is not None:
+            up = torch.clamp(up, min=-up_bound, max=up_bound)
+        return torch.nn.functional.silu(gate) * up
+    return apply_input_activation(values, "gelu_tanh")
 
 
 def _resolve_slot_tensor(
@@ -161,6 +209,8 @@ def _make_slot_evaluator(
     up_gate_block_size: int,
     down_block_size: int,
     act_quant: str | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> Callable[[int, torch.Tensor], torch.Tensor]:
     rows, hidden_size = input_2d.shape
     if up_gate_block_scales is not None:
@@ -179,9 +229,13 @@ def _make_slot_evaluator(
             up_s = torch.index_select(up_gate_scale, 0, safe_slot_1d).squeeze(0)
             up_w = up_q.float() * up_s.unsqueeze(1)
             mid = active_2d[row_index : row_index + 1].float() @ up_w.t()
-            activated = _activate_intermediate(mid, activation_fn, gate_first=gate_first).to(
-                logical_dtype
-            )
+            activated = _activate_intermediate(
+                mid,
+                activation_fn,
+                gate_first=gate_first,
+                gate_bound=gate_bound,
+                up_bound=up_bound,
+            ).to(logical_dtype)
             act_rot = rotate_groups(activated.float(), group_size)
             down_q = _decode_trellis_slot(
                 down_qdata,
@@ -220,7 +274,13 @@ def _make_slot_evaluator(
                 up_s,
                 logical_dtype,
             )
-            activated = _activate_intermediate(mid, activation_fn, gate_first=gate_first)
+            activated = _activate_intermediate(
+                mid,
+                activation_fn,
+                gate_first=gate_first,
+                gate_bound=gate_bound,
+                up_bound=up_bound,
+            )
             down_q, down_s = int8_ref.prepare_input(activated, group_size)
             return int8_ref.linear_prepared(
                 down_q,
@@ -261,7 +321,13 @@ def _make_slot_evaluator(
                 proj_group_size=0,
                 output_dtype=logical_dtype,
             )
-            activated = _activate_intermediate(mid, activation_fn, gate_first=gate_first)
+            activated = _activate_intermediate(
+                mid,
+                activation_fn,
+                gate_first=gate_first,
+                gate_bound=gate_bound,
+                up_bound=up_bound,
+            )
             return _nvfp4_w4a4_row_proj(
                 activated,
                 down_q,
@@ -280,9 +346,13 @@ def _make_slot_evaluator(
             high_first=high_first,
             group_size=0,
         )
-        activated = _activate_intermediate(mid, activation_fn, gate_first=gate_first).to(
-            logical_dtype
-        )
+        activated = _activate_intermediate(
+            mid,
+            activation_fn,
+            gate_first=gate_first,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
+        ).to(logical_dtype)
         return nvfp4_ref.linear_w4a16(
             activated.float(),
             down_q,
@@ -325,9 +395,13 @@ def moe_ffn_reference(
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
     act_quant: str | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> torch.Tensor:
     """Run an independent PyTorch reference across routed expert slots."""
-    parse_input_activation(activation_fn, name="MoE")
+    resolved_gate_bound, resolved_up_bound = validate_moe_activation_bounds(
+        activation_fn, gate_bound, up_bound
+    )
     rows = math.prod(input.shape[:-1])
     hidden_size = input.shape[-1]
     top_k = topk_ids.shape[-1]
@@ -366,6 +440,8 @@ def moe_ffn_reference(
             up_gate_block_size=up_gate_block_size,
             down_block_size=down_block_size,
             act_quant=act_quant,
+            gate_bound=resolved_gate_bound,
+            up_bound=resolved_up_bound,
         )
         topk_ids_2d = topk_ids.reshape(rows, top_k)
         topk_weights_2d = topk_weights.reshape(rows, top_k)

@@ -33,6 +33,7 @@ from ._routing_triton import (
     _unpack_2d_tile_pid,
     moe_2d_tile_grid,
 )
+from .reference import is_gated_activation
 
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(nvfp4_layout.BLOCK_SIZE)
 _NVFP4_QDATA_BLOCK_SIZE_TL = tl.constexpr(nvfp4_layout.QDATA_BLOCK_SIZE)
@@ -661,17 +662,27 @@ def _load_activated_pair_tile(
     k_offs,
     k_valid,
     intermediate_size,
+    gate_bound,
+    up_bound,
     group_size: tl.constexpr,
-    is_swiglu: tl.constexpr,
+    is_gated: tl.constexpr,
     gate_first: tl.constexpr,
+    has_gate_bound: tl.constexpr,
+    has_up_bound: tl.constexpr,
     accelerator_backend: tl.constexpr,
     block_k: tl.constexpr,
 ):
-    if is_swiglu:
+    if is_gated:
         base = pair_idx * (intermediate_size.to(tl.int64) * 2) + k_offs
         first = tl.load(mid_ptr + base, mask=k_valid, other=0.0).to(tl.float32)
         second = tl.load(mid_ptr + base + intermediate_size, mask=k_valid, other=0.0).to(tl.float32)
-        vals = swiglu(second, first) if gate_first else swiglu(first, second)
+        gate = first if gate_first else second
+        up = second if gate_first else first
+        if has_gate_bound:
+            gate = tl.minimum(gate, gate_bound)
+        if has_up_bound:
+            up = tl.clamp(up, -up_bound, up_bound)
+        vals = swiglu(up, gate)
     else:
         vals = tl.load(
             mid_ptr + pair_idx * intermediate_size.to(tl.int64) + k_offs,
@@ -805,7 +816,7 @@ def nvfp4_moe_gather_kernel(
         tl.store(out_rs_ptr + compact_idx, tl.load(in_rs_ptr + src_row))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["gate_bound", "up_bound"])
 def nvfp4_moe_activate_quant_kernel(
     mid_ptr,
     compact_to_pair_ptr,
@@ -813,11 +824,15 @@ def nvfp4_moe_activate_quant_kernel(
     sc_out_ptr,
     row_scale_ptr,
     intermediate_size,
+    gate_bound,
+    up_bound,
     block_k: tl.constexpr,
     group_size: tl.constexpr,
-    is_swiglu: tl.constexpr,
+    is_gated: tl.constexpr,
     gate_first: tl.constexpr,
     high_first: tl.constexpr,
+    has_gate_bound: tl.constexpr,
+    has_up_bound: tl.constexpr,
     accelerator_backend: tl.constexpr,
 ):
     """Apply SwiGLU/GeLU-tanh, optional ConvRot rotation, and per-row dynamic NVFP4 encode."""
@@ -837,9 +852,13 @@ def nvfp4_moe_activate_quant_kernel(
             k_offs,
             k_valid,
             intermediate_size,
+            gate_bound,
+            up_bound,
             group_size,
-            is_swiglu,
+            is_gated,
             gate_first,
+            has_gate_bound,
+            has_up_bound,
             accelerator_backend,
             block_k,
         )
@@ -858,9 +877,13 @@ def nvfp4_moe_activate_quant_kernel(
             k_offs,
             k_valid,
             intermediate_size,
+            gate_bound,
+            up_bound,
             group_size,
-            is_swiglu,
+            is_gated,
             gate_first,
+            has_gate_bound,
+            has_up_bound,
             accelerator_backend,
             block_k,
         )
@@ -1052,6 +1075,8 @@ def launch_nvfp4_activate_quant(
     gate_first: bool,
     high_first: bool,
     accelerator_backend: str,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     num_pairs = mid.shape[0]
     with device_context(mid.device):
@@ -1062,11 +1087,15 @@ def launch_nvfp4_activate_quant(
             sc_out,
             rs_out,
             intermediate_size,
+            0.0 if gate_bound is None else float(gate_bound),
+            0.0 if up_bound is None else float(up_bound),
             block_k=_schedule.NVFP4_W4A4_QUANT_BLOCK_K,
             group_size=group_size,
-            is_swiglu=activation_fn == "swiglu",
+            is_gated=is_gated_activation(activation_fn),
             gate_first=gate_first,
             high_first=high_first,
+            has_gate_bound=gate_bound is not None,
+            has_up_bound=up_bound is not None,
             accelerator_backend=accelerator_backend,
             num_warps=4,
         )
