@@ -28,6 +28,7 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler.compiler import LazyDict
 
 from piper_kernels import compile_options
+from piper_kernels.linear.nvfp4 import reference as nvfp4_ref
 from piper_kernels.moe import (
     MoEWeights,
     PreparedMoEInput,
@@ -42,7 +43,14 @@ from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
-MoEFormat = Literal["nvfp4_w4a16", "convrot_nvfp4_w4a16", "convrot_int8", "convrot_trellis"]
+MoEFormat = Literal[
+    "nvfp4",
+    "convrot_nvfp4",
+    "nvfp4_w4a16",
+    "convrot_nvfp4_w4a16",
+    "convrot_int8",
+    "convrot_trellis",
+]
 TrellisLayoutKind = Literal["uniform", "var2d", "var1d"]
 ActivationKind = Literal["swiglu", "gelu_tanh"]
 
@@ -354,6 +362,9 @@ def _make_moe_weights(
     )
 
 
+_UNSET_ACT_QUANT = object()
+
+
 def _reference_for_weights(
     x: torch.Tensor,
     weights: MoEWeights,
@@ -364,12 +375,16 @@ def _reference_for_weights(
     prepared_input: PreparedMoEInput | None = None,
     out: torch.Tensor | None = None,
     accumulate: bool = False,
+    act_quant: str | object | None = _UNSET_ACT_QUANT,
 ) -> torch.Tensor:
     prepared_data = None if prepared_input is None else prepared_input.data.cpu()
     prepared_scale = (
         None
         if (prepared_input is None or prepared_input.scale is None)
         else prepared_input.scale.cpu()
+    )
+    resolved_act_quant = (
+        weights.act_quant if act_quant is _UNSET_ACT_QUANT else act_quant  # type: ignore[assignment]
     )
     return moe_reference.moe_ffn_reference(
         x.cpu(),
@@ -410,6 +425,7 @@ def _reference_for_weights(
         ),
         up_gate_block_size=weights.up_gate_block_size,
         down_block_size=weights.down_block_size,
+        act_quant=resolved_act_quant,  # type: ignore[arg-type]
     )
 
 
@@ -507,13 +523,29 @@ def _oracle_slot_output(
         down_gs = (
             None if weights.down_global_scale is None else weights.down_global_scale[slot].cpu()
         )
-        up_t = _oracle_nvfp4_tensor(
-            weights, weights.up_gate_qdata[slot].cpu(), weights.up_gate_scale[slot].cpu(), up_gs
-        )
-        down_t = _oracle_nvfp4_tensor(
-            weights, weights.down_qdata[slot].cpu(), weights.down_scale[slot].cpu(), down_gs
-        )
-        mid = F.linear(x_row.float(), up_t.dequantize(torch.float32))
+        if weights.act_quant == "dynamic":
+            mid = nvfp4_ref.linear(
+                x_row,
+                weights.up_gate_qdata[slot].cpu(),
+                weights.up_gate_scale[slot].cpu(),
+                up_gs,
+                None,
+                None,
+                dynamic_activation_scale=True,
+                high_first=weights.high_first,
+                group_size=weights.group_size,
+            ).float()
+        else:
+            up_t = _oracle_nvfp4_tensor(
+                weights,
+                weights.up_gate_qdata[slot].cpu(),
+                weights.up_gate_scale[slot].cpu(),
+                up_gs,
+            )
+            down_t = _oracle_nvfp4_tensor(
+                weights, weights.down_qdata[slot].cpu(), weights.down_scale[slot].cpu(), down_gs
+            )
+            mid = F.linear(x_row.float(), up_t.dequantize(torch.float32))
     if weights.activation_fn == "swiglu":
         first, second = mid.chunk(2, dim=-1)
         activated = F.silu(first) * second if weights.gate_first else first * F.silu(second)
@@ -521,6 +553,18 @@ def _oracle_slot_output(
         activated = F.gelu(mid, approximate="tanh")
     if weights.weight_format == "convrot_int8":
         return F.linear(activated, down_w)[0]
+    if weights.act_quant == "dynamic":
+        return nvfp4_ref.linear(
+            activated,
+            weights.down_qdata[slot].cpu(),
+            weights.down_scale[slot].cpu(),
+            down_gs,
+            None,
+            None,
+            dynamic_activation_scale=True,
+            high_first=weights.high_first,
+            group_size=weights.group_size,
+        )[0]
     activated_q = activated.to(weights.logical_dtype)
     return F.linear(activated_q.float(), down_t.dequantize(torch.float32))[0]
 
@@ -583,6 +627,19 @@ def _assert_matches_reference(
     expected_dev = expected.to(actual.device)
     assert actual.dtype is dtype
     assert torch.isfinite(actual).all()
+    if weight_format in ("nvfp4", "convrot_nvfp4"):
+        row_actual = actual.float().reshape(-1, actual.shape[-1])
+        row_expected = expected_dev.float().reshape(-1, expected_dev.shape[-1])
+        denom = row_expected.norm(dim=-1).clamp_min(1e-6)
+        row_rel = (row_actual - row_expected).norm(dim=-1) / denom
+        tight_tol = 2e-3 if dtype is torch.float32 else 2.5e-2
+        overall_rel = (row_actual - row_expected).norm() / row_expected.norm().clamp_min(1e-6)
+        if row_rel.shape[0] <= 2:
+            assert float(row_rel.max()) < tight_tol
+        else:
+            assert float(row_rel.median()) < tight_tol
+        assert float(overall_rel) < 0.08
+        return
     if weight_format == "convrot_int8":
         denom = expected_dev.float().norm().clamp_min(1e-6)
         rel_l2 = (actual.float() - expected_dev.float()).norm() / denom
@@ -640,6 +697,8 @@ def _assert_clean_amd_compile(
 
 def test_from_hp_and_from_quantized_zero_copy_slab() -> None:
     for weight_format, group_size in (
+        ("nvfp4", 0),
+        ("convrot_nvfp4", 64),
         ("nvfp4_w4a16", 0),
         ("convrot_nvfp4_w4a16", 64),
         ("convrot_int8", 64),
@@ -654,6 +713,9 @@ def test_from_hp_and_from_quantized_zero_copy_slab() -> None:
             seed=10 + group_size,
         )
         assert weights.weight_format == weight_format
+        assert weights.act_quant == (
+            "dynamic" if weight_format in ("nvfp4", "convrot_nvfp4") else None
+        )
         assert weights.num_slots == 4
         assert weights.hidden_size == 128
         assert weights.intermediate_size == 192
@@ -688,7 +750,9 @@ def test_from_hp_and_from_quantized_zero_copy_slab() -> None:
             activation_fn=weights.activation_fn,
             gate_first=weights.gate_first,
             high_first=weights.high_first,
+            act_quant=weights.act_quant,
         )
+        assert wrapped.weight_format == weight_format
         assert wrapped.up_gate_qdata.data_ptr() == weights.up_gate_qdata.data_ptr()
         assert wrapped.up_gate_scale.data_ptr() == weights.up_gate_scale.data_ptr()
         assert wrapped.down_qdata.data_ptr() == weights.down_qdata.data_ptr()
@@ -710,6 +774,7 @@ def test_from_hp_and_from_quantized_zero_copy_slab() -> None:
                 activation_fn=weights.activation_fn,
                 gate_first=weights.gate_first,
                 high_first=weights.high_first,
+                act_quant=weights.act_quant,
             )
             assert wrapped_3d.up_gate_global_scale is not None
             assert (
@@ -718,13 +783,62 @@ def test_from_hp_and_from_quantized_zero_copy_slab() -> None:
             )
 
 
-def test_validation_errors_leave_caller_out_untouched() -> None:
+def test_nvfp4_w4a4_format_and_act_quant_validation_errors() -> None:
     up_hp, down_hp = _make_dense_weights(2, 128, 128, dtype=torch.bfloat16, seed=19)
+    with pytest.raises(ValueError, match="group_size=0"):
+        MoEWeights.from_hp(up_hp, down_hp, weight_format="nvfp4", group_size=64)
     with pytest.raises(ValueError, match="group_size=0"):
         MoEWeights.from_hp(up_hp, down_hp, weight_format="nvfp4_w4a16", group_size=64)
     with pytest.raises(ValueError, match="group_size in"):
+        MoEWeights.from_hp(up_hp, down_hp, weight_format="convrot_nvfp4", group_size=0)
+    with pytest.raises(ValueError, match="group_size in"):
         MoEWeights.from_hp(up_hp, down_hp, weight_format="convrot_nvfp4_w4a16", group_size=0)
 
+    weights = _make_moe_weights(
+        3, 128, 128, weight_format="convrot_int8", group_size=64, dtype=torch.bfloat16, seed=21
+    )
+    nvfp4_weights = _make_moe_weights(
+        3, 128, 128, weight_format="convrot_nvfp4_w4a16", group_size=64, dtype=torch.float16
+    )
+    for bad_aq in ("static", 123):
+        with pytest.raises(ValueError, match="act_quant"):
+            MoEWeights.from_quantized(
+                nvfp4_weights.up_gate_qdata,
+                nvfp4_weights.up_gate_scale,
+                nvfp4_weights.down_qdata,
+                nvfp4_weights.down_scale,
+                logical_dtype=nvfp4_weights.logical_dtype,
+                group_size=nvfp4_weights.group_size,
+                act_quant=bad_aq,  # type: ignore[arg-type]
+            )
+    with pytest.raises(ValueError, match="act_quant"):
+        MoEWeights.from_quantized(
+            weights.up_gate_qdata,
+            weights.up_gate_scale,
+            weights.down_qdata,
+            weights.down_scale,
+            logical_dtype=weights.logical_dtype,
+            group_size=weights.group_size,
+            act_quant="dynamic",
+        )
+    trellis_w = _make_trellis_moe_weights(2, 128, 128, group_size=64, dtype=torch.bfloat16, seed=23)
+    with pytest.raises(ValueError, match="act_quant"):
+        MoEWeights.from_quantized(
+            trellis_w.up_gate_qdata,
+            trellis_w.up_gate_scale,
+            trellis_w.down_qdata,
+            trellis_w.down_scale,
+            logical_dtype=trellis_w.logical_dtype,
+            group_size=trellis_w.group_size,
+            up_gate_block_scales=trellis_w.up_gate_block_scales,
+            down_block_scales=trellis_w.down_block_scales,
+            up_gate_block_size=trellis_w.up_gate_block_size,
+            down_block_size=trellis_w.down_block_size,
+            act_quant="dynamic",
+        )
+
+
+def test_validation_errors_leave_caller_out_untouched() -> None:
     weights = _make_moe_weights(
         3, 128, 128, weight_format="convrot_int8", group_size=64, dtype=torch.bfloat16, seed=21
     )
@@ -888,6 +1002,8 @@ def test_rejected_inplace_calls_preserve_out_version() -> None:
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
+        ("nvfp4", 0),
+        ("convrot_nvfp4", 64),
         ("nvfp4_w4a16", 0),
         ("convrot_nvfp4_w4a16", 64),
         ("convrot_int8", 64),
@@ -1041,6 +1157,8 @@ def test_cpu_slot_indirection_misses_accumulate_and_strided_out() -> None:
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
+        ("nvfp4", 0),
+        ("convrot_nvfp4", 64),
         ("nvfp4_w4a16", 0),
         ("convrot_nvfp4_w4a16", 64),
         ("convrot_int8", 64),
@@ -1540,8 +1658,14 @@ def test_cpu_autocast_and_bf16_rounding_parity() -> None:
         moe_ffn(x_round, w_bf16, ids, wts.to(torch.bfloat16)),
     )
 
-    # FakeTensorMode covers prepare_moe_input and moe_ffn across all three formats.
-    for fmt, gs in (("nvfp4_w4a16", 0), ("convrot_nvfp4_w4a16", 64), ("convrot_int8", 64)):
+    # FakeTensorMode covers prepare_moe_input and moe_ffn across supported formats.
+    for fmt, gs in (
+        ("nvfp4", 0),
+        ("convrot_nvfp4", 64),
+        ("nvfp4_w4a16", 0),
+        ("convrot_nvfp4_w4a16", 64),
+        ("convrot_int8", 64),
+    ):
         w_fmt = _make_moe_weights(
             2,
             64,
@@ -2166,7 +2290,12 @@ def test_offline_nvidia_compile_zero_spills(
 )
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
-    [("nvfp4_w4a16", 0), ("convrot_nvfp4_w4a16", 64)],
+    [
+        ("nvfp4", 0),
+        ("convrot_nvfp4", 64),
+        ("nvfp4_w4a16", 0),
+        ("convrot_nvfp4_w4a16", 64),
+    ],
 )
 @pytest.mark.parametrize("rows", [1, 8, 128])
 def test_offline_nvfp4_compile_rejects_unsupported_targets(
@@ -2255,6 +2384,59 @@ def test_offline_compile_validation_and_sm120_routing() -> None:
     )
     assert wide_chunk_sm120["nvfp4_grouped"].hash == small_chunk_sm120["nvfp4_grouped"].hash
     assert wide_chunk_sm120["bucket_scatter"].hash == small_chunk_sm120["bucket_scatter"].hash
+
+    wide_w4a4_sm120 = moe_triton.compile_moe_kernels(
+        sm120,
+        weight_format="convrot_nvfp4",
+        logical_dtype=torch.bfloat16,
+        rows=2048,
+        top_k=6,
+        num_slots=256,
+        hidden_size=8192,
+        intermediate_size=4096,
+        group_size=64,
+    )
+    small_w4a4_sm120 = moe_triton.compile_moe_kernels(
+        sm120,
+        weight_format="convrot_nvfp4",
+        logical_dtype=torch.bfloat16,
+        rows=390,
+        top_k=6,
+        num_slots=256,
+        hidden_size=8192,
+        intermediate_size=4096,
+        group_size=64,
+    )
+    assert (
+        wide_w4a4_sm120["nvfp4_w4a4_grouped_up"].hash
+        == small_w4a4_sm120["nvfp4_w4a4_grouped_up"].hash
+    )
+    assert (
+        wide_w4a4_sm120["nvfp4_w4a4_grouped_down"].hash
+        == small_w4a4_sm120["nvfp4_w4a4_grouped_down"].hash
+    )
+
+    m1_w4a4 = _compile_nvidia_and_assert_clean(
+        sm120,
+        weight_format="convrot_nvfp4",
+        group_size=64,
+        rows=1,
+        top_k=6,
+        hidden_size=512,
+        intermediate_size=512,
+    )
+    assert "nvfp4_gemv_up" in m1_w4a4
+    assert "bucket" not in m1_w4a4
+    batched_w4a4 = _compile_nvidia_and_assert_clean(
+        sm120,
+        weight_format="nvfp4",
+        group_size=0,
+        rows=8,
+        top_k=6,
+        hidden_size=512,
+        intermediate_size=512,
+    )
+    assert {"nvfp4_gemv_up", "nvfp4_gemv_down", "bucket"}.issubset(batched_w4a4)
 
     for smoke_rows in (1, 8, 128):
         smoke = _compile_nvidia_and_assert_clean(
@@ -4404,6 +4586,57 @@ def test_offline_nvidia_prefill_compile_zero_spills(
         )
 
 
+@pytest.mark.parametrize("target", [GPUTarget("cuda", 120, 32), GPUTarget("cuda", 121, 32)])
+@pytest.mark.parametrize(
+    ("weight_format", "group_size"),
+    [("nvfp4", 0), ("convrot_nvfp4", 64)],
+)
+@pytest.mark.parametrize("logical_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(("rows", "num_slots"), [(64, 64), (512, 16)])
+@pytest.mark.parametrize(
+    ("activation_fn", "has_global_scale"), [("swiglu", True), ("gelu_tanh", False)]
+)
+def test_offline_nvidia_nvfp4_w4a4_prefill_compile_zero_spills(
+    target: GPUTarget,
+    weight_format: MoEFormat,
+    group_size: int,
+    logical_dtype: torch.dtype,
+    rows: int,
+    num_slots: int,
+    activation_fn: ActivationKind,
+    has_global_scale: bool,
+) -> None:
+    compiled = _compile_nvidia_and_assert_clean(
+        target,
+        weight_format=weight_format,
+        logical_dtype=logical_dtype,
+        rows=rows,
+        top_k=6,
+        num_slots=num_slots,
+        hidden_size=5120,
+        intermediate_size=2304,
+        group_size=group_size,
+        activation_fn=activation_fn,
+        has_global_scale=has_global_scale,
+        accumulate=not has_global_scale,
+    )
+    expected_keys = (
+        "bucket_count",
+        "bucket_scatter",
+        "weighted_reduce",
+        "nvfp4_row_quant",
+        "nvfp4_gather",
+        "nvfp4_activate_quant",
+        "nvfp4_w4a4_grouped_up",
+        "nvfp4_w4a4_grouped_down",
+    )
+    for key in expected_keys:
+        assert key in compiled
+    for key in ("nvfp4_w4a4_grouped_up", "nvfp4_w4a4_grouped_down"):
+        ptx = compiled[key].asm["ptx"]
+        assert "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X" in ptx
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm HIP compiler is Linux-only")
 @pytest.mark.parametrize(("arch", "warp_size"), _AMD_TARGETS)
 @pytest.mark.parametrize(("rows", "accumulate"), [(128, False), (256, True)])
@@ -4473,6 +4706,22 @@ def test_offline_amd_prefill_compile_matrix_and_fences(
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
+        pytest.param(
+            "nvfp4",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "nvfp4_w4a16",
             0,
@@ -4584,7 +4833,7 @@ def test_gpu_prefill_matches_reference(weight_format: MoEFormat, group_size: int
         dtype=torch.float32,
     )
     if weight_format != "convrot_int8":
-        hf_dtype = torch.bfloat16 if weight_format == "nvfp4_w4a16" else torch.float16
+        hf_dtype = torch.bfloat16 if weight_format in ("nvfp4", "nvfp4_w4a16") else torch.float16
         hf_up, hf_dn = _make_dense_weights(2, 256, 256, dtype=hf_dtype, device="cuda", seed=835)
         w_hf = MoEWeights.from_hp(
             hf_up, hf_dn, weight_format=weight_format, group_size=group_size, high_first=True
@@ -4599,6 +4848,30 @@ def test_gpu_prefill_matches_reference(weight_format: MoEFormat, group_size: int
         )
 
 
+def _assert_prefill_launch_counts(launches: list[str], weight_format: MoEFormat) -> None:
+    for k_name in (
+        "moe_prefill_bucket_count_kernel",
+        "moe_prefill_bucket_scatter_kernel",
+        "moe_m1_weighted_reduce_kernel",
+    ):
+        assert launches.count(k_name) == 1
+    if weight_format in ("nvfp4", "convrot_nvfp4"):
+        assert launches.count("nvfp4_moe_row_quant_kernel") == 1
+        assert launches.count("nvfp4_moe_gather_kernel") == 1
+        assert launches.count("nvfp4_moe_activate_quant_kernel") == 1
+        assert launches.count("nvfp4_w4a4_moe_grouped_gemm_kernel") == 2
+        assert "nvfp4_moe_grouped_gemm_kernel" not in launches
+        assert "nvfp4_moe_batched_gemv_kernel" not in launches
+    elif weight_format == "convrot_int8":
+        assert launches.count("moe_prefill_gather_kernel") == 1
+        assert launches.count("int8_moe_grouped_gemm_kernel") == 2
+        assert "int8_moe_batched_matmul_kernel" not in launches
+    else:
+        assert launches.count("moe_prefill_gather_kernel") == 1
+        assert launches.count("nvfp4_moe_grouped_gemm_kernel") == 2
+        assert "nvfp4_moe_batched_gemv_kernel" not in launches
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
@@ -4607,6 +4880,22 @@ def test_gpu_prefill_matches_reference(weight_format: MoEFormat, group_size: int
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
+        pytest.param(
+            "nvfp4",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "nvfp4_w4a16",
             0,
@@ -4656,19 +4945,7 @@ def test_gpu_prefill_skew_tails_waves_and_launches(
             x_skew, w, ids_skew, wts_skew, expert_to_slot=torch.tensor([1, 2, 0], device="cuda")
         )
     )
-    for k_name in (
-        "moe_prefill_bucket_count_kernel",
-        "moe_prefill_bucket_scatter_kernel",
-        "moe_prefill_gather_kernel",
-        "moe_m1_weighted_reduce_kernel",
-    ):
-        assert launches.count(k_name) == 1
-    if weight_format == "convrot_int8":
-        assert launches.count("int8_moe_grouped_gemm_kernel") == 2
-        assert "int8_moe_batched_matmul_kernel" not in launches
-    else:
-        assert launches.count("nvfp4_moe_grouped_gemm_kernel") == 2
-        assert "nvfp4_moe_batched_gemv_kernel" not in launches
+    _assert_prefill_launch_counts(launches, weight_format)
     _assert_matches_reference(
         actual_skew,
         _reference_for_weights(
@@ -4847,7 +5124,9 @@ def test_gpu_prefill_global_scales_and_multichunk() -> None:
     # 2. Natural multi-chunk prefill (M=300, top_k=64, H=2048, I=1024 exceeds 256 MiB workspace).
     multi_formats: list[tuple[MoEFormat, int]] = []
     if _NVFP4_MOE_GPU_AVAILABLE:
-        multi_formats.extend([("nvfp4_w4a16", 0), ("convrot_nvfp4_w4a16", 64)])
+        multi_formats.extend(
+            [("nvfp4", 0), ("convrot_nvfp4", 64), ("nvfp4_w4a16", 0), ("convrot_nvfp4_w4a16", 64)]
+        )
     if _INT8_MOE_GPU_AVAILABLE:
         multi_formats.append(("convrot_int8", 256))
     for fmt, gs in multi_formats:
@@ -4902,6 +5181,22 @@ def test_gpu_prefill_global_scales_and_multichunk() -> None:
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
+        pytest.param(
+            "nvfp4",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "nvfp4_w4a16",
             0,
@@ -5010,6 +5305,22 @@ def test_gpu_prefill_cuda_graph_replay(weight_format: MoEFormat, group_size: int
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
+        pytest.param(
+            "nvfp4",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "nvfp4_w4a16",
             0,
@@ -6330,7 +6641,12 @@ def test_gpu_nvfp4_moe_rejects_unsupported_targets_without_mutation_or_fallback(
 ) -> None:
     torch.manual_seed(1010)
     gpu_weights: list[MoEWeights] = []
-    for fmt, gs in (("nvfp4_w4a16", 0), ("convrot_nvfp4_w4a16", 64)):
+    for fmt, gs in (
+        ("nvfp4", 0),
+        ("convrot_nvfp4", 64),
+        ("nvfp4_w4a16", 0),
+        ("convrot_nvfp4_w4a16", 64),
+    ):
         cpu_w = _make_moe_weights(
             2,
             64,
@@ -6357,6 +6673,7 @@ def test_gpu_nvfp4_moe_rejects_unsupported_targets_without_mutation_or_fallback(
                     None if cpu_w.down_global_scale is None else cpu_w.down_global_scale.cuda()
                 ),
                 group_size=gs,
+                act_quant=cpu_w.act_quant,
             )
         )
 
@@ -6450,3 +6767,96 @@ def test_compile_dynamic_active_slots_hint_single_frame() -> None:
         )
     assert counter.frame_count == 1
     torch._dynamo.reset()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _NVFP4_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM12x")
+@pytest.mark.parametrize(("weight_format", "group_size"), [("nvfp4", 0), ("convrot_nvfp4", 64)])
+def test_gpu_nvfp4_w4a4_hybrid_regimes_dense_tile_and_extreme_scales(
+    weight_format: MoEFormat, group_size: int
+) -> None:
+    torch.manual_seed(1020 + group_size)
+    num_slots, hidden_size, inter_size = 3, 128, 128
+    up_hp, down_hp = _make_dense_weights(
+        num_slots,
+        hidden_size,
+        inter_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        seed=1025 + group_size,
+    )
+    w_dyn = MoEWeights.from_hp(up_hp, down_hp, weight_format=weight_format, group_size=group_size)
+    w_a16_fmt: MoEFormat = "convrot_nvfp4_w4a16" if group_size > 0 else "nvfp4_w4a16"
+    w_a16 = MoEWeights.from_hp(up_hp, down_hp, weight_format=w_a16_fmt, group_size=group_size)
+
+    # M=1 and batched decode keep W4A16 execution; prefill switches to W4A4 (including dense BM=64).
+    for rows in (1, 8):
+        x_dec = torch.randn((rows, hidden_size), device="cuda", dtype=torch.bfloat16)
+        ids_dec = torch.randint(0, num_slots, (rows, 2), device="cuda", dtype=torch.int64)
+        wts_dec = torch.softmax(torch.randn((rows, 2), device="cuda"), dim=-1).to(torch.bfloat16)
+        out_dyn, launches_dec = _record_triton_launches(
+            lambda x_dec=x_dec, ids_dec=ids_dec, wts_dec=wts_dec: moe_ffn(
+                x_dec, w_dyn, ids_dec, wts_dec
+            )
+        )
+        out_a16 = moe_ffn(x_dec, w_a16, ids_dec, wts_dec)
+        assert "nvfp4_w4a4_moe_grouped_gemm_kernel" not in launches_dec
+        torch.testing.assert_close(out_dyn, out_a16, rtol=1e-3, atol=1e-3)
+
+    # Dense prefill (256 * 2 / 3 > 128 -> BM=64), with an all-zero input row and global_scale=None.
+    x_dense = torch.randn((256, hidden_size), device="cuda", dtype=torch.bfloat16)
+    x_dense[0].zero_()
+    x_dense[-1].zero_()
+    ids_dense = torch.randint(0, num_slots, (256, 2), device="cuda", dtype=torch.int64)
+    wts_dense = torch.softmax(torch.randn((256, 2), device="cuda"), dim=-1).to(torch.bfloat16)
+    out_dense, launches_dense = _record_triton_launches(
+        lambda: moe_ffn(x_dense, w_dyn, ids_dense, wts_dense)
+    )
+    assert launches_dense.count("nvfp4_w4a4_moe_grouped_gemm_kernel") == 2
+    ref_w4a4 = _reference_for_weights(x_dense, w_dyn, ids_dense, wts_dense)
+    ref_w4a16 = _reference_for_weights(x_dense, w_a16, ids_dense, wts_dense)
+    _assert_matches_reference(
+        out_dense, ref_w4a4, weight_format=weight_format, dtype=torch.bfloat16
+    )
+    assert torch.equal(out_dense[0], torch.zeros_like(out_dense[0]))
+    assert torch.equal(out_dense[-1], torch.zeros_like(out_dense[-1]))
+    # Confirm actual W4A4 quantization noise (not a silent W4A16 fallback).
+    diff_vs_a16 = (out_dense.float() - ref_w4a16.to("cuda").float()).norm() / ref_w4a16.to(
+        "cuda"
+    ).float().norm().clamp_min(1e-6)
+    assert float(diff_vs_a16) > 1e-2
+
+    # Extreme global scales (0.0, 1e-30, and 1e37 inputs) and per-tensor weight global scale=None.
+    w_no_gs = MoEWeights.from_hp(
+        up_hp,
+        down_hp,
+        weight_format=weight_format,
+        group_size=group_size,
+        compute_per_tensor_scale=False,
+    )
+    out_no_gs = moe_ffn(x_dense[:32], w_no_gs, ids_dense[:32], wts_dense[:32])
+    ref_no_gs = _reference_for_weights(x_dense[:32], w_no_gs, ids_dense[:32], wts_dense[:32])
+    _assert_matches_reference(
+        out_no_gs, ref_no_gs, weight_format=weight_format, dtype=torch.bfloat16
+    )
+    if group_size == 0:
+        w_base32 = _make_moe_weights(
+            2, 64, 64, weight_format="nvfp4", dtype=torch.float32, device="cuda", seed=1030
+        )
+        w_extreme = MoEWeights.from_quantized(
+            torch.full_like(w_base32.up_gate_qdata, 0x77),
+            torch.ones_like(w_base32.up_gate_scale.float()).to(torch.float8_e4m3fn),
+            torch.full_like(w_base32.down_qdata, 0x77),
+            torch.ones_like(w_base32.down_scale.float()).to(torch.float8_e4m3fn),
+            logical_dtype=torch.float32,
+            up_gate_global_scale=torch.tensor([0.0, 1e-30], device="cuda", dtype=torch.float32),
+            down_global_scale=torch.tensor([1.0, 1e-30], device="cuda", dtype=torch.float32),
+            act_quant="dynamic",
+        )
+        x_huge = torch.full((36, 64), 1e37, device="cuda", dtype=torch.float32)
+        ids_gs = torch.tensor([[0, 1]], device="cuda", dtype=torch.int64).repeat(36, 1)
+        wts_gs = torch.ones((36, 2), device="cuda", dtype=torch.float32)
+        actual_ext = moe_ffn(x_huge, w_extreme, ids_gs, wts_gs)
+        expected_ext = _reference_for_weights(x_huge, w_extreme, ids_gs, wts_gs).to("cuda")
+        assert torch.isfinite(actual_ext).all()
+        torch.testing.assert_close(actual_ext, expected_ext, rtol=1e-4, atol=1e-4)

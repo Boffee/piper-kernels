@@ -7,6 +7,19 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Native NVIDIA Blackwell SM12x (`sm120`/`sm121`) NVFP4 W4A4 grouped-GEMM prefill in
+  `piper_kernels.moe` via `MoEWeights.from_hp(..., weight_format="nvfp4" | "convrot_nvfp4")`
+  and `MoEWeights.from_quantized(..., act_quant="dynamic")` without adding custom ops. Shares
+  the existing packed NVFP4 slabs, keeps weight-only W4A16 execution on single-token (`M = 1`)
+  and small-batch (`M <= 16` and `M * top_k <= 512`) decode, and routes prefill batches onto
+  Triton 3.9 `tl.dot_scaled` (`mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X`)
+  with per-row dynamic activation quantization (fusing optional ConvRot Hadamard rotation and
+  `swiglu`/`gelu_tanh`), delivering up to `3.69x` over NVFP4 W4A16 (`462.5` E2E TFLOPS at
+  `E=8, rows=1024`) and `1.32x`–`2.03x` over ConvRot INT8 on `H=5120, I=2304, top_k=6`
+  prefill. Verified live on RTX 5090 (`sm120`), CPU/`meta`, and with zero register spills offline
+  across `sm120` and `sm121`; live `sm121`, multi-GPU, non-SM12x CUDA, ROCm, and Windows
+  execution remain unexercised locally (non-SM12x/ROCm targets are offline-compile and mock-tested
+  to fail fast with `ValueError` without mutating `out`).
 - Offset-causal chunked prefill in `piper_attention_decode` (`seq_q >= 64` on NVIDIA
   SM8x/SM12x and AMD RDNA4 `gfx1200`/`gfx1201`), reading finalized `PiperKVChunkPool`
   slots zero-copy via `chunk_to_slot` plus K1024/V1024 chunk-centered live BF16/FP16

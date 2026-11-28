@@ -101,6 +101,41 @@ def _decode_trellis_slot(
     )
 
 
+def _nvfp4_w4a4_row_proj(
+    row_fp32: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor | None,
+    *,
+    high_first: bool,
+    proj_group_size: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    from piper_kernels.linear.nvfp4 import reference as nvfp4_ref  # noqa: PLC0415
+    from piper_kernels.weights.nvfp4._quantization import dequantize_nvfp4  # noqa: PLC0415
+
+    a_q, a_s, a_rs = nvfp4_ref.prepare_input(
+        row_fp32,
+        None,
+        dynamic_activation_scale=True,
+        high_first=high_first,
+        group_size=proj_group_size,
+    )
+    acc = (
+        dequantize_nvfp4(a_q, a_s, swizzled=True, high_first=high_first)
+        @ dequantize_nvfp4(weight_qdata, weight_scale, swizzled=True, high_first=high_first).T
+    )
+    a_rs_f = a_rs.to(device=acc.device, dtype=torch.float32)
+    if weight_global_scale is not None:
+        b_gs = weight_global_scale.to(device=acc.device, dtype=torch.float32)
+        combine = (a_rs_f.abs() < 1.0) != (b_gs.abs() < 1.0)
+        scaled = torch.where(combine, acc * (a_rs_f * b_gs), (acc * a_rs_f) * b_gs)
+        result = torch.where((a_rs_f == 0.0) | (b_gs == 0.0), torch.zeros_like(acc), scaled)
+    else:
+        result = torch.where(a_rs_f == 0.0, torch.zeros_like(acc), acc * a_rs_f)
+    return result.to(output_dtype)
+
+
 def _make_slot_evaluator(
     input_2d: torch.Tensor,
     up_gate_qdata: torch.Tensor,
@@ -125,6 +160,7 @@ def _make_slot_evaluator(
     down_slot_offsets: torch.Tensor | None,
     up_gate_block_size: int,
     down_block_size: int,
+    act_quant: str | None = None,
 ) -> Callable[[int, torch.Tensor], torch.Tensor]:
     rows, hidden_size = input_2d.shape
     if up_gate_block_scales is not None:
@@ -215,6 +251,26 @@ def _make_slot_evaluator(
             if down_global_scale is None
             else torch.index_select(down_global_scale, 0, safe_slot_1d).squeeze(0)
         )
+        if act_quant == "dynamic":
+            mid = _nvfp4_w4a4_row_proj(
+                active_2d[row_index : row_index + 1].float(),
+                up_q,
+                up_s,
+                up_gs,
+                high_first=high_first,
+                proj_group_size=0,
+                output_dtype=logical_dtype,
+            )
+            activated = _activate_intermediate(mid, activation_fn, gate_first=gate_first)
+            return _nvfp4_w4a4_row_proj(
+                activated,
+                down_q,
+                down_s,
+                down_gs,
+                high_first=high_first,
+                proj_group_size=group_size,
+                output_dtype=torch.float32,
+            )
         mid = nvfp4_ref.linear_w4a16(
             active_2d[row_index : row_index + 1].float(),
             up_q,
@@ -268,6 +324,7 @@ def moe_ffn_reference(
     down_slot_offsets: torch.Tensor | None = None,
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
+    act_quant: str | None = None,
 ) -> torch.Tensor:
     """Run an independent PyTorch reference across routed expert slots."""
     parse_input_activation(activation_fn, name="MoE")
@@ -308,6 +365,7 @@ def moe_ffn_reference(
             down_slot_offsets=down_slot_offsets,
             up_gate_block_size=up_gate_block_size,
             down_block_size=down_block_size,
+            act_quant=act_quant,
         )
         topk_ids_2d = topk_ids.reshape(rows, top_k)
         topk_weights_2d = topk_weights.reshape(rows, top_k)

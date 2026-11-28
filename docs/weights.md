@@ -166,7 +166,8 @@ renormalization and transposed weights raise `NotImplementedError`.
 
 `piper_kernels.moe` provides offload-first single-token (`M = 1`), small-batch, and prefill
 (`M > 1`) execution across expert-major quantized slabs stored as `[num_slots, ...]`: NVFP4 W4A16
-(`"nvfp4_w4a16"`), ConvRot NVFP4 W4A16 (`"convrot_nvfp4_w4a16"`), ConvRot INT8 W8A8
+(`"nvfp4_w4a16"`), ConvRot NVFP4 W4A16 (`"convrot_nvfp4_w4a16"`), dynamic NVFP4 (`"nvfp4"`,
+`"convrot_nvfp4"`, or `act_quant="dynamic"` on `MoEWeights.from_quantized`), ConvRot INT8 W8A8
 (`"convrot_int8"`), and ConvRot Trellis (`"convrot_trellis"`). Each contiguous slab holds
 `up_gate_qdata`, `up_gate_scale`, `down_qdata`, `down_scale`, optional per-slot `float32` NVFP4
 global scales (`[num_slots]`, `[num_slots, 1]`, or `[num_slots, 1, 1]`), and for ConvRot Trellis
@@ -175,10 +176,17 @@ sizes (`up_gate_block_size`, `down_block_size`), and optional variable-row metad
 `slot_offsets`), so runtimes can wrap resident slabs or staging buffers zero-copy with
 `MoEWeights.from_quantized`.
 
-NVFP4 slabs use packed `uint8` nibbles and finite (`0x7F`/`0xFF` NaN bytes excluded)
-`SWIZZLE_32_4_4` `float8_e4m3fn` 16-value block scales on widths divisible by 16 (and
-`group_size` for ConvRot); GPU NVFP4 MoE execution targets NVIDIA SM12x (`ValueError` on
-other GPUs), while CPU and `meta` remain supported. ConvRot INT8 slabs use `int8`
+NVFP4 slabs use packed `uint8` nibbles and finite (`0x7F`/`0xFF` NaN bytes excluded;
+non-negative finite required for `act_quant="dynamic"` because Blackwell `.ue4m3` scale operands
+ignore the sign bit) `SWIZZLE_32_4_4` `float8_e4m3fn` 16-value block scales on widths divisible
+by 16 (and `group_size` for ConvRot). `"nvfp4"` and `"convrot_nvfp4"` share the exact same packed
+weight storage as `"nvfp4_w4a16"` / `"convrot_nvfp4_w4a16"`, keeping high-precision W4A16 execution
+for single-token (`M = 1`) and small-batch (`M <= 16` and `M * top_k <= 512`) decode while
+switching prefill onto native SM12x Blackwell FP4 (`tl.dot_scaled`) W4A4 grouped GEMMs with
+per-row dynamic activation quantization (fusing optional ConvRot rotation and `swiglu`/`gelu_tanh`
+activation). GPU NVFP4 MoE execution targets NVIDIA SM12x (`ValueError` on other GPUs), while CPU
+and `meta` remain supported (evaluating per-row dynamic W4A4 reference semantics when
+`act_quant="dynamic"`). ConvRot INT8 slabs use `int8`
 values, `float32` per-row scales (`[num_slots, out]` or `[num_slots, out, 1]`),
 `group_size` in `{16, 64, 256}`, and widths up to `131_071` so INT32 accumulators never
 wrap; GPU INT8 kernels target NVIDIA SM80+ and supported AMD ROCm GPUs, while earlier
@@ -252,9 +260,10 @@ Set `gate_first=False` when checkpoints pack `[up | gate]` halves (matching Pipe
 convention), and pass `activation_fn="gelu_tanh"` for `tanh`-GELU experts without a paired gate
 projection. `prepare_moe_input` returns an independent snapshot safe to reuse across waves
 even when accumulating into `out=input` (storing FP32 rotated activations for
-`"convrot_nvfp4_w4a16"` and `"convrot_trellis"` across FP16, BF16, and FP32 inputs). Calling
+`"convrot_nvfp4"`, `"convrot_nvfp4_w4a16"`, and `"convrot_trellis"` across FP16, BF16, and FP32
+inputs, avoiding redundant rotation during both W4A16 decode and W4A4 prefill). Calling
 `moe_ffn` without `out` returns a freshly allocated contiguous tensor; multi-row (`M > 1`) calls
-compact and batch active expert slots on-device across NVFP4 W4A16, ConvRot INT8, and ConvRot
+compact and batch active expert slots on-device across NVFP4 W4A4/W4A16, ConvRot INT8, and ConvRot
 Trellis (chunked under a bounded workspace for large prompts).
 Caller-supplied `out` must match input
 shape/dtype/device, have `stride(-1) == 1` with disjoint rows (`out.view(rows, H).stride(0) >= H`

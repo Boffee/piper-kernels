@@ -51,6 +51,24 @@ def select_nvfp4_prefill_schedule(
     )
 
 
+def select_nvfp4_w4a4_prefill_schedule(
+    target: AcceleratorTarget,
+    *,
+    chunk_rows: int,
+    top_k: int,
+    num_slots: int,
+    active_slots_hint: int,
+) -> _schedule.Nvfp4W4A4PrefillSchedule:
+    """Resolve the NVFP4 W4A4 grouped prefill schedule for ``target``."""
+    return _nvidia_policy.select_nvfp4_w4a4_prefill_schedule(
+        target,
+        chunk_rows=chunk_rows,
+        top_k=top_k,
+        num_slots=num_slots,
+        active_slots_hint=active_slots_hint,
+    )
+
+
 def select_int8_launch_schedule(target: AcceleratorTarget) -> _schedule.Int8LaunchSchedule:
     """Resolve the INT8 decode launch schedule for ``target``."""
     if target.is_nvidia_cuda:

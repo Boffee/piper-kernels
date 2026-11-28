@@ -20,13 +20,16 @@ from .._schedule import (
     PREFILL_NVFP4_DENSE_BLOCK_M,
     PREFILL_NVFP4_SPARSE_BLOCK_M,
     PREFILL_NVFP4_SPARSE_BLOCK_N,
+    PREFILL_NVFP4_W4A4_DENSE_THRESHOLD,
     TRELLIS_GEMV_BATCH_BLOCK_M,
     TRELLIS_GEMV_NUM_WARPS,
     Int8LaunchSchedule,
     Nvfp4BatchedSchedule,
     Nvfp4M1Schedule,
     Nvfp4PrefillSchedule,
+    Nvfp4W4A4PrefillSchedule,
     TrellisMoeSchedule,
+    cdiv,
     select_prefill_block_m,
 )
 
@@ -125,6 +128,35 @@ def select_nvfp4_prefill_schedule(
         block_k=PREFILL_NVFP4_BLOCK_K,
         num_warps=NVFP4_DOT_NUM_WARPS_CUDA,
         single_dot=False,
+    )
+
+
+def select_nvfp4_w4a4_prefill_schedule(
+    target: AcceleratorTarget,
+    *,
+    chunk_rows: int,
+    top_k: int,
+    num_slots: int,
+    active_slots_hint: int,
+) -> Nvfp4W4A4PrefillSchedule:
+    """Resolve grouped prefill NVFP4 W4A4 ``tl.dot_scaled`` schedule for NVIDIA SM12x."""
+    _require_nvfp4_sm12x(target)
+    eff_slots = min(num_slots, active_slots_hint) if active_slots_hint > 0 else num_slots
+    avg_m = cdiv(chunk_rows * top_k, max(1, eff_slots))
+    if avg_m <= PREFILL_NVFP4_W4A4_DENSE_THRESHOLD:
+        return Nvfp4W4A4PrefillSchedule(
+            block_m=32,
+            block_n=128,
+            block_k=256,
+            num_warps=4,
+            num_stages=3,
+        )
+    return Nvfp4W4A4PrefillSchedule(
+        block_m=64,
+        block_n=128,
+        block_k=128,
+        num_warps=8,
+        num_stages=3,
     )
 
 

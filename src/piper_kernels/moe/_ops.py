@@ -67,6 +67,7 @@ class _MoEOperands:
     down_slot_offsets: torch.Tensor | None = None
     up_gate_block_size: int = 0
     down_block_size: int = 0
+    act_quant: str | None = None
 
     def weight_tensors(self) -> tuple[torch.Tensor | None, ...]:
         return (
@@ -115,6 +116,7 @@ class _MoEOperands:
             self.down_slot_offsets,
             self.up_gate_block_size,
             self.down_block_size,
+            self.act_quant,
         )
         if inplace:
             assert self.out is not None
@@ -144,6 +146,7 @@ class _MoEOperands:
             self.active_slots_hint,
             self.up_gate_block_size,
             self.down_block_size,
+            self.act_quant,
         )
 
 
@@ -312,6 +315,8 @@ class _WeightStorage(Protocol):
     def up_gate_block_size(self) -> int: ...
     @property
     def down_block_size(self) -> int: ...
+    @property
+    def act_quant(self) -> str | None: ...
 
 
 def _validate_weight_storage(
@@ -320,6 +325,8 @@ def _validate_weight_storage(
     parse_input_activation(ops.activation_fn, name="MoE")
     if not isinstance(ops.gate_first, bool) or not isinstance(ops.high_first, bool):
         raise TypeError("MoE gate_first and high_first must be booleans")
+    if ops.act_quant is not None and (type(ops.act_quant) is not str or ops.act_quant != "dynamic"):
+        raise ValueError(f"MoE act_quant must be None or 'dynamic', got {ops.act_quant!r}")
     group_size = ops.group_size
     if isinstance(group_size, bool) or not isinstance(group_size, (int, torch.SymInt)):
         raise TypeError(f"MoE group_size must be an integer, got {group_size!r}")
@@ -345,6 +352,8 @@ def _validate_weight_storage(
     if has_trellis_arg:
         if ops.high_first:
             raise ValueError("ConvRot Trellis MoE weights do not support high_first nibble packing")
+        if ops.act_quant is not None:
+            raise ValueError("ConvRot Trellis MoE weights do not support NVFP4 act_quant")
         validate_group_size(group_size)
         if ops.up_gate_global_scale is not None or ops.down_global_scale is not None:
             raise ValueError("ConvRot Trellis MoE weights do not use per-expert global scales")
@@ -472,6 +481,8 @@ def _validate_weight_storage(
     if ops.up_gate_qdata.dtype is torch.int8:
         if ops.high_first:
             raise ValueError("ConvRot INT8 MoE weights do not support high_first nibble packing")
+        if ops.act_quant is not None:
+            raise ValueError("ConvRot INT8 MoE weights do not support NVFP4 act_quant")
         validate_group_size(group_size)
         if ops.up_gate_global_scale is not None or ops.down_global_scale is not None:
             raise ValueError("ConvRot INT8 MoE weights do not use per-expert global scales")
@@ -847,6 +858,7 @@ def _run_moe_ffn(ops: _MoEOperands) -> torch.Tensor:
             down_slot_offsets=ops.down_slot_offsets,
             up_gate_block_size=ops.up_gate_block_size,
             down_block_size=ops.down_block_size,
+            act_quant=ops.act_quant,
         )
 
     return reference.moe_ffn_reference(
@@ -876,6 +888,7 @@ def _run_moe_ffn(ops: _MoEOperands) -> torch.Tensor:
         down_slot_offsets=ops.down_slot_offsets,
         up_gate_block_size=ops.up_gate_block_size,
         down_block_size=ops.down_block_size,
+        act_quant=ops.act_quant,
     )
 
 
@@ -906,6 +919,7 @@ def moe_ffn(
     down_slot_offsets: torch.Tensor | None = None,
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
+    act_quant: str | None = None,
 ) -> torch.Tensor:
     """Execute a slot-indirect quantized MoE FFN and return a fresh output tensor."""
     return _run_moe_ffn(
@@ -937,6 +951,7 @@ def moe_ffn(
             down_slot_offsets,
             up_gate_block_size,
             down_block_size,
+            act_quant,
         )
     )
 
@@ -968,6 +983,7 @@ def _moe_ffn_fake(
     down_slot_offsets: torch.Tensor | None = None,
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
+    act_quant: str | None = None,
 ) -> torch.Tensor:
     ops = _MoEOperands(
         input,
@@ -997,6 +1013,7 @@ def _moe_ffn_fake(
         down_slot_offsets,
         up_gate_block_size,
         down_block_size,
+        act_quant,
     )
     _reject_autograd(ops)
     _validate_op_operands(ops)
@@ -1032,6 +1049,7 @@ def moe_ffn_(
     down_slot_offsets: torch.Tensor | None = None,
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
+    act_quant: str | None = None,
 ) -> None:
     """Execute a slot-indirect quantized MoE FFN into caller-owned ``out``."""
     _run_moe_ffn(
@@ -1063,6 +1081,7 @@ def moe_ffn_(
             down_slot_offsets,
             up_gate_block_size,
             down_block_size,
+            act_quant,
         )
     )
 
@@ -1096,6 +1115,7 @@ def _moe_ffn_inplace_fake(
     down_slot_offsets: torch.Tensor | None = None,
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
+    act_quant: str | None = None,
 ) -> None:
     ops = _MoEOperands(
         input,
@@ -1125,6 +1145,7 @@ def _moe_ffn_inplace_fake(
         down_slot_offsets,
         up_gate_block_size,
         down_block_size,
+        act_quant,
     )
     _reject_autograd(ops)
     _validate_op_operands(ops)
@@ -1158,6 +1179,7 @@ def _moe_ffn_autograd(
     down_slot_offsets: torch.Tensor | None = None,
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
+    act_quant: str | None = None,
 ) -> torch.Tensor:
     ops = _MoEOperands(
         input,
@@ -1187,6 +1209,7 @@ def _moe_ffn_autograd(
         down_slot_offsets,
         up_gate_block_size,
         down_block_size,
+        act_quant,
     )
     _reject_autograd(ops)
     with torch._C._AutoDispatchBelowAutograd():
@@ -1224,6 +1247,7 @@ def _moe_ffn_inplace_autograd(
     down_slot_offsets: torch.Tensor | None = None,
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
+    act_quant: str | None = None,
 ) -> None:
     ops = _MoEOperands(
         input,
@@ -1253,6 +1277,7 @@ def _moe_ffn_inplace_autograd(
         down_slot_offsets,
         up_gate_block_size,
         down_block_size,
+        act_quant,
     )
     _reject_autograd(ops)
     # Validate eagerly above ADInplaceOrView so rejected calls leave out._version intact.
