@@ -44,7 +44,9 @@ def rdna4_available(device: torch.device | str | int | None = None) -> bool:
     """Return whether ``device`` (default CUDA device) is a supported Linux/Windows RDNA4 GPU."""
     if sys.platform not in ("linux", "win32") or not torch.cuda.is_available():
         return False
-    return AcceleratorTarget.from_device(_resolve_cuda_device(device)).is_rdna4
+    return AcceleratorTarget.from_device(_resolve_cuda_device(device)).is_hip_architecture(
+        "gfx1200", "gfx1201"
+    )
 
 
 def convrot_int8_w8a8_available(device: torch.device | str | int | None = None) -> bool:
@@ -54,8 +56,7 @@ def convrot_int8_w8a8_available(device: torch.device | str | int | None = None) 
     target = AcceleratorTarget.from_device(_resolve_cuda_device(device))
     return (target.is_nvidia_cuda and target.cuda_capability_at_least(7, 5)) or (
         sys.platform in ("linux", "win32")
-        and target.is_amd_hip
-        and target.is_architecture("gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201")
+        and target.is_hip_architecture("gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201")
     )
 
 
@@ -64,7 +65,7 @@ def exact_gfx1201_available() -> bool:
     if sys.platform not in ("linux", "win32") or not torch.cuda.is_available():
         return False
     target = AcceleratorTarget.from_device(torch.device("cuda"))
-    return target.is_amd_hip and target.is_architecture("gfx1201")
+    return target.is_hip_architecture("gfx1201")
 
 
 def blackwell_cuda_available() -> bool:

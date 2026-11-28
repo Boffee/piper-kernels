@@ -6,7 +6,7 @@ from typing import Literal
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarget
 
 from ._nvidia import policy as nvidia_policy
 
@@ -31,16 +31,12 @@ except ModuleNotFoundError as error:
 
 def supports_amd_target(target: AcceleratorTarget) -> bool:
     """Return whether target uses the four-wave Q64/K64 ROCm RDNA4 dense Piper kernel."""
-    return (
-        sys.platform in ("linux", "win32")
-        and target.is_amd_hip
-        and target.is_architecture("gfx1200", "gfx1201")
-    )
+    return sys.platform in ("linux", "win32") and target.is_hip_architecture(*GFX120X_ARCHITECTURES)
 
 
 def kv_chunk_layout(target: AcceleratorTarget) -> tuple[int, bool, bool]:
     """Return ``(key_scales, grouped_qk, pack_wmma)`` from target ISA capabilities."""
-    if target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201"):
+    if target.is_hip_architecture(*GFX120X_ARCHITECTURES):
         return 16, True, True
     if nvidia_policy.supports_target(target):
         grouped_qk = nvidia_policy.groups_qk_scales(target)

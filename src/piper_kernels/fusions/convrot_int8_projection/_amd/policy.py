@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from piper_kernels._triton.targets import (
+    GFX120X_ARCHITECTURES,
     RDNA4_INT8_ACCUMULATOR_SEED,
     RDNA4_INT8_ACCUMULATOR_SEED_MIN_REDUCTION,
     AcceleratorTarget,
@@ -78,11 +79,7 @@ def supports_head_dim(head_dim: int) -> bool:
 
 def supports_target(target: AcceleratorTarget) -> bool:
     """Match validated RDNA4 HIP targets on Linux and Windows."""
-    return (
-        sys.platform in ("linux", "win32")
-        and target.is_amd_hip
-        and target.is_architecture("gfx1200", "gfx1201")
-    )
+    return sys.platform in ("linux", "win32") and target.is_hip_architecture(*GFX120X_ARCHITECTURES)
 
 
 def supports_gluon(

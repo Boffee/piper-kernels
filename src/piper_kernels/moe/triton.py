@@ -27,7 +27,11 @@ from piper_kernels._triton.primitives import (
     splitk_tile_bounds,
 )
 from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget, rdna4_int8_accumulator_seed
+from piper_kernels._triton.targets import (
+    GFX120X_ARCHITECTURES,
+    AcceleratorTarget,
+    rdna4_int8_accumulator_seed,
+)
 from piper_kernels.linear._splitk import device_sm_count, select_split_k
 from piper_kernels.linear.convrot.int8.trellis_triton import _gemv_accumulate_k_blocks
 from piper_kernels.linear.convrot.int8.triton import _accumulate_int8_tile, splitk_accumulator_seed
@@ -1712,11 +1716,13 @@ def trellis_moe_gemv_kernel(
 
 
 def _int8_launch_config(target: AcceleratorTarget) -> tuple[int, int, dict[str, object]]:
-    is_rdna4 = target.is_rdna4
-    block_k = 256 if is_rdna4 else 64
-    num_stages = 2 if (target.is_nvidia_cuda or is_rdna4) else 1
+    is_gfx120x = target.is_hip_architecture(*GFX120X_ARCHITECTURES)
+    block_k = 256 if is_gfx120x else 64
+    num_stages = 2 if (target.is_nvidia_cuda or is_gfx120x) else 1
     compiler_options: dict[str, object] = (
-        dict(amd_compiler_workarounds.lds_only_fence_options(is_rdna4)) if target.is_amd_hip else {}
+        dict(amd_compiler_workarounds.lds_only_fence_options(is_gfx120x))
+        if target.is_amd_hip
+        else {}
     )
     return block_k, num_stages, compiler_options
 
@@ -1871,7 +1877,7 @@ def _nvfp4_prefill_config(
             _NVFP4_SM120_DOT_NUM_WARPS,
             True,
         )
-    is_wave64 = target.is_amd_hip and target.is_architecture("gfx942")
+    is_wave64 = target.is_hip_architecture("gfx942")
     if block_m == _PREFILL_NVFP4_SPARSE_BLOCK_M:
         block_n = _PREFILL_NVFP4_SPARSE_BLOCK_N
         num_warps = (
@@ -2089,7 +2095,11 @@ def _nvfp4_batched_config(
     post_scale_only = not (use_dot and active_dtype is torch.float16)
     is_sm120 = target.is_cuda_capability(12)
     if use_dot:
-        block_k = _NVFP4_DOT_BLOCK_K_RDNA4 if target.is_rdna4 else _NVFP4_DOT_BLOCK_K
+        block_k = (
+            _NVFP4_DOT_BLOCK_K_RDNA4
+            if target.is_hip_architecture(*GFX120X_ARCHITECTURES)
+            else _NVFP4_DOT_BLOCK_K
+        )
         num_warps = (
             _NVFP4_SM120_DOT_NUM_WARPS
             if is_sm120
@@ -3792,9 +3802,10 @@ def _select_trellis_moe_schedule(
     expected_slots: int,
 ) -> _TrellisMoeSchedule:
     """Resolve all target-dependent kernel choices for ``trellis_moe_gemv_kernel``."""
+    is_gfx120x = target.is_hip_architecture(*GFX120X_ARCHITECTURES)
     if not batched:
         block_m, block_n = (1, 1)
-    elif target.is_rdna4:
+    elif is_gfx120x:
         block_m = (
             _TRELLIS_GEMV_RDNA4_SPARSE_BLOCK_M
             if num_pairs * 2 <= 3 * max(1, expected_slots)
@@ -3809,8 +3820,8 @@ def _select_trellis_moe_schedule(
         num_warps=_TRELLIS_GEMV_NUM_WARPS,
         unroll_k=2 if (target.is_cuda_capability(12) and block_m == 1) else 1,
         use_dp4a=target.is_nvidia_cuda,
-        use_sad_u8=target.is_rdna4,
-        split_x_loads=target.is_rdna4,
+        use_sad_u8=is_gfx120x,
+        split_x_loads=is_gfx120x,
     )
 
 
@@ -4138,7 +4149,7 @@ def _dispatch_trellis_moe(
                         batched=True,
                     ),
                 )
-                if resolved_target.is_rdna4
+                if resolved_target.is_hip_architecture(*GFX120X_ARCHITECTURES)
                 else weight_buckets
             )
             split_k_up = _select_trellis_split_k(

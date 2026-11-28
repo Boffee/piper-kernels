@@ -18,7 +18,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarget
 
 from ._amd.isa import sad_u8_lcg_numerator_i32
 from ._layout import (
@@ -580,7 +580,7 @@ def decode_slots_int8_kernel(
 
 def _decode_num_warps(target: AcceleratorTarget) -> int:
     """Return the optimal warp count for Trellis block decoding on ``target``."""
-    return 1 if target.is_rdna4 else _DEFAULT_DECODE_WARPS
+    return 1 if target.is_hip_architecture(*GFX120X_ARCHITECTURES) else _DEFAULT_DECODE_WARPS
 
 
 def _decode_stream_flags(
@@ -593,9 +593,9 @@ def _decode_stream_flags(
 ) -> tuple[bool, bool, bool, bool, int]:
     """Return ``(use_dp4a, use_sad_u8, has_tail_bytes, clamped_load, num_warps)``."""
     has_tail_bytes = per_slot_2d or (stream_bytes % 4 != 0)
-    use_sad_u8 = target.is_rdna4
+    is_gfx120x = target.is_hip_architecture(*GFX120X_ARCHITECTURES)
     clamped_load = (
-        target.is_rdna4
+        is_gfx120x
         and (not variable_rows)
         and ptr_aligned
         and (not has_tail_bytes)
@@ -603,10 +603,10 @@ def _decode_stream_flags(
     )
     return (
         target.is_nvidia_cuda,
-        use_sad_u8,
+        is_gfx120x,
         has_tail_bytes,
         clamped_load,
-        _decode_num_warps(target),
+        1 if is_gfx120x else _DEFAULT_DECODE_WARPS,
     )
 
 
