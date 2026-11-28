@@ -1,4 +1,4 @@
-"""ConvRot Trellis W4A16 MoE Triton kernels and host dispatcher."""
+"""ConvRot Trellis W4A16 MoE Triton kernels and leaf kernel launcher."""
 
 # Triton's JIT launcher, constexpr arguments, and wide kernel signatures are not
 # fully represented by Python typing rules.
@@ -7,21 +7,17 @@
 
 from __future__ import annotations
 
-from typing import Literal
-
 import torch
 import triton
 import triton.language as tl
 
 from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget
-from piper_kernels.linear._splitk import device_sm_count
 from piper_kernels.linear.convrot.int8.trellis_triton import _gemv_accumulate_k_blocks
 from piper_kernels.trellis._layout import WRAP_GUARD_BYTES, TrellisLayout
 from piper_kernels.trellis.triton import _le_step_bits_4, compute_row_offsets_2d
 
-from . import _routing_triton, _schedule
-from ._routing_triton import _resolve_slot
+from . import _schedule
+from ._routing_triton import A16ChunkRouting, _resolve_slot
 
 _WRAP_GUARD_BYTES = tl.constexpr(WRAP_GUARD_BYTES)
 _BATCH_BLOCK_M_TL = tl.constexpr(_schedule.BATCH_BLOCK_M)
@@ -386,7 +382,7 @@ def launch_trellis_proj(
     row_widths: torch.Tensor | None,
     slot_offsets: torch.Tensor | None,
     block_size: int,
-    routing: _routing_triton.A16ChunkRouting,
+    routing: A16ChunkRouting,
     expert_to_slot: torch.Tensor | None,
     output: torch.Tensor,
     *,
@@ -492,194 +488,4 @@ def launch_trellis_proj(
             use_sad_u8=schedule.use_sad_u8,
             split_x_loads=schedule.split_x_loads,
             num_warps=schedule.num_warps,
-        )
-
-
-def dispatch_trellis_a16_moe(
-    input_2d: torch.Tensor,
-    ids_2d: torch.Tensor,
-    weights_2d: torch.Tensor,
-    up_gate_qdata: torch.Tensor,
-    up_gate_block_scales: torch.Tensor,
-    up_gate_scale: torch.Tensor,
-    up_gate_row_widths: torch.Tensor | None,
-    up_gate_slot_offsets: torch.Tensor | None,
-    up_gate_block_size: int,
-    down_qdata: torch.Tensor,
-    down_block_scales: torch.Tensor,
-    down_scale: torch.Tensor,
-    down_row_widths: torch.Tensor | None,
-    down_slot_offsets: torch.Tensor | None,
-    down_block_size: int,
-    expert_to_slot: torch.Tensor | None,
-    prepared_data: torch.Tensor | None,
-    out_2d: torch.Tensor,
-    *,
-    resolved_target: AcceleratorTarget,
-    regime: Literal["m1", "batched", "prefill"],
-    chunk_rows: int,
-    accumulate: bool,
-    group_size: int,
-    activation_fn: str,
-    gate_first: bool,
-    active_slots_hint: int,
-) -> None:
-    device = input_2d.device
-    num_sms = device_sm_count(device)
-    rows, hidden_size = input_2d.shape
-    num_slots, _, down_blocks = down_block_scales.shape
-    intermediate_size = down_blocks * down_block_size
-    up_gate_out, up_blocks = up_gate_block_scales.shape[1], up_gate_block_scales.shape[2]
-    top_k = ids_2d.shape[1]
-
-    if regime == "prefill":
-        # Non-INT8 accelerators (e.g. SM75) fall back to chunked batched A16 GEMV.
-        a16_chunk_rows = min(
-            rows, _schedule.BATCH_MAX_ROWS, max(1, _schedule.BUCKET_MAX_PAIRS // max(1, top_k))
-        )
-        batched = a16_chunk_rows > 1
-    else:
-        a16_chunk_rows = chunk_rows
-        batched = regime == "batched"
-
-    up_slot_bytes = up_gate_qdata.numel() // max(1, num_slots)
-    down_slot_bytes = down_qdata.numel() // max(1, num_slots)
-    expected_slots = min(num_slots, active_slots_hint) if active_slots_hint > 0 else num_slots
-    split_k_up = split_k_down = 1
-    schedule = _routing_triton.select_trellis_schedule(
-        resolved_target,
-        batched=batched,
-        num_pairs=top_k,
-        expected_slots=expected_slots,
-    )
-    if not batched:
-        active_slots = _schedule.expected_bucket_tiles(
-            top_k, num_slots, active_slots_hint, batched=False
-        )
-        split_k_up = _schedule.select_trellis_split_k(
-            num_sms, active_slots, up_gate_out, up_blocks, max(1, up_slot_bytes * active_slots)
-        )
-        split_k_down = _schedule.select_trellis_split_k(
-            num_sms, active_slots, hidden_size, down_blocks, max(1, down_slot_bytes * active_slots)
-        )
-
-    def _launch_trellis_step(
-        per_expert_input: bool,
-        x: torch.Tensor,
-        routing: _routing_triton.A16ChunkRouting,
-        output: torch.Tensor,
-        split_k: int,
-    ) -> None:
-        if not per_expert_input:
-            q, bs, rs, rw, so, bsz, n_out, n_in = (
-                up_gate_qdata,
-                up_gate_block_scales,
-                up_gate_scale,
-                up_gate_row_widths,
-                up_gate_slot_offsets,
-                up_gate_block_size,
-                up_gate_out,
-                hidden_size,
-            )
-        else:
-            q, bs, rs, rw, so, bsz, n_out, n_in = (
-                down_qdata,
-                down_block_scales,
-                down_scale,
-                down_row_widths,
-                down_slot_offsets,
-                down_block_size,
-                hidden_size,
-                intermediate_size,
-            )
-        launch_trellis_proj(
-            x,
-            q,
-            bs,
-            rs,
-            rw,
-            so,
-            bsz,
-            routing,
-            expert_to_slot,
-            output,
-            out_features=n_out,
-            in_features=n_in,
-            num_slots=num_slots,
-            split_k=split_k,
-            batched=batched,
-            per_expert_input=per_expert_input,
-            is_splitk=per_expert_input or split_k > 1,
-            schedule=schedule,
-        )
-
-    for active_chunk, ids_chunk, weights_chunk, out_chunk in _routing_triton.iter_a16_chunks(
-        input_2d, ids_2d, weights_2d, out_2d, prepared_data, group_size, a16_chunk_rows
-    ):
-        if batched:
-            num_pairs = active_chunk.shape[0] * top_k
-            schedule = _routing_triton.select_trellis_schedule(
-                resolved_target,
-                batched=True,
-                num_pairs=num_pairs,
-                expected_slots=expected_slots,
-            )
-            weight_buckets = min(
-                _schedule.max_bucket_tiles(num_pairs, num_slots, _schedule.BATCH_BLOCK_M),
-                _schedule.expected_bucket_tiles(
-                    num_pairs, num_slots, active_slots_hint, batched=True
-                ),
-            )
-            active_proj_tiles = (
-                min(
-                    _schedule.max_bucket_tiles(num_pairs, num_slots, schedule.block_m),
-                    _schedule.expected_bucket_tiles(
-                        num_pairs,
-                        num_slots,
-                        active_slots_hint,
-                        block_m=schedule.block_m,
-                        batched=True,
-                    ),
-                )
-                if schedule.use_subtile_splitk
-                else weight_buckets
-            )
-            split_k_up = _schedule.select_trellis_split_k(
-                num_sms,
-                active_proj_tiles,
-                triton.cdiv(up_gate_out, schedule.block_n),
-                up_blocks,
-                max(1, up_slot_bytes * weight_buckets),
-            )
-            split_k_down = _schedule.select_trellis_split_k(
-                num_sms,
-                active_proj_tiles,
-                triton.cdiv(hidden_size, schedule.block_n),
-                down_blocks,
-                max(1, down_slot_bytes * weight_buckets),
-            )
-        _routing_triton.run_a16_chunk(
-            active_chunk,
-            ids_chunk,
-            weights_chunk,
-            out_chunk,
-            num_slots=num_slots,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            up_gate_out=up_gate_out,
-            expert_to_slot=expert_to_slot,
-            target=resolved_target,
-            batched=batched,
-            accumulate=accumulate,
-            group_size=group_size,
-            activation_fn=activation_fn,
-            gate_first=gate_first,
-            split_k_up=split_k_up,
-            split_k_down=split_k_down,
-            up_row_scale=up_gate_scale,
-            down_row_scale=down_scale,
-            up_global_scale=None,
-            down_global_scale=None,
-            post_scale_only=True,
-            launch_proj=_launch_trellis_step,
         )
