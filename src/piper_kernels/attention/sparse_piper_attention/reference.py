@@ -10,7 +10,7 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage.reference import 
 from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS as _BLOCK_ROWS
 
 from ._contracts import valid_block_rows
-from ._routes import PackedRoutes
+from ._routing import PackedRoutes
 
 _RECURRENCE_ROWS = 128
 _P_UINT8_RANGE = 255.0

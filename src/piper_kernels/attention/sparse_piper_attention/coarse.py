@@ -137,12 +137,16 @@ def mean_pool_block_values(
         raise ValueError("coarse attention V must contain at least one sequence row")
 
     if block_lengths is not None:
+        # Preserve the standalone value-pooling range guard on eager calls;
+        # hot inference paths (sparse_piper_coarse_residual, SparsePiperAttention)
+        # use metadata-only validation per the validation contract.
         validate_block_lengths(
             block_lengths,
             sequence_length=sequence_length,
             device=value.device,
             context="coarse attention",
             require_contiguous=False,
+            check_values=True,
         )
     return _mean_pool_token_blocks(value, block_lengths)
 
@@ -296,8 +300,7 @@ def _coarse_residual_impl(
     block_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply the common Q/K/V-derived coarse residual implementation."""
-    from ._routing import score_chunks  # noqa: PLC0415
-    from ._summaries import _sequence_block_summaries_validated  # noqa: PLC0415
+    from ._routing import _sequence_block_summaries_validated, score_chunks  # noqa: PLC0415
 
     validate_routing_mode(routing_mode)
     resolved_blocks = validate_coarse_residual_inputs(

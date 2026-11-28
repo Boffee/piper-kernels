@@ -251,13 +251,14 @@ def test_fused_qk_compilation_is_reused_across_sequence_shapes(preparation, head
 
     single_cache_kernels = (
         preparation._quantize_query_with_summary_kernel,
-        preparation._quantize_key_with_summary_kernel,
         preparation._quantize_value_per_tile_kernel,
         qk_quantization.quantize_query_per_warp_kernel,
-        qk_quantization.quantize_key_tile_centered_per_block_kernel,
     )
-    summary_kernel = _summaries_triton._block_summary_kernel
-    for kernel in (*single_cache_kernels, summary_kernel):
+    dual_cache_kernels = (
+        qk_quantization.quantize_key_tile_centered_per_block_kernel,
+        _summaries_triton._block_summary_kernel,
+    )
+    for kernel in (*single_cache_kernels, *dual_cache_kernels):
         kernel.device_caches.clear()
     for batch, heads, rows, sparse_key_blocks, head_major in (
         (1, 4, 1024, 16, False),
@@ -307,7 +308,10 @@ def test_fused_qk_compilation_is_reused_across_sequence_shapes(preparation, head
         sum(len(cache[0]) for cache in kernel.device_caches.values()) == 1
         for kernel in single_cache_kernels
     )
-    assert sum(len(cache[0]) for cache in summary_kernel.device_caches.values()) == 2
+    assert all(
+        sum(len(cache[0]) for cache in kernel.device_caches.values()) == 2
+        for kernel in dual_cache_kernels
+    )
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])

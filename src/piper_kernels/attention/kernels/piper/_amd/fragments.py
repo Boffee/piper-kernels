@@ -47,6 +47,29 @@ _RESCALE_CONSTRAINTS = gl.constexpr(
 # amd_compiler_workarounds.USE_SCALAR_FMA. Kernels read it at compile time.
 _SCALAR_FMA: gl.constexpr = gl.constexpr(amd_compiler_workarounds.USE_SCALAR_FMA)
 
+# Launch attributes shared by RDNA4 dense and sparse Piper attention compiles.
+ATTENTION_LLVM_FN_ATTRS: tuple[tuple[str, str], ...] = (
+    ("target-features", "-cumode"),
+    *amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS,
+    *amd_compiler_workarounds.LDS_ONLY_FENCE_ATTRS,
+)
+
+
+def requires_64bit_query_offsets(
+    query_storage_sequence_length: int,
+    head_dim: int,
+) -> bool:
+    """Return whether packed Q uint64-word offsets exceed signed 32-bit range."""
+    return query_storage_sequence_length * (head_dim // 8) > (1 << 31)
+
+
+def requires_64bit_context_offsets(
+    storage_sequence_length: int,
+    head_dim: int,
+) -> bool:
+    """Return whether local K/V byte offsets exceed unsigned 32-bit range."""
+    return storage_sequence_length * head_dim > (1 << 32)
+
 
 @gluon.jit
 def scalar_fma(a, b, c):

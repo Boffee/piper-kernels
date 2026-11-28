@@ -7,7 +7,7 @@ from piper_kernels import SparsePiperAttention
 from piper_kernels.attention.sparse_piper_attention import _backend
 from piper_kernels.attention.sparse_piper_attention._budget import _ResolvedRouteLayout
 from piper_kernels.attention.sparse_piper_attention._contracts import validate_force_tiles
-from piper_kernels.attention.sparse_piper_attention._routes import (
+from piper_kernels.attention.sparse_piper_attention._routing import (
     PackedRouteAndCoarseBuilder,
     PackedRouteBuilder,
 )

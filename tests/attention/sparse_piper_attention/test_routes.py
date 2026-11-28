@@ -12,12 +12,12 @@ from piper_kernels.attention.sparse_piper_attention._budget import (
     _resolve_route_layout,
     _ResolvedRouteLayout,
 )
-from piper_kernels.attention.sparse_piper_attention._routes import (
-    PackedRouteBuilder,
-    _select_portable_routes,
-)
 from piper_kernels.attention.sparse_piper_attention._routes_triton import (
     build_force_tile_bitmask,
+)
+from piper_kernels.attention.sparse_piper_attention._routing import (
+    PackedRouteBuilder,
+    _select_portable_routes,
 )
 
 pytestmark = pytest.mark.gpu

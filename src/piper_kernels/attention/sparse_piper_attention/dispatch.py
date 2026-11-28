@@ -219,7 +219,6 @@ def _validate_inputs(
             device=query.device,
             context="sparse Piper attention",
             require_contiguous=True,
-            check_values=False,
         )
     _validate_sparse_key_blocks(
         sparse_key_blocks,

@@ -33,8 +33,6 @@ from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
 from piper_kernels.attention.sparse_piper_attention._routing import (
     packed_routes_from_sequences,
     routing_scores,
-)
-from piper_kernels.attention.sparse_piper_attention._summaries import (
     sequence_block_summaries,
 )
 from piper_kernels.attention.sparse_piper_attention.coarse import (
