@@ -5,7 +5,7 @@ from functools import partial
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import SUPPORTED_HEAD_DIMS, ValueFormat
 
 from ._contracts import (
@@ -27,7 +27,7 @@ _RDNA4_MINMAX_LARGE_QUERY_THRESHOLD = 128
 
 def supports_amd_target(target: AcceleratorTarget) -> bool:
     """Return whether target runs the wave32 RDNA4 sparse-attention kernels."""
-    return target.is_amd_hip and target.is_architecture("gfx1200", "gfx1201")
+    return target.is_hip_architecture(*GFX120X_ARCHITECTURES)
 
 
 def select_amd_minmax_score_schedule(query_blocks: int) -> MinmaxScoreSchedule:

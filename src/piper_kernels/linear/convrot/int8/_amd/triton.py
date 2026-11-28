@@ -22,7 +22,7 @@ from piper_kernels._residual import ResidualAdd
 from piper_kernels._residual.triton import add_residual
 from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
-from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarget
 from piper_kernels.weights.convrot import triton as convrot_backend
 from piper_kernels.weights.convrot.int8.triton import (
     _quantize_int8,
@@ -398,7 +398,7 @@ def _amd_matmul_compiler_options(
     ``_triton.amd_compiler_workarounds`` so LDS barriers omit redundant
     ``global_inv`` fences while keeping ``iterative-ilp`` scheduling.
     """
-    if not target.is_architecture("gfx1200", "gfx1201"):
+    if not target.is_hip_architecture(*GFX120X_ARCHITECTURES):
         return {}
     # llvm_fn_attrs was added to Triton's HIP options after the initial gfx12
     # backend. Older compatible releases retain the portable schedule.

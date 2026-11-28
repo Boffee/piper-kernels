@@ -106,6 +106,15 @@ def test_rocm_preserves_normalized_architecture_without_nvidia_features(
     assert target == AcceleratorTarget(backend="hip", architecture="gfx1201")
     assert target.is_amd_hip
     assert target.is_architecture("gfx1200", "gfx1201")
+    assert target.is_hip_architecture("gfx1200", "gfx1201")
+    assert target.is_hip_architecture("gfx1201")
+    assert not target.is_hip_architecture("gfx1200")
+    assert not AcceleratorTarget(backend="hip", architecture="gfx1250").is_hip_architecture(
+        "gfx1200", "gfx1201"
+    )
+    assert not AcceleratorTarget(backend="cuda", architecture="gfx1201").is_hip_architecture(
+        "gfx1200", "gfx1201"
+    )
     assert not target.is_nvidia_cuda
     assert target.cuda_capability is None
     assert not target.supports_uint8_int8_mma

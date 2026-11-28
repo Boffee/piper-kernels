@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import torch
 
 from piper_kernels._triton.targets import (
+    GFX120X_ARCHITECTURES,
     RDNA4_MIN_FULL_GRID_TILES,
     AcceleratorTarget,
     rdna4_int8_accumulator_seed,
@@ -71,10 +72,8 @@ class AmdExecutionPlan(LinearExecutionPlan):
 
 def supports_target(target: AcceleratorTarget) -> bool:
     """Select HIP architectures covered by the AMD compile tests on Linux and Windows."""
-    return (
-        sys.platform in ("linux", "win32")
-        and target.is_amd_hip
-        and target.is_architecture(*_SUPPORTED_ARCHITECTURES)
+    return sys.platform in ("linux", "win32") and target.is_hip_architecture(
+        *_SUPPORTED_ARCHITECTURES
     )
 
 
@@ -128,7 +127,7 @@ def _supports_rdna4_128m_fast_path(
 ) -> bool:
     """Check shared gfx1201 128-row schedule and signed-INT32 SRD byte bounds."""
     if not (
-        target.is_architecture("gfx1201")
+        target.is_hip_architecture("gfx1201")
         and plan.matmul_block_m == 128
         and plan.matmul_num_warps == 8
         and plan.matmul_num_stages == 2
@@ -247,7 +246,7 @@ def select_execution_plan(
     if in_features <= 0:
         raise ValueError("ConvRot preparation row width must be positive")
     block_size = max(128, 1 << (in_features - 1).bit_length())
-    rdna4 = target.is_architecture("gfx1200", "gfx1201")
+    rdna4 = target.is_hip_architecture(*GFX120X_ARCHITECTURES)
     fused_num_warps = 4
     if rdna4:
         if in_features & (in_features - 1):
@@ -263,7 +262,7 @@ def select_execution_plan(
     # Keep the existing tile for underfilled grids: below two workgroups per
     # WGP, the final wave can dominate the benefit of wider loads.
     wide_k = (
-        target.is_architecture("gfx1201")
+        target.is_hip_architecture("gfx1201")
         and in_features % 8192 == 0
         and rows is not None
         and out_features is not None
@@ -280,7 +279,7 @@ def select_execution_plan(
     # paired with Split-K when N is narrow), while 17..32 and 33..64 rows use
     # 128-column blocks. Above 64 rows, keep 128-row plans so paired and
     # fused-residual fast paths apply uniformly.
-    if target.is_architecture("gfx1201") and rows is not None and out_features is not None:
+    if target.is_hip_architecture("gfx1201") and rows is not None and out_features is not None:
         if 1 <= rows <= 16:
             block_m, block_n, block_k, matmul_warps = 16, 64, 256, 4
         elif 17 <= rows <= 32:
@@ -307,16 +306,20 @@ _TRELLIS_RDNA4_LARGE_SCRATCH_MIN_IN_FEATURES = 8192
 
 def trellis_gemv_max_rows(target: AcceleratorTarget) -> int:
     """Return the small-batch continuous Trellis A16 row cutoff for AMD targets."""
-    return _TRELLIS_RDNA4_GEMV_MAX_ROWS if target.is_rdna4 else TRELLIS_DEFAULT_GEMV_MAX_ROWS
+    return (
+        _TRELLIS_RDNA4_GEMV_MAX_ROWS
+        if target.is_hip_architecture(*GFX120X_ARCHITECTURES)
+        else TRELLIS_DEFAULT_GEMV_MAX_ROWS
+    )
 
 
 def trellis_w8a8_scratch_budget(target: AcceleratorTarget, rows: int, in_features: int) -> int:
     """Return bounded Trellis W8A8 INT8 scratch decode budget matching Infinity Cache size."""
-    if not target.is_rdna4:
+    if not target.is_hip_architecture(*GFX120X_ARCHITECTURES):
         return default_trellis_w8a8_scratch_budget(rows)
     # gfx1201 carries 64 MB Infinity Cache (use 64 MiB for wide-K prefill); gfx1200 has 32 MB.
     use_large = (
-        target.is_architecture("gfx1201")
+        target.is_hip_architecture("gfx1201")
         and rows >= _TRELLIS_RDNA4_LARGE_SCRATCH_MIN_ROWS
         and in_features > _TRELLIS_RDNA4_LARGE_SCRATCH_MIN_IN_FEATURES
     )
@@ -336,7 +339,7 @@ def select_trellis_schedule(
     weight_bytes: int,
 ) -> TrellisLinearSchedule:
     """Resolve AMD Trellis A16 GEMV schedule (scoping RDNA4 tuning strictly to RDNA4)."""
-    if not target.is_rdna4:
+    if not target.is_hip_architecture(*GFX120X_ARCHITECTURES):
         return select_default_trellis_schedule(
             num_sms, rows, out_features, blocks_per_row, weight_bytes, use_dp4a=False
         )

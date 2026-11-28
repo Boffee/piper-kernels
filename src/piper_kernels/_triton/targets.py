@@ -5,7 +5,8 @@ from dataclasses import dataclass
 
 import torch
 
-_AMD_W4A16_ARCHITECTURES = ("gfx942", "gfx1100", "gfx1151", "gfx1200", "gfx1201")
+GFX120X_ARCHITECTURES = ("gfx1200", "gfx1201")
+_AMD_W4A16_ARCHITECTURES = ("gfx942", "gfx1100", "gfx1151", *GFX120X_ARCHITECTURES)
 
 RDNA4_INT8_ACCUMULATOR_SEED = 0x155555
 RDNA4_INT8_ACCUMULATOR_SEED_MIN_REDUCTION = 4096
@@ -74,16 +75,15 @@ class AcceleratorTarget:
         """Return whether this target uses AMD's HIP backend."""
         return self.backend == "hip"
 
-    @property
-    def is_rdna4(self) -> bool:
-        """Return whether this target is an AMD RDNA4 (``gfx1200``/``gfx1201``) GPU."""
-        return self.is_amd_hip and self.is_architecture("gfx1200", "gfx1201")
-
     def is_architecture(self, *architectures: str) -> bool:
         """Match one of the exact canonical architecture names."""
         return self.architecture is not None and self.architecture in (
             _normalize_architecture(architecture) for architecture in architectures
         )
+
+    def is_hip_architecture(self, *architectures: str) -> bool:
+        """Match one of the exact canonical AMD HIP architecture names."""
+        return self.is_amd_hip and self.is_architecture(*architectures)
 
     @property
     def cuda_capability(self) -> tuple[int, int] | None:
@@ -126,8 +126,7 @@ class AcceleratorTarget:
         """Return whether NVFP4 W4A16 execution is supported on this target."""
         return (self.is_nvidia_cuda and self.cuda_capability_at_least(7, 5)) or (
             sys.platform in ("linux", "win32")
-            and self.is_amd_hip
-            and self.is_architecture(*_AMD_W4A16_ARCHITECTURES)
+            and self.is_hip_architecture(*_AMD_W4A16_ARCHITECTURES)
         )
 
 
@@ -144,7 +143,7 @@ def rdna4_int8_accumulator_seed(
     """
     seed = RDNA4_INT8_ACCUMULATOR_SEED
     if (
-        target.is_architecture("gfx1201")
+        target.is_hip_architecture("gfx1201")
         and output_tiles >= RDNA4_MIN_FULL_GRID_TILES
         and RDNA4_INT8_ACCUMULATOR_SEED_MIN_REDUCTION
         <= reduction_width

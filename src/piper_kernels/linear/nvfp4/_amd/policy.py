@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarget
 
 from .._w4a16_schedule import (
     W4A16_DOT_BLOCK_K,
@@ -244,7 +244,7 @@ def select_w4a16_schedule(
     input_features: int,
 ) -> W4A16Schedule:
     """Resolve the AMD ROCm W4A16 schedule for ``target``."""
-    if target.is_architecture("gfx1200", "gfx1201"):
+    if target.is_hip_architecture(*GFX120X_ARCHITECTURES):
         return _rdna4_w4a16_schedule(num_sms, rows, input_dtype, out_features, input_features)
     return default_w4a16_schedule(
         num_sms,
