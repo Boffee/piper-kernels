@@ -38,11 +38,10 @@ from piper_kernels.attention.scheduling import (
 )
 
 from .._decode_schedule import (
-    CENTER_CHUNK,
-    FAST_MAX_DECODE_SPLITS,
     DecodeSchedule,
     default_decode_schedule,
 )
+from .._validation import WindowMode, resolve_window_mode
 
 ATTENTION_KERNELS = ("triton", "gluon_async_copy")
 
@@ -155,10 +154,10 @@ def _generic_execution_plan(
     *,
     head_dim: int,
     is_causal: bool = False,
-    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    window_mode: WindowMode | None = None,
 ) -> PiperAttentionExecutionPlan:
     """Build capability-based defaults before exact-target tuning is applied."""
-    resolved_mode = ("causal" if is_causal else "none") if window_mode is None else window_mode
+    resolved_mode = resolve_window_mode(is_causal, window_mode)
     grouped_qk = groups_qk_scales(target)
     unbounded = resolved_mode == "none"
     split_pv_head_dim = target.is_cuda_capability(12) and unbounded and head_dim == 128
@@ -256,17 +255,14 @@ def _sm120_execution_plan(
 
 
 def _sm120_decode_schedule() -> DecodeSchedule:
+    # SM12x uses DecodeSchedule only for direct live-tail Split-KV decode; finalized pool
+    # slots always execute the native INT8-Q/UINT8-P chunked prefill kernel.
     return DecodeSchedule(
         block_n=64,
         num_warps=4,
         num_stages=2,
-        loop_num_stages=2,
-        frozen_qk_mode="tf32x2",
         tail_qk_precision="tf32x3",
         pv_precision="tf32",
-        max_splits=FAST_MAX_DECODE_SPLITS,
-        target_ctas_per_sm=3,
-        tiles_per_chunk_cap=CENTER_CHUNK // 64,
         max_tail_splits=4,
     )
 
@@ -340,15 +336,13 @@ def select_execution_plan(
     query_length: int,
     key_length: int | None = None,
     quantized_query: bool = False,
-    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    window_mode: WindowMode | None = None,
 ) -> PiperAttentionExecutionPlan:
     """Combine capability defaults with measured policy; omitted K length means self-attention.
 
     ``quantized_query`` selects a plan for Q that a producer already quantized.
     """
-    resolved_mode: Literal["none", "causal", "windowed"] = (
-        ("causal" if is_causal else "none") if window_mode is None else window_mode
-    )
+    resolved_mode = resolve_window_mode(is_causal, window_mode)
     if target.is_cuda_capability(8, 9):
         return _sm89_execution_plan(
             head_dim=head_dim, window_mode=resolved_mode, quantized_query=quantized_query

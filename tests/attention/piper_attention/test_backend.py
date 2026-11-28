@@ -70,6 +70,19 @@ def test_prefill_backend_target_gating(
     assert _backend.prefill_backend(AcceleratorTarget(backend, architecture)) == expected
 
 
+def test_validate_prefill_backend_checks_layout_compatibility() -> None:
+    _backend.validate_prefill_backend("nvidia", grouped_qk=True, pack_wmma=False)
+    _backend.validate_prefill_backend("nvidia", grouped_qk=False, pack_wmma=False)
+    _backend.validate_prefill_backend("amd", grouped_qk=True, pack_wmma=True)
+
+    with pytest.raises(ValueError, match="prefill_backend"):
+        _backend.validate_prefill_backend("bogus", grouped_qk=True, pack_wmma=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="pack_wmma"):
+        _backend.validate_prefill_backend("amd", grouped_qk=True, pack_wmma=False)
+    with pytest.raises(ValueError, match="grouped_qk"):
+        _backend.validate_prefill_backend("amd", grouped_qk=False, pack_wmma=True)
+
+
 def test_fake_execution_does_not_select_or_launch_backend(monkeypatch):
     assert piper_attention is not None
     forbid_device_probes(monkeypatch, "fake execution must not inspect hardware")

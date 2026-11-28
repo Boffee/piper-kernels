@@ -142,20 +142,20 @@ def merge_attention_lse(  # noqa: PLR0915
         if is_compiling:
             outputs = [torch.resolve_neg(torch.resolve_conj(t)) for t in outputs]
             lses = [torch.resolve_neg(torch.resolve_conj(t)) for t in lses]
-        kv_prefill = None
+        lse_merge = None
         if is_compiling or runtime.supports_device(ref_device):
             try:
-                from . import _kv_prefill as kv_prefill_mod  # noqa: PLC0415
+                from . import _lse_merge as lse_merge_mod  # noqa: PLC0415
 
-                kv_prefill = kv_prefill_mod
+                lse_merge = lse_merge_mod
             except ModuleNotFoundError as error:
                 if error.name != "triton":
                     raise
         head_dim = ref_shape[-1]
         if (
-            kv_prefill is not None
+            lse_merge is not None
             and head_dim > 0
-            and kv_prefill.can_launch_merge_attention_lse(outputs, lses)
+            and lse_merge.can_launch_merge_attention_lse(outputs, lses)
         ):
             total_rows = 1
             for dim in ref_shape[:-1]:
@@ -165,19 +165,19 @@ def merge_attention_lse(  # noqa: PLR0915
             if total_rows == 0:
                 return merged_out, merged_lse
             if len(outputs) <= 8:
-                kv_prefill.launch_merge_attention_lse_chunk(outputs, lses, merged_out, merged_lse)
+                lse_merge.launch_merge_attention_lse_chunk(outputs, lses, merged_out, merged_lse)
                 return merged_out, merged_lse
             remaining_out = list(outputs)
             remaining_lse = list(lses)
             while len(remaining_out) > 8:
                 acc_out = torch.empty(ref_shape, device=ref_device, dtype=torch.float32)
                 acc_lse = torch.empty(ref_shape[:-1], device=ref_device, dtype=torch.float32)
-                kv_prefill.launch_merge_attention_lse_chunk(
+                lse_merge.launch_merge_attention_lse_chunk(
                     remaining_out[:7], remaining_lse[:7], acc_out, acc_lse
                 )
                 remaining_out = [acc_out, *remaining_out[7:]]
                 remaining_lse = [acc_lse, *remaining_lse[7:]]
-            kv_prefill.launch_merge_attention_lse_chunk(
+            lse_merge.launch_merge_attention_lse_chunk(
                 remaining_out, remaining_lse, merged_out, merged_lse
             )
             return merged_out, merged_lse

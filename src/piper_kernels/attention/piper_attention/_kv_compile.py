@@ -1,9 +1,9 @@
-"""Offline Triton compilation harnesses for Piper KV decode and chunked prefill."""
+"""Offline Triton/Gluon compile harnesses for Piper KV freeze, decode, prefill, and LSE merge."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Literal
+from collections.abc import Callable, Mapping
+from typing import Any, Protocol
 
 import torch
 import triton
@@ -13,16 +13,482 @@ from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarg
 
 from . import _backend, _quantization
 from ._decode_schedule import BLOCK_QH, REDUCE_NUM_WARPS
-from ._kv_prefill import (
-    _MAX_MERGE_WAVES,
-    _MERGE_STRIDE_FIELDS,
+from ._lse_merge import (
+    MAX_MERGE_WAVES,
+    MERGE_STRIDE_FIELDS,
     _merge_two_attention_waves_kernel,
+)
+from ._nvidia import policy as _nvidia_policy
+from ._validation import WindowMode, resolve_window_mode
+from .triton import (
+    _piper_decode_frozen_split_kernel,
     _piper_decode_splitkv_reduce_kernel,
     _piper_decode_tail_split_kernel,
     select_decode_schedule,
 )
-from ._quantization import _div16_attrs
-from .triton import _piper_decode_frozen_split_kernel
+
+POOL_SLOT_STRIDE_NAMES: tuple[str, ...] = (
+    "stride_ki_s",
+    "stride_ks_s",
+    "stride_kc_s",
+    "stride_vi_s",
+    "stride_vs_s",
+    "stride_vm_s",
+)
+
+_KEY_DIV16_BASE = frozenset(
+    {
+        "output_ptr",
+        "scale_ptr",
+        "center_ptr",
+        "stride_ob",
+        "stride_oh",
+        "stride_on",
+        "stride_ch",
+    }
+)
+_VALUE_DIV16_BASE = frozenset(
+    {
+        "output_ptr",
+        "scale_multiplier_ptr",
+        "log_scale_ptr",
+        "value_mean_ptr",
+        "stride_ob",
+        "stride_oh",
+        "stride_mh",
+        "stride_ch",
+    }
+)
+
+
+def _div16_attrs(
+    arg_names: list[str], div16_names: frozenset[str]
+) -> dict[tuple[int, ...], list[list[object]]]:
+    return {
+        (idx,): [["tt.divisibility", 16]]
+        for idx, name in enumerate(arg_names)
+        if name in div16_names
+    }
+
+
+def compile_pointer_attrs(
+    arg_names: list[str],
+    signature: dict[str, str],
+    *,
+    div16_names: frozenset[str] = frozenset(),
+    all_strides_div16: bool = False,
+    pointer_range_32: bool = True,
+) -> dict[tuple[int, ...], list[list[object]]]:
+    """Attach live pointer divisibility/range attrs and selected stride attrs."""
+    ptr_attrs: list[list[object]] = [["tt.divisibility", 16]]
+    if pointer_range_32:
+        ptr_attrs.append(["tt.pointer_range", 32])
+    attrs: dict[tuple[int, ...], list[list[object]]] = {}
+    for idx, name in enumerate(arg_names):
+        ty = signature.get(name)
+        if isinstance(ty, str) and ty.startswith("*"):
+            attrs[(idx,)] = list(ptr_attrs)
+        elif ty is not None and (
+            name in div16_names or (all_strides_div16 and name.startswith("stride_"))
+        ):
+            attrs[(idx,)] = [["tt.divisibility", 16]]
+    return attrs
+
+
+def validate_kv_compile_args(dtype: torch.dtype, head_dim: int) -> str:
+    """Validate offline KV compile dtype/head_dim and return the Triton pointer dtype stem."""
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"dtype must be float16 or bfloat16, got {dtype}")
+    if head_dim not in (64, 128):
+        raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
+    return "bf16" if dtype is torch.bfloat16 else "fp16"
+
+
+class _JitKernel(Protocol):
+    arg_names: list[str]
+
+
+def build_kernel_source(
+    kernel: _JitKernel,
+    *,
+    constants: dict[str, object],
+    overrides: dict[str, str],
+    attrs: Mapping[tuple[int, ...], object] | None = None,
+    gluon: bool = False,
+    div16_names: frozenset[str] = frozenset(),
+    all_strides_div16: bool = False,
+    pointer_range_32: bool = True,
+) -> object:
+    """Construct a Triton ASTSource or GluonASTSource with i32 defaults and pointer attrs."""
+    arg_names: list[str] = list(kernel.arg_names)
+    sig: dict[str, str] = {name: "i32" for name in arg_names if name not in constants}
+    sig.update(overrides)
+    resolved_attrs: Any = (
+        compile_pointer_attrs(
+            arg_names,
+            sig,
+            div16_names=div16_names,
+            all_strides_div16=all_strides_div16,
+            pointer_range_32=pointer_range_32,
+        )
+        if attrs is None
+        else attrs
+    )
+    jit_fn: Any = kernel
+    if gluon:
+        from triton.experimental.gluon._runtime import GluonASTSource  # noqa: PLC0415
+
+        return GluonASTSource(jit_fn, sig, constexprs=constants, attrs=resolved_attrs)
+    from triton.compiler import ASTSource  # noqa: PLC0415
+
+    return ASTSource(jit_fn, sig, constexprs=constants, attrs=resolved_attrs)
+
+
+def _frozen_pool_prefill_overrides(
+    triton_dtype: str,
+    constants: dict[str, object],
+    *,
+    wide_pool: bool,
+    has_chunk_splits: bool,
+    has_tail: bool,
+) -> dict[str, str]:
+    """Build shared pointer and scalar overrides for NVIDIA and AMD frozen-pool prefill kernels."""
+    overrides: dict[str, str] = {
+        "query_ptr": "*i8",
+        "query_scale_ptr": "*fp32",
+        "key_int8_ptr": "*i8",
+        "key_scale_ptr": "*fp32",
+        "key_center_ptr": "*fp32",
+        "value_int8_ptr": "*i8",
+        "value_scale_ptr": "*fp32",
+        "value_mean_ptr": "*fp32",
+        "chunk_to_slot_ptr": "*i32",
+        "num_chunks_ptr": "*i32",
+        "output_ptr": "*fp32" if has_chunk_splits else f"*{triton_dtype}",
+        "lse_ptr": "*fp32",
+        "partial_bias_ptr": "*fp32",
+        "partial_log_denom_ptr": "*fp32",
+        "window_left": "i64",
+        "window_right": "i64",
+        "logical_seq_q": "i32",
+    }
+    if wide_pool:
+        overrides.update(dict.fromkeys(POOL_SLOT_STRIDE_NAMES, "i64"))
+    if has_tail:
+        overrides["tail_len_ptr"] = "*i32"
+    else:
+        constants["tail_len_ptr"] = None
+        overrides["tail_len_ptr"] = "constexpr"
+    return overrides
+
+
+def _compile_quantize_pair(
+    target: object,
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+    scatter_slots: bool,
+    has_key_lengths: bool,
+    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
+) -> tuple[object, object]:
+    triton_dtype = validate_kv_compile_args(dtype, head_dim)
+    accel = AcceleratorTarget.from_compiler_target(target)
+    _, grouped_qk, pack_wmma = _backend.kv_chunk_layout(accel)
+
+    key_kernel = _quantization._quantize_key_k1024_kernel
+    value_kernel = _quantization._quantize_value_k1024_kernel
+
+    key_source = build_kernel_source(
+        key_kernel,
+        constants={
+            "grouped_qk": grouped_qk,
+            "scatter_slots": scatter_slots,
+            "head_dim": head_dim,
+            "has_key_lengths": has_key_lengths,
+        },
+        overrides={
+            "key_ptr": f"*{triton_dtype}",
+            "output_ptr": "*i8",
+            "scale_ptr": "*fp32",
+            "center_ptr": "*fp32",
+            "slot_ids_ptr": "*i32",
+        },
+        attrs=(
+            _div16_attrs(key_kernel.arg_names, _KEY_DIV16_BASE | {"stride_sh"})
+            if scatter_slots
+            else None
+        ),
+        div16_names=_KEY_DIV16_BASE | {"stride_cb", "stride_kb", "stride_kh", "stride_kn"},
+    )
+
+    store_log_scale = pack_wmma and not scatter_slots
+    scale_by_p_range = pack_wmma and not scatter_slots
+    use_tile_layout = True
+    value_source = build_kernel_source(
+        value_kernel,
+        constants={
+            "stride_ok": 1,
+            "store_log_scale": store_log_scale,
+            "scale_by_p_range": scale_by_p_range,
+            "pack_wmma": pack_wmma,
+            "tile_layout": use_tile_layout,
+            "scatter_slots": scatter_slots,
+            "head_dim": head_dim,
+            "has_key_lengths": has_key_lengths,
+        },
+        overrides={
+            "value_ptr": f"*{triton_dtype}",
+            "output_ptr": "*i8",
+            "scale_multiplier_ptr": "*fp32",
+            "log_scale_ptr": "*fp32",
+            "value_mean_ptr": "*fp32",
+            "slot_ids_ptr": "*i32",
+        },
+        attrs=(_div16_attrs(value_kernel.arg_names, _VALUE_DIV16_BASE) if scatter_slots else None),
+        div16_names=_VALUE_DIV16_BASE
+        | {"stride_mb", "stride_cb", "stride_vb", "stride_vh", "stride_vn"},
+    )
+
+    value_options: dict[str, object] = {
+        "num_warps": _quantization._value_quantize_num_warps(
+            head_dim,
+            tile_layout=use_tile_layout,
+            pack_wmma=pack_wmma,
+            has_key_lengths=has_key_lengths,
+        )
+    }
+    compiler = triton.compile if compile_fn is None else compile_fn
+    return (
+        compiler(key_source, target, {"num_warps": 4}),
+        compiler(value_source, target, value_options),
+    )
+
+
+def compile_kv_freeze_kernels(
+    target: object,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 128,
+    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
+) -> tuple[object, object]:
+    """Offline-compile K1024 and V1024 slot-scatter freeze kernels for ``target``."""
+    return _compile_quantize_pair(
+        target,
+        dtype=dtype,
+        head_dim=head_dim,
+        scatter_slots=True,
+        has_key_lengths=False,
+        compile_fn=compile_fn,
+    )
+
+
+def compile_kv_tail_quantize_kernels(
+    target: object,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 128,
+    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
+) -> tuple[object, object]:
+    """Offline-compile K1024 and V1024 ragged tail quantization kernels for ``target``."""
+    return _compile_quantize_pair(
+        target,
+        dtype=dtype,
+        head_dim=head_dim,
+        scatter_slots=False,
+        has_key_lengths=True,
+        compile_fn=compile_fn,
+    )
+
+
+def compile_nvidia_prefill_kernels(  # noqa: PLR0913
+    target: object,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 128,
+    has_chunk_map: bool = True,
+    is_causal: bool = True,
+    wide_pool: bool = False,
+    has_chunk_splits: bool = False,
+    per_row_query_scale: bool = False,
+    window_mode: WindowMode | None = None,
+    has_tail: bool = False,
+    include_tail: bool = True,
+    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
+) -> tuple[object, ...]:
+    """Offline-compile unified NVIDIA frozen-pool and offset-window tail prefill kernels."""
+    from ._nvidia import prefill as nvidia_prefill  # noqa: PLC0415
+
+    accel = AcceleratorTarget.from_compiler_target(target)
+    triton_dtype = validate_kv_compile_args(dtype, head_dim)
+    grouped_qk = _nvidia_policy.groups_qk_scales(accel)
+    compiler = triton.compile if compile_fn is None else compile_fn
+    frozen_mode: WindowMode = "none" if window_mode is None else window_mode
+    tail_mode = resolve_window_mode(is_causal, window_mode)
+
+    def _compile_variant(
+        *,
+        tail_mode_flag: bool,
+        variant_window_mode: WindowMode,
+        chunk_map: bool,
+        chunk_splits: bool,
+        per_row: bool,
+        with_tail: bool,
+    ) -> object:
+        block_m, num_warps, split_pv, num_stages, loop_num_stages = (
+            _nvidia_policy.select_prefill_config(
+                accel,
+                head_dim=head_dim,
+                is_tail=tail_mode_flag,
+                has_chunk_map=chunk_map,
+                has_chunk_splits=chunk_splits,
+                window_mode=variant_window_mode,
+            )
+        )
+        constants: dict[str, object] = {
+            "query_heads_per_kv_head": 3,
+            "head_dim": head_dim,
+            "grouped_qk": grouped_qk,
+            "split_pv_head_dim": split_pv,
+            "has_chunk_map": chunk_map,
+            "is_tail": tail_mode_flag,
+            "window_mode": variant_window_mode,
+            "block_m": block_m,
+            "loop_num_stages": loop_num_stages,
+            "has_chunk_splits": chunk_splits,
+            "per_row_query_scale": per_row,
+            "has_tail": with_tail,
+        }
+        wide = wide_pool and not tail_mode_flag
+        overrides = _frozen_pool_prefill_overrides(
+            triton_dtype,
+            constants,
+            wide_pool=wide,
+            has_chunk_splits=chunk_splits,
+            has_tail=with_tail,
+        )
+        source = build_kernel_source(
+            nvidia_prefill._piper_chunked_prefill_kernel,
+            constants=constants,
+            overrides=overrides,
+            pointer_range_32=not wide,
+        )
+        return compiler(source, target, {"num_warps": num_warps, "num_stages": num_stages})
+
+    frozen_compiled = _compile_variant(
+        tail_mode_flag=False,
+        variant_window_mode=frozen_mode,
+        chunk_map=has_chunk_map,
+        chunk_splits=has_chunk_splits,
+        per_row=per_row_query_scale,
+        with_tail=has_tail,
+    )
+    if not include_tail:
+        return (frozen_compiled,)
+    tail_compiled = _compile_variant(
+        tail_mode_flag=True,
+        variant_window_mode=tail_mode,
+        chunk_map=False,
+        chunk_splits=False,
+        per_row=False,
+        with_tail=False,
+    )
+    return (frozen_compiled, tail_compiled)
+
+
+def compile_amd_prefill_kernels(  # noqa: PLR0913
+    target: object,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 128,
+    has_chunk_map: bool = True,
+    is_causal: bool = True,
+    wide_pool: bool = False,
+    has_chunk_splits: bool = False,
+    per_row_query_scale: bool = False,
+    window_mode: WindowMode | None = None,
+    has_tail: bool = False,
+    include_tail: bool = True,
+    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
+) -> tuple[object, ...]:
+    """Offline-compile RDNA4 frozen-pool and optional offset-window tail prefill kernels."""
+    from ._amd import gluon as amd_gluon  # noqa: PLC0415
+
+    triton_dtype = validate_kv_compile_args(dtype, head_dim)
+    options: dict[str, object] = {
+        "num_warps": 4,
+        "num_stages": 1,
+        "llvm_fn_attrs": amd_gluon._LLVM_FN_ATTRS,
+    }
+    compiler = triton.compile if compile_fn is None else compile_fn
+    frozen_mode: WindowMode = "none" if window_mode is None else window_mode
+    tail_mode = resolve_window_mode(is_causal, window_mode)
+
+    frozen_constants: dict[str, object] = {
+        "query_heads_per_kv_head": 3,
+        "head_dim": head_dim,
+        "has_chunk_map": has_chunk_map,
+        "wide_query_offsets": False,
+        "has_chunk_splits": has_chunk_splits,
+        "per_row_query_scale": per_row_query_scale,
+        "has_tail": has_tail,
+        "window_mode": frozen_mode,
+    }
+    frozen_overrides = _frozen_pool_prefill_overrides(
+        triton_dtype,
+        frozen_constants,
+        wide_pool=wide_pool,
+        has_chunk_splits=has_chunk_splits,
+        has_tail=has_tail,
+    )
+    frozen_source = build_kernel_source(
+        amd_gluon._frozen_pool_piper_kernel,
+        constants=frozen_constants,
+        overrides=frozen_overrides,
+        gluon=True,
+        pointer_range_32=not wide_pool,
+    )
+
+    frozen_compiled = compiler(frozen_source, target, options)
+    if not include_tail:
+        return (frozen_compiled,)
+
+    tail_overrides: dict[str, str] = dict.fromkeys(
+        (
+            "query_scale_ptr",
+            "key_scale_ptr",
+            "key_center_ptr",
+            "multiplier_ptr",
+            "log_scale_ptr",
+            "value_mean_ptr",
+            "lse_ptr",
+        ),
+        "*fp32",
+    )
+    tail_overrides.update(
+        query_ptr="*i8",
+        key_ptr="*i8",
+        value_ptr="*i8",
+        key_lengths_ptr="*i32",
+        output_ptr=f"*{triton_dtype}",
+        window_left="i64",
+        window_right="i64",
+    )
+    tail_source = build_kernel_source(
+        amd_gluon._dense_piper_kernel,
+        constants={
+            "query_heads_per_kv_head": 3,
+            "head_dim": head_dim,
+            "window_mode": tail_mode,
+            "wide_query_offsets": False,
+            "wide_context_offsets": False,
+            "store_lse": True,
+            "has_key_lengths": True,
+            "offset_causal_from_key_length": tail_mode != "none",
+        },
+        overrides=tail_overrides,
+        gluon=True,
+    )
+    return (frozen_compiled, compiler(tail_source, target, options))
 
 
 def compile_kv_decode_kernels(  # noqa: PLR0913
@@ -35,21 +501,17 @@ def compile_kv_decode_kernels(  # noqa: PLR0913
     contiguous_inputs: bool = True,
     wide_pool: bool = False,
     reduce_vectorize_splits: bool = False,
-    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    window_mode: WindowMode | None = None,
     has_tail: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, object, object]:
     """Compile frozen-split, tail-split, and reduce decode kernels offline."""
-    triton_dtype = _quantization.validate_kv_compile_args(dtype, head_dim)
+    triton_dtype = validate_kv_compile_args(dtype, head_dim)
     accel = AcceleratorTarget.from_compiler_target(target)
     backend = _backend.prefill_backend(accel)
     schedule = select_decode_schedule(accel, head_dim)
-    frozen_mode: Literal["none", "causal", "windowed"] = (
-        "none" if window_mode is None else window_mode
-    )
-    tail_mode: Literal["none", "causal", "windowed"] = (
-        ("causal" if is_causal else "none") if window_mode is None else window_mode
-    )
+    frozen_mode: WindowMode = "none" if window_mode is None else window_mode
+    tail_mode = resolve_window_mode(is_causal, window_mode)
 
     compiler = triton.compile if compile_fn is None else compile_fn
     split_options: dict[str, object] = {
@@ -58,9 +520,7 @@ def compile_kv_decode_kernels(  # noqa: PLR0913
         **dict(schedule.compiler_options),
     }
     if backend == "amd":
-        from ._amd import gluon as amd_gluon  # noqa: PLC0415
-
-        frozen_compiled = amd_gluon.compile_amd_prefill_kernels(
+        frozen_compiled = compile_amd_prefill_kernels(
             target,
             dtype=dtype,
             head_dim=head_dim,
@@ -75,9 +535,7 @@ def compile_kv_decode_kernels(  # noqa: PLR0913
             compile_fn=compile_fn,
         )[0]
     elif backend == "nvidia":
-        from ._nvidia import prefill as nvidia_prefill  # noqa: PLC0415
-
-        frozen_compiled = nvidia_prefill.compile_nvidia_prefill_kernels(
+        frozen_compiled = compile_nvidia_prefill_kernels(
             target,
             dtype=dtype,
             head_dim=head_dim,
@@ -119,12 +577,7 @@ def compile_kv_decode_kernels(  # noqa: PLR0913
             "head_dim": head_dim,
             "block_qh": BLOCK_QH,
             "block_n": schedule.block_n,
-            "qk_mode": schedule.frozen_qk_mode,
             "pv_precision": schedule.pv_precision,
-            # Free a pipeline buffer stage when windowed D=128 spills at loop=2.
-            "loop_num_stages": (
-                1 if (frozen_mode == "windowed" and head_dim == 128) else schedule.loop_num_stages
-            ),
             "has_tail": has_tail,
             "window_mode": frozen_mode,
         }
@@ -134,7 +587,7 @@ def compile_kv_decode_kernels(  # noqa: PLR0913
             frozen_constants["tail_len_ptr"] = None
             frozen_overrides["tail_len_ptr"] = "constexpr"
         if wide_pool:
-            frozen_overrides.update(dict.fromkeys(_quantization.POOL_SLOT_STRIDE_NAMES, "i64"))
+            frozen_overrides.update(dict.fromkeys(POOL_SLOT_STRIDE_NAMES, "i64"))
         frozen_noncontig = frozenset(
             {
                 "key_int8_ptr",
@@ -152,7 +605,7 @@ def compile_kv_decode_kernels(  # noqa: PLR0913
                 "stride_pop",
             }
         )
-        frozen_source = _quantization.build_kernel_source(
+        frozen_source = build_kernel_source(
             _piper_decode_frozen_split_kernel,
             constants=frozen_constants,
             overrides=frozen_overrides,
@@ -169,7 +622,7 @@ def compile_kv_decode_kernels(  # noqa: PLR0913
     tail_noncontig = frozenset(
         {"partial_out_ptr", "stride_pob", "stride_poh", "stride_pos", "stride_pop"}
     )
-    tail_source = _quantization.build_kernel_source(
+    tail_source = build_kernel_source(
         _piper_decode_tail_split_kernel,
         constants={
             "window_mode": tail_mode,
@@ -213,7 +666,7 @@ def compile_kv_decode_kernels(  # noqa: PLR0913
             "stride_os",
         }
     )
-    reduce_source = _quantization.build_kernel_source(
+    reduce_source = build_kernel_source(
         _piper_decode_splitkv_reduce_kernel,
         constants={
             "head_dim": head_dim,
@@ -260,8 +713,8 @@ def compile_merge_attention_lse_kernel(  # noqa: PLR0912
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> object:
     """Offline-compile the unified 1..8-wave LSE merge kernel for ``target``."""
-    if not 1 <= num_waves <= _MAX_MERGE_WAVES:
-        raise ValueError(f"num_waves must be in 1..{_MAX_MERGE_WAVES}, got {num_waves}")
+    if not 1 <= num_waves <= MAX_MERGE_WAVES:
+        raise ValueError(f"num_waves must be in 1..{MAX_MERGE_WAVES}, got {num_waves}")
     if head_dim < 1:
         raise ValueError(f"head_dim must be positive, got {head_dim}")
     triton_dtype = (
@@ -285,7 +738,7 @@ def compile_merge_attention_lse_kernel(  # noqa: PLR0912
         "dim3": "i64",
         "head_dim": "i64",
     }
-    for wave_idx in range(_MAX_MERGE_WAVES):
+    for wave_idx in range(MAX_MERGE_WAVES):
         if wave_idx < num_waves:
             overrides[f"out_{wave_idx}_ptr"] = f"*{triton_dtype}"
             overrides[f"lse_{wave_idx}_ptr"] = "*fp32"
@@ -295,12 +748,12 @@ def compile_merge_attention_lse_kernel(  # noqa: PLR0912
             overrides[f"out_{wave_idx}_ptr"] = "constexpr"
             overrides[f"lse_{wave_idx}_ptr"] = "constexpr"
     if is_contiguous:
-        for field in _MERGE_STRIDE_FIELDS:
+        for field in MERGE_STRIDE_FIELDS:
             constants[field] = None
             overrides[field] = "constexpr"
     else:
-        for wave_idx in range(_MAX_MERGE_WAVES):
-            wave_fields = _MERGE_STRIDE_FIELDS[wave_idx * 9 : (wave_idx + 1) * 9]
+        for wave_idx in range(MAX_MERGE_WAVES):
+            wave_fields = MERGE_STRIDE_FIELDS[wave_idx * 9 : (wave_idx + 1) * 9]
             if wave_idx < num_waves:
                 for field in wave_fields:
                     overrides[field] = "i64"
@@ -308,7 +761,7 @@ def compile_merge_attention_lse_kernel(  # noqa: PLR0912
                 for field in wave_fields:
                     constants[field] = None
                     overrides[field] = "constexpr"
-    merge_source = _quantization.build_kernel_source(
+    merge_source = build_kernel_source(
         _merge_two_attention_waves_kernel,
         constants=constants,
         overrides=overrides,
@@ -326,12 +779,12 @@ def compile_kv_prefill_kernels(  # noqa: PLR0913
     wide_pool: bool = False,
     has_chunk_splits: bool = False,
     per_row_query_scale: bool = False,
-    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    window_mode: WindowMode | None = None,
     has_tail: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, ...]:
     """Offline-compile two-wave merge and native chunked prefill kernels for ``target``."""
-    _quantization.validate_kv_compile_args(dtype, head_dim)
+    validate_kv_compile_args(dtype, head_dim)
     merge_compiled = compile_merge_attention_lse_kernel(
         target,
         dtype=dtype,
@@ -345,11 +798,9 @@ def compile_kv_prefill_kernels(  # noqa: PLR0913
     accel = AcceleratorTarget.from_compiler_target(target)
     backend = _backend.prefill_backend(accel)
     if backend == "amd":
-        from ._amd import gluon as amd_gluon  # noqa: PLC0415
-
         return (
             merge_compiled,
-            *amd_gluon.compile_amd_prefill_kernels(
+            *compile_amd_prefill_kernels(
                 target,
                 dtype=dtype,
                 head_dim=head_dim,
@@ -364,11 +815,9 @@ def compile_kv_prefill_kernels(  # noqa: PLR0913
             ),
         )
     if backend == "nvidia":
-        from ._nvidia import prefill as nvidia_prefill  # noqa: PLC0415
-
         return (
             merge_compiled,
-            *nvidia_prefill.compile_nvidia_prefill_kernels(
+            *compile_nvidia_prefill_kernels(
                 target,
                 dtype=dtype,
                 head_dim=head_dim,
