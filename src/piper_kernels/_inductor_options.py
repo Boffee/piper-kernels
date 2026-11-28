@@ -29,11 +29,15 @@ from torch._inductor.custom_graph_pass import (
 _PRE_GRAD_PASS = "pre_grad_custom_pass"
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 
-_FFN_OPS = frozenset(
+_SEMANTIC_LINEAR_OPS = frozenset(
     {
         "piper_kernels::convrot_int8_linear",
         "piper_kernels::nvfp4_linear",
         "piper_kernels::convrot_nvfp4_linear",
+    }
+)
+_FFN_OPS = _SEMANTIC_LINEAR_OPS | frozenset(
+    {
         "piper_kernels::convrot_int8_ffn",
         "piper_kernels::nvfp4_ffn",
     }
@@ -162,7 +166,13 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
             residual_updates=self.residual_updates or residual_updates,
         )
 
-    def _run_phase1(self, graph: torch.fx.Graph, op_names: set[str]) -> bool:
+    def _run_phase1(
+        self,
+        graph: torch.fx.Graph,
+        op_names: set[str],
+        *,
+        normalize_inputs: bool,
+    ) -> bool:
         changed = False
         if self.ffn and (op_names & _FFN_OPS):
             from piper_kernels.fusions.ffn._compile import fold_ffns  # noqa: PLC0415
@@ -175,7 +185,9 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
                 fold_attention_projections,
             )
 
-            changed = fold_attention_projections(graph) or changed
+            changed = (
+                fold_attention_projections(graph, normalize_inputs=normalize_inputs) or changed
+            )
         if (op_names & _SPARSE_INT8_OPS) and any(
             name.startswith("piper_kernels::convrot_int8_") for name in op_names
         ):
@@ -183,7 +195,7 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
                 fold_sparse_attention,
             )
 
-            changed = fold_sparse_attention(graph) or changed
+            changed = fold_sparse_attention(graph, normalize_inputs=normalize_inputs) or changed
         return changed
 
     def _run_phase2(self, graph: torch.fx.Graph, op_names: set[str]) -> bool:
@@ -193,14 +205,6 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
         nvfp4 = "piper_kernels::nvfp4_linear" in op_names
         convrot_nvfp4 = "piper_kernels::convrot_nvfp4_linear" in op_names
         changed = False
-        if int8 or nvfp4 or convrot_nvfp4:
-            from piper_kernels.linear._compile_fx import coalesce_input_casts  # noqa: PLC0415
-            from piper_kernels.linear._projection_views import (  # noqa: PLC0415
-                normalize_projection_views,
-            )
-
-            changed = normalize_projection_views(graph)
-            changed = coalesce_input_casts(graph) or changed
         if int8 or "piper_kernels::convrot_int8_prepare_input" in op_names:
             from piper_kernels.linear.convrot.int8._compile import fold_linear  # noqa: PLC0415
 
@@ -246,7 +250,19 @@ class _PiperPostGradPass(CustomInferenceAwareGraphPass):
             )
 
             fold_residual_updates(graph)
-        if self._run_phase1(graph, op_names):
+        normalized = False
+        if (self.linear or self.ffn or self.attention) and (op_names & _SEMANTIC_LINEAR_OPS):
+            from piper_kernels.linear._compile_fx import coalesce_input_casts  # noqa: PLC0415
+            from piper_kernels.linear._projection_views import (  # noqa: PLC0415
+                normalize_projection_views,
+            )
+
+            norm_changed = normalize_projection_views(graph)
+            norm_changed = coalesce_input_casts(graph) or norm_changed
+            if norm_changed:
+                op_names = _graph_op_names(graph)
+            normalized = True
+        if self._run_phase1(graph, op_names, normalize_inputs=not normalized):
             op_names = _graph_op_names(graph)
         if self._run_phase2(graph, op_names):
             op_names = _graph_op_names(graph)

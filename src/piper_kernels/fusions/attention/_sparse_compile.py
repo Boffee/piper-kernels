@@ -19,6 +19,9 @@ from piper_kernels.linear import _preparation_sharing as preparation_sharing
 from piper_kernels.linear._compile_fx import (
     ordered_tuple_output_producer as ordered_tuple_output_producer,  # noqa: PLC0414 - shared export
 )
+from piper_kernels.linear._compile_fx import (
+    same_dimension as same_dimension,  # noqa: PLC0414 - shared export
+)
 
 from . import _projected_qk_compile as projected_qk_compile
 from ._projected_qk_compile import (
@@ -144,18 +147,11 @@ class ValidatedAttentionOutput:
     input_features: int
 
 
-def same_dimension(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
-    """Compare two static or symbolic dimensions structurally."""
-    return preparation_sharing.dimension_key(left) == preparation_sharing.dimension_key(right)
-
-
 def optional_tensor_metadata(value: object) -> tuple[bool, torch.Tensor | None]:
     """Validate an optional FX node operand and return its fake-tensor metadata."""
     if value is None:
         return True, None
-    if not isinstance(value, torch.fx.Node):
-        return False, None
-    metadata = preparation_sharing.tensor_metadata(value)
+    metadata = linear_fx.node_tensor_metadata(value)
     return metadata is not None, metadata
 
 

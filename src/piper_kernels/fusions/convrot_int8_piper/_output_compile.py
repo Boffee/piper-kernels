@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, cast
 
 import torch
-from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.fx.node import Argument, map_arg
 
 from piper_kernels.linear import _compile_fx as linear_fx
@@ -80,13 +79,6 @@ def _attention_source(node: object) -> tuple[torch.fx.Node, dict[str, Argument]]
     return None if attn_bound is None else (attention, attn_bound)
 
 
-def _metadata(node: torch.fx.Node) -> torch.Tensor | int | torch.SymInt:
-    value = node.meta.get("val")
-    if not isinstance(value, (torch.Tensor, int, torch.SymInt)):
-        raise ValueError("missing tensor or size metadata")
-    return value
-
-
 def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple[Argument, ...], dict[str, Any]] | None:  # noqa: PLR0911, PLR0912
     bound = _compile_fx.BoundLinearNodes.from_call(linear)
     if bound is None:
@@ -120,9 +112,7 @@ def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple[Argument, ...], dict[
         return None
     batch, heads, sequence, head_dim = attention_value.shape
     expected = (batch, sequence, heads * head_dim)
-    if any(
-        not statically_known_true(a == b) for a, b in zip(input_value.shape, expected, strict=True)
-    ):
+    if not linear_fx.same_shape(input_value.shape, expected):
         return None
     if (
         input_value.dtype is not attention_value.dtype
@@ -152,19 +142,13 @@ def _fused_arguments(linear: torch.fx.Node) -> tuple[tuple[Argument, ...], dict[
     )
     kwargs = {"head_dim": head_dim}
     try:
-        values = cast(tuple[Any, ...], map_arg(arguments, _metadata))
+        values = cast(tuple[Any, ...], map_arg(arguments, linear_fx.require_node_metadata))
         query_shape = output.DenseOutputOperands(*values, head_dim=head_dim).validate()
     except KeyError, TypeError, ValueError, RuntimeError:
         return None
-    if any(
-        not statically_known_true(a == b)
-        for a, b in zip(query_shape, attention_value.shape, strict=True)
-    ):
+    if not linear_fx.same_shape(query_shape, attention_value.shape):
         return None
-    if not all(
-        statically_known_true(a == b)
-        for a, b in zip(projected.shape, (batch, sequence, values[20].shape[0]), strict=True)
-    ):
+    if not linear_fx.same_shape(projected.shape, (batch, sequence, values[20].shape[0])):
         return None
     if linear_backend.select_linear_backend(input_value) is None:
         return None

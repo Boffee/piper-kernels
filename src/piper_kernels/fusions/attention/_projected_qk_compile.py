@@ -396,15 +396,10 @@ def valid_rope_tables(
             or table.dtype is not torch.float32
             or table.ndim != 2
             or table.device != device
-            or preparation_sharing.dimension_key(table.shape[0])
-            != preparation_sharing.dimension_key(sequence_length)
-            or preparation_sharing.dimension_key(table.shape[1])
-            != preparation_sharing.dimension_key(rotary_dim)
+            or not linear_fx.same_shape(table.shape, (sequence_length, rotary_dim))
         ):
             return False
-    if preparation_sharing.dimension_key(half_rotary_dim) != preparation_sharing.dimension_key(
-        (rotary_dim + 1) // 2
-    ):
+    if not linear_fx.same_dimension(half_rotary_dim, (rotary_dim + 1) // 2):
         return False
     if isinstance(rotary_dim, int):
         return (

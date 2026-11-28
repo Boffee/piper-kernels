@@ -120,8 +120,7 @@ def _can_reuse_source_as_output(source: torch.fx.Node, original: torch.fx.Node) 
         source_value.dtype is not output_value.dtype
         or source_value.device != output_value.device
         or not source_value.is_contiguous()
-        or tuple(map(preparation_sharing.dimension_key, source_value.shape))
-        != tuple(map(preparation_sharing.dimension_key, output_value.shape))
+        or not linear_fx.same_shape(source_value.shape, output_value.shape)
     ):
         return False
     before_output = set()

@@ -6,6 +6,7 @@ import torch
 from torch.fx.node import Argument
 
 from piper_kernels.fusions.residual_updates import _graph as residual_graph
+from piper_kernels.linear import _compile_fx as linear_fx
 
 from . import _head_slices as head_slices
 
@@ -27,7 +28,8 @@ def fold_residual_adds(
     def compute(
         graph: torch.fx.Graph, update: torch.fx.Node, add: dict[str, Argument]
     ) -> torch.fx.Node:
-        operands = residual_graph.bind_arguments(update)
+        operands = linear_fx.bind_arguments(update)
+        assert operands is not None
         values = {
             **add,
             **{name: value for name, value in operands.items() if name != "output_dtype"},

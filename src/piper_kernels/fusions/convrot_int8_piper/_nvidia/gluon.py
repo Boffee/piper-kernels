@@ -38,11 +38,12 @@ from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import (
     NvidiaExecutionPlan,
     ProjectionOperation,
 )
-from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as linear_gluon
 
 from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
 from . import policy
+
+linear_gluon = fragments.linear_gluon
 
 # K/V storage and K tile sums use K64 tiles.
 _TILE_ROWS = 64
@@ -314,18 +315,14 @@ def default_execution_plan(
     target: AcceleratorTarget | None = None,
 ) -> NvidiaExecutionPlan:
     """Resolve operand metadata, accepting an explicit target for offline tuning."""
-    target = AcceleratorTarget.from_device(input_qdata.device) if target is None else target
-    return policy.select_execution_plan(
-        target,
+    return fragments.resolve_execution_plan(
+        policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
         operation=operation,
-        input_features=input_qdata.shape[2],
         head_dim=head_dim,
         rotary_dim=rotary_dim,
-        operands_aligned=(
-            linear_gluon.operands_aligned(input_qdata, weight_qdata)
-            and input_qdata.is_contiguous()
-            and weight_qdata.is_contiguous()
-        ),
+        target=target,
     )
 
 
@@ -524,16 +521,14 @@ def project_query(
     execution_plan: NvidiaExecutionPlan | None = None,
 ) -> None:
     """Project a query window, with the Gluon kernel when it covers the operands."""
-    plan = (
-        execution_plan
-        if execution_plan is not None
-        else default_execution_plan(
-            input_qdata,
-            weight_qdata,
-            operation="query",
-            head_dim=out[0].shape[3],
-            rotary_dim=cos.shape[1],
-        )
+    plan = fragments.resolve_execution_plan(
+        policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation="query",
+        head_dim=out[0].shape[3],
+        rotary_dim=cos.shape[1],
+        execution_plan=execution_plan,
     )
     launch = _project_query_gluon if plan.uses_gluon else projection.project_query
     launch(
@@ -569,16 +564,14 @@ def project_key(
     execution_plan: NvidiaExecutionPlan | None = None,
 ) -> None:
     """Project keys, with the Gluon kernel when it covers the operands."""
-    plan = (
-        execution_plan
-        if execution_plan is not None
-        else default_execution_plan(
-            input_qdata,
-            weight_qdata,
-            operation="key",
-            head_dim=out[0].shape[3],
-            rotary_dim=cos.shape[1],
-        )
+    plan = fragments.resolve_execution_plan(
+        policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation="key",
+        head_dim=out[0].shape[3],
+        rotary_dim=cos.shape[1],
+        execution_plan=execution_plan,
     )
     launch = _project_key_gluon if plan.uses_gluon else projection.project_key
     launch(
@@ -608,12 +601,13 @@ def project_value(
     execution_plan: NvidiaExecutionPlan | None = None,
 ) -> None:
     """Project values, with the Gluon kernel when it covers the operands."""
-    plan = (
-        execution_plan
-        if execution_plan is not None
-        else default_execution_plan(
-            input_qdata, weight_qdata, operation="value", head_dim=out[0].shape[2]
-        )
+    plan = fragments.resolve_execution_plan(
+        policy.select_execution_plan,
+        input_qdata,
+        weight_qdata,
+        operation="value",
+        head_dim=out[0].shape[2],
+        execution_plan=execution_plan,
     )
     if plan.uses_gluon:
         _project_value_gluon(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import operator
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -28,9 +27,6 @@ from piper_kernels.linear.convrot.int8 import _compile_fx
 from piper_kernels.weights.convrot import _rotation
 
 from . import _backend, _output_compile
-from . import (
-    distributed_output as distributed_output_operators,  # noqa: F401 - registers distributed output ops
-)
 from . import key as key_operators  # noqa: F401 - registers the K projection
 from . import value as value_operators  # noqa: F401 - registers the V projection
 
@@ -60,12 +56,6 @@ class _MatchedProjection:
 def _qk_quantization(device: torch.device) -> QKQuantizationGranularity:
     """Emit Q/K scales in the granularity the device's quantized attention reads."""
     return _quantized_dispatch.select_qk_quantization(AcceleratorTarget.from_device(device))
-
-
-def _same_shape(left: Sequence[int | torch.SymInt], right: Sequence[int | torch.SymInt]) -> bool:
-    return len(left) == len(right) and all(
-        statically_known_true(a == b) for a, b in zip(left, right, strict=True)
-    )
 
 
 def _valid_projected_tensor(matched: _MatchedProjection, *, normalized: bool = True) -> bool:
@@ -114,7 +104,9 @@ def _valid_projected_tensor(matched: _MatchedProjection, *, normalized: bool = T
     batch, sequence_length = input_value.shape[:2]
     if (
         output_value.device != input_value.device
-        or not _same_shape(output_value.shape, (batch, heads, sequence_length, head_dim))
+        or not linear_compile_fx.same_shape(
+            output_value.shape, (batch, heads, sequence_length, head_dim)
+        )
         or (isinstance(sequence_length, int) and sequence_length < 1)
         or (isinstance(batch, int) and batch < 1)
     ):
@@ -213,13 +205,13 @@ def _valid_query_attention(
     ):
         return False
     return not (
-        not _same_shape(key.shape, value.shape)
-        or not _same_shape((key.shape[0], key.shape[3]), (batch, head_dim))
+        not linear_compile_fx.same_shape(key.shape, value.shape)
+        or not linear_compile_fx.same_shape((key.shape[0], key.shape[3]), (batch, head_dim))
         or not statically_known_true(key.shape[1] > 0)
         or heads % key.shape[1] != 0
         or not statically_known_true(key.shape[2] > 0)
         or not isinstance(is_causal, bool)
-        or (is_causal and not _same_shape((sequence_length,), (key.shape[2],)))
+        or (is_causal and not linear_compile_fx.same_dimension(sequence_length, key.shape[2]))
         or projected_compile.positive_float(softmax_scale) is None
     )
 
@@ -489,10 +481,12 @@ def _fuse_context(graph: torch.fx.Graph) -> bool:
     return changed
 
 
-def fold_attention_projections(graph: torch.fx.Graph) -> bool:
+def fold_attention_projections(graph: torch.fx.Graph, *, normalize_inputs: bool = True) -> bool:
     """Fold ConvRot INT8 Q/K/V projections into dense Piper operand preparation."""
-    changed = _projection_views.normalize_projection_views(graph)
-    changed = linear_compile_fx.coalesce_input_casts(graph) or changed
+    changed = False
+    if normalize_inputs:
+        changed = _projection_views.normalize_projection_views(graph)
+        changed = linear_compile_fx.coalesce_input_casts(graph) or changed
     changed = _fold_query_projections(graph) or changed
     changed = _fuse_context(graph) or changed
     if changed:
@@ -520,7 +514,7 @@ _HEAD_SLICING = head_slices.HeadSlicing(
     columns="weight_qdata",
     once=("bias",),
     alignment="group_size",
-    unsliceable=(),
+    unsliceable=("comm_group_size",),
     # Dense launches lose efficiency at half the heads, and at H3's shape the add has
     # room below the K projection's peak, so full-size windows add little peak.
     widened_window_rows="query_chunk_rows",
@@ -533,10 +527,7 @@ def fold_distributed_attention_output(graph: torch.fx.Graph) -> bool:
     return distributed_fold.fold_distributed_projected_output(
         graph,
         output_op=_kernels.convrot_int8_piper_projected_query_attention_output.default,
-        reduce_scatter_op=_kernels.convrot_int8_piper_projected_query_attention_reduce_scatter.default,
-        reduce_scatter_residual_op=(
-            _kernels.convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default
-        ),
+        residual_op=_kernels.convrot_int8_piper_projected_query_attention_residual_add_.default,
     )
 
 

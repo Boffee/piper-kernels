@@ -7,16 +7,14 @@ contiguous ``[batch, sequence, features]`` transfers over PyTorch's functional c
 from __future__ import annotations
 
 import operator
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
 
 import torch
-from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.fx.node import Argument
 
 from piper_kernels._triton import runtime
-from piper_kernels.linear._preparation_sharing import tensor_metadata
 
 _c10d = torch.ops._c10d_functional
 _aten = torch.ops.aten
@@ -60,8 +58,19 @@ def _is_contiguous_3d_device_tensor(value: torch.Tensor | None) -> bool:
     )
 
 
-def _same_dim(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
-    return bool(statically_known_true(left == right))
+def _bind_reshape(node: torch.fx.Node) -> tuple[torch.fx.Node, Argument] | None:
+    if node.op != "call_function" or node.target not in _RESHAPE_TARGETS:
+        return None
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
+    bound = linear_fx.bind_arguments(node)
+    if bound is None:
+        return None
+    source = bound.get("self")
+    shape_arg = bound["shape"] if "shape" in bound else bound.get("size")
+    if not isinstance(source, torch.fx.Node):
+        return None
+    return source, shape_arg
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +122,7 @@ def _match_split_getitem(item: object, expected_index: int) -> torch.fx.Node | N
 def _match_split_getitems(
     cat_items: Sequence[object],
     group_size: int,
-) -> tuple[torch.fx.Node, torch.fx.Node | int] | None:
+) -> tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node | int, int] | None:
     """Recover a single ``split(tensor, split_size, dim)`` feeding ``0..W-1`` getitems."""
     if len(cat_items) != group_size:
         return None
@@ -125,20 +134,24 @@ def _match_split_getitems(
             return None
         split_node = producer
         seen_getitems.add(cast(torch.fx.Node, item))
+    if split_node is None or set(split_node.users) != seen_getitems:
+        return None
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
+    split_bound = linear_fx.bind_call(split_node, _aten.split.Tensor)
+    if split_bound is None:
+        return None
+    source = split_bound["self"]
+    split_size = split_bound["split_size"]
+    split_dim = split_bound["dim"]
     if (
-        split_node is None
-        or split_node.op != "call_function"
-        or split_node.target is not _aten.split.Tensor
-        or split_node.kwargs
-        or len(split_node.args) not in (2, 3)
-        or not isinstance(split_node.args[0], torch.fx.Node)
-        or set(split_node.users) != seen_getitems
+        not isinstance(source, torch.fx.Node)
+        or not isinstance(split_size, (torch.fx.Node, int))
+        or isinstance(split_size, bool)
+        or type(split_dim) is not int
     ):
         return None
-    split_size = split_node.args[1]
-    if not isinstance(split_size, (torch.fx.Node, int)) or isinstance(split_size, bool):
-        return None
-    return split_node, split_size
+    return split_node, source, split_size, split_dim
 
 
 def _match_all_gather_view(
@@ -150,58 +163,51 @@ def _match_all_gather_view(
     ]
     | None
 ):
-    result = None
-    if node.target in _RESHAPE_TARGETS and len(node.args) == 2:
-        wait_node, shape_arg = node.args
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
+    reshaped = _bind_reshape(node)
+    if reshaped is not None:
+        wait_node, shape_arg = reshaped
         sequence_expr = (
             shape_arg[1] if isinstance(shape_arg, (list, tuple)) and len(shape_arg) == 3 else None
         )
         if (
-            isinstance(wait_node, torch.fx.Node)
-            and statically_known_true(output_value.shape[0] == 1)
+            linear_fx.same_dimension(output_value.shape[0], 1)
             and isinstance(sequence_expr, (torch.fx.Node, int))
             and not isinstance(sequence_expr, bool)
         ):
-            result = (wait_node, None, None, sequence_expr)
-    elif node.target is _aten.cat.default and len(node.args) == 2 and node.args[1] == 1:
-        cat_items = node.args[0]
-        matched_split = (
-            _match_split_getitems(cat_items, len(cat_items))
-            if isinstance(cat_items, (list, tuple)) and len(cat_items) >= 2
-            else None
-        )
-        if matched_split is not None:
-            split_node, batch_split_arg = matched_split
-            split_dim = split_node.args[2] if len(split_node.args) == 3 else 0
-            wait_node = split_node.args[0]
-            if split_dim == 0 and isinstance(wait_node, torch.fx.Node):
-                result = (wait_node, split_node, batch_split_arg, None)
-    return result
+            return (wait_node, None, None, sequence_expr)
+        return None
+    cat_bound = linear_fx.bind_call(node, _aten.cat.default)
+    cat_items = cat_bound["tensors"] if cat_bound is not None and cat_bound["dim"] == 1 else None
+    if not isinstance(cat_items, (list, tuple)) or len(cat_items) < 2:
+        return None
+    matched_split = _match_split_getitems(cat_items, len(cat_items))
+    if matched_split is None or matched_split[3] != 0:
+        return None
+    split_node, wait_node, batch_split_arg, _ = matched_split
+    return (wait_node, split_node, batch_split_arg, None)
 
 
 def _match_all_gather_wait(
     wait_node: torch.fx.Node,
 ) -> tuple[torch.fx.Node, torch.fx.Node, int, str] | None:
-    if (
-        wait_node.op != "call_function"
-        or wait_node.target is not _WAIT_TENSOR
-        or wait_node.kwargs
-        or len(wait_node.args) != 1
-        or len(wait_node.users) != 1
-    ):
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
+    wait_bound = linear_fx.bind_call(wait_node, _WAIT_TENSOR)
+    if wait_bound is None or len(wait_node.users) != 1:
         return None
-    all_gather_node = wait_node.args[0]
+    all_gather_node = wait_bound["tensor"]
+    ag_bound = linear_fx.bind_call(all_gather_node, _ALL_GATHER)
     if (
-        not isinstance(all_gather_node, torch.fx.Node)
-        or all_gather_node.op != "call_function"
-        or all_gather_node.target is not _ALL_GATHER
-        or all_gather_node.kwargs
-        or len(all_gather_node.args) != 3
+        ag_bound is None
+        or not isinstance(all_gather_node, torch.fx.Node)
         or len(all_gather_node.users) != 1
     ):
         return None
-    input_node, group_size_arg, group_name = all_gather_node.args
-    group_size = _static_group_size(group_size_arg)
+    input_node = ag_bound["input"]
+    group_size = _static_group_size(ag_bound["group_size"])
+    group_name = ag_bound["group_name"]
     if (
         not isinstance(input_node, torch.fx.Node)
         or group_size is None
@@ -213,12 +219,10 @@ def _match_all_gather_wait(
 
 def match_sequence_all_gather(node: torch.fx.Node) -> SequenceAllGatherMatch | None:
     """Match DTensor ``Shard(1) -> Replicate()`` reconstructing ``[B, W * T_local, H]``."""
-    output_value = tensor_metadata(node)
-    if (
-        node.op != "call_function"
-        or node.kwargs
-        or not _is_contiguous_3d_device_tensor(output_value)
-    ):
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
+    output_value = linear_fx.node_tensor_metadata(node)
+    if node.op != "call_function" or not _is_contiguous_3d_device_tensor(output_value):
         return None
     assert output_value is not None
 
@@ -232,8 +236,8 @@ def match_sequence_all_gather(node: torch.fx.Node) -> SequenceAllGatherMatch | N
         return None
     all_gather_node, input_node, group_size, group_name = wait_match
 
-    input_value = tensor_metadata(input_node)
-    wait_value = tensor_metadata(wait_node)
+    input_value = linear_fx.node_tensor_metadata(input_node)
+    wait_value = linear_fx.node_tensor_metadata(wait_node)
     if (
         not _is_contiguous_3d_device_tensor(input_value)
         or wait_value is None
@@ -244,25 +248,16 @@ def match_sequence_all_gather(node: torch.fx.Node) -> SequenceAllGatherMatch | N
         return None
 
     batch, local_sequence, hidden = input_value.shape
-    shapes_ok = (
-        _same_dim(wait_value.shape[0], batch * group_size)
-        and _same_dim(wait_value.shape[1], local_sequence)
-        and _same_dim(wait_value.shape[2], hidden)
-        and _same_dim(output_value.shape[0], batch)
-        and _same_dim(output_value.shape[1], local_sequence * group_size)
-        and _same_dim(output_value.shape[2], hidden)
-    )
+    shapes_ok = linear_fx.same_shape(
+        wait_value.shape, (batch * group_size, local_sequence, hidden)
+    ) and linear_fx.same_shape(output_value.shape, (batch, local_sequence * group_size, hidden))
     if split_node is not None:
-        batch_val = (
-            batch_split_arg.meta.get("val")
-            if isinstance(batch_split_arg, torch.fx.Node)
-            else batch_split_arg
-        )
+        batch_val = linear_fx.argument_metadata(batch_split_arg)
         shapes_ok = (
             shapes_ok
             and isinstance(batch_val, (int, torch.SymInt))
             and not isinstance(batch_val, bool)
-            and _same_dim(batch_val, batch)
+            and linear_fx.same_dimension(batch_val, batch)
         )
     if not shapes_ok:
         return None
@@ -285,58 +280,49 @@ def _match_reduce_scatter_repack(
     group_size: int,
     output_value: torch.Tensor,
 ) -> tuple[torch.fx.Node, torch.fx.Node | None, torch.fx.Node | None] | None:
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
+    cat_bound = linear_fx.bind_call(repack_node, _aten.cat.default)
     if (
-        repack_node.op == "call_function"
-        and repack_node.target is _aten.cat.default
-        and not repack_node.kwargs
-        and len(repack_node.args) in (1, 2)
-        and (len(repack_node.args) == 1 or repack_node.args[1] == 0)
-        and isinstance(repack_node.args[0], (list, tuple))
+        cat_bound is not None
+        and cat_bound["dim"] == 0
+        and isinstance(cat_bound["tensors"], (list, tuple))
     ):
-        matched_split = _match_split_getitems(repack_node.args[0], group_size)
+        matched_split = _match_split_getitems(cat_bound["tensors"], group_size)
         if matched_split is None:
             return None
-        split_node, _ = matched_split
-        split_dim = split_node.args[2] if len(split_node.args) == 3 else 0
+        split_node, source, _, split_dim = matched_split
         if split_dim != 1:
             return None
-        return cast(torch.fx.Node, split_node.args[0]), split_node, repack_node
+        return source, split_node, repack_node
 
-    if (
-        repack_node.op == "call_function"
-        and repack_node.target in _RESHAPE_TARGETS
-        and not repack_node.kwargs
-        and len(repack_node.args) == 2
-        and isinstance(repack_node.args[0], torch.fx.Node)
-        and statically_known_true(output_value.shape[0] == 1)
-    ):
-        return repack_node.args[0], None, None
+    reshaped = _bind_reshape(repack_node)
+    if reshaped is not None and linear_fx.same_dimension(output_value.shape[0], 1):
+        return reshaped[0], None, None
     return None
 
 
 def _match_reduce_scatter_wait(
     wait_node: torch.fx.Node,
 ) -> tuple[torch.fx.Node, torch.fx.Node, int, str, torch.Tensor] | None:
-    if (
-        wait_node.op != "call_function"
-        or wait_node.target is not _WAIT_TENSOR
-        or wait_node.kwargs
-        or len(wait_node.args) != 1
-    ):
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
+    wait_bound = linear_fx.bind_call(wait_node, _WAIT_TENSOR)
+    if wait_bound is None:
         return None
-    reduce_scatter_node = wait_node.args[0]
+    reduce_scatter_node = wait_bound["tensor"]
+    rs_bound = linear_fx.bind_call(reduce_scatter_node, _REDUCE_SCATTER)
     if (
-        not isinstance(reduce_scatter_node, torch.fx.Node)
-        or reduce_scatter_node.op != "call_function"
-        or reduce_scatter_node.target is not _REDUCE_SCATTER
-        or reduce_scatter_node.kwargs
-        or len(reduce_scatter_node.args) != 4
+        rs_bound is None
+        or not isinstance(reduce_scatter_node, torch.fx.Node)
         or len(reduce_scatter_node.users) != 1
     ):
         return None
-    repack_node, reduce_op, group_size_arg, group_name = reduce_scatter_node.args
-    group_size = _static_group_size(group_size_arg)
-    output_value = tensor_metadata(wait_node)
+    repack_node = rs_bound["input"]
+    reduce_op = rs_bound["reduce_op"]
+    group_size = _static_group_size(rs_bound["group_size"])
+    group_name = rs_bound["group_name"]
+    output_value = linear_fx.node_tensor_metadata(wait_node)
     if (
         not isinstance(repack_node, torch.fx.Node)
         or reduce_op != "sum"
@@ -352,6 +338,8 @@ def _match_reduce_scatter_wait(
 
 def match_sequence_reduce_scatter(wait_node: torch.fx.Node) -> SequenceReduceScatterMatch | None:
     """Match DTensor ``Partial('sum') -> Shard(1)`` reducing ``[B, W * T_local, H]``."""
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
     wait_match = _match_reduce_scatter_wait(wait_node)
     if wait_match is None:
         return None
@@ -362,8 +350,8 @@ def match_sequence_reduce_scatter(wait_node: torch.fx.Node) -> SequenceReduceSca
         return None
     input_node, split_node, cat_node = repack_match
 
-    input_value = tensor_metadata(input_node)
-    repack_value = tensor_metadata(repack_node)
+    input_value = linear_fx.node_tensor_metadata(input_node)
+    repack_value = linear_fx.node_tensor_metadata(repack_node)
     if (
         not _is_contiguous_3d_device_tensor(input_value)
         or repack_value is None
@@ -375,13 +363,8 @@ def match_sequence_reduce_scatter(wait_node: torch.fx.Node) -> SequenceReduceSca
 
     batch, local_sequence, hidden = output_value.shape
     if not (
-        _same_dim(input_value.shape[0], batch)
-        and _same_dim(input_value.shape[1], local_sequence * group_size)
-        and _same_dim(input_value.shape[2], hidden)
-        and repack_value.ndim == 3
-        and _same_dim(repack_value.shape[0], batch * group_size)
-        and _same_dim(repack_value.shape[1], local_sequence)
-        and _same_dim(repack_value.shape[2], hidden)
+        linear_fx.same_shape(input_value.shape, (batch, local_sequence * group_size, hidden))
+        and linear_fx.same_shape(repack_value.shape, (batch * group_size, local_sequence, hidden))
     ):
         return None
 
@@ -459,19 +442,20 @@ def collect_sym_size_users(
     consumer_node: torch.fx.Node,
 ) -> list[torch.fx.Node] | None:
     """Verify ``gathered_node`` only feeds ``consumer_node`` and valid 3-D ``aten.sym_size.int``."""
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
     sym_size_users: list[torch.fx.Node] = []
     saw_consumer = False
     for user in gathered_node.users:
         if user is consumer_node:
             saw_consumer = True
-        elif (
-            user.op == "call_function"
-            and user.target is _aten.sym_size.int
-            and not user.kwargs
-            and len(user.args) == 2
-            and user.args[0] is gathered_node
-            and type(user.args[1]) is int
-            and -3 <= user.args[1] < 3
+            continue
+        sym_bound = linear_fx.bind_call(user, _aten.sym_size.int)
+        if (
+            sym_bound is not None
+            and sym_bound["self"] is gathered_node
+            and type(sym_bound["dim"]) is int
+            and -3 <= sym_bound["dim"] < 3
         ):
             sym_size_users.append(user)
         else:
@@ -511,10 +495,14 @@ def rewrite_sym_size_users(
     """Rewrite ``aten.sym_size.int(all_gather_output, dim)`` users to read ``input_node``."""
     if not sym_size_users:
         return
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
     positions = {node: idx for idx, node in enumerate(graph.nodes)}
     full_sequence_arg = all_gather_match.full_sequence_arg
     for sym_user in sym_size_users:
-        raw_dim = cast(int, sym_user.args[1])
+        sym_bound = linear_fx.bind_call(sym_user, _aten.sym_size.int)
+        assert sym_bound is not None
+        raw_dim = cast(int, sym_bound["dim"])
         dim = raw_dim % 3
         if dim == 1:
             if (
@@ -541,6 +529,7 @@ def rewrite_sym_size_users(
             graph.erase_node(sym_user)
         else:
             sym_user.args = (all_gather_match.input_node, raw_dim)
+            sym_user.kwargs = {}
 
 
 def find_insertion_point(
@@ -561,28 +550,9 @@ def find_insertion_point(
     return earliest_node
 
 
-def call_in_schema_order(
-    graph: torch.fx.Graph,
-    target: torch._ops.OpOverload,
-    values: Mapping[str, Argument],
-) -> torch.fx.Node:
-    """Call ``target`` placing arguments by schema order and kwarg-only semantics."""
-    args: list[Argument] = []
-    kwargs: dict[str, Argument] = {}
-    for index, argument in enumerate(target._schema.arguments):
-        if argument.name not in values:
-            continue
-        if argument.kwarg_only or len(args) < index:
-            kwargs[argument.name] = values[argument.name]
-        else:
-            args.append(values[argument.name])
-    return graph.call_function(target, tuple(args), kwargs)
-
-
 __all__ = [
     "SequenceAllGatherMatch",
     "SequenceReduceScatterMatch",
-    "call_in_schema_order",
     "collect_indexed_outputs",
     "collect_sym_size_users",
     "erase_sequence_all_gather",

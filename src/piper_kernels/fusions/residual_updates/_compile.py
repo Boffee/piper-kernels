@@ -36,7 +36,6 @@ import torch
 from torch.fx.node import Argument
 
 from piper_kernels.linear import _compile_fx as linear_fx
-from piper_kernels.linear import _preparation_sharing as preparation_sharing
 
 from . import _gates, _ops
 from ._graph import RESIDUAL_ADD, call_functional
@@ -45,10 +44,6 @@ _log = logging.getLogger(__name__)
 
 _aten = torch.ops.aten
 _COPY = _aten.copy_.default
-
-
-def _metadata(value: Argument) -> torch.Tensor | None:
-    return preparation_sharing.tensor_metadata(value) if isinstance(value, torch.fx.Node) else None
 
 
 def _gated_sum(node: torch.fx.Node) -> dict[str, Argument] | None:
@@ -65,7 +60,12 @@ def _gated_sum(node: torch.fx.Node) -> dict[str, Argument] | None:
         if selected is None:
             continue
         gate, indices, python_indexing = selected
-        operands = (_metadata(base), _metadata(update), _metadata(gate), _metadata(indices))
+        operands = (
+            linear_fx.node_tensor_metadata(base),
+            linear_fx.node_tensor_metadata(update),
+            linear_fx.node_tensor_metadata(gate),
+            linear_fx.node_tensor_metadata(indices),
+        )
         base_value, update_value, gate_value, indices_value = operands
         if (
             base_value is None

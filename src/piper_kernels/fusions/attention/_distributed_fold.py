@@ -9,13 +9,13 @@ from torch.fx.node import Argument
 
 from piper_kernels._distributed import _fx as distributed_fx
 from piper_kernels.fusions.residual_updates import _graph as residual_graph
-from piper_kernels.linear import _preparation_sharing as preparation_sharing
+from piper_kernels.linear import _compile_fx as linear_fx
 
 
 def _match_exclusive_projected_output(
     reduce_scatter_match: distributed_fx.SequenceReduceScatterMatch,
     output_op: torch._ops.OpOverload,
-) -> torch.fx.Node | None:
+) -> tuple[torch.fx.Node, dict[str, Argument]] | None:
     producer = reduce_scatter_match.input_node
     if producer.op != "call_function" or producer.target is not output_op:
         return None
@@ -26,7 +26,14 @@ def _match_exclusive_projected_output(
     )
     if set(producer.users) != {consumer}:
         return None
-    return producer
+    operands = linear_fx.bind_arguments(producer)
+    if (
+        operands is None
+        or operands.get("comm_group_size") is not None
+        or operands.get("comm_group_name") is not None
+    ):
+        return None
+    return producer, operands
 
 
 def _fold_attention_reduce_scatter_residual(
@@ -34,7 +41,7 @@ def _fold_attention_reduce_scatter_residual(
     call: torch.fx.Node,
     *,
     output_op: torch._ops.OpOverload,
-    reduce_scatter_residual_op: torch._ops.OpOverload,
+    residual_op: torch._ops.OpOverload,
 ) -> bool:
     residual_match = distributed_fx.match_distributed_residual_add(
         call, residual_graph.RESIDUAL_ADD
@@ -42,11 +49,11 @@ def _fold_attention_reduce_scatter_residual(
     if residual_match is None:
         return False
     base, reduce_scatter_match = residual_match
-    producer = _match_exclusive_projected_output(reduce_scatter_match, output_op)
-    base_val = preparation_sharing.tensor_metadata(base)
-    if producer is None or base_val is None:
+    matched = _match_exclusive_projected_output(reduce_scatter_match, output_op)
+    base_val = linear_fx.node_tensor_metadata(base)
+    if matched is None or base_val is None:
         return False
-    operands = residual_graph.bind_arguments(producer)
+    producer, operands = matched
     if operands.get("output_dtype", torch.bfloat16) is not base_val.dtype:
         return False
 
@@ -55,12 +62,12 @@ def _fold_attention_reduce_scatter_residual(
         "gate": cast(Argument, call.kwargs["gate"]),
         "gate_indices": cast(Argument, call.kwargs["gate_indices"]),
         "python_indexing": cast(Argument, call.kwargs["python_indexing"]),
+        **{name: value for name, value in operands.items() if name != "output_dtype"},
         "comm_group_size": reduce_scatter_match.group_size,
         "comm_group_name": reduce_scatter_match.group_name,
-        **{name: value for name, value in operands.items() if name != "output_dtype"},
     }
     with graph.inserting_before(call):
-        result = residual_graph.call_functional(graph, reduce_scatter_residual_op, values)
+        result = residual_graph.call_functional(graph, residual_op, values)
     for user in list(call.users):
         user.replace_all_uses_with(result)
         graph.erase_node(user)
@@ -76,22 +83,21 @@ def _fold_attention_reduce_scatter_standalone(
     wait_node: torch.fx.Node,
     *,
     output_op: torch._ops.OpOverload,
-    reduce_scatter_op: torch._ops.OpOverload,
 ) -> bool:
     reduce_scatter_match = distributed_fx.match_sequence_reduce_scatter(wait_node)
     if reduce_scatter_match is None:
         return False
-    producer = _match_exclusive_projected_output(reduce_scatter_match, output_op)
-    if producer is None:
+    matched = _match_exclusive_projected_output(reduce_scatter_match, output_op)
+    if matched is None:
         return False
-    operands = residual_graph.bind_arguments(producer)
+    producer, operands = matched
     values = {
+        **operands,
         "comm_group_size": reduce_scatter_match.group_size,
         "comm_group_name": reduce_scatter_match.group_name,
-        **operands,
     }
     with graph.inserting_before(wait_node):
-        replacement = distributed_fx.call_in_schema_order(graph, reduce_scatter_op, values)
+        replacement = linear_fx.call_in_schema_order(graph, output_op, values)
     replacement.meta = wait_node.meta.copy()
     replacement.meta.pop("eager_input_vals", None)
     wait_node.replace_all_uses_with(replacement)
@@ -105,8 +111,7 @@ def fold_distributed_projected_output(
     graph: torch.fx.Graph,
     *,
     output_op: torch._ops.OpOverload,
-    reduce_scatter_op: torch._ops.OpOverload,
-    reduce_scatter_residual_op: torch._ops.OpOverload,
+    residual_op: torch._ops.OpOverload,
 ) -> bool:
     """Fold ``output_op -> reduce_scatter -> (optional) residual_add_``."""
     if not distributed_fx.has_c10d_collectives(graph):
@@ -119,7 +124,7 @@ def fold_distributed_projected_output(
                 graph,
                 node,
                 output_op=output_op,
-                reduce_scatter_residual_op=reduce_scatter_residual_op,
+                residual_op=residual_op,
             )
             or changed
         )
@@ -129,7 +134,6 @@ def fold_distributed_projected_output(
                 graph,
                 node,
                 output_op=output_op,
-                reduce_scatter_op=reduce_scatter_op,
             )
             or changed
         )

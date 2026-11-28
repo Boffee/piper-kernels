@@ -280,8 +280,23 @@ class DenseOutputOperands:
         )
 
 
+def _resolve_distributed_comm(
+    comm_group_size: int | None,
+    comm_group_name: str | None,
+) -> tuple[int, str] | None:
+    if comm_group_size is None and comm_group_name is None:
+        return None
+    if comm_group_size is None or comm_group_name is None:
+        raise ValueError(
+            "distributed dense Piper requires both comm_group_size and comm_group_name"
+        )
+    return comm_group_size, comm_group_name
+
+
 @torch.library.custom_op(
-    "piper_kernels::convrot_int8_piper_projected_query_attention_output", mutates_args=()
+    "piper_kernels::convrot_int8_piper_projected_query_attention_output",
+    mutates_args=(),
+    tags=(torch.Tag.cudagraph_unsafe,),
 )
 def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     input_qdata: torch.Tensor,
@@ -312,8 +327,10 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     *,
     head_dim: int,
     query_chunk_rows: int = DEFAULT_QUERY_CHUNK_ROWS,
+    comm_group_size: int | None = None,
+    comm_group_name: str | None = None,
 ) -> torch.Tensor:
-    """Pipeline local Q through attention and output with query_chunk_rows as a cap."""
+    """Pipeline Q through attention and output, optionally with reduce-scatter."""
     operands = DenseOutputOperands(
         input_qdata,
         input_scale,
@@ -343,6 +360,11 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         head_dim,
         query_chunk_rows,
     )
+    comm = _resolve_distributed_comm(comm_group_size, comm_group_name)
+    if comm is not None:
+        from . import distributed_output  # noqa: PLC0415
+
+        return distributed_output.run_distributed_dense_output(comm[0], comm[1], operands)
     shape = operands.validate()
     if shape[0] == 0:
         return input_qdata.new_empty((0, shape[2], weight_qdata.shape[0]), dtype=output_dtype)
@@ -379,8 +401,10 @@ def _projected_query_attention_output_op_fake(  # noqa: PLR0913, PLR0917
     *,
     head_dim: int,
     query_chunk_rows: int = DEFAULT_QUERY_CHUNK_ROWS,
+    comm_group_size: int | None = None,
+    comm_group_name: str | None = None,
 ) -> torch.Tensor:
-    batch, _, sequence, _ = DenseOutputOperands(
+    operands = DenseOutputOperands(
         input_qdata,
         input_scale,
         query_weight,
@@ -408,13 +432,25 @@ def _projected_query_attention_output_op_fake(  # noqa: PLR0913, PLR0917
         output_input_scale,
         head_dim,
         query_chunk_rows,
-    ).validate()
+    )
+    comm = _resolve_distributed_comm(comm_group_size, comm_group_name)
+    if comm is not None:
+        from . import distributed_output  # noqa: PLC0415
+
+        (batch, _, _, _), local_sequence_length, _ = (
+            distributed_output.validate_distributed_dense_output(comm[0], comm[1], operands)
+        )
+        return input_qdata.new_empty(
+            (batch, local_sequence_length, weight_qdata.shape[0]), dtype=output_dtype
+        )
+    batch, _, sequence, _ = operands.validate()
     return input_qdata.new_empty((batch, sequence, weight_qdata.shape[0]), dtype=output_dtype)
 
 
 @torch.library.custom_op(
     "piper_kernels::convrot_int8_piper_projected_query_attention_residual_add_",
     mutates_args=("base",),
+    tags=(torch.Tag.cudagraph_unsafe,),
 )
 def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     base: torch.Tensor,
@@ -448,13 +484,15 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     *,
     head_dim: int,
     query_chunk_rows: int = DEFAULT_QUERY_CHUNK_ROWS,
+    comm_group_size: int | None = None,
+    comm_group_name: str | None = None,
 ) -> None:
     """Add ``gate[gate_indices] * attention_output`` into ``base`` without a full-size output.
 
     The attention operands match ``convrot_int8_piper_projected_query_attention_output``;
     the output dtype is ``base``'s. The linear backend adds each window's projection
-    into its ``base`` rows in FP32. The native epilogue preserves projection rounding
-    without scratch.
+    into its ``base`` rows in FP32. When ``comm_group_size`` and ``comm_group_name`` are
+    provided, overlaps bounded peer-chunk reduce-scatter into this rank's ``base`` rows.
     """
     operands = DenseOutputOperands(
         input_qdata,
@@ -485,6 +523,17 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
         head_dim,
         query_chunk_rows,
     )
+    comm = _resolve_distributed_comm(comm_group_size, comm_group_name)
+    if comm is not None:
+        from . import distributed_output  # noqa: PLC0415
+
+        distributed_output.run_distributed_dense_output(
+            comm[0],
+            comm[1],
+            operands,
+            residual=(base, gate, gate_indices, python_indexing),
+        )
+        return
     shape, residual_add = operands.validate_residual_add(
         (base, gate, gate_indices, python_indexing)
     )
@@ -526,8 +575,10 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
     *,
     head_dim: int,
     query_chunk_rows: int = DEFAULT_QUERY_CHUNK_ROWS,
+    comm_group_size: int | None = None,
+    comm_group_name: str | None = None,
 ) -> None:
-    DenseOutputOperands(
+    operands = DenseOutputOperands(
         input_qdata,
         input_scale,
         query_weight,
@@ -555,7 +606,19 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
         output_input_scale,
         head_dim,
         query_chunk_rows,
-    ).validate_residual_add((base, gate, gate_indices, python_indexing))
+    )
+    comm = _resolve_distributed_comm(comm_group_size, comm_group_name)
+    if comm is not None:
+        from . import distributed_output  # noqa: PLC0415
+
+        distributed_output.validate_distributed_dense_output(
+            comm[0],
+            comm[1],
+            operands,
+            residual=(base, gate, gate_indices, python_indexing),
+        )
+        return
+    operands.validate_residual_add((base, gate, gate_indices, python_indexing))
 
 
 __all__: list[str] = []

@@ -567,6 +567,19 @@ class SparseProjectedQueryOperands:
         )
 
 
+def _resolve_distributed_comm(
+    comm_group_size: int | None,
+    comm_group_name: str | None,
+) -> tuple[int, str] | None:
+    if comm_group_size is None and comm_group_name is None:
+        return None
+    if comm_group_size is None or comm_group_name is None:
+        raise ValueError(
+            "distributed sparse Piper requires both comm_group_size and comm_group_name"
+        )
+    return comm_group_size, comm_group_name
+
+
 @torch.library.custom_op(
     "piper_kernels::convrot_int8_sparse_piper_projected_query_attention_output",
     mutates_args=(),
@@ -617,7 +630,10 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
     *,
     input_group_size: int | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
+    comm_group_size: int | None = None,
+    comm_group_name: str | None = None,
 ) -> torch.Tensor:
+    comm = _resolve_distributed_comm(comm_group_size, comm_group_name)
     gate_projection = prepare_projected_gate_projection(
         key,
         logical_sequence_length,
@@ -630,7 +646,7 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         gate_bias,
         input_group_size,
     )
-    return SparseProjectedQueryOperands(
+    operands = SparseProjectedQueryOperands(
         query_input,
         query_input_scale,
         query_weight_qdata,
@@ -669,7 +685,14 @@ def _projected_query_attention_output_op(  # noqa: PLR0913, PLR0917
         output_input_scale=output_input_scale,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
-    ).run(gate_projection=gate_projection)
+    )
+    if comm is not None:
+        from . import distributed_output  # noqa: PLC0415
+
+        return distributed_output.run_distributed_projected_query_attention_output(
+            comm[0], comm[1], operands, gate_projection=gate_projection
+        )
+    return operands.run(gate_projection=gate_projection)
 
 
 @torch.library.custom_op(
@@ -887,7 +910,30 @@ def _projected_query_attention_output_op_fake(
     *,
     input_group_size: int | None = None,  # noqa: ARG001 - custom-op keyword
     output_dtype: torch.dtype = torch.bfloat16,
+    comm_group_size: int | None = None,
+    comm_group_name: str | None = None,
 ) -> torch.Tensor:
+    comm = _resolve_distributed_comm(comm_group_size, comm_group_name)
+    if comm is not None:
+        from piper_kernels._distributed import _peer_exchange as peer_exchange  # noqa: PLC0415
+
+        sequence_length = output_common.validate_output_metadata(
+            key,
+            logical_sequence_length,
+            block_lengths,
+            output_dtype=output_dtype,
+            force_tile_ids=force_tile_ids,
+            force_tile_counts=force_tile_counts,
+        )
+        local_sequence_length = peer_exchange.validate_distributed_sequence(
+            sequence_length,
+            comm[0],
+            comm[1],
+            name="distributed sparse Piper",
+        )
+        return output_common.new_projected_output(
+            key, local_sequence_length, weight_qdata.shape[0], output_dtype=output_dtype
+        )
     return output_common.fake_projected_output(
         key,
         logical_sequence_length,
@@ -969,6 +1015,8 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     force_tile_counts: torch.Tensor | None = None,
     *,
     input_group_size: int | None = None,
+    comm_group_size: int | None = None,
+    comm_group_name: str | None = None,
     head_slice_index: int = 0,
     num_head_slices: int = 1,
 ) -> None:
@@ -980,26 +1028,50 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
     dtype is ``base``'s. The linear backend adds each window's projection into its
     ``base`` rows in FP32; its native epilogue preserves projection rounding without scratch.
 
-    To add attention in ``num_head_slices`` equal head slices, call once per slice:
-    the Q, K, V, and coarse-gate operands hold slice ``head_slice_index``'s heads, the
-    output projection takes their share of its input columns, and ``ratio_profile``
-    covers every slice's heads. Each head then keeps the blocks it keeps unsliced.
+    When ``comm_group_size`` and ``comm_group_name`` are provided, overlaps bounded
+    peer-chunk reduce-scatter into this rank's ``base`` rows (head slicing must remain
+    at ``head_slice_index=0, num_head_slices=1``).
     """
-    start_head, end_head = _resolve_head_slice(
-        ratio_profile, query_weight_qdata, key, head_slice_index, num_head_slices
-    )
-    residual_add = output_common.validate_residual_add(
-        base,
-        gate,
-        gate_indices,
-        python_indexing,
-        key,
-        logical_sequence_length,
-        block_lengths,
-        weight_qdata.shape[0],
-        force_tile_ids,
-        force_tile_counts,
-    )
+    comm = _resolve_distributed_comm(comm_group_size, comm_group_name)
+    if comm is not None:
+        if head_slice_index != 0 or num_head_slices != 1:
+            raise ValueError("distributed sparse Piper residual add does not support head slicing")
+        from . import distributed_output  # noqa: PLC0415
+
+        residual_add = ResidualAdd(
+            base=base,
+            gate=gate,
+            gate_indices=gate_indices,
+            python_indexing=python_indexing,
+        )
+        distributed_output.validate_distributed_residual_add(
+            comm[0],
+            comm[1],
+            residual_add,
+            key,
+            logical_sequence_length,
+            block_lengths,
+            weight_qdata,
+            force_tile_ids,
+            force_tile_counts,
+        )
+        start_head, end_head = 0, None
+    else:
+        start_head, end_head = _resolve_head_slice(
+            ratio_profile, query_weight_qdata, key, head_slice_index, num_head_slices
+        )
+        residual_add = output_common.validate_residual_add(
+            base,
+            gate,
+            gate_indices,
+            python_indexing,
+            key,
+            logical_sequence_length,
+            block_lengths,
+            weight_qdata.shape[0],
+            force_tile_ids,
+            force_tile_counts,
+        )
     gate_projection = prepare_projected_gate_projection(
         key,
         logical_sequence_length,
@@ -1012,7 +1084,7 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
         gate_bias,
         input_group_size,
     )
-    SparseProjectedQueryOperands(
+    operands = SparseProjectedQueryOperands(
         query_input,
         query_input_scale,
         query_weight_qdata,
@@ -1051,7 +1123,19 @@ def _projected_query_attention_residual_add_op(  # noqa: PLR0913, PLR0917
         output_input_scale=output_input_scale,
         force_tile_ids=force_tile_ids,
         force_tile_counts=force_tile_counts,
-    ).run(
+    )
+    if comm is not None:
+        from . import distributed_output  # noqa: PLC0415
+
+        distributed_output.run_distributed_projected_query_attention_output(
+            comm[0],
+            comm[1],
+            operands,
+            gate_projection=gate_projection,
+            residual_add=residual_add,
+        )
+        return
+    operands.run(
         gate_projection=gate_projection,
         residual_add=residual_add,
         start_head=start_head,
@@ -1108,9 +1192,34 @@ def _projected_query_attention_residual_add_op_fake(  # noqa: PLR0913, PLR0917
     force_tile_counts: torch.Tensor | None = None,
     *,
     input_group_size: int | None = None,  # noqa: ARG001 - custom-op keyword
+    comm_group_size: int | None = None,
+    comm_group_name: str | None = None,
     head_slice_index: int = 0,
     num_head_slices: int = 1,
 ) -> None:
+    comm = _resolve_distributed_comm(comm_group_size, comm_group_name)
+    if comm is not None:
+        if head_slice_index != 0 or num_head_slices != 1:
+            raise ValueError("distributed sparse Piper residual add does not support head slicing")
+        from . import distributed_output  # noqa: PLC0415
+
+        distributed_output.validate_distributed_residual_add(
+            comm[0],
+            comm[1],
+            ResidualAdd(
+                base=base,
+                gate=gate,
+                gate_indices=gate_indices,
+                python_indexing=python_indexing,
+            ),
+            key,
+            logical_sequence_length,
+            block_lengths,
+            weight_qdata,
+            force_tile_ids,
+            force_tile_counts,
+        )
+        return
     _resolve_head_slice(ratio_profile, query_weight_qdata, key, head_slice_index, num_head_slices)
     output_common.validate_residual_add(
         base,

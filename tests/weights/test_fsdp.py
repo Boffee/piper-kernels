@@ -1342,8 +1342,7 @@ def _check_gpu_hybrid_tpsp_fsdp(
     flat_targets = [target for graph_targets in cap_hybrid.all_targets for target in graph_targets]
     assert "_c10d_functional.all_gather_into_tensor_coalesced.default" in flat_targets
     assert (
-        "piper_kernels."
-        "convrot_int8_piper_projected_query_attention_reduce_scatter_residual_add_.default"
+        "piper_kernels.convrot_int8_piper_projected_query_attention_residual_add_.default"
         in flat_targets
     )
     assert "piper_kernels.convrot_int8_ffn_update_.default" in flat_targets

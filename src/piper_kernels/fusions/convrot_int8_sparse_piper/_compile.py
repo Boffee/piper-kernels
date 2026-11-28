@@ -346,8 +346,9 @@ _HEAD_SLICING = head_slices.HeadSlicing(
     columns="weight_qdata",
     once=("bias",),
     alignment="group_size",
-    # A materialized coarse gate holds heads along its third dimension.
-    unsliceable=("coarse_gate",),
+    # A materialized coarse gate holds heads along its third dimension; distributed ops
+    # reduce-scatter across ranks and run unsliced.
+    unsliceable=("coarse_gate", "comm_group_size"),
     # At H3's shape, the add's routing scores and coarse-gate windows bring it up to the
     # K projection's peak, so full-size windows would raise the peak for little speed.
     widened_window_rows=None,
@@ -356,10 +357,12 @@ _HEAD_SLICING = head_slices.HeadSlicing(
 )
 
 
-def fold_sparse_attention(graph: torch.fx.Graph) -> bool:
+def fold_sparse_attention(graph: torch.fx.Graph, *, normalize_inputs: bool = True) -> bool:
     """Fold ConvRot INT8 projections, output projections, residuals, and collectives."""
-    changed = projection_views.normalize_projection_views(graph)
-    changed = linear_compile_fx.coalesce_input_casts(graph) or changed
+    changed = False
+    if normalize_inputs:
+        changed = projection_views.normalize_projection_views(graph)
+        changed = linear_compile_fx.coalesce_input_casts(graph) or changed
     changed = _fold_sparse_piper_projection(graph) or changed
     changed = _output_compile._fold_attention_output(graph) or changed
     post_changed = residual_fold.fold_residual_adds(

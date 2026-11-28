@@ -140,10 +140,11 @@ in [`_compile.py`](_compile.py) via the shared
 [`_distributed_fold.py`](../attention/_distributed_fold.py) helper to rewrite
 `convrot_int8_piper_projected_query_attention_output -> reduce_scatter_tensor` (and an
 exclusive trailing in-place `residual_add_`) into
-`convrot_int8_piper_projected_query_attention_reduce_scatter` or
-`..._reduce_scatter_residual_add_`. Both custom operators live in
-[`distributed_output.py`](distributed_output.py) and delegate bounded peer chunk
-exchange behind own-rank attention to
+`convrot_int8_piper_projected_query_attention_output` or
+`convrot_int8_piper_projected_query_attention_residual_add_` parameterized with
+`comm_group_size` and `comm_group_name`. Both custom operators live in
+[`output.py`](output.py) and delegate bounded peer chunk exchange behind own-rank
+attention to [`distributed_output.py`](distributed_output.py) and
 [`_peer_exchange.py`](../../_distributed/_peer_exchange.py).
 
 Rank-local sequences divisible by 128 tokens (matching dense query-tile alignment on SM89,

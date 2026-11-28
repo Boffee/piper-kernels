@@ -14,11 +14,6 @@ import torch
 from piper_kernels._residual import ResidualAdd, validate_residual_add
 from piper_kernels._residual.triton import apply_residual_add
 from piper_kernels._triton import runtime
-from piper_kernels.linear import _preparation_sharing as preparation_sharing
-
-
-def _same_dimension(left: int | torch.SymInt, right: int | torch.SymInt) -> bool:
-    return preparation_sharing.dimension_key(left) == preparation_sharing.dimension_key(right)
 
 
 def supports_residual_add(
@@ -35,13 +30,14 @@ def supports_residual_add(
     int64 row index per ``base`` row. Symbolic sizes are compared without adding shape
     guards.
     """
+    from piper_kernels.linear import _compile_fx as linear_fx  # noqa: PLC0415
+
     if base.ndim < 1 or not base.dtype.is_floating_point:
         return False
     rows = math.prod(base.shape[:-1])
     return bool(
         all(
-            value.ndim == base.ndim
-            and all(map(_same_dimension, value.shape, base.shape, strict=True))
+            linear_fx.same_shape(value.shape, base.shape)
             and value.dtype is base.dtype
             and value.device == base.device
             and value.layout is torch.strided
@@ -54,13 +50,13 @@ def supports_residual_add(
         and gate.device == base.device
         and gate.layout is torch.strided
         and gate.stride(-1) == 1
-        and _same_dimension(gate.shape[-1], base.shape[-1])
+        and linear_fx.same_dimension(gate.shape[-1], base.shape[-1])
         and indices.ndim == 1
         and indices.dtype in (torch.int32, torch.int64)
         and indices.device == base.device
         and indices.layout is torch.strided
         and indices.is_contiguous()
-        and _same_dimension(indices.numel(), rows)
+        and linear_fx.same_dimension(indices.numel(), rows)
         and runtime.supports_device(base.device)
     )
 
