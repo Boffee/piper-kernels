@@ -578,11 +578,6 @@ def decode_slots_int8_kernel(
     )  # fmt: skip
 
 
-def _decode_num_warps(target: AcceleratorTarget) -> int:
-    """Return the optimal warp count for Trellis block decoding on ``target``."""
-    return 1 if target.is_hip_architecture(*GFX120X_ARCHITECTURES) else _DEFAULT_DECODE_WARPS
-
-
 def _decode_stream_flags(
     target: AcceleratorTarget,
     stream_bytes: int,
