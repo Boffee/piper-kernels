@@ -2,71 +2,11 @@
 
 from __future__ import annotations
 
-import torch
-
 from piper_kernels._triton.targets import AcceleratorTarget
 
 from . import _schedule
 from ._amd import policy as _amd_policy
 from ._nvidia import policy as _nvidia_policy
-
-
-def select_nvfp4_m1_schedule(target: AcceleratorTarget) -> _schedule.Nvfp4M1Schedule:
-    """Resolve the NVFP4 ``rows == 1`` decode schedule for ``target``."""
-    return _nvidia_policy.select_nvfp4_m1_schedule(target)
-
-
-def select_nvfp4_batched_schedule(
-    target: AcceleratorTarget,
-    *,
-    rows: int,
-    active_dtype: torch.dtype,
-    logical_dtype: torch.dtype,
-) -> _schedule.Nvfp4BatchedSchedule:
-    """Resolve the NVFP4 batched decode schedule for ``target``."""
-    return _nvidia_policy.select_nvfp4_batched_schedule(
-        target, rows=rows, active_dtype=active_dtype, logical_dtype=logical_dtype
-    )
-
-
-def select_nvfp4_prefill_schedule(
-    target: AcceleratorTarget,
-    *,
-    chunk_rows: int,
-    top_k: int,
-    num_slots: int,
-    active_slots_hint: int,
-    active_dtype: torch.dtype,
-    logical_dtype: torch.dtype,
-) -> _schedule.Nvfp4PrefillSchedule:
-    """Resolve the NVFP4 grouped prefill schedule for ``target``."""
-    return _nvidia_policy.select_nvfp4_prefill_schedule(
-        target,
-        chunk_rows=chunk_rows,
-        top_k=top_k,
-        num_slots=num_slots,
-        active_slots_hint=active_slots_hint,
-        active_dtype=active_dtype,
-        logical_dtype=logical_dtype,
-    )
-
-
-def select_nvfp4_w4a4_prefill_schedule(
-    target: AcceleratorTarget,
-    *,
-    chunk_rows: int,
-    top_k: int,
-    num_slots: int,
-    active_slots_hint: int,
-) -> _schedule.Nvfp4W4A4PrefillSchedule:
-    """Resolve the NVFP4 W4A4 grouped prefill schedule for ``target``."""
-    return _nvidia_policy.select_nvfp4_w4a4_prefill_schedule(
-        target,
-        chunk_rows=chunk_rows,
-        top_k=top_k,
-        num_slots=num_slots,
-        active_slots_hint=active_slots_hint,
-    )
 
 
 def select_int8_launch_schedule(target: AcceleratorTarget) -> _schedule.Int8LaunchSchedule:

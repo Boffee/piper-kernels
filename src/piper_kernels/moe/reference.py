@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Literal, cast
 
 import torch
@@ -27,6 +28,28 @@ _GATED_MOE_ACTIVATIONS = ("swiglu", "swiglu_clamped")
 def is_gated_activation(activation_fn: str) -> bool:
     """Return whether a MoE activation consumes paired ``[gate, up]`` projections."""
     return activation_fn in _GATED_MOE_ACTIVATIONS
+
+
+@dataclass(frozen=True, slots=True)
+class _ActivationConfig:
+    """Normalized MoE intermediate activation configuration."""
+
+    activation_fn: str = "swiglu"
+    gate_first: bool = True
+    gate_bound: float | None = None
+    up_bound: float | None = None
+
+    @property
+    def is_gated(self) -> bool:
+        return is_gated_activation(self.activation_fn)
+
+    @property
+    def gate_bound_value(self) -> float:
+        return 0.0 if self.gate_bound is None else float(self.gate_bound)
+
+    @property
+    def up_bound_value(self) -> float:
+        return 0.0 if self.up_bound is None else float(self.up_bound)
 
 
 def parse_moe_activation(activation_fn: str, *, name: str = "MoE") -> MoEActivation:

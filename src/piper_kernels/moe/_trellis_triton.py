@@ -17,7 +17,7 @@ from piper_kernels.trellis._layout import WRAP_GUARD_BYTES, TrellisLayout
 from piper_kernels.trellis.triton import _le_step_bits_4, compute_row_offsets_2d
 
 from . import _schedule
-from ._routing_triton import A16ChunkRouting, _resolve_slot, _unpack_2d_tile_pid, moe_2d_tile_grid
+from ._routing_triton import ChunkRouting, _resolve_slot, _unpack_2d_tile_pid, moe_2d_tile_grid
 
 _WRAP_GUARD_BYTES = tl.constexpr(WRAP_GUARD_BYTES)
 _BATCH_BLOCK_M_TL = tl.constexpr(_schedule.BATCH_BLOCK_M)
@@ -384,8 +384,7 @@ def launch_trellis_proj(
     row_widths: torch.Tensor | None,
     slot_offsets: torch.Tensor | None,
     block_size: int,
-    routing: A16ChunkRouting,
-    expert_to_slot: torch.Tensor | None,
+    routing: ChunkRouting,
     output: torch.Tensor,
     *,
     out_features: int,
@@ -415,7 +414,7 @@ def launch_trellis_proj(
     else:
         grid_tiles = routing.top_k
         active_slots = (
-            _resolve_m1_active_slots(routing.topk_ids_flat, expert_to_slot, num_slots)
+            _resolve_m1_active_slots(routing.topk_ids_flat, routing.expert_to_slot, num_slots)
             if variable_rows
             else None
         )

@@ -143,6 +143,57 @@ def moe_bucket_tokens_kernel(
     )
 
 
+@triton.jit
+def _load_activate_rotate_tile(
+    mid_ptr,
+    pair_idx,
+    k_offs,
+    k_valid,
+    intermediate_size,
+    gate_bound,
+    up_bound,
+    block_k: tl.constexpr,
+    group_size: tl.constexpr,
+    is_gated: tl.constexpr,
+    gate_first: tl.constexpr,
+    has_gate_bound: tl.constexpr,
+    has_up_bound: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+    round_to_logical: tl.constexpr = False,
+    logical_ref_ptr=None,
+):
+    """Load up/gate intermediates, apply activation (+ bounds), and optional ConvRot."""
+    inter_i64 = intermediate_size.to(tl.int64)
+    k_offs_i64 = k_offs.to(tl.int64)
+    if is_gated:
+        base = pair_idx * (inter_i64 * 2) + k_offs_i64
+        first = tl.load(mid_ptr + base, mask=k_valid, other=0.0).to(tl.float32)
+        second = tl.load(mid_ptr + base + inter_i64, mask=k_valid, other=0.0).to(tl.float32)
+        gate = first if gate_first else second
+        up = second if gate_first else first
+        if has_gate_bound:
+            gate = tl.minimum(gate, gate_bound)
+        if has_up_bound:
+            up = tl.clamp(up, -up_bound, up_bound)
+        vals = swiglu(up, gate)
+    else:
+        vals = tl.load(
+            mid_ptr + pair_idx * inter_i64 + k_offs_i64,
+            mask=k_valid,
+            other=0.0,
+        ).to(tl.float32)
+        vals = gelu_tanh(vals, accelerator_backend)
+    vals = tl.where(k_valid, vals, 0.0)
+    if round_to_logical:
+        # Round activation outputs to logical_dtype before optional FP32 ConvRot rotation.
+        vals = vals.to(
+            logical_ref_ptr.dtype.element_ty  # pyright: ignore[reportOptionalMemberAccess]
+        ).to(tl.float32)
+    if group_size > 0:
+        vals = rotate_hadamard_groups(vals, block_k, group_size, normalize=True)
+    return vals
+
+
 @triton.jit(do_not_specialize=["num_pairs", "gate_bound", "up_bound"])
 def moe_m1_activate_rotate_kernel(
     mid_ptr,
@@ -183,31 +234,27 @@ def moe_m1_activate_rotate_kernel(
 
     offs = tile_idx * block_size + tl.arange(0, block_size)
     valid = offs < intermediate_size
-    up_gate_stride = intermediate_size * (2 if is_gated else 1)
-    k_base = k_idx.to(tl.int64) * up_gate_stride
-
-    if is_gated:
-        first = tl.load(mid_ptr + k_base + offs, mask=valid, other=0.0).to(tl.float32)
-        second = tl.load(mid_ptr + k_base + intermediate_size + offs, mask=valid, other=0.0).to(
-            tl.float32
-        )
-        gate = first if gate_first else second
-        up = second if gate_first else first
-        if has_gate_bound:
-            gate = tl.minimum(gate, gate_bound)
-        if has_up_bound:
-            up = tl.clamp(up, -up_bound, up_bound)
-        act = swiglu(up, gate)
-    else:
-        vals = tl.load(mid_ptr + k_base + offs, mask=valid, other=0.0).to(tl.float32)
-        act = gelu_tanh(vals, accelerator_backend)
-
-    # Round activation outputs to logical_dtype before optional FP32 ConvRot rotation.
-    act = act.to(logical_ref_ptr.dtype.element_ty).to(tl.float32)
-    if group_size > 0:
-        act = rotate_hadamard_groups(act, block_size, group_size, normalize=True)
+    pair_i64 = k_idx.to(tl.int64)
+    act = _load_activate_rotate_tile(
+        mid_ptr,
+        pair_i64,
+        offs,
+        valid,
+        intermediate_size,
+        gate_bound,
+        up_bound,
+        block_k=block_size,
+        group_size=group_size,
+        is_gated=is_gated,
+        gate_first=gate_first,
+        has_gate_bound=has_gate_bound,
+        has_up_bound=has_up_bound,
+        accelerator_backend=accelerator_backend,
+        round_to_logical=True,
+        logical_ref_ptr=logical_ref_ptr,
+    )
     tl.store(
-        act_ptr + k_idx.to(tl.int64) * intermediate_size + offs,
+        act_ptr + pair_i64 * intermediate_size + offs.to(tl.int64),
         act.to(act_ptr.dtype.element_ty),
         mask=valid,
     )
@@ -547,7 +594,7 @@ def moe_prefill_gather_kernel(
 
 
 @dataclass(frozen=True, slots=True)
-class A16ChunkRouting:
+class ChunkRouting:
     topk_ids_flat: torch.Tensor
     expert_to_slot: torch.Tensor | None
     tile_slots: torch.Tensor | None
@@ -556,3 +603,14 @@ class A16ChunkRouting:
     num_pairs: int
     top_k: int
     has_slot_map: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PrefillBuckets:
+    tile_slots: torch.Tensor
+    tile_m_start: torch.Tensor
+    tile_m_len: torch.Tensor
+    compact_to_pair: torch.Tensor
+    pair_to_compact: torch.Tensor
+    max_tiles: int
+    slot_counts: torch.Tensor
