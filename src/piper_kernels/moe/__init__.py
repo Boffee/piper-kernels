@@ -21,7 +21,10 @@ from piper_kernels.weights.convrot._rotation import rotate_groups, validate_grou
 from . import _ops
 from .reference import _autocast_disabled
 
+type MoEActQuant = Literal["dynamic"]
 type MoEWeightFormat = Literal[
+    "nvfp4",
+    "convrot_nvfp4",
     "nvfp4_w4a16",
     "convrot_nvfp4_w4a16",
     "convrot_int8",
@@ -30,6 +33,8 @@ type MoEWeightFormat = Literal[
 
 _SUPPORTED_LOGICAL_DTYPES = _ops._SUPPORTED_LOGICAL_DTYPES
 _SUPPORTED_WEIGHT_FORMATS = (
+    "nvfp4",
+    "convrot_nvfp4",
     "nvfp4_w4a16",
     "convrot_nvfp4_w4a16",
     "convrot_int8",
@@ -82,6 +87,7 @@ class MoEWeights:
     down_slot_offsets: torch.Tensor | None = None
     up_gate_block_size: int = 0
     down_block_size: int = 0
+    act_quant: MoEActQuant | None = None
 
     def __post_init__(self) -> None:
         if self.logical_dtype not in _SUPPORTED_LOGICAL_DTYPES:
@@ -97,6 +103,8 @@ class MoEWeights:
             return "convrot_trellis"
         if self.up_gate_qdata.dtype is torch.int8:
             return "convrot_int8"
+        if self.act_quant == "dynamic":
+            return "convrot_nvfp4" if self.group_size > 0 else "nvfp4"
         return "convrot_nvfp4_w4a16" if self.group_size > 0 else "nvfp4_w4a16"
 
     @property
@@ -149,6 +157,7 @@ class MoEWeights:
         down_slot_offsets: torch.Tensor | None = None,
         up_gate_block_size: int = 0,
         down_block_size: int = 0,
+        act_quant: MoEActQuant | None = None,
     ) -> MoEWeights:
         """Wrap existing expert-major quantized storage without copying."""
         has_trellis = (
@@ -198,6 +207,7 @@ class MoEWeights:
             down_slot_offsets=down_slot_offsets,
             up_gate_block_size=up_gate_block_size,
             down_block_size=down_block_size,
+            act_quant=act_quant,
         )
 
     @classmethod
@@ -256,6 +266,7 @@ class MoEWeights:
             gate_first=gate_first,
             high_first=high_first,
             compute_per_tensor_scale=compute_per_tensor_scale,
+            act_quant="dynamic" if weight_format in ("nvfp4", "convrot_nvfp4") else None,
         )
 
 
@@ -287,10 +298,11 @@ def _validate_from_hp_inputs(
         bits_per_weight is not None or bytes_per_block is not None
     ):
         raise ValueError("bits_per_weight and bytes_per_block apply only to convrot_trellis")
-    if weight_format == "nvfp4_w4a16" and group_size != 0:
-        raise ValueError("nvfp4_w4a16 requires group_size=0; use convrot_nvfp4_w4a16")
-    if weight_format == "convrot_nvfp4_w4a16" and group_size == 0:
-        raise ValueError("convrot_nvfp4_w4a16 requires group_size in (16, 64, 256)")
+    if weight_format in ("nvfp4", "nvfp4_w4a16") and group_size != 0:
+        suggested = "convrot_nvfp4" if weight_format == "nvfp4" else "convrot_nvfp4_w4a16"
+        raise ValueError(f"{weight_format} requires group_size=0; use {suggested}")
+    if weight_format in ("convrot_nvfp4", "convrot_nvfp4_w4a16") and group_size == 0:
+        raise ValueError(f"{weight_format} requires group_size in (16, 64, 256)")
     if up_gate_hp.layout is not torch.strided or down_hp.layout is not torch.strided:
         raise ValueError("MoE from_hp weights must use strided layout")
     if up_gate_hp.ndim != 3 or down_hp.ndim != 3:
@@ -546,6 +558,7 @@ def _quantize_hp_nvfp4(
     gate_first: bool,
     high_first: bool,
     compute_per_tensor_scale: bool,
+    act_quant: MoEActQuant | None = None,
 ) -> MoEWeights:
     from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout  # noqa: PLC0415
 
@@ -584,6 +597,7 @@ def _quantize_hp_nvfp4(
         activation_fn=activation_fn,
         gate_first=gate_first,
         high_first=high_first,
+        act_quant=act_quant,
     )
 
 
@@ -767,11 +781,13 @@ def moe_ffn(
             weights.down_slot_offsets,
             weights.up_gate_block_size,
             weights.down_block_size,
+            weights.act_quant,
         )
     )
 
 
 __all__ = [
+    "MoEActQuant",
     "MoEWeightFormat",
     "MoEWeights",
     "PreparedMoEInput",

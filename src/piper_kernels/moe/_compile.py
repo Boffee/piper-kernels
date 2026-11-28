@@ -38,9 +38,13 @@ from ._int8_triton import (
     int8_moe_m1_matmul_kernel,
 )
 from ._nvfp4_triton import (
+    nvfp4_moe_activate_quant_kernel,
     nvfp4_moe_batched_gemv_kernel,
+    nvfp4_moe_gather_kernel,
     nvfp4_moe_grouped_gemm_kernel,
     nvfp4_moe_m1_gemv_kernel,
+    nvfp4_moe_row_quant_kernel,
+    nvfp4_w4a4_moe_grouped_gemm_kernel,
 )
 from ._ops import _INT8_MAX_REDUCTION_WIDTH
 from ._routing_triton import (
@@ -67,6 +71,17 @@ def _bind_opt_ptrs(
             sig[name] = ptr_type
 
 
+def _div16_attrs(
+    arg_names: Sequence[str],
+    signature: dict[str, str],
+    *extra_int_args: str,
+) -> dict[tuple[int, ...], list[list[object]]]:
+    """Attach 16-alignment hints for pointer args and selected integer strides."""
+    aligned = [name for name, ty in signature.items() if ty.startswith("*")]
+    aligned.extend(extra_int_args)
+    return {(arg_names.index(name),): [["tt.divisibility", 16]] for name in aligned}
+
+
 def _nvfp4_aligned_attrs(
     arg_names: Sequence[str],
     signature: dict[str, str],
@@ -75,13 +90,12 @@ def _nvfp4_aligned_attrs(
     in_features: int,
 ) -> dict[tuple[int, ...], list[list[object]]]:
     """Attach runtime pointer and packed-stride divisibility hints for offline compile."""
-    aligned = [name for name, ty in signature.items() if ty.startswith("*")]
-    aligned.append("expert_scale_stride")
+    extra = ["expert_scale_stride"]
     if out_features % 16 == 0:
-        aligned.append("out_features")
+        extra.append("out_features")
     if (in_features // 2) % 16 == 0:
-        aligned.append("packed_k")
-    return {(arg_names.index(name),): [["tt.divisibility", 16]] for name in aligned}
+        extra.append("packed_k")
+    return _div16_attrs(arg_names, signature, *extra)
 
 
 def _compile_bucket_kernel(
@@ -276,12 +290,13 @@ def _validate_nvfp4_compile_format(
         )
     if hidden_size % nvfp4_layout.BLOCK_SIZE or intermediate_size % nvfp4_layout.BLOCK_SIZE:
         raise ValueError("NVFP4 MoE hidden_size and intermediate_size must be multiples of 16")
-    if weight_format == "nvfp4_w4a16":
+    if weight_format in ("nvfp4", "nvfp4_w4a16"):
         if group_size != 0:
-            raise ValueError("nvfp4_w4a16 requires group_size=0; use convrot_nvfp4_w4a16")
+            suggested = "convrot_nvfp4" if weight_format == "nvfp4" else "convrot_nvfp4_w4a16"
+            raise ValueError(f"{weight_format} requires group_size=0; use {suggested}")
         return
     if group_size == 0:
-        raise ValueError("convrot_nvfp4_w4a16 requires group_size in (16, 64, 256)")
+        raise ValueError(f"{weight_format} requires group_size in (16, 64, 256)")
     validate_group_size(group_size)
     if hidden_size % group_size or intermediate_size % group_size:
         raise ValueError(
@@ -352,7 +367,7 @@ def _validate_compile_format(
     has_slot_offsets: bool = False,
     bytes_per_block: int | None = None,
 ) -> None:
-    if weight_format in ("nvfp4_w4a16", "convrot_nvfp4_w4a16"):
+    if weight_format in ("nvfp4", "convrot_nvfp4", "nvfp4_w4a16", "convrot_nvfp4_w4a16"):
         _validate_nvfp4_compile_format(
             accel,
             weight_format=weight_format,
@@ -387,6 +402,7 @@ def _compile_prefill_utility_kernels(
     has_slot_map: bool,
     accumulate: bool,
     compile_fn: TritonCompileFn,
+    include_gather: bool = True,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     count_sig: dict[str, str] = {
         "topk_ids_ptr": "*i64",
@@ -402,24 +418,7 @@ def _compile_prefill_utility_kernels(
         "has_slot_map": has_slot_map,
     }
     _bind_opt_ptrs(count_sig, count_constexprs, expert_to_slot_ptr="*i64" if has_slot_map else None)
-    gather_sig: dict[str, str] = {
-        "input_ptr": gather_ty,
-        "compact_to_pair_ptr": "*i32",
-        "out_ptr": gather_ty,
-        "hidden_size": "i32",
-        "top_k": "i32",
-    }
-    gather_constexprs: dict[str, object] = {
-        "block_k": _schedule.PREFILL_GATHER_BLOCK_K,
-        "has_scale": is_int8,
-    }
-    _bind_opt_ptrs(
-        gather_sig,
-        gather_constexprs,
-        input_scale_ptr="*fp32" if is_int8 else None,
-        out_scale_ptr="*fp32" if is_int8 else None,
-    )
-    return {
+    compiled: dict[str, triton.compiler.CompiledKernel] = {
         "bucket_count": compile_fn(
             ASTSource(moe_prefill_bucket_count_kernel, count_sig, constexprs=count_constexprs),
             target,
@@ -446,11 +445,6 @@ def _compile_prefill_utility_kernels(
             target,
             {"num_warps": 4},
         ),
-        "gather": compile_fn(
-            ASTSource(moe_prefill_gather_kernel, gather_sig, constexprs=gather_constexprs),
-            target,
-            {"num_warps": 4},
-        ),
         "weighted_reduce": _compile_weighted_reduce(
             target,
             out_ty=out_ty,
@@ -463,6 +457,30 @@ def _compile_prefill_utility_kernels(
             compile_fn=compile_fn,
         ),
     }
+    if include_gather:
+        gather_sig: dict[str, str] = {
+            "input_ptr": gather_ty,
+            "compact_to_pair_ptr": "*i32",
+            "out_ptr": gather_ty,
+            "hidden_size": "i32",
+            "top_k": "i32",
+        }
+        gather_constexprs: dict[str, object] = {
+            "block_k": _schedule.PREFILL_GATHER_BLOCK_K,
+            "has_scale": is_int8,
+        }
+        _bind_opt_ptrs(
+            gather_sig,
+            gather_constexprs,
+            input_scale_ptr="*fp32" if is_int8 else None,
+            out_scale_ptr="*fp32" if is_int8 else None,
+        )
+        compiled["gather"] = compile_fn(
+            ASTSource(moe_prefill_gather_kernel, gather_sig, constexprs=gather_constexprs),
+            target,
+            {"num_warps": 4},
+        )
+    return compiled
 
 
 def _compile_int8_prefill_kernels(
@@ -673,6 +691,196 @@ def _compile_nvfp4_prefill_kernels(
         accelerator_backend=accel.backend,
         has_slot_map=has_slot_map,
         use_compact_map=True,
+        compile_fn=compile_fn,
+    )
+    return compiled
+
+
+def _compile_nvfp4_w4a4_grouped_gemm(
+    target: GPUTarget,
+    *,
+    schedule: _schedule.Nvfp4W4A4PrefillSchedule,
+    output_ty: str,
+    out_features: int,
+    in_features: int,
+    has_global_scale: bool,
+    compile_fn: TritonCompileFn,
+) -> triton.compiler.CompiledKernel:
+    sig: dict[str, str] = {
+        "a_q_ptr": "*u8",
+        "a_sc_ptr": "*fp8e4nv",
+        "a_rs_ptr": "*fp32",
+        "b_q_ptr": "*u8",
+        "b_sc_ptr": "*fp8e4nv",
+        "tile_slots_ptr": "*i32",
+        "tile_m_start_ptr": "*i32",
+        "tile_m_len_ptr": "*i32",
+        "output_ptr": output_ty,
+        "max_tiles": "i32",
+        "out_features": "i32",
+        "packed_k": "i32",
+        "scale_column_blocks": "i32",
+        "expert_scale_stride": "i32",
+    }
+    constexprs: dict[str, object] = {
+        "block_m": schedule.block_m,
+        "block_n": schedule.block_n,
+        "block_k": schedule.block_k,
+        "group_m": _schedule.PREFILL_GROUP_M,
+        "has_global_scale": has_global_scale,
+    }
+    _bind_opt_ptrs(sig, constexprs, b_gs_ptr="*fp32" if has_global_scale else None)
+    attrs = _nvfp4_aligned_attrs(
+        nvfp4_w4a4_moe_grouped_gemm_kernel.arg_names,
+        sig,
+        out_features=out_features,
+        in_features=in_features,
+    )
+    return compile_fn(
+        ASTSource(nvfp4_w4a4_moe_grouped_gemm_kernel, sig, constexprs, attrs=attrs),
+        target,
+        {"num_warps": schedule.num_warps, "num_stages": schedule.num_stages},
+    )
+
+
+def _compile_nvfp4_w4a4_prefill_kernels(
+    target: GPUTarget,
+    accel: AcceleratorTarget,
+    *,
+    rows: int,
+    top_k: int,
+    num_slots: int,
+    active_slots_hint: int,
+    hidden_size: int,
+    intermediate_size: int,
+    out_ty: str,
+    group_size: int,
+    activation_fn: str,
+    gate_first: bool,
+    high_first: bool,
+    has_slot_map: bool,
+    has_global_scale: bool,
+    accumulate: bool,
+    compile_fn: TritonCompileFn,
+) -> dict[str, triton.compiler.CompiledKernel]:
+    schedule = _policy.select_nvfp4_w4a4_prefill_schedule(
+        accel,
+        chunk_rows=rows,
+        top_k=top_k,
+        num_slots=num_slots,
+        active_slots_hint=active_slots_hint,
+    )
+    compiled = _compile_prefill_utility_kernels(
+        target,
+        gather_ty=out_ty,
+        out_ty=out_ty,
+        is_int8=False,
+        block_m=schedule.block_m,
+        has_slot_map=has_slot_map,
+        accumulate=accumulate,
+        compile_fn=compile_fn,
+        include_gather=False,
+    )
+    rq_sig = {
+        "x_ptr": out_ty,
+        "q_out_ptr": "*u8",
+        "sc_out_ptr": "*fp8e4nv",
+        "row_scale_ptr": "*fp32",
+        "hidden_size": "i32",
+        "x_row_stride": "i32",
+    }
+    rq_attrs = _div16_attrs(
+        nvfp4_moe_row_quant_kernel.arg_names,
+        rq_sig,
+        *(("hidden_size", "x_row_stride") if hidden_size % 16 == 0 else ()),
+    )
+    compiled["nvfp4_row_quant"] = compile_fn(
+        ASTSource(
+            nvfp4_moe_row_quant_kernel,
+            rq_sig,
+            constexprs={
+                "block_k": _schedule.NVFP4_W4A4_QUANT_BLOCK_K,
+                "group_size": group_size,
+                "high_first": high_first,
+            },
+            attrs=rq_attrs,
+        ),
+        target,
+        {"num_warps": 4},
+    )
+    g_sig = {
+        "in_q_ptr": "*u8",
+        "in_sc_ptr": "*fp8e4nv",
+        "in_rs_ptr": "*fp32",
+        "compact_to_pair_ptr": "*i32",
+        "out_q_ptr": "*u8",
+        "out_sc_ptr": "*fp8e4nv",
+        "out_rs_ptr": "*fp32",
+        "packed_k": "i32",
+        "top_k": "i32",
+    }
+    g_attrs = _div16_attrs(
+        nvfp4_moe_gather_kernel.arg_names,
+        g_sig,
+        *(("packed_k",) if (hidden_size // 2) % 16 == 0 else ()),
+    )
+    compiled["nvfp4_gather"] = compile_fn(
+        ASTSource(
+            nvfp4_moe_gather_kernel,
+            g_sig,
+            constexprs={"block_bytes": _schedule.NVFP4_W4A4_GATHER_BLOCK_BYTES},
+            attrs=g_attrs,
+        ),
+        target,
+        {"num_warps": 4},
+    )
+    aq_sig = {
+        "mid_ptr": out_ty,
+        "compact_to_pair_ptr": "*i32",
+        "q_out_ptr": "*u8",
+        "sc_out_ptr": "*fp8e4nv",
+        "row_scale_ptr": "*fp32",
+        "intermediate_size": "i32",
+    }
+    aq_attrs = _div16_attrs(
+        nvfp4_moe_activate_quant_kernel.arg_names,
+        aq_sig,
+        *(("intermediate_size",) if intermediate_size % 16 == 0 else ()),
+    )
+    compiled["nvfp4_activate_quant"] = compile_fn(
+        ASTSource(
+            nvfp4_moe_activate_quant_kernel,
+            aq_sig,
+            constexprs={
+                "block_k": _schedule.NVFP4_W4A4_QUANT_BLOCK_K,
+                "group_size": group_size,
+                "is_swiglu": activation_fn == "swiglu",
+                "gate_first": gate_first,
+                "high_first": high_first,
+                "accelerator_backend": accel.backend,
+            },
+            attrs=aq_attrs,
+        ),
+        target,
+        {"num_warps": 4},
+    )
+    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    compiled["nvfp4_w4a4_grouped_up"] = _compile_nvfp4_w4a4_grouped_gemm(
+        target,
+        schedule=schedule,
+        output_ty=out_ty,
+        out_features=up_gate_out,
+        in_features=hidden_size,
+        has_global_scale=has_global_scale,
+        compile_fn=compile_fn,
+    )
+    compiled["nvfp4_w4a4_grouped_down"] = _compile_nvfp4_w4a4_grouped_gemm(
+        target,
+        schedule=schedule,
+        output_ty="*fp32",
+        out_features=hidden_size,
+        in_features=intermediate_size,
+        has_global_scale=has_global_scale,
         compile_fn=compile_fn,
     )
     return compiled
@@ -1311,6 +1519,116 @@ def _compile_trellis_kernels(
     return compiled
 
 
+def _compile_prefill_kernels_dispatch(
+    target: GPUTarget,
+    accel: AcceleratorTarget,
+    *,
+    is_trellis: bool,
+    has_int8_backend: bool,
+    is_nvfp4_w4a4: bool,
+    chunk_rows: int,
+    top_k: int,
+    num_slots: int,
+    active_slots_hint: int,
+    logical_dtype: torch.dtype,
+    out_ty: str,
+    hidden_size: int,
+    intermediate_size: int,
+    block_size: int,
+    variable_rows: bool,
+    has_slot_offsets: bool,
+    bytes_per_block: int | None,
+    group_size: int,
+    activation_fn: str,
+    gate_first: bool,
+    high_first: bool,
+    has_slot_map: bool,
+    has_global_scale: bool,
+    accumulate: bool,
+    compile_fn: TritonCompileFn,
+) -> dict[str, triton.compiler.CompiledKernel] | None:
+    if is_trellis and has_int8_backend:
+        return _compile_trellis_prefill_kernels(
+            target,
+            accel,
+            rows=chunk_rows,
+            top_k=top_k,
+            num_slots=num_slots,
+            active_slots_hint=active_slots_hint,
+            out_ty=out_ty,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            block_size=block_size,
+            variable_rows=variable_rows,
+            has_slot_offsets=has_slot_offsets,
+            bytes_per_block=bytes_per_block,
+            activation_fn=activation_fn,
+            gate_first=gate_first,
+            has_slot_map=has_slot_map,
+            accumulate=accumulate,
+            compile_fn=compile_fn,
+        )
+    if has_int8_backend:
+        return _compile_int8_prefill_kernels(
+            target,
+            accel,
+            rows=chunk_rows,
+            top_k=top_k,
+            num_slots=num_slots,
+            active_slots_hint=active_slots_hint,
+            out_ty=out_ty,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_fn=activation_fn,
+            gate_first=gate_first,
+            has_slot_map=has_slot_map,
+            accumulate=accumulate,
+            compile_fn=compile_fn,
+        )
+    if is_nvfp4_w4a4:
+        return _compile_nvfp4_w4a4_prefill_kernels(
+            target,
+            accel,
+            rows=chunk_rows,
+            top_k=top_k,
+            num_slots=num_slots,
+            active_slots_hint=active_slots_hint,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            out_ty=out_ty,
+            group_size=group_size,
+            activation_fn=activation_fn,
+            gate_first=gate_first,
+            high_first=high_first,
+            has_slot_map=has_slot_map,
+            has_global_scale=has_global_scale,
+            accumulate=accumulate,
+            compile_fn=compile_fn,
+        )
+    if not is_trellis:
+        return _compile_nvfp4_prefill_kernels(
+            target,
+            accel,
+            rows=chunk_rows,
+            top_k=top_k,
+            num_slots=num_slots,
+            active_slots_hint=active_slots_hint,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            logical_dtype=logical_dtype,
+            out_ty=out_ty,
+            group_size=group_size,
+            activation_fn=activation_fn,
+            gate_first=gate_first,
+            high_first=high_first,
+            has_slot_map=has_slot_map,
+            has_global_scale=has_global_scale,
+            accumulate=accumulate,
+            compile_fn=compile_fn,
+        )
+    return None
+
+
 def compile_moe_kernels(
     target: GPUTarget,
     *,
@@ -1367,6 +1685,7 @@ def compile_moe_kernels(
     up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
     is_int8 = weight_format == "convrot_int8"
     is_trellis = weight_format == "convrot_trellis"
+    is_nvfp4_w4a4 = weight_format in ("nvfp4", "convrot_nvfp4")
     compile_fn = compiler or default_triton_compile
     out_ty = TRITON_FLOAT_POINTER_TYPES[logical_dtype]
 
@@ -1386,59 +1705,29 @@ def compile_moe_kernels(
         up_gate_out=up_gate_out,
         logical_elem_bytes=logical_dtype.itemsize,
         group_size=group_size,
+        is_nvfp4_w4a4=is_nvfp4_w4a4,
     )
     regime, chunk_rows = _schedule.select_moe_execution_regime(rows, top_k, bytes_per_pair)
 
-    if regime == "prefill" and has_int8_backend:
-        if is_trellis:
-            return _compile_trellis_prefill_kernels(
-                target,
-                accel,
-                rows=chunk_rows,
-                top_k=top_k,
-                num_slots=num_slots,
-                active_slots_hint=active_slots_hint,
-                out_ty=out_ty,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                block_size=block_size,
-                variable_rows=variable_rows,
-                has_slot_offsets=has_slot_offsets,
-                bytes_per_block=bytes_per_block,
-                activation_fn=activation_fn,
-                gate_first=gate_first,
-                has_slot_map=has_slot_map,
-                accumulate=accumulate,
-                compile_fn=compile_fn,
-            )
-        return _compile_int8_prefill_kernels(
+    if regime == "prefill":
+        prefill_compiled = _compile_prefill_kernels_dispatch(
             target,
             accel,
-            rows=chunk_rows,
+            is_trellis=is_trellis,
+            has_int8_backend=has_int8_backend,
+            is_nvfp4_w4a4=is_nvfp4_w4a4,
+            chunk_rows=chunk_rows,
             top_k=top_k,
             num_slots=num_slots,
             active_slots_hint=active_slots_hint,
-            out_ty=out_ty,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            activation_fn=activation_fn,
-            gate_first=gate_first,
-            has_slot_map=has_slot_map,
-            accumulate=accumulate,
-            compile_fn=compile_fn,
-        )
-    if regime == "prefill" and not is_trellis:
-        return _compile_nvfp4_prefill_kernels(
-            target,
-            accel,
-            rows=chunk_rows,
-            top_k=top_k,
-            num_slots=num_slots,
-            active_slots_hint=active_slots_hint,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
             logical_dtype=logical_dtype,
             out_ty=out_ty,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            block_size=block_size,
+            variable_rows=variable_rows,
+            has_slot_offsets=has_slot_offsets,
+            bytes_per_block=bytes_per_block,
             group_size=group_size,
             activation_fn=activation_fn,
             gate_first=gate_first,
@@ -1448,6 +1737,8 @@ def compile_moe_kernels(
             accumulate=accumulate,
             compile_fn=compile_fn,
         )
+        if prefill_compiled is not None:
+            return prefill_compiled
 
     if regime == "prefill":
         a16_rows = min(

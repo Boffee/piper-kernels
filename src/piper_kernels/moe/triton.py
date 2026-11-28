@@ -31,9 +31,13 @@ from ._int8_triton import (
     int8_moe_m1_matmul_kernel,
 )
 from ._nvfp4_triton import (
+    nvfp4_moe_activate_quant_kernel,
     nvfp4_moe_batched_gemv_kernel,
+    nvfp4_moe_gather_kernel,
     nvfp4_moe_grouped_gemm_kernel,
     nvfp4_moe_m1_gemv_kernel,
+    nvfp4_moe_row_quant_kernel,
+    nvfp4_w4a4_moe_grouped_gemm_kernel,
 )
 from ._routing_triton import (
     A16ChunkRouting,
@@ -573,6 +577,164 @@ def _run_nvfp4_prefill_chunk(
     )
 
 
+def _run_nvfp4_w4a4_prefill_chunk(
+    src_chunk: torch.Tensor,
+    topk_ids_chunk: torch.Tensor,
+    topk_weights_chunk: torch.Tensor,
+    up_gate_qdata: torch.Tensor,
+    up_gate_scale: torch.Tensor,
+    down_qdata: torch.Tensor,
+    down_scale: torch.Tensor,
+    up_gate_global_scale: torch.Tensor | None,
+    down_global_scale: torch.Tensor | None,
+    expert_to_slot: torch.Tensor | None,
+    out_chunk: torch.Tensor,
+    *,
+    target: AcceleratorTarget,
+    input_is_rotated: bool,
+    accumulate: bool,
+    group_size: int,
+    activation_fn: str,
+    gate_first: bool,
+    high_first: bool,
+    active_slots_hint: int,
+    up_scale_cols: int,
+    up_scale_stride: int,
+    down_scale_cols: int,
+    down_scale_stride: int,
+) -> None:
+    device = src_chunk.device
+    chunk_rows = src_chunk.shape[0]
+    top_k = topk_ids_chunk.shape[1]
+    num_pairs = chunk_rows * top_k
+    num_slots, hidden_size, packed_inter = down_qdata.shape
+    packed_hidden = hidden_size // 2
+    intermediate_size = 2 * packed_inter
+    up_gate_out = up_gate_qdata.shape[1]
+    schedule = _policy.select_nvfp4_w4a4_prefill_schedule(
+        target,
+        chunk_rows=chunk_rows,
+        top_k=top_k,
+        num_slots=num_slots,
+        active_slots_hint=active_slots_hint,
+    )
+    block_m = schedule.block_m
+
+    x_q = torch.empty((chunk_rows, packed_hidden), device=device, dtype=torch.uint8)
+    x_sc = torch.empty((chunk_rows, hidden_size // 16), device=device, dtype=torch.float8_e4m3fn)
+    x_rs = torch.empty((chunk_rows,), device=device, dtype=torch.float32)
+    _nvfp4_triton.launch_nvfp4_row_quant(
+        src_chunk,
+        x_q,
+        x_sc,
+        x_rs,
+        group_size=0 if input_is_rotated else group_size,
+        high_first=high_first,
+    )
+
+    tile_slots, tile_m_start, tile_m_len, compact_to_pair, pair_to_compact, max_tiles, _ = (
+        _launch_moe_prefill_bucket(topk_ids_chunk.reshape(-1), expert_to_slot, num_slots, block_m)
+    )
+    x_q_compact = torch.empty((num_pairs, packed_hidden), device=device, dtype=torch.uint8)
+    x_sc_compact = torch.empty(
+        (num_pairs, hidden_size // 16), device=device, dtype=torch.float8_e4m3fn
+    )
+    x_rs_compact = torch.empty((num_pairs,), device=device, dtype=torch.float32)
+    _nvfp4_triton.launch_nvfp4_gather(
+        x_q,
+        x_sc,
+        x_rs,
+        compact_to_pair,
+        x_q_compact,
+        x_sc_compact,
+        x_rs_compact,
+        packed_k=packed_hidden,
+        top_k=top_k,
+    )
+    del x_q, x_sc, x_rs
+
+    mid = torch.empty((num_pairs, up_gate_out), device=device, dtype=out_chunk.dtype)
+    _nvfp4_triton.launch_nvfp4_w4a4_grouped_gemm(
+        x_q_compact,
+        x_sc_compact,
+        x_rs_compact,
+        up_gate_qdata,
+        up_gate_scale,
+        up_gate_global_scale,
+        tile_slots,
+        tile_m_start,
+        tile_m_len,
+        mid,
+        max_tiles=max_tiles,
+        out_features=up_gate_out,
+        in_features=hidden_size,
+        scale_cols=up_scale_cols,
+        scale_stride=up_scale_stride,
+        block_m=block_m,
+        block_n=schedule.block_n,
+        block_k=schedule.block_k,
+        num_warps=schedule.num_warps,
+        num_stages=schedule.num_stages,
+        has_global_scale=up_gate_global_scale is not None,
+    )
+    del x_q_compact, x_sc_compact, x_rs_compact
+
+    act_q = torch.empty((num_pairs, packed_inter), device=device, dtype=torch.uint8)
+    act_sc = torch.empty(
+        (num_pairs, intermediate_size // 16), device=device, dtype=torch.float8_e4m3fn
+    )
+    act_rs = torch.empty((num_pairs,), device=device, dtype=torch.float32)
+    _nvfp4_triton.launch_nvfp4_activate_quant(
+        mid,
+        compact_to_pair,
+        act_q,
+        act_sc,
+        act_rs,
+        intermediate_size=intermediate_size,
+        group_size=group_size,
+        activation_fn=activation_fn,
+        gate_first=gate_first,
+        high_first=high_first,
+        accelerator_backend=target.backend,
+    )
+    del mid
+
+    down_out = torch.empty((num_pairs, hidden_size), device=device, dtype=torch.float32)
+    _nvfp4_triton.launch_nvfp4_w4a4_grouped_gemm(
+        act_q,
+        act_sc,
+        act_rs,
+        down_qdata,
+        down_scale,
+        down_global_scale,
+        tile_slots,
+        tile_m_start,
+        tile_m_len,
+        down_out,
+        max_tiles=max_tiles,
+        out_features=hidden_size,
+        in_features=intermediate_size,
+        scale_cols=down_scale_cols,
+        scale_stride=down_scale_stride,
+        block_m=block_m,
+        block_n=schedule.block_n,
+        block_k=schedule.block_k,
+        num_warps=schedule.num_warps,
+        num_stages=schedule.num_stages,
+        has_global_scale=down_global_scale is not None,
+    )
+    del act_q, act_sc, act_rs
+    _launch_moe_prefill_weighted_reduce(
+        down_out,
+        pair_to_compact,
+        topk_weights_chunk.reshape(-1),
+        out_chunk,
+        hidden_size,
+        top_k,
+        accumulate=accumulate,
+    )
+
+
 def _dispatch_nvfp4_moe(
     input_2d: torch.Tensor,
     ids_2d: torch.Tensor,
@@ -588,6 +750,7 @@ def _dispatch_nvfp4_moe(
     out_2d: torch.Tensor,
     *,
     resolved_target: AcceleratorTarget,
+    act_quant: str | None,
     accumulate: bool,
     group_size: int,
     activation_fn: str,
@@ -605,6 +768,7 @@ def _dispatch_nvfp4_moe(
     up_scale_stride = up_gate_scale.shape[1] * up_gate_scale.shape[2]
     down_scale_cols = int(triton.cdiv(intermediate_size, nvfp4_layout.SCALE_COLUMN_TILE))
     down_scale_stride = down_scale.shape[1] * down_scale.shape[2]
+    is_w4a4 = act_quant == "dynamic"
 
     bytes_per_pair = _schedule.prefill_bytes_per_pair(
         is_int8=False,
@@ -613,10 +777,45 @@ def _dispatch_nvfp4_moe(
         up_gate_out=up_gate_out,
         logical_elem_bytes=input_2d.element_size(),
         group_size=group_size,
+        is_nvfp4_w4a4=is_w4a4,
     )
     regime, chunk_rows = _schedule.select_moe_execution_regime(rows, top_k, bytes_per_pair)
 
     if regime == "prefill":
+        if is_w4a4:
+            prep_full = None if prepared_data is None else prepared_data.reshape(rows, hidden_size)
+            input_is_rotated = prep_full is not None and group_size > 0
+            for start in range(0, rows, chunk_rows):
+                end = min(start + chunk_rows, rows)
+                src_chunk = (
+                    input_2d[start:end] if prep_full is None else prep_full[start:end]
+                ).contiguous()
+                _run_nvfp4_w4a4_prefill_chunk(
+                    src_chunk,
+                    ids_2d[start:end],
+                    weights_2d[start:end],
+                    up_gate_qdata,
+                    up_gate_scale,
+                    down_qdata,
+                    down_scale,
+                    up_gate_global_scale,
+                    down_global_scale,
+                    expert_to_slot,
+                    out_2d[start:end],
+                    target=resolved_target,
+                    input_is_rotated=input_is_rotated,
+                    accumulate=accumulate,
+                    group_size=group_size,
+                    activation_fn=activation_fn,
+                    gate_first=gate_first,
+                    high_first=high_first,
+                    active_slots_hint=active_slots_hint,
+                    up_scale_cols=up_scale_cols,
+                    up_scale_stride=up_scale_stride,
+                    down_scale_cols=down_scale_cols,
+                    down_scale_stride=down_scale_stride,
+                )
+            return
         for active_chunk, ids_chunk, weights_chunk, out_chunk in _iter_a16_chunks(
             input_2d, ids_2d, weights_2d, out_2d, prepared_data, group_size, chunk_rows
         ):
@@ -1816,6 +2015,7 @@ def moe_ffn(
     down_slot_offsets: torch.Tensor | None = None,
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
+    act_quant: str | None = None,
 ) -> torch.Tensor:
     """Execute single-token, small-batch, or prefill quantized MoE kernels on GPU."""
     device = input.device
@@ -1892,6 +2092,7 @@ def moe_ffn(
             prepared_data,
             out_2d,
             resolved_target=resolved_target,
+            act_quant=act_quant,
             accumulate=accumulate,
             group_size=group_size,
             activation_fn=activation_fn,
@@ -1969,8 +2170,12 @@ __all__ = [
     "moe_prefill_bucket_scatter_kernel",
     "moe_prefill_gather_kernel",
     "moe_splitk_reduce_kernel",
+    "nvfp4_moe_activate_quant_kernel",
     "nvfp4_moe_batched_gemv_kernel",
+    "nvfp4_moe_gather_kernel",
     "nvfp4_moe_grouped_gemm_kernel",
     "nvfp4_moe_m1_gemv_kernel",
+    "nvfp4_moe_row_quant_kernel",
+    "nvfp4_w4a4_moe_grouped_gemm_kernel",
     "trellis_moe_gemv_kernel",
 ]

@@ -51,6 +51,9 @@ PREFILL_NVFP4_DENSE_BLOCK_M = 32
 PREFILL_NVFP4_SPARSE_BLOCK_N = 64
 PREFILL_NVFP4_BLOCK_K = 64
 NVFP4_SM120_PREFILL_BLOCK_K = 128
+PREFILL_NVFP4_W4A4_DENSE_THRESHOLD = 128
+NVFP4_W4A4_QUANT_BLOCK_K = 256
+NVFP4_W4A4_GATHER_BLOCK_BYTES = 512
 PREFILL_INT8_SPARSE_BLOCK_M = 16
 PREFILL_INT8_DENSE_BLOCK_M = 64
 PREFILL_INT8_SPARSE_BLOCK_N = 64
@@ -95,6 +98,17 @@ class Nvfp4PrefillSchedule:
     block_k: int
     num_warps: int
     single_dot: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Nvfp4W4A4PrefillSchedule:
+    """Grouped prefill NVFP4 W4A4 ``tl.dot_scaled`` MoE projection schedule."""
+
+    block_m: int
+    block_n: int
+    block_k: int
+    num_warps: int
+    num_stages: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,8 +180,20 @@ def prefill_bytes_per_pair(
     up_gate_out: int,
     logical_elem_bytes: int,
     group_size: int,
+    is_nvfp4_w4a4: bool = False,
 ) -> int:
     """Estimate temporary workspace bytes required per routed `(token, k)` pair."""
+    if is_nvfp4_w4a4:
+        return (
+            hidden_size // 2
+            + hidden_size // 16
+            + 4
+            + up_gate_out * logical_elem_bytes
+            + intermediate_size // 2
+            + intermediate_size // 16
+            + 4
+            + hidden_size * 4
+        )
     if is_int8:
         return hidden_size + up_gate_out * logical_elem_bytes + intermediate_size + hidden_size * 4
     active_elem_bytes = 4 if group_size > 0 else logical_elem_bytes

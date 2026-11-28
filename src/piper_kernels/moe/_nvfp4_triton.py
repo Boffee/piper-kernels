@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._triton.primitives import splitk_tile_bounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.linear.nvfp4._w4a16_triton import (
@@ -20,7 +21,9 @@ from piper_kernels.linear.nvfp4._w4a16_triton import (
     _load_scaled_nvfp4_pairs,
     _split_global_scale,
 )
+from piper_kernels.weights.convrot.triton import rotate_hadamard_groups
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
+from piper_kernels.weights.nvfp4.triton import encode_nvfp4_blocks, swizzled_scale_offsets
 
 from . import _schedule
 from ._routing_triton import (
@@ -633,4 +636,489 @@ def launch_nvfp4_grouped_gemm(
             single_dot=single_dot,
             num_warps=num_warps,
             num_stages=1,
+        )
+
+
+@triton.jit
+def _load_rotated_row_tile(
+    x_ptr,
+    row_offset,
+    k_offs,
+    k_valid,
+    group_size: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    vals = tl.load(x_ptr + row_offset + k_offs, mask=k_valid, other=0.0).to(tl.float32)
+    if group_size > 0:
+        vals = rotate_hadamard_groups(vals, block_k, group_size, normalize=True)
+    return vals
+
+
+@triton.jit
+def _load_activated_pair_tile(
+    mid_ptr,
+    pair_idx,
+    k_offs,
+    k_valid,
+    intermediate_size,
+    group_size: tl.constexpr,
+    is_swiglu: tl.constexpr,
+    gate_first: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    if is_swiglu:
+        base = pair_idx * (intermediate_size.to(tl.int64) * 2) + k_offs
+        first = tl.load(mid_ptr + base, mask=k_valid, other=0.0).to(tl.float32)
+        second = tl.load(mid_ptr + base + intermediate_size, mask=k_valid, other=0.0).to(tl.float32)
+        vals = swiglu(second, first) if gate_first else swiglu(first, second)
+    else:
+        vals = tl.load(
+            mid_ptr + pair_idx * intermediate_size.to(tl.int64) + k_offs,
+            mask=k_valid,
+            other=0.0,
+        ).to(tl.float32)
+        vals = gelu_tanh(vals, accelerator_backend)
+    vals = tl.where(k_valid, vals, 0.0)
+    if group_size > 0:
+        vals = rotate_hadamard_groups(vals, block_k, group_size, normalize=True)
+    return vals
+
+
+@triton.jit
+def _store_encoded_nvfp4_tile(
+    vals,
+    row_scale,
+    row_idx,
+    k_base,
+    packed_k,
+    scale_k,
+    q_out_ptr,
+    sc_out_ptr,
+    block_k: tl.constexpr,
+    high_first: tl.constexpr,
+):
+    block_scales_count: tl.constexpr = block_k // _NVFP4_BLOCK_SIZE_TL
+    block_packed_k: tl.constexpr = block_k // 2
+    q_bytes, sc_fp8 = encode_nvfp4_blocks(
+        tl.reshape(vals, (block_scales_count, _NVFP4_BLOCK_SIZE_TL)),
+        row_scale,
+        block_scales_count,
+        high_first,
+    )
+    byte_offs = (k_base // 2) + tl.arange(0, block_packed_k)
+    tl.store(
+        q_out_ptr + row_idx * packed_k + byte_offs,
+        tl.reshape(q_bytes, (block_packed_k,)),
+        mask=byte_offs < packed_k,
+    )
+    sc_offs = (k_base // _NVFP4_BLOCK_SIZE_TL) + tl.arange(0, block_scales_count)
+    tl.store(
+        sc_out_ptr + row_idx * scale_k + sc_offs,
+        sc_fp8,
+        mask=sc_offs < scale_k,
+    )
+
+
+@triton.jit
+def nvfp4_moe_row_quant_kernel(
+    x_ptr,
+    q_out_ptr,
+    sc_out_ptr,
+    row_scale_ptr,
+    hidden_size,
+    x_row_stride,
+    block_k: tl.constexpr,
+    group_size: tl.constexpr,
+    high_first: tl.constexpr,
+):
+    """Per-row dynamic NVFP4 quantization with optional fused ConvRot Hadamard rotation."""
+    row = tl.program_id(0).to(tl.int64)
+    row_offset = row * x_row_stride.to(tl.int64)
+    row_amax = tl.full((), 0.0, dtype=tl.float32)
+    for k_base in range(0, hidden_size, block_k):
+        k_offs = k_base + tl.arange(0, block_k)
+        k_valid = k_offs < hidden_size
+        vals = _load_rotated_row_tile(x_ptr, row_offset, k_offs, k_valid, group_size, block_k)
+        row_amax = tl.maximum(row_amax, tl.max(tl.abs(vals), axis=0))
+
+    row_scale = row_amax * (1.0 / (448.0 * 6.0))
+    tl.store(row_scale_ptr + row, row_scale)
+    packed_k = (hidden_size // 2).to(tl.int64)
+    scale_k = (hidden_size // _NVFP4_BLOCK_SIZE_TL).to(tl.int64)
+    for k_base in range(0, hidden_size, block_k):
+        k_offs = k_base + tl.arange(0, block_k)
+        k_valid = k_offs < hidden_size
+        vals = _load_rotated_row_tile(x_ptr, row_offset, k_offs, k_valid, group_size, block_k)
+        _store_encoded_nvfp4_tile(
+            vals,
+            row_scale,
+            row,
+            k_base,
+            packed_k,
+            scale_k,
+            q_out_ptr,
+            sc_out_ptr,
+            block_k,
+            high_first,
+        )
+
+
+@triton.jit(do_not_specialize=["top_k"])
+def nvfp4_moe_gather_kernel(
+    in_q_ptr,
+    in_sc_ptr,
+    in_rs_ptr,
+    compact_to_pair_ptr,
+    out_q_ptr,
+    out_sc_ptr,
+    out_rs_ptr,
+    packed_k,
+    top_k,
+    block_bytes: tl.constexpr,
+):
+    """Gather packed NVFP4 activations, E4M3FN block scales, and row scales by compacted pair."""
+    compact_idx = tl.program_id(0).to(tl.int64)
+    pid_k = tl.program_id(1)
+    pair_id = tl.load(compact_to_pair_ptr + compact_idx).to(tl.int64)
+    if pair_id < 0:
+        if pid_k == 0:
+            tl.store(out_rs_ptr + compact_idx, 0.0)
+        return
+
+    src_row = pair_id // top_k
+    packed_stride = packed_k.to(tl.int64)
+    byte_offs = pid_k * block_bytes + tl.arange(0, block_bytes)
+    byte_valid = byte_offs < packed_k
+    q_vals = tl.load(in_q_ptr + src_row * packed_stride + byte_offs, mask=byte_valid, other=0)
+    tl.store(out_q_ptr + compact_idx * packed_stride + byte_offs, q_vals, mask=byte_valid)
+
+    scale_k = packed_k // _NVFP4_QDATA_BLOCK_SIZE_TL
+    scale_stride = scale_k.to(tl.int64)
+    block_sc: tl.constexpr = block_bytes // _NVFP4_QDATA_BLOCK_SIZE_TL
+    sc_offs = pid_k * block_sc + tl.arange(0, block_sc)
+    sc_valid = sc_offs < scale_k
+    sc_vals = tl.load(in_sc_ptr + src_row * scale_stride + sc_offs, mask=sc_valid, other=0.0)
+    tl.store(out_sc_ptr + compact_idx * scale_stride + sc_offs, sc_vals, mask=sc_valid)
+
+    if pid_k == 0:
+        tl.store(out_rs_ptr + compact_idx, tl.load(in_rs_ptr + src_row))
+
+
+@triton.jit
+def nvfp4_moe_activate_quant_kernel(
+    mid_ptr,
+    compact_to_pair_ptr,
+    q_out_ptr,
+    sc_out_ptr,
+    row_scale_ptr,
+    intermediate_size,
+    block_k: tl.constexpr,
+    group_size: tl.constexpr,
+    is_swiglu: tl.constexpr,
+    gate_first: tl.constexpr,
+    high_first: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+):
+    """Apply SwiGLU/GeLU-tanh, optional ConvRot rotation, and per-row dynamic NVFP4 encode."""
+    pair = tl.program_id(0).to(tl.int64)
+    orig_pair = tl.load(compact_to_pair_ptr + pair)
+    if orig_pair < 0:
+        tl.store(row_scale_ptr + pair, 0.0)
+        return
+
+    row_amax = tl.full((), 0.0, dtype=tl.float32)
+    for k_base in range(0, intermediate_size, block_k):
+        k_offs = k_base + tl.arange(0, block_k)
+        k_valid = k_offs < intermediate_size
+        vals = _load_activated_pair_tile(
+            mid_ptr,
+            pair,
+            k_offs,
+            k_valid,
+            intermediate_size,
+            group_size,
+            is_swiglu,
+            gate_first,
+            accelerator_backend,
+            block_k,
+        )
+        row_amax = tl.maximum(row_amax, tl.max(tl.abs(vals), axis=0))
+
+    row_scale = row_amax * (1.0 / (448.0 * 6.0))
+    tl.store(row_scale_ptr + pair, row_scale)
+    packed_k = (intermediate_size // 2).to(tl.int64)
+    scale_k = (intermediate_size // _NVFP4_BLOCK_SIZE_TL).to(tl.int64)
+    for k_base in range(0, intermediate_size, block_k):
+        k_offs = k_base + tl.arange(0, block_k)
+        k_valid = k_offs < intermediate_size
+        vals = _load_activated_pair_tile(
+            mid_ptr,
+            pair,
+            k_offs,
+            k_valid,
+            intermediate_size,
+            group_size,
+            is_swiglu,
+            gate_first,
+            accelerator_backend,
+            block_k,
+        )
+        _store_encoded_nvfp4_tile(
+            vals,
+            row_scale,
+            pair,
+            k_base,
+            packed_k,
+            scale_k,
+            q_out_ptr,
+            sc_out_ptr,
+            block_k,
+            high_first,
+        )
+
+
+@triton.jit(do_not_specialize=["max_tiles"])
+def nvfp4_w4a4_moe_grouped_gemm_kernel(
+    a_q_ptr,
+    a_sc_ptr,
+    a_rs_ptr,
+    b_q_ptr,
+    b_sc_ptr,
+    b_gs_ptr,
+    tile_slots_ptr,
+    tile_m_start_ptr,
+    tile_m_len_ptr,
+    output_ptr,
+    max_tiles,
+    out_features,
+    packed_k,
+    scale_column_blocks,
+    expert_scale_stride,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    group_m: tl.constexpr,
+    has_global_scale: tl.constexpr,
+):
+    """Grouped NVFP4 W4A4 ``tl.dot_scaled`` GEMM over contiguous slot-compacted tiles."""
+    num_pid_n = tl.cdiv(out_features, block_n)
+    tile_idx, pid_n = _swizzle_grouped_pid(tl.program_id(0), max_tiles, num_pid_n, group_m)
+    slot = tl.load(tile_slots_ptr + tile_idx).to(tl.int64)
+    if slot < 0:
+        return
+
+    m_start_i32 = tl.load(tile_m_start_ptr + tile_idx)
+    tile_len = tl.load(tile_m_len_ptr + tile_idx)
+    m_local = tl.arange(0, block_m)
+    m_valid = m_local < tile_len
+    # Keep 32-bit tile offsets across the K-loop to avoid SM12x register spills.
+    m_offs = m_start_i32 + m_local
+    n_offs = pid_n * block_n + tl.arange(0, block_n)
+    n_valid = n_offs < out_features
+
+    block_packed_k: tl.constexpr = block_k // 2
+    block_scale_k: tl.constexpr = block_k // _NVFP4_BLOCK_SIZE_TL
+    scale_k = packed_k // _NVFP4_QDATA_BLOCK_SIZE_TL
+    slot_b_q_ptr = b_q_ptr + slot * out_features.to(tl.int64) * packed_k
+    slot_b_sc_ptr = b_sc_ptr + slot * expert_scale_stride.to(tl.int64)
+
+    acc = tl.zeros((block_m, block_n), dtype=tl.float32)
+    num_k_tiles = tl.cdiv(packed_k, block_packed_k)
+    for k_tile in range(num_k_tiles):
+        k_byte_offs = k_tile * block_packed_k + tl.arange(0, block_packed_k)
+        k_byte_valid = k_byte_offs < packed_k
+        k_sc_offs = k_tile * block_scale_k + tl.arange(0, block_scale_k)
+        k_sc_valid = k_sc_offs < scale_k
+
+        a_q = tl.load(
+            a_q_ptr + m_offs.to(tl.int64)[:, None] * packed_k + k_byte_offs[None, :],
+            mask=m_valid[:, None] & k_byte_valid[None, :],
+            other=0,
+        )
+        a_sc = tl.load(
+            a_sc_ptr + m_offs.to(tl.int64)[:, None] * scale_k + k_sc_offs[None, :],
+            mask=m_valid[:, None] & k_sc_valid[None, :],
+            other=0.0,
+        )
+        b_q = tl.load(
+            slot_b_q_ptr + n_offs.to(tl.int64)[:, None] * packed_k + k_byte_offs[None, :],
+            mask=n_valid[:, None] & k_byte_valid[None, :],
+            other=0,
+        )
+        b_sc_offs = swizzled_scale_offsets(
+            n_offs.to(tl.int64)[:, None],
+            k_sc_offs[None, :],
+            scale_column_blocks,
+        )
+        b_sc = tl.load(
+            slot_b_sc_ptr + b_sc_offs,
+            mask=n_valid[:, None] & k_sc_valid[None, :],
+            other=0.0,
+        )
+        acc = tl.dot_scaled(
+            a_q,
+            a_sc,
+            "e2m1",
+            tl.trans(b_q),
+            b_sc,
+            "e2m1",
+            acc=acc,
+            lhs_k_pack=True,
+            rhs_k_pack=True,
+        )
+
+    a_rs = tl.load(a_rs_ptr + m_offs.to(tl.int64), mask=m_valid, other=0.0).to(tl.float32)[:, None]
+    if has_global_scale:
+        b_gs = tl.load(b_gs_ptr + slot).to(tl.float32)
+        combine = (tl.abs(a_rs) < 1.0) != (tl.abs(b_gs) < 1.0)
+        scaled = tl.where(combine, acc * (a_rs * b_gs), (acc * a_rs) * b_gs)
+        out_val = tl.where((a_rs == 0.0) | (b_gs == 0.0), 0.0, scaled)
+    else:
+        out_val = tl.where(a_rs == 0.0, 0.0, acc * a_rs)
+
+    tl.store(
+        output_ptr + m_offs.to(tl.int64)[:, None] * out_features + n_offs.to(tl.int64)[None, :],
+        out_val.to(output_ptr.dtype.element_ty),
+        mask=m_valid[:, None] & n_valid[None, :],
+    )
+
+
+def launch_nvfp4_row_quant(
+    x: torch.Tensor,
+    q_out: torch.Tensor,
+    sc_out: torch.Tensor,
+    rs_out: torch.Tensor,
+    *,
+    group_size: int,
+    high_first: bool,
+) -> None:
+    rows, hidden_size = x.shape
+    with device_context(x.device):
+        nvfp4_moe_row_quant_kernel[(rows,)](
+            x,
+            q_out,
+            sc_out,
+            rs_out,
+            hidden_size,
+            x.stride(0),
+            block_k=_schedule.NVFP4_W4A4_QUANT_BLOCK_K,
+            group_size=group_size,
+            high_first=high_first,
+            num_warps=4,
+        )
+
+
+def launch_nvfp4_gather(
+    in_q: torch.Tensor,
+    in_sc: torch.Tensor,
+    in_rs: torch.Tensor,
+    compact_to_pair: torch.Tensor,
+    out_q: torch.Tensor,
+    out_sc: torch.Tensor,
+    out_rs: torch.Tensor,
+    *,
+    packed_k: int,
+    top_k: int,
+) -> None:
+    num_pairs = compact_to_pair.shape[0]
+    grid = (num_pairs, triton.cdiv(packed_k, _schedule.NVFP4_W4A4_GATHER_BLOCK_BYTES))
+    with device_context(in_q.device):
+        nvfp4_moe_gather_kernel[grid](
+            in_q,
+            in_sc,
+            in_rs,
+            compact_to_pair,
+            out_q,
+            out_sc,
+            out_rs,
+            packed_k,
+            top_k,
+            block_bytes=_schedule.NVFP4_W4A4_GATHER_BLOCK_BYTES,
+            num_warps=4,
+        )
+
+
+def launch_nvfp4_activate_quant(
+    mid: torch.Tensor,
+    compact_to_pair: torch.Tensor,
+    q_out: torch.Tensor,
+    sc_out: torch.Tensor,
+    rs_out: torch.Tensor,
+    *,
+    intermediate_size: int,
+    group_size: int,
+    activation_fn: str,
+    gate_first: bool,
+    high_first: bool,
+    accelerator_backend: str,
+) -> None:
+    num_pairs = mid.shape[0]
+    with device_context(mid.device):
+        nvfp4_moe_activate_quant_kernel[(num_pairs,)](
+            mid,
+            compact_to_pair,
+            q_out,
+            sc_out,
+            rs_out,
+            intermediate_size,
+            block_k=_schedule.NVFP4_W4A4_QUANT_BLOCK_K,
+            group_size=group_size,
+            is_swiglu=activation_fn == "swiglu",
+            gate_first=gate_first,
+            high_first=high_first,
+            accelerator_backend=accelerator_backend,
+            num_warps=4,
+        )
+
+
+def launch_nvfp4_w4a4_grouped_gemm(
+    a_q: torch.Tensor,
+    a_sc: torch.Tensor,
+    a_rs: torch.Tensor,
+    b_q: torch.Tensor,
+    b_sc: torch.Tensor,
+    b_gs: torch.Tensor | None,
+    tile_slots: torch.Tensor,
+    tile_m_start: torch.Tensor,
+    tile_m_len: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    max_tiles: int,
+    out_features: int,
+    in_features: int,
+    scale_cols: int,
+    scale_stride: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_warps: int,
+    num_stages: int,
+    has_global_scale: bool,
+) -> None:
+    grid = (max_tiles * triton.cdiv(out_features, block_n),)
+    with device_context(a_q.device):
+        nvfp4_w4a4_moe_grouped_gemm_kernel[grid](
+            a_q,
+            a_sc,
+            a_rs,
+            b_q,
+            b_sc,
+            b_gs,
+            tile_slots,
+            tile_m_start,
+            tile_m_len,
+            output,
+            max_tiles,
+            out_features,
+            in_features // 2,
+            scale_cols,
+            scale_stride,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            group_m=_schedule.PREFILL_GROUP_M,
+            has_global_scale=has_global_scale,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
