@@ -6088,6 +6088,31 @@ def test_gpu_m1_top_k_exceeds_cuda_grid_y_limit() -> None:
             dtype=torch.bfloat16,
         )
 
+    # Wide H on ConvRot Trellis M1 (down_proj grid_x * blockDim.x exceeds HIP grid_size_x).
+    w_trellis = _make_moe_weights(
+        2,
+        4096,
+        256,
+        weight_format="convrot_trellis",
+        group_size=64,
+        dtype=torch.bfloat16,
+        device="cuda",
+        seed=1007,
+    )
+    x_trellis = torch.randn((1, 4096), device="cuda", dtype=torch.bfloat16)
+    actual_tr, launches_tr = _record_triton_launches(
+        lambda: moe_ffn(x_trellis, w_trellis, ids, wts, active_slots_hint=2)
+    )
+    assert "trellis_moe_gemv_kernel" in launches_tr
+    assert "moe_m1_activate_rotate_kernel" in launches_tr
+    assert "moe_m1_weighted_reduce_kernel" in launches_tr
+    _assert_matches_reference(
+        actual_tr,
+        _independent_moe_oracle(x_trellis, w_trellis, ids, wts),
+        weight_format="convrot_trellis",
+        dtype=torch.bfloat16,
+    )
+
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")

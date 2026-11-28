@@ -79,13 +79,29 @@ _prepare_value_kernel = _quantization._quantize_value_k1024_kernel
 
 
 @gluon.jit
+def _unfused_mul(a, b):
+    """Multiply FP32 values via opaque ``v_mul_f32`` so LLVM cannot contract into FMA."""
+    return gl.inline_asm_elementwise(
+        "v_mul_f32 $0, $1, $2",
+        constraints="=v,v,v",
+        args=(a, b),
+        dtype=gl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@gluon.jit
 def _softmax_fragment(scores, maximum, scale, multiplier, row_active=None):
     """Pack one 16-column fragment while retaining unrounded denominator mass."""
     row_layout: gl.constexpr = maximum.type.layout
     maximum = gl.convert_layout(maximum, gl.SliceLayout(2, scores.type.layout))
-    scale = gl.convert_layout(scale, maximum.type.layout)
     multiplier = gl.convert_layout(multiplier, gl.SliceLayout(1, scores.type.layout))
-    probabilities = gl.exp2(gl.fma(scores, scale[:, :, None], -maximum[:, :, None]))
+    if scale is None:
+        probabilities = gl.exp2(scores - maximum[:, :, None])
+    else:
+        scale = gl.convert_layout(scale, maximum.type.layout)
+        probabilities = gl.exp2(gl.fma(scores, scale[:, :, None], -maximum[:, :, None]))
     total = gl.convert_layout(gl.sum(probabilities, 2), row_layout)
     scaled_probs = probabilities * multiplier[:, None, :]
     if row_active is not None:
@@ -300,8 +316,14 @@ def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
             multiplier = gl.load(multiplier_ptr + kv_batch_head * key_storage + key_rows[None, :])
             log_scale = gl.load(log_scale_ptr + kv_batch_head * key_storage + key_rows[None, :])
             if safe_softmax:
+                # Pre-scale FP32 scores via unfused v_mul_f32 so LLVM cannot contract
+                # scores * scale - maximum back into FMA and mismatch block_max rounding.
+                scores = _unfused_mul(scores, scale[:, :, None])
+                shifted_scores = gl.where(
+                    scores != -float("inf"), scores + log_scale[:, None, :], -float("inf")
+                )
                 block_max = gl.reduce(
-                    scalar_fma(scores, scale[:, :, None], log_scale[:, None, :]),
+                    shifted_scores,
                     2,
                     max_propagate_nan,
                 )
@@ -320,7 +342,7 @@ def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
                         tile_k_bias,
                     )
                 )
-                packed, total = _softmax_tile(scores, safe_block_max, scale, multiplier, has_block)
+                packed, total = _softmax_tile(scores, safe_block_max, None, multiplier, has_block)
                 row_sum = gl.where(has_block, total * current_weight, 0.0)
             else:
                 block_max = gl.max(
@@ -511,20 +533,18 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0915
                 scale = query_scale * gl.load(ks_slot_ptr + tile)
                 scores = gl.where(
                     chunk_active[:, :, None],
-                    gl.where(scale[:, :, None] == 0, 0.0, scores),
+                    gl.where(scale[:, :, None] == 0, 0.0, _unfused_mul(scores, scale[:, :, None])),
                     -float("inf"),
                 )
-                scale = gl.where(scale == 0, 1.0, scale)
                 raw_vs = gl.load(vs_slot_ptr + tile * 64 + columns[None, :])
                 multiplier = raw_vs * 255.0
                 log_scale = gl.where(raw_vs == 0.0, _GL_LOG2_SCALE_EPSILON, gl.log2(raw_vs))
+                shifted_scores = gl.where(
+                    scores != -float("inf"), scores + log_scale[:, None, :], -float("inf")
+                )
                 block_max = gl.where(
                     chunk_active,
-                    gl.reduce(
-                        scalar_fma(scores, scale[:, :, None], log_scale[:, None, :]),
-                        2,
-                        max_propagate_nan,
-                    ),
+                    gl.reduce(shifted_scores, 2, max_propagate_nan),
                     -float("inf"),
                 )
                 next_max, next_bias, old_weight, current_weight, has_block, safe_block_max = (
@@ -535,7 +555,7 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0915
                         k_bias,
                     )
                 )
-                packed, total = _softmax_tile(scores, safe_block_max, scale, multiplier, has_block)
+                packed, total = _softmax_tile(scores, safe_block_max, None, multiplier, has_block)
                 row_sum = gl.where(has_block, total * current_weight, 0.0)
                 denominator = denominator * old_weight + row_sum
                 chunk_denom = chunk_denom * old_weight + row_sum

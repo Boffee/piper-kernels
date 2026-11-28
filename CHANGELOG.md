@@ -81,6 +81,21 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Fixed
 
+- `piper_attention_decode` (AMD RDNA4 `gfx1200`/`gfx1201`): pre-scaled FP32 QK scores via
+  unfused `v_mul_f32` before `block_max` and `exp2` subtraction in `_frozen_pool_piper_kernel`
+  and the `safe_softmax` chunked-prefill tail path of `_dense_piper_kernel`, preventing
+  `fma(scores, scale, -block_max)` overflow (`NaN`) when `|scores * scale| >= 2^31` while
+  keeping zero VGPR/SGPR/scratch spills and leaving dense `safe_softmax=False` unchanged.
+  Verified live on AMD RX 9070 XT (`gfx1201`) and offline on `gfx1200`/`gfx1201`; live NVIDIA,
+  non-`gfx1201` AMD, multi-GPU, and Windows execution remain unexercised locally.
+- `moe_ffn`: packed single-token and flattened-tile M1/Split-K/activation kernels
+  (`nvfp4_moe_m1_gemv_kernel`, `int8_moe_m1_matmul_kernel`, `trellis_moe_gemv_kernel`,
+  `moe_splitk_reduce_kernel`, and `moe_m1_activate_rotate_kernel`) across 2D `(grid_x, grid_y)`
+  with `split_k` on `grid_z`, staying within both CUDA's `gridDim.y <= 65,535` /
+  `gridDim.x <= 2^31 - 1` bounds and HIP's 32-bit `grid_size_x` total work-item limit on
+  high-`top_k` wide-`H` workloads. Verified on CPU, live AMD RX 9070 XT (`gfx1201`), and
+  offline compilation targets; live NVIDIA, non-`gfx1201` AMD, multi-GPU, and Windows execution
+  remain unexercised locally.
 - `piper_attention`, `freeze_kv_chunks_`, and `piper_attention_decode`: guarded causal
   masked `+inf` `k_bias` tiles in NVIDIA Triton and AMD Gluon chunked prefill so
   masked-out future key tiles cannot poison active rows with `(-inf) + (+inf) = NaN`,

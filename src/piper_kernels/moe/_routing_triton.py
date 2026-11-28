@@ -156,6 +156,44 @@ def _swap_halves_col(offs_n_i64, out_features, swap_halves: tl.constexpr):
     return tl.where(offs_n_i64 < half_n, offs_n_i64 + half_n, offs_n_i64 - half_n)
 
 
+_CUDA_MAX_GRID_X = 0x7FFF_FFFF
+_HIP_MAX_WORKITEMS_X = 0xFFFF_FFFF
+# Conservative wave64 bound covers both wave32 (RDNA) and wave64 (CDNA) HIP targets.
+_HIP_MAX_WARP_SIZE = 64
+
+
+def moe_2d_tile_grid(
+    n_tiles: int,
+    item_count: int,
+    *,
+    num_warps: int,
+    is_amd_hip: bool,
+    split_k: int = 1,
+) -> tuple[int, int, int]:
+    """Pack ``(n_tiles, item_count)`` across ``(grid_x, grid_y, split_k)`` safely."""
+    if n_tiles <= 0 or item_count <= 0:
+        return (0, 0, split_k)
+    max_grid_x = (
+        _HIP_MAX_WORKITEMS_X // (num_warps * _HIP_MAX_WARP_SIZE) if is_amd_hip else _CUDA_MAX_GRID_X
+    )
+    if n_tiles * item_count <= max_grid_x:
+        return (n_tiles * item_count, 1, split_k)
+    items_per_x = max(1, max_grid_x // n_tiles)
+    return (n_tiles * items_per_x, triton.cdiv(item_count, items_per_x), split_k)
+
+
+@triton.jit
+def _unpack_2d_tile_pid(n_tiles):
+    """Unpack ``(pid_n, item_idx)`` from ``(n_tiles * items_per_x, grid_y[, split_k])``."""
+    pid_0 = tl.program_id(0)
+    pid_n = pid_0 % n_tiles
+    item_idx = pid_0 // n_tiles
+    if tl.num_programs(1) > 1:
+        items_per_x = tl.num_programs(0) // n_tiles
+        item_idx = tl.program_id(1) * items_per_x + item_idx
+    return pid_n, item_idx
+
+
 @triton.jit
 def _resolve_slot(
     topk_ids_ptr,
@@ -244,7 +282,7 @@ def moe_bucket_tokens_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_pairs"])
 def moe_m1_activate_rotate_kernel(
     mid_ptr,
     act_ptr,
@@ -254,6 +292,7 @@ def moe_m1_activate_rotate_kernel(
     intermediate_size,
     num_experts,
     num_slots,
+    num_pairs,
     block_size: tl.constexpr,
     group_size: tl.constexpr,
     activation_fn: tl.constexpr,
@@ -263,9 +302,9 @@ def moe_m1_activate_rotate_kernel(
 ):
     """Apply SwiGLU or GeLU-tanh and optional ConvRot transform for active slots."""
     n_tiles = tl.cdiv(intermediate_size, block_size)
-    pid_0 = tl.program_id(0)
-    tile_idx = pid_0 % n_tiles
-    k_idx = pid_0 // n_tiles
+    tile_idx, k_idx = _unpack_2d_tile_pid(n_tiles)
+    if k_idx >= num_pairs:
+        return
     slot = _resolve_slot(
         topk_ids_ptr,
         expert_to_slot_ptr,
@@ -384,9 +423,9 @@ def moe_splitk_reduce_kernel(
 ):
     """Deterministically reduce Split-K up/gate partials across active slots."""
     n_tiles = tl.cdiv(out_features, block_n)
-    pid_0 = tl.program_id(0)
-    pid_n = pid_0 % n_tiles
-    k_idx = pid_0 // n_tiles
+    pid_n, k_idx = _unpack_2d_tile_pid(n_tiles)
+    if k_idx >= num_pairs:
+        return
     offs_n = pid_n * block_n + tl.arange(0, block_n)
     offs_n_i64 = offs_n.to(tl.int64)
     n_valid = offs_n < out_features
