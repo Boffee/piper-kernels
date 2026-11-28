@@ -69,6 +69,8 @@ class AttentionConfig:
     is_causal: bool = False
     scale: float | None = None
     seed: int = 0
+    window_left: int | None = None
+    window_right: int | None = None
 
     def __post_init__(self) -> None:
         if self.dtype not in _DTYPES.values():
@@ -81,13 +83,18 @@ class AttentionConfig:
 
     def as_dict(self) -> dict[str, str | bool | float | int | None]:
         """Return stable machine-readable field names."""
-        return {
+        payload: dict[str, str | bool | float | int | None] = {
             "dtype": self.dtype_name,
             "is_causal": self.is_causal,
             "scale": self.scale,
             "qkv_layout": ATTENTION_QKV_LAYOUT,
             "seed": self.seed,
         }
+        if self.window_left is not None:
+            payload["window_left"] = self.window_left
+        if self.window_right is not None:
+            payload["window_right"] = self.window_right
+        return payload
 
 
 def attention_dtype(name: str) -> torch.dtype:
@@ -125,6 +132,24 @@ def make_attention_inputs(
 def run_sdpa(inputs: AttentionInputs, config: AttentionConfig) -> torch.Tensor:
     """Run the common full-precision quality reference."""
     query, key, value = inputs
+    if config.window_left is not None or config.window_right is not None:
+        q_len, k_len = query.shape[2], key.shape[2]
+        q_pos = torch.arange(q_len, device=query.device).unsqueeze(1)
+        k_pos = torch.arange(k_len, device=query.device).unsqueeze(0)
+        mask = torch.ones((q_len, k_len), device=query.device, dtype=torch.bool)
+        if config.window_left is not None:
+            mask = mask & (k_pos >= q_pos - config.window_left)
+        eff_right = 0 if config.is_causal else config.window_right
+        if eff_right is not None:
+            mask = mask & (k_pos <= q_pos + eff_right)
+        return torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=mask,
+            scale=config.scale,
+            enable_gqa=query.shape[1] != key.shape[1],
+        )
     return torch.nn.functional.scaled_dot_product_attention(
         query,
         key,

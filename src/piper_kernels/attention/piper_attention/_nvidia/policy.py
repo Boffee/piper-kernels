@@ -154,12 +154,15 @@ def _generic_execution_plan(
     target: AcceleratorTarget,
     *,
     head_dim: int,
-    is_causal: bool,
+    is_causal: bool = False,
+    window_mode: Literal["none", "causal", "windowed"] | None = None,
 ) -> PiperAttentionExecutionPlan:
     """Build capability-based defaults before exact-target tuning is applied."""
+    resolved_mode = ("causal" if is_causal else "none") if window_mode is None else window_mode
     grouped_qk = groups_qk_scales(target)
-    split_pv_head_dim = target.is_cuda_capability(12) and not is_causal and head_dim == 128
-    block_m = 64 if is_causal or split_pv_head_dim else 128
+    unbounded = resolved_mode == "none"
+    split_pv_head_dim = target.is_cuda_capability(12) and unbounded and head_dim == 128
+    block_m = 64 if not unbounded or split_pv_head_dim else 128
     use_tensor_descriptors = target.is_cuda_capability(12) and block_m == 128 and head_dim == 128
     return PiperAttentionExecutionPlan(
         block_m=block_m,
@@ -171,7 +174,10 @@ def _generic_execution_plan(
 
 
 def _sm89_execution_plan(
-    *, head_dim: int, is_causal: bool, quantized_query: bool
+    *,
+    head_dim: int,
+    window_mode: Literal["none", "causal", "windowed"],
+    quantized_query: bool,
 ) -> PiperAttentionExecutionPlan:
     """Build the exact-SM89 plan measured on an RTX 4070 Ti SUPER.
 
@@ -184,8 +190,9 @@ def _sm89_execution_plan(
     preparation pass it replaces.
     """
     wide = head_dim == 128
+    causal_mode = window_mode == "causal"
     return PiperAttentionExecutionPlan(
-        block_m=64 if wide or (is_causal and quantized_query) else 128,
+        block_m=64 if wide or (causal_mode and quantized_query) else 128,
         grouped_qk=False,
         split_pv_head_dim=False,
         use_tensor_descriptors=False,
@@ -201,20 +208,22 @@ def _sm89_execution_plan(
 def _sm120_execution_plan(
     *,
     head_dim: int,
-    is_causal: bool,
+    window_mode: Literal["none", "causal", "windowed"],
     query_length: int,
     key_length: int,
 ) -> PiperAttentionExecutionPlan:
     """Build the loop, probability, and value-metadata plan measured on exact SM120."""
+    causal_mode = window_mode == "causal"
+    unbounded = window_mode == "none"
     split_pv_head_dim = head_dim == 128
     # Short calls retain pointer loads where descriptor setup dominates.
     use_tensor_descriptors = (
         key_length // 64 >= _SM120_D64_DESCRIPTOR_MIN_KEY_TILES
         if head_dim == 64
-        else not is_causal or query_length >= _SM120_CAUSAL_DESCRIPTOR_MIN_QUERY_LENGTH
+        else unbounded or query_length >= _SM120_CAUSAL_DESCRIPTOR_MIN_QUERY_LENGTH
     )
-    block_m = 64 if is_causal else 128
-    strided_causal_d64 = is_causal and head_dim == 64 and use_tensor_descriptors
+    block_m = 64 if not unbounded else 128
+    strided_causal_d64 = causal_mode and head_dim == 64 and use_tensor_descriptors
     # Packed conversion wins for D64 and non-causal D128. The D128 causal
     # specialization is neutral to slightly slower and retains stock lowering.
     return PiperAttentionExecutionPlan(
@@ -222,19 +231,19 @@ def _sm120_execution_plan(
         grouped_qk=True,
         split_pv_head_dim=split_pv_head_dim,
         use_tensor_descriptors=use_tensor_descriptors,
-        num_stages=2 if use_tensor_descriptors and not is_causal else 3,
-        derive_value_log_bound=not is_causal,
-        optimize_causal_traversal=is_causal,
+        num_stages=2 if use_tensor_descriptors and unbounded else 3,
+        derive_value_log_bound=unbounded,
+        optimize_causal_traversal=causal_mode,
         # The combined full/tail kernel benefits from loop-invariant motion
         # for causal D64. Aligned grids retain their measured original loop.
-        loop_licm=is_causal and head_dim == 64 and query_length % block_m != 0,
-        use_packed_probability_conversion=not (is_causal and head_dim == 128),
+        loop_licm=causal_mode and head_dim == 64 and query_length % block_m != 0,
+        use_packed_probability_conversion=not (causal_mode and head_dim == 128),
         # On SM120, retaining the CTA-uniform query-tail branch improves the
         # strided D128 kernel with masked K tails. Aligned K keeps its own winner.
-        retain_query_tail_for_strided_output=not is_causal and head_dim == 128,
+        retain_query_tail_for_strided_output=unbounded and head_dim == 128,
         # Measured Q128/four-warp noncausal kernels fit two CTAs per SM.
         # Zero leaves output chunk planning independent of device occupancy.
-        output_ctas_per_sm=0 if is_causal else 2,
+        output_ctas_per_sm=0 if not unbounded else 2,
         # Interleave heads within small groups of causal query tiles to spread
         # their different prefix lengths across the GPU. Contiguous output
         # retains its measured original ordering.
@@ -298,6 +307,7 @@ def select_prefill_config(
     is_tail: bool,
     has_chunk_map: bool = True,
     has_chunk_splits: bool = False,
+    window_mode: Literal["none", "causal", "windowed"] = "none",
 ) -> tuple[int, int, bool, int, int]:
     """Return ``(block_m, num_warps, split_pv_head_dim, num_stages, loop_num_stages)``."""
     if target.is_cuda_capability(12):
@@ -307,10 +317,15 @@ def select_prefill_config(
             return 64, 4, False, 3, loop_stages
         if not is_tail:
             return 64, 8, True, 2, 2
-        return 64, 4, True, 2, 1
+        # Windowed D=128 tail needs 8 warps on SM12x to keep zero SASS spills.
+        return 64, 8 if window_mode == "windowed" else 4, True, 2, 1
     if not is_tail:
         num_warps = 8 if head_dim == 128 else 4
-        return 64, num_warps, head_dim == 128, 1, 1
+        # Unify the PV accumulator for SM80 windowed D=128 to keep zero SASS spills.
+        split_pv = head_dim == 128 and not (
+            window_mode == "windowed" and target.is_cuda_capability(8, 0)
+        )
+        return 64, num_warps, split_pv, 1, 1
     if head_dim == 128 and not target.is_cuda_capability(8, 0):
         return 32, 4, False, 1, 1
     split_pv = head_dim == 128 or target.is_cuda_capability(8, 9)
@@ -325,24 +340,28 @@ def select_execution_plan(
     query_length: int,
     key_length: int | None = None,
     quantized_query: bool = False,
+    window_mode: Literal["none", "causal", "windowed"] | None = None,
 ) -> PiperAttentionExecutionPlan:
     """Combine capability defaults with measured policy; omitted K length means self-attention.
 
     ``quantized_query`` selects a plan for Q that a producer already quantized.
     """
+    resolved_mode: Literal["none", "causal", "windowed"] = (
+        ("causal" if is_causal else "none") if window_mode is None else window_mode
+    )
     if target.is_cuda_capability(8, 9):
         return _sm89_execution_plan(
-            head_dim=head_dim, is_causal=is_causal, quantized_query=quantized_query
+            head_dim=head_dim, window_mode=resolved_mode, quantized_query=quantized_query
         )
     if target.is_cuda_capability(12, 0):
         return _sm120_execution_plan(
             head_dim=head_dim,
-            is_causal=is_causal,
+            window_mode=resolved_mode,
             query_length=query_length,
             key_length=query_length if key_length is None else key_length,
         )
     return _generic_execution_plan(
         target,
         head_dim=head_dim,
-        is_causal=is_causal,
+        window_mode=resolved_mode,
     )

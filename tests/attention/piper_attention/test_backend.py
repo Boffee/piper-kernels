@@ -76,10 +76,14 @@ def test_fake_execution_does_not_select_or_launch_backend(monkeypatch):
     with forbid_triton_driver("fake execution must not launch kernels"), FakeTensorMode():
         query = torch.empty(2, 193, 6, 128, device="cuda:0", dtype=torch.bfloat16).transpose(1, 2)
         key = torch.empty(2, 2, 257, 128, device="cuda:0", dtype=query.dtype)
-        output = torch.ops.piper_kernels.piper_attention.default(query, key, key, 128**-0.5, False)
+        output, lse = torch.ops.piper_kernels.piper_attention.default(
+            query, key, key, 128**-0.5, False
+        )
         assert output.shape == query.shape
         assert output.dtype == query.dtype
         assert output.is_contiguous()
+        assert lse.shape == (0,)
+        assert lse.dtype is torch.float32
 
 
 def test_dense_cpu_fallback_remains_usable_without_triton():

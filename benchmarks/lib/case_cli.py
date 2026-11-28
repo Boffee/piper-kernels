@@ -64,6 +64,8 @@ def apply_case(
             "kv_heads": case.kv_heads,
             "head_dim": case.head_dim,
             "causal": case.causal,
+            "window_left": case.window_left,
+            "window_right": case.window_right,
             "scale": None,
         }
     else:

@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from typing import Literal, overload
 
 import torch
+from torch._guards import detect_fake_mode
 
 from piper_kernels._triton import runtime
 from piper_kernels._validation import validate_positive_finite_float
@@ -98,7 +99,7 @@ def _validate_lse_waves(
     return ref_shape, ref_dtype, ref_device
 
 
-def merge_attention_lse(
+def merge_attention_lse(  # noqa: PLR0915
     outputs: Sequence[torch.Tensor],
     lses: Sequence[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -120,12 +121,67 @@ def merge_attention_lse(
         ``NaN``), supporting differentiable autograd, eager execution, and
         ``torch.compile(fullgraph=True)``.
     """
-    _, ref_dtype, ref_device = _validate_lse_waves(outputs, lses)
+    ref_shape, ref_dtype, ref_device = _validate_lse_waves(outputs, lses)
     acc_dtype = (
         torch.float64
         if ref_dtype is torch.float64 or any(lse.dtype is torch.float64 for lse in lses)
         else torch.float32
     )
+    needs_grad = torch.is_grad_enabled() and any(t.requires_grad for t in (*outputs, *lses))
+    is_compiling = torch.compiler.is_compiling()
+    is_standalone_fake = (not is_compiling) and (detect_fake_mode((*outputs, *lses)) is not None)
+    triton_ok = (
+        (ref_device.type == "cuda")
+        and (not needs_grad)
+        and (acc_dtype is torch.float32)
+        and (not is_standalone_fake)
+    )
+    if triton_ok and not is_compiling:
+        triton_ok = not any(t.is_neg() or t.is_conj() for t in (*outputs, *lses))
+    if triton_ok:
+        if is_compiling:
+            outputs = [torch.resolve_neg(torch.resolve_conj(t)) for t in outputs]
+            lses = [torch.resolve_neg(torch.resolve_conj(t)) for t in lses]
+        kv_prefill = None
+        if is_compiling or runtime.supports_device(ref_device):
+            try:
+                from . import _kv_prefill as kv_prefill_mod  # noqa: PLC0415
+
+                kv_prefill = kv_prefill_mod
+            except ModuleNotFoundError as error:
+                if error.name != "triton":
+                    raise
+        head_dim = ref_shape[-1]
+        if (
+            kv_prefill is not None
+            and head_dim > 0
+            and kv_prefill.can_launch_merge_attention_lse(outputs, lses)
+        ):
+            total_rows = 1
+            for dim in ref_shape[:-1]:
+                total_rows *= dim
+            merged_out = torch.empty(ref_shape, device=ref_device, dtype=ref_dtype)
+            merged_lse = torch.empty(ref_shape[:-1], device=ref_device, dtype=torch.float32)
+            if total_rows == 0:
+                return merged_out, merged_lse
+            if len(outputs) <= 8:
+                kv_prefill.launch_merge_attention_lse_chunk(outputs, lses, merged_out, merged_lse)
+                return merged_out, merged_lse
+            remaining_out = list(outputs)
+            remaining_lse = list(lses)
+            while len(remaining_out) > 8:
+                acc_out = torch.empty(ref_shape, device=ref_device, dtype=torch.float32)
+                acc_lse = torch.empty(ref_shape[:-1], device=ref_device, dtype=torch.float32)
+                kv_prefill.launch_merge_attention_lse_chunk(
+                    remaining_out[:7], remaining_lse[:7], acc_out, acc_lse
+                )
+                remaining_out = [acc_out, *remaining_out[7:]]
+                remaining_lse = [acc_lse, *remaining_lse[7:]]
+            kv_prefill.launch_merge_attention_lse_chunk(
+                remaining_out, remaining_lse, merged_out, merged_lse
+            )
+            return merged_out, merged_lse
+
     autocast_ctx = (
         torch.amp.autocast(device_type=ref_device.type, enabled=False)
         if torch.amp.is_autocast_available(ref_device.type)
@@ -285,6 +341,12 @@ def _validate_decode_tail(
     _validate_int32_1d(tail_len, name="tail_len", device=device, length=batch)
 
 
+def _normalize_window_arg(value: int | None, *, name: str) -> _SymInt:
+    if value is None:
+        return -1
+    return _require_int(value, name=name, minimum=0, maximum=_INT64_MAX, allow_symint=True)
+
+
 def _validate_decode_inputs(  # noqa: PLR0913, PLR0917
     query: torch.Tensor,
     key_int8: torch.Tensor,
@@ -301,6 +363,8 @@ def _validate_decode_inputs(  # noqa: PLR0913, PLR0917
     scale: float | None,
     is_causal: bool,
     active_chunks_hint: _SymInt,
+    window_left: _SymInt,
+    window_right: _SymInt,
     *,
     check_target: bool,
 ) -> tuple[_KVChunkConfig | None, float]:
@@ -346,6 +410,20 @@ def _validate_decode_inputs(  # noqa: PLR0913, PLR0917
         maximum=_INT64_MAX,
         allow_symint=True,
     )
+    _require_int(
+        window_left,
+        name="window_left",
+        minimum=-1,
+        maximum=_INT64_MAX,
+        allow_symint=True,
+    )
+    _require_int(
+        window_right,
+        name="window_right",
+        minimum=-1,
+        maximum=_INT64_MAX,
+        allow_symint=True,
+    )
 
     config = _resolve_checked_config(device, key_scales) if check_target else None
     return config, resolved_scale
@@ -368,6 +446,8 @@ def _piper_attention_decode_op(  # noqa: PLR0913, PLR0917
     scale: float | None = None,
     is_causal: bool = True,
     active_chunks_hint: int = 0,
+    window_left: int = -1,
+    window_right: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     all_tensors = (
         query,
@@ -405,6 +485,8 @@ def _piper_attention_decode_op(  # noqa: PLR0913, PLR0917
         scale,
         is_causal,
         active_chunks_hint,
+        window_left,
+        window_right,
         check_target=not _is_fake_or_compiling(non_null_tensors),
     )
     if query.device.type == "meta" or query.shape[0] == 0:
@@ -438,6 +520,8 @@ def _piper_attention_decode_op(  # noqa: PLR0913, PLR0917
                 active_chunks_hint=active_chunks_hint,
                 prefill_backend=config.prefill_backend,
                 target=config.target,
+                window_left=window_left,
+                window_right=window_right,
             )
         from . import triton as _decode_triton  # noqa: PLC0415 - GPU-only Triton dependency
 
@@ -460,6 +544,8 @@ def _piper_attention_decode_op(  # noqa: PLR0913, PLR0917
             pack_wmma=config.pack_wmma,
             active_chunks_hint=active_chunks_hint,
             target=config.target,
+            window_left=window_left,
+            window_right=window_right,
         )
 
     from .reference import piper_attention_decode_reference  # noqa: PLC0415 - lazy CPU fallback
@@ -480,6 +566,8 @@ def _piper_attention_decode_op(  # noqa: PLR0913, PLR0917
         scale=resolved_scale,
         is_causal=is_causal,
         pack_wmma=config.pack_wmma,
+        window_left=window_left,
+        window_right=window_right,
     )
 
 
@@ -500,6 +588,8 @@ def _piper_attention_decode_fake(  # noqa: PLR0913, PLR0917
     scale: float | None = None,
     is_causal: bool = True,
     active_chunks_hint: int = 0,
+    window_left: int = -1,
+    window_right: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     all_tensors = (
         query,
@@ -533,6 +623,8 @@ def _piper_attention_decode_fake(  # noqa: PLR0913, PLR0917
         scale,
         is_causal,
         active_chunks_hint,
+        window_left,
+        window_right,
         check_target=False,
     )
     return (
@@ -558,6 +650,8 @@ def _piper_attention_decode_autograd(  # noqa: PLR0913, PLR0917
     scale: float | None = None,
     is_causal: bool = True,
     active_chunks_hint: int = 0,
+    window_left: int = -1,
+    window_right: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     non_null_tensors = tuple(
         t
@@ -597,6 +691,8 @@ def _piper_attention_decode_autograd(  # noqa: PLR0913, PLR0917
                 scale,
                 is_causal,
                 active_chunks_hint,
+                window_left,
+                window_right,
             )
     finally:
         _DECODE_AUTOGRAD_CHECKED.reset(token)
@@ -620,6 +716,8 @@ def piper_attention_decode(
     tail_len: torch.Tensor | None = None,
     scale: float | None = None,
     is_causal: bool = True,
+    window_left: int | None = None,
+    window_right: int | None = None,
     return_lse: Literal[False] = False,
     active_chunks_hint: int = 0,
 ) -> torch.Tensor: ...
@@ -637,6 +735,8 @@ def piper_attention_decode(
     tail_len: torch.Tensor | None = None,
     scale: float | None = None,
     is_causal: bool = True,
+    window_left: int | None = None,
+    window_right: int | None = None,
     return_lse: Literal[True],
     active_chunks_hint: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
@@ -654,6 +754,8 @@ def piper_attention_decode(
     tail_len: torch.Tensor | None = None,
     scale: float | None = None,
     is_causal: bool = True,
+    window_left: int | None = None,
+    window_right: int | None = None,
     return_lse: bool = False,
     active_chunks_hint: int = 0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
@@ -670,6 +772,8 @@ def piper_attention_decode(  # noqa: PLR0913
     tail_len: torch.Tensor | None = None,
     scale: float | None = None,
     is_causal: bool = True,
+    window_left: int | None = None,
+    window_right: int | None = None,
     return_lse: bool = False,
     active_chunks_hint: int = 0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -699,7 +803,14 @@ def piper_attention_decode(  # noqa: PLR0913
             enforces ``token_idx <= active_tail - seq_q + q_pos`` (supporting
             ``seq_q == 1``, non-64-aligned offsets, and ``seq_q > active_tail``).
             When ``False``, all active tail tokens up to ``tail_len`` are visible
-            to every query token; ignored when no tail is provided.
+            to every query token; ignored when no tail is provided unless
+            ``window_left`` or ``window_right`` is set.
+        window_left: Optional inclusive non-negative left window distance (or
+            ``None`` for unlimited). When either ``window_left`` or
+            ``window_right`` is provided, bounds apply across both frozen chunks
+            and live tail using logical positions ``q_pos = total_kv - seq_q + q_idx``.
+        window_right: Optional inclusive non-negative right window distance (or
+            ``None`` for unlimited; capped at ``0`` when ``is_causal=True``).
         return_lse: If ``True``, return ``(output, lse)`` with ``float32`` natural-log
             ``lse`` of shape ``[batch, q_heads, seq_q]`` (``-inf`` where a query sees
             zero valid KV tokens while ``output`` is ``0.0``).
@@ -745,6 +856,8 @@ def piper_attention_decode(  # noqa: PLR0913
         maximum=_INT64_MAX,
         allow_symint=True,
     )
+    resolved_left = _normalize_window_arg(window_left, name="window_left")
+    resolved_right = _normalize_window_arg(window_right, name="window_right")
     _require_tensors((("query", query), ("num_chunks", num_chunks)))
     _require_tensors(
         (
@@ -781,6 +894,8 @@ def piper_attention_decode(  # noqa: PLR0913
         resolved_scale,
         is_causal,
         active_chunks_hint,
+        resolved_left,
+        resolved_right,
     )
     if return_lse:
         return output, lse

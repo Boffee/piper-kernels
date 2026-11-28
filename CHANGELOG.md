@@ -7,6 +7,17 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Position-based sliding windows (`window_left`, `window_right`) and dense
+  `return_lse=True` output in `piper_attention`, matching cache-tail position windows in
+  `piper_attention_decode` with Split-KV chunk/subtile clipping (returning zero output and
+  `-inf` LSE for queries with empty key intersections), a single-launch fused Triton GPU
+  `merge_attention_lse` reduction across up to 8 waves (chunked across 7-wave groups
+  above 8), and `convrot_int8_piper` FX fusion guards requiring default unlimited/causal
+  windows and `return_lse=False`. Verified live on RTX 5090 (`sm120`), CPU/`meta`, and
+  offline compilation across `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
+  `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201` (allowing the documented SGPR spills
+  on `gfx1201` windowed prefill/decode and strided 8-wave HIP `merge_attention_lse`); live
+  non-SM120 CUDA, ROCm, multi-GPU, and Windows execution remain unexercised locally.
 - Hard-clamped SwiGLU (`activation_fn="swiglu_clamped"`, requiring positive finite
   `gate_bound` and `up_bound` floats to evaluate
   `silu(min(gate, gate_bound)) * clamp(up, -up_bound, up_bound)`) in `MoEWeights` and

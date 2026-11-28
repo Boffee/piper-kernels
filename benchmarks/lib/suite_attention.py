@@ -49,44 +49,74 @@ def make_inputs(case: AttentionCase, device: torch.device) -> AttentionInputs:
 
 
 def sampled_dense_reference(
-    inputs: AttentionInputs, rows: torch.Tensor, *, causal: bool = False
+    inputs: AttentionInputs,
+    rows: torch.Tensor,
+    *,
+    causal: bool = False,
+    window_left: int | None = None,
+    window_right: int | None = None,
 ) -> torch.Tensor:
     """Evaluate sampled queries against all keys in FP32, one head at a time.
 
     Sampling the sequence before attention would change the softmax and could
-    hide errors in long-context cases. The causal mask uses original row indices.
+    hide errors in long-context cases. The causal/window mask uses original row indices.
     """
     query, key, value = inputs
     batch, heads, _, width = query.shape
     reference = torch.empty((batch, heads, rows.numel(), width), device=query.device)
     key_positions = torch.arange(key.shape[2], device=key.device)
+    eff_right = 0 if causal else window_right
     for b in range(batch):
         for head in range(heads):
             kv_head = head // (heads // key.shape[1])
             q = query[b, head].index_select(0, rows).float()
             scores = (q @ key[b, kv_head].float().T) * width**-0.5
-            if causal:
-                scores.masked_fill_(key_positions[None, :] > rows[:, None], -torch.inf)
+            if window_left is not None:
+                scores.masked_fill_(
+                    key_positions[None, :] < rows[:, None] - window_left, -torch.inf
+                )
+            if eff_right is not None:
+                scores.masked_fill_(key_positions[None, :] > rows[:, None] + eff_right, -torch.inf)
             reference[b, head] = scores.softmax(dim=-1) @ value[b, kv_head].float()
     return reference
 
 
 def _dense_operation(case: AttentionCase, device: torch.device, name: str) -> Operation:
     inputs = make_inputs(case, device)
-    config = AttentionConfig(attention_dtype(case.dtype), is_causal=case.causal, seed=case.seed)
+    config = AttentionConfig(
+        attention_dtype(case.dtype),
+        is_causal=case.causal,
+        seed=case.seed,
+        window_left=case.window_left,
+        window_right=case.window_right,
+    )
     if name == "pytorch-sdpa":
         run = partial(run_sdpa, inputs, config)
         limit = 0.01
+    elif name == "piper_attention":
+        kwargs: dict[str, object] = {"is_causal": case.causal}
+        if case.window_left is not None:
+            kwargs["window_left"] = case.window_left
+        if case.window_right is not None:
+            kwargs["window_right"] = case.window_right
+        run = partial(piper_attention, *inputs, **kwargs)
+        # A synthetic-input approximation gate, not a model-quality guarantee.
+        limit = 0.06
     else:
-        function = piper_attention if name == "piper_attention" else sage_attention_2pp
-        run = partial(function, *inputs, is_causal=case.causal)
+        run = partial(sage_attention_2pp, *inputs, is_causal=case.causal)
         # A synthetic-input approximation gate, not a model-quality guarantee.
         limit = 0.06
 
     def check(output: torch.Tensor) -> QualityCheck:
         validate_output_metadata(output, inputs[0].shape, inputs[0].dtype)
         rows = sample_indices(case.sequence, device=device)
-        expected = sampled_dense_reference(inputs, rows, causal=case.causal)
+        expected = sampled_dense_reference(
+            inputs,
+            rows,
+            causal=case.causal,
+            window_left=case.window_left,
+            window_right=case.window_right,
+        )
         actual = output.index_select(2, rows).float()
         return QualityCheck(
             metrics=measure_quality(actual, expected),
@@ -222,8 +252,18 @@ def implementations(case: AttentionCase, device: torch.device) -> list[Implement
     )
     if case.heads != case.kv_heads:
         sage_reason = "Sage requires equal query and key/value head counts"
+    has_window = case.window_left is not None or case.window_right is not None
+    sdpa_reason = (
+        "PyTorch SDPA dense benchmark path does not implement sliding-window masks"
+        if has_window
+        else None
+    )
+    if has_window:
+        sage_reason = "SageAttention2++ does not support sliding windows"
     return [
-        Implementation("pytorch-sdpa", partial(_dense_operation, case, device, "pytorch-sdpa")),
+        Implementation(
+            "pytorch-sdpa", partial(_dense_operation, case, device, "pytorch-sdpa"), sdpa_reason
+        ),
         Implementation(
             "piper_attention",
             partial(_dense_operation, case, device, "piper_attention"),

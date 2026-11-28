@@ -14,6 +14,7 @@ from typing import cast
 import torch
 
 _MAX_FINITE_FLOAT_INT = (1 << 1024) - (1 << 970) - 1
+_INT64_MAX = (1 << 63) - 1
 
 
 def _require_real_scalar(
@@ -101,6 +102,30 @@ def validate_positive_finite_float(
     return converted
 
 
+def validate_nonnegative_int(
+    value: int,
+    message: str,
+    *,
+    type_message: str | None = None,
+) -> int:
+    """Validate a nonnegative integer or SymInt across eager and compiled runs."""
+    if isinstance(value, bool) or not isinstance(value, (int, torch.SymInt)):
+        error_prefix = message if type_message is None else type_message
+        got = (
+            f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype})"
+            if isinstance(value, torch.Tensor)
+            else type(value).__name__
+        )
+        raise TypeError(f"{error_prefix}, got {got}")
+    if torch.compiler.is_compiling() or isinstance(value, torch.SymInt):
+        torch._check(value >= 0, lambda: message)
+        torch._check(value <= _INT64_MAX, lambda: message)
+        return cast(int, value)
+    if value < 0 or value > _INT64_MAX:
+        raise ValueError(f"{message}, got {value}")
+    return value
+
+
 def static_positive_finite_float(value: object) -> float | None:
     """Return a finite positive static Python float, or None for non-static/invalid values."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -115,5 +140,6 @@ def static_positive_finite_float(value: object) -> float | None:
 __all__ = [
     "static_positive_finite_float",
     "validate_finite_float",
+    "validate_nonnegative_int",
     "validate_positive_finite_float",
 ]

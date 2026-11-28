@@ -198,6 +198,11 @@ def _make_candidate[PreparedT](
             raise UnsupportedTuningCandidateError(str(error)) from error
 
         def bind[T](selected: _AttentionBackend[T]) -> Operation[torch.Tensor]:
+            prepare_kwargs: dict[str, object] = {"execution_plan": plan}
+            if config.window_left is not None:
+                prepare_kwargs["window_left"] = config.window_left
+            if config.window_right is not None:
+                prepare_kwargs["window_right"] = config.window_right
             return phase_operation(
                 lambda: selected.prepare(
                     query,
@@ -205,7 +210,7 @@ def _make_candidate[PreparedT](
                     value,
                     scale,
                     config.is_causal,
-                    execution_plan=plan,
+                    **prepare_kwargs,
                 ),
                 selected.launch,
                 phase=phase,
@@ -246,19 +251,29 @@ def _main(argv: Sequence[str] | None = None) -> None:
         args.kv_heads,
     )
     scale = args.head_dim**-0.5
+    window_left = getattr(args, "window_left", None)
+    window_right = getattr(args, "window_right", None)
     config = AttentionConfig(
         dtype=attention_dtype(args.dtype),
         is_causal=args.causal,
         scale=scale,
         seed=args.seed,
+        window_left=window_left,
+        window_right=window_right,
     )
     inputs = make_attention_inputs(shape, config=config, device=device)
     query, key, _ = inputs
+    window_mode = (
+        "windowed"
+        if (window_left is not None or (not args.causal and window_right not in (None, 0)))
+        else ("causal" if (args.causal or window_right == 0) else "none")
+    )
     production_plan = piper_attention_backend.default_execution_plan(
         query,
         args.causal,
         target=target,
         key_length=key.shape[2],
+        window_mode=window_mode,
     )
     candidates = tuple(
         _make_candidate(

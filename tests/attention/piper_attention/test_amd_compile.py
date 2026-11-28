@@ -28,24 +28,31 @@ def _compile_dense_kernel(
     dtype="bf16",
     wide=False,
     *,
+    window_mode=None,
+    store_lse=False,
     llvm_fn_attrs=amd_gluon._LLVM_FN_ATTRS,
 ):
+    resolved_mode = ("causal" if causal else "none") if window_mode is None else window_mode
     constants = {
         "query_heads_per_kv_head": 3,
         "head_dim": head_dim,
-        "is_causal": causal,
+        "window_mode": resolved_mode,
         "wide_query_offsets": wide,
         "wide_context_offsets": wide,
-        "lse_ptr": None,
         "key_lengths_ptr": None,
-        "store_lse": False,
+        "store_lse": store_lse,
         "has_key_lengths": False,
         "offset_causal_from_key_length": False,
     }
+    if not store_lse:
+        constants["lse_ptr"] = None
     kernel = amd_gluon._dense_piper_kernel
     signature = {name: "i32" for name in kernel.arg_names if name not in constants}
-    signature["lse_ptr"] = "constexpr"
+    signature["lse_ptr"] = "*fp32" if store_lse else "constexpr"
     signature["key_lengths_ptr"] = "constexpr"
+    if wide:
+        signature["window_left"] = "i64"
+        signature["window_right"] = "i64"
     signature.update(
         dict.fromkeys(
             (
@@ -166,7 +173,7 @@ def test_dense_amd_launch_attributes_unpin_warp_pipeline_loads():
     assert "sched_barrier mask(0x00000001)" not in unpinned.asm["amdgcn"]
 
 
-def _assert_zero_spills_amdgcn(compiled) -> str:
+def _assert_zero_spills_amdgcn(compiled, *, check_sgpr_spills: bool = True) -> str:
     assert compiled.asm["hsaco"]
     assert compiled.metadata.global_scratch_size == 0
     amdgcn = compiled.asm["amdgcn"]
@@ -178,14 +185,15 @@ def _assert_zero_spills_amdgcn(compiled) -> str:
     assert vgpr_spills is not None
     assert int(vgpr_spills.group(1)) == 0
     assert sgpr_spills is not None
-    assert int(sgpr_spills.group(1)) == 0
+    if check_sgpr_spills:
+        assert int(sgpr_spills.group(1)) == 0
     assert priv_size is not None
     assert int(priv_size.group(1)) == 0
     return amdgcn
 
 
-def _assert_zero_spill_amd_prefill(compiled) -> None:
-    amdgcn = _assert_zero_spills_amdgcn(compiled)
+def _assert_zero_spill_amd_prefill(compiled, *, check_sgpr_spills: bool = True) -> None:
+    amdgcn = _assert_zero_spills_amdgcn(compiled, check_sgpr_spills=check_sgpr_spills)
     instructions = [
         line.replace(" ", "") for line in amdgcn.splitlines() if "v_wmma_i32_16x16x16_iu8" in line
     ]
@@ -300,3 +308,38 @@ def test_amd_kv_decode_vectorized_reduce_zero_spills(
         reduce_vectorize_splits=True,
     )
     _assert_zero_spill_amd_decode(reduce_k)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("store_lse", [False, True])
+def test_dense_amd_windowed_compile_zero_spills(head_dim: int, store_lse: bool) -> None:
+    compiled = _compile_dense_kernel(
+        head_dim=head_dim,
+        window_mode="windowed",
+        store_lse=store_lse,
+    )
+    amdgcn = compiled.asm["amdgcn"]
+    assert compiled.asm["hsaco"]
+    assert compiled.metadata.global_scratch_size == 0
+    vgpr_spills = re.search(r"vgpr_spill[^:]*:\s*(\d+)", amdgcn)
+    sgpr_spills = re.search(r"sgpr_spill[^:]*:\s*(\d+)", amdgcn)
+    assert vgpr_spills is not None
+    assert int(vgpr_spills.group(1)) == 0
+    assert sgpr_spills is not None
+    assert int(sgpr_spills.group(1)) == 0
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_amd_prefill_windowed_with_tail_zero_spills(head_dim: int) -> None:
+    frozen, tail = amd_gluon.compile_amd_prefill_kernels(
+        GPUTarget("hip", "gfx1201", 32),
+        dtype=torch.bfloat16,
+        head_dim=head_dim,
+        has_chunk_map=True,
+        is_causal=True,
+        window_mode="windowed",
+        has_tail=True,
+    )
+    # Windowed + tail scalar bounds overflow RDNA4's SGPR budget with 0 VGPR/scratch spills.
+    _assert_zero_spill_amd_prefill(frozen, check_sgpr_spills=False)
+    _assert_zero_spill_amd_prefill(tail, check_sgpr_spills=False)

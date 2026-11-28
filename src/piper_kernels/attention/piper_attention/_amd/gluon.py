@@ -27,6 +27,7 @@ Architecture and codegen behavior:
 # pyright: reportGeneralTypeIssues=false, reportIndexIssue=false, reportAttributeAccessIssue=false
 
 import math
+from typing import Literal
 
 import torch
 import triton
@@ -59,7 +60,10 @@ from .._validation import (
     PreparedAttention,
     PreparedContext,
     PreparedQuery,
+    WindowMode,
+    normalize_window_bounds,
     resolve_query_window,
+    validate_lse_buffer,
     validate_output_buffer,
     validate_query_offset,
 )
@@ -175,6 +179,8 @@ def _finalize_safe_output(numerator, denominator, running_max, running_bias):
         "stride_om",
         "stride_lb",
         "stride_lh",
+        "window_left",
+        "window_right",
     ]
 )
 def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
@@ -201,7 +207,7 @@ def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
     stride_om,
     query_heads_per_kv_head: gl.constexpr,
     head_dim: gl.constexpr,
-    is_causal: gl.constexpr,
+    window_mode: gl.constexpr,
     wide_query_offsets: gl.constexpr,
     wide_context_offsets: gl.constexpr,
     lse_ptr=None,
@@ -211,18 +217,24 @@ def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
     store_lse: gl.constexpr = False,
     has_key_lengths: gl.constexpr = False,
     offset_causal_from_key_length: gl.constexpr = False,
+    window_left=-1,
+    window_right=-1,
 ):
-    safe_softmax: gl.constexpr = store_lse or has_key_lengths
+    is_causal_mode: gl.constexpr = window_mode == "causal"
+    is_windowed_mode: gl.constexpr = window_mode == "windowed"
+    safe_softmax: gl.constexpr = store_lse or has_key_lengths or is_windowed_mode
     head = gl.program_id(1).to(gl.int64)
     batch = gl.program_id(2).to(gl.int64)
     batch_head = batch * heads + head
     kv_batch_head = batch * (heads // query_heads_per_kv_head) + head // query_heads_per_kv_head
     if has_key_lengths:
         key_length = gl.minimum(gl.maximum(gl.load(key_lengths_ptr + batch), 0), key_length)
-    if offset_causal_from_key_length and is_causal:
+    if offset_causal_from_key_length and window_mode != "none":
         global_query_start = key_length - query_rows
     # Launch causal query blocks longest-prefix-first to prevent tail-wave imbalance.
-    query_block = (gl.num_programs(0) - 1 - gl.program_id(0)) if is_causal else gl.program_id(0)
+    query_block = (
+        (gl.num_programs(0) - 1 - gl.program_id(0)) if is_causal_mode else gl.program_id(0)
+    )
     stored_query_block = query_start // 64 + query_block
     row_layout: gl.constexpr = gl.SliceLayout(2, MMA_LAYOUT)
     block_layout: gl.constexpr = gl.SliceLayout(1, row_layout)
@@ -255,20 +267,67 @@ def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
     denominator = gl.zeros([1, 64], gl.float32, row_layout)
     running_max = gl.full([1, 64], -float("inf"), gl.float32, row_layout)
     running_bias = gl.zeros([1, 64], gl.float32, row_layout)
+    first_tile = 0
     tile_count = gl.cdiv(key_length, 64)
     first_causal_tile = 0
     global_query_block = 0
-    if is_causal:
+    boundary_tile_lo = 0
+    boundary_tile_hi = tile_count
+    eff_wl = gl.zeros((), dtype=gl.int64)
+    eff_wr = gl.zeros((), dtype=gl.int64)
+    if is_causal_mode:
+        global_row_start = global_query_start.to(gl.int64) + query_block.to(gl.int64) * 64
         if safe_softmax:
-            global_row_start = global_query_start.to(gl.int64) + query_block.to(gl.int64) * 64
             causal_end = gl.maximum(global_row_start + 64, 0)
             tile_count = gl.minimum(tile_count, gl.cdiv(causal_end, 64).to(gl.int32))
             first_causal_tile = (gl.maximum(global_row_start + 1, 0) // 64).to(gl.int32)
         else:
             global_query_block = global_query_start // 64 + query_block
             tile_count = gl.minimum(tile_count, global_query_block + 1)
+    elif is_windowed_mode:
+        eff_wl = gl.minimum(
+            window_left.to(gl.int64),
+            gl.maximum(0, global_query_start.to(gl.int64) + query_rows.to(gl.int64)),
+        )
+        eff_wr = gl.minimum(
+            window_right.to(gl.int64), key_length.to(gl.int64) + query_rows.to(gl.int64)
+        )
+        global_row_start = global_query_start.to(gl.int64) + query_block.to(gl.int64) * 64
+        global_row_end = (
+            gl.minimum(
+                global_row_start + 64, global_query_start.to(gl.int64) + query_rows.to(gl.int64)
+            )
+            - 1
+        )
+        vis_k_start = (
+            gl.maximum(0, global_row_start - eff_wl)
+            if window_left >= 0
+            else gl.zeros((), dtype=gl.int64)
+        )
+        vis_k_end = (
+            gl.minimum(key_length.to(gl.int64), global_row_end + eff_wr + 1)
+            if window_right >= 0
+            else key_length.to(gl.int64)
+        )
+        if vis_k_start >= vis_k_end:
+            first_tile = 0
+            tile_count = 0
+        else:
+            first_tile = (vis_k_start // 64).to(gl.int32)
+            tile_count = gl.minimum(tile_count, gl.cdiv(vis_k_end, 64).to(gl.int32))
+        boundary_tile_lo = (
+            gl.cdiv(gl.maximum(0, global_row_end - eff_wl), 64).to(gl.int32)
+            if window_left >= 0
+            else 0
+        )
+        boundary_tile_hi = (
+            gl.minimum(tile_count, ((global_row_start + eff_wr) // 64).to(gl.int32))
+            if window_right >= 0
+            else tile_count
+        )
+    first_chunk = first_tile // _GL_TILES_PER_CHUNK
     chunk_count = gl.cdiv(tile_count, _GL_TILES_PER_CHUNK)
-    for chunk in range(chunk_count):
+    for chunk in range(first_chunk, chunk_count):
         k_bias = qk_fp32_center_bias(
             query_ptr + batch_head * query_storage * head_dim,
             stored_query_block,
@@ -280,8 +339,9 @@ def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
             row_layout,
         )
         chunk_denom = gl.zeros([1, 64], gl.float32, row_layout)
-        tile_start = chunk * _GL_TILES_PER_CHUNK
-        tile_stop = gl.minimum(tile_start + _GL_TILES_PER_CHUNK, tile_count)
+        chunk_tile_base = chunk * _GL_TILES_PER_CHUNK
+        tile_start = gl.maximum(chunk_tile_base, first_tile)
+        tile_stop = gl.minimum(chunk_tile_base + _GL_TILES_PER_CHUNK, tile_count)
         for tile in range(tile_start, tile_stop):
             key_blocks = gl.full([1], tile, gl.int32, block_layout)
             scores = qk_tiles(
@@ -300,15 +360,30 @@ def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
                 tile.to(gl.int64) * 64 + columns if wide_context_offsets else tile * 64 + columns
             )
             boundary = (tile + 1) * 64 > key_length
-            if is_causal:
+            if is_causal_mode:
                 if safe_softmax:
                     boundary = boundary | (tile >= first_causal_tile)
                 else:
                     boundary = boundary | (tile == global_query_block)
+            elif is_windowed_mode:
+                boundary = boundary | (tile < boundary_tile_lo) | (tile >= boundary_tile_hi)
             if boundary:
-                valid = key_rows[None, None, :] < key_length
-                if is_causal:
+                valid = (key_rows[None, None, :] < key_length) & (
+                    global_query_rows[None, :, None] == global_query_rows[None, :, None]
+                )
+                if is_causal_mode:
                     valid = valid & (key_rows[None, None, :] <= global_query_rows[None, :, None])
+                elif is_windowed_mode:
+                    if window_left >= 0:
+                        valid = valid & (
+                            key_rows[None, None, :].to(gl.int64)
+                            >= (global_query_rows[None, :, None].to(gl.int64) - eff_wl)
+                        )
+                    if window_right >= 0:
+                        valid = valid & (
+                            key_rows[None, None, :].to(gl.int64)
+                            <= (global_query_rows[None, :, None].to(gl.int64) + eff_wr)
+                        )
                 # Fused scaling must not turn a masked zero-scale score into 0 * -inf.
                 scores = gl.where(
                     valid, gl.where(scale[:, :, None] == 0, 0.0, scores), -float("inf")
@@ -328,11 +403,13 @@ def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
                     2,
                     max_propagate_nan,
                 )
-                if is_causal:
+                if is_causal_mode:
                     tile_start_n = tile.to(gl.int64) * 64 if wide_context_offsets else tile * 64
                     tile_has_keys = tile_start_n <= global_query_rows[None, :]
                     block_max = gl.where(tile_has_keys, block_max, -float("inf"))
                     tile_k_bias = gl.where(tile_has_keys, k_bias, 0.0)
+                elif is_windowed_mode:
+                    tile_k_bias = gl.where(block_max != -float("inf"), k_bias, 0.0)
                 else:
                     tile_k_bias = k_bias
                 next_max, next_bias, old_weight, current_weight, has_block, safe_block_max = (
@@ -422,6 +499,10 @@ def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
         "stride_lh",
         "split_chunks",
         "total_splits",
+        "tail_cap",
+        "window_left",
+        "window_right",
+        "logical_seq_q",
     ]
 )
 def _frozen_pool_piper_kernel(  # noqa: PLR0912, PLR0915
@@ -465,8 +546,19 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0912, PLR0915
     wide_query_offsets: gl.constexpr,
     has_chunk_splits: gl.constexpr = False,
     per_row_query_scale: gl.constexpr = False,
+    tail_len_ptr=None,
+    tail_cap=0,
+    window_left=-1,
+    window_right=-1,
+    logical_seq_q=0,
+    has_tail: gl.constexpr = False,
+    window_mode: gl.constexpr = "none",
 ):
     """Prefill Q blocks directly against finalized 1024-token slots in PiperKVChunkPool."""
+    is_causal_mode: gl.constexpr = window_mode == "causal"
+    is_windowed_mode: gl.constexpr = window_mode == "windowed"
+    has_window: gl.constexpr = is_causal_mode or is_windowed_mode
+
     head = gl.program_id(1).to(gl.int64)
     if has_chunk_splits:
         batch_split = gl.program_id(2)
@@ -489,6 +581,9 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0912, PLR0915
     columns = gl.arange(0, 64, gl.SliceLayout(0, column_layout))
     features = gl.arange(0, head_dim, gl.SliceLayout(0, column_layout))
     output_rows = query_block.to(gl.int64) * 64 + rows
+    eff_logical_seq_q = gl.maximum(logical_seq_q, 1)
+    eff_seq_q = eff_logical_seq_q if per_row_query_scale else seq_q
+    row_q_idx = (output_rows % eff_logical_seq_q) if per_row_query_scale else output_rows
 
     query = query_fragments(
         query_ptr + batch_head * query_storage * head_dim,
@@ -511,21 +606,75 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0912, PLR0915
     running_bias = gl.zeros([1, 64], gl.float32, row_layout)
 
     active_chunks = gl.minimum(gl.maximum(gl.load(num_chunks_ptr + batch), 0), max_chunks)
-    if has_chunk_splits:
+    if has_window:
+        active_tail = (
+            gl.minimum(gl.maximum(gl.load(tail_len_ptr + batch), 0), tail_cap).to(gl.int64)
+            if has_tail
+            else gl.zeros((), dtype=gl.int64)
+        )
+        frozen_tokens = active_chunks.to(gl.int64) * 1024
+        total_kv = frozen_tokens + active_tail
+        eff_wl = gl.minimum(window_left.to(gl.int64), total_kv)
+        eff_wr = gl.minimum(window_right.to(gl.int64), total_kv + eff_seq_q.to(gl.int64))
+        global_query_start = total_kv - eff_seq_q.to(gl.int64)
+        if per_row_query_scale:
+            q_tile_first = query_block.to(gl.int64) * 64
+            q_tile_last = gl.minimum(q_tile_first + 64, seq_q.to(gl.int64)) - 1
+            same_head = (q_tile_first // eff_logical_seq_q) == (q_tile_last // eff_logical_seq_q)
+            q_idx_min = gl.where(same_head, q_tile_first % eff_logical_seq_q, 0)
+            q_idx_max = gl.where(same_head, q_tile_last % eff_logical_seq_q, eff_logical_seq_q - 1)
+        else:
+            q_idx_min = query_block.to(gl.int64) * 64
+            q_idx_max = gl.minimum(q_idx_min + 64, seq_q.to(gl.int64)) - 1
+        q_row_min = global_query_start + q_idx_min
+        q_row_max = global_query_start + q_idx_max
+        k_min = (
+            gl.maximum(0, q_row_min - eff_wl)
+            if (is_windowed_mode and window_left >= 0)
+            else gl.zeros((), dtype=gl.int64)
+        )
+        if is_causal_mode:
+            k_max_excl = gl.minimum(frozen_tokens, gl.maximum(0, q_row_max + 1))
+        elif window_right >= 0:
+            k_max_excl = gl.minimum(frozen_tokens, gl.maximum(0, q_row_max + eff_wr + 1))
+        else:
+            k_max_excl = frozen_tokens
         total_tiles = active_chunks * _GL_TILES_PER_CHUNK
-        tiles_per_split = (total_tiles + split_chunks - 1) // split_chunks
-        tile_start = gl.minimum(total_tiles, split_id * tiles_per_split)
-        tile_end = gl.minimum(total_tiles, tile_start + tiles_per_split)
-        has_work = tile_start < tile_end
-        chunk_start = gl.where(has_work, tile_start // _GL_TILES_PER_CHUNK, 0)
-        chunk_end = gl.where(has_work, (tile_end - 1) // _GL_TILES_PER_CHUNK + 1, 0)
-        first_tile = gl.where(has_work, tile_start % _GL_TILES_PER_CHUNK, 0)
-        last_tile = gl.where(has_work, (tile_end - 1) % _GL_TILES_PER_CHUNK + 1, 0)
+        vis_t_start = gl.minimum(total_tiles.to(gl.int64), k_min // 64).to(gl.int32)
+        vis_t_end = gl.maximum(
+            vis_t_start,
+            gl.minimum(total_tiles.to(gl.int64), gl.cdiv(k_max_excl, 64)).to(gl.int32),
+        )
+        win_lo_base = (
+            global_query_start - eff_wl
+            if (is_windowed_mode and window_left >= 0)
+            else -eff_seq_q.to(gl.int64) - 1
+        )
+        win_hi_base = (
+            global_query_start + eff_wr
+            if (is_windowed_mode and window_right >= 0)
+            else (global_query_start if is_causal_mode else frozen_tokens + 1024)
+        )
     else:
-        chunk_start = 0
-        chunk_end = active_chunks
-        first_tile = 0
-        last_tile = _GL_TILES_PER_CHUNK
+        vis_t_start = gl.zeros((), dtype=gl.int32)
+        vis_t_end = active_chunks * _GL_TILES_PER_CHUNK
+        win_lo_base = gl.zeros((), dtype=gl.int64)
+        win_hi_base = gl.zeros((), dtype=gl.int64)
+
+    if has_chunk_splits:
+        vis_tiles = vis_t_end - vis_t_start
+        tiles_per_split = (vis_tiles + split_chunks - 1) // split_chunks
+        tile_start = gl.minimum(vis_t_end, vis_t_start + split_id * tiles_per_split)
+        tile_end = gl.minimum(vis_t_end, tile_start + tiles_per_split)
+    else:
+        tile_start = vis_t_start
+        tile_end = vis_t_end
+    has_work = tile_start < tile_end
+    chunk_start = gl.where(has_work, tile_start // _GL_TILES_PER_CHUNK, 0)
+    chunk_end = gl.where(has_work, (tile_end - 1) // _GL_TILES_PER_CHUNK + 1, 0)
+    first_tile = gl.where(has_work, tile_start % _GL_TILES_PER_CHUNK, 0)
+    last_tile = gl.where(has_work, (tile_end - 1) % _GL_TILES_PER_CHUNK + 1, 0)
+
     kv_stride_ki: gl.constexpr = 1024 * head_dim
     kv_stride_ks: gl.constexpr = 16
     kv_stride_vs: gl.constexpr = 1024
@@ -566,12 +715,25 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0912, PLR0915
             )
             chunk_active = k_bias != -float("inf")
             chunk_denom = gl.zeros([1, 64], gl.float32, row_layout)
-            if has_chunk_splits:
+            if has_chunk_splits or has_window:
                 t_begin = gl.where(chunk == chunk_start, first_tile, 0)
                 t_end = gl.where(chunk == chunk_end - 1, last_tile, _GL_TILES_PER_CHUNK)
             else:
                 t_begin = 0
                 t_end = _GL_TILES_PER_CHUNK
+            if has_window:
+                chunk_base64 = chunk.to(gl.int64) * 1024
+                chunk_win_lo = gl.maximum(
+                    0,
+                    gl.minimum(1024, (win_lo_base + row_q_idx) - chunk_base64),
+                ).to(gl.int32)
+                chunk_win_hi = gl.maximum(
+                    -1,
+                    gl.minimum(1024, (win_hi_base + row_q_idx) - chunk_base64),
+                ).to(gl.int32)
+            else:
+                chunk_win_lo = gl.zeros([64], gl.int32, gl.SliceLayout(0, row_layout))
+                chunk_win_hi = gl.full([64], 1024, gl.int32, gl.SliceLayout(0, row_layout))
             for tile in range(t_begin, t_end):
                 key_blocks = gl.full([1], tile, gl.int32, block_layout)
                 scores = qk_tiles(
@@ -587,19 +749,42 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0912, PLR0915
                 vs_idx = tile * 64 + columns
                 multiplier = smem_vs.gather(vs_idx, 0)[None, :]
                 log_scale = smem_log.gather(vs_idx, 0)[None, :]
-                scores = gl.where(
+                scaled_scores = gl.where(
                     scale[:, :, None] == 0, 0.0, _unfused_mul(scores, scale[:, :, None])
                 )
-                shifted_scores = gl.where(
-                    chunk_active[:, :, None], scores + log_scale[:, None, :], scores
-                )
+                if has_window:
+                    key_rows_local = tile * 64 + columns
+                    valid = chunk_active[:, :, None] & (
+                        columns[None, None, :] == columns[None, None, :]
+                    )
+                    if is_causal_mode:
+                        valid = valid & (
+                            key_rows_local[None, None, :] <= chunk_win_hi[None, :, None]
+                        )
+                    else:
+                        valid = valid & (
+                            (key_rows_local[None, None, :] >= chunk_win_lo[None, :, None])
+                            & (key_rows_local[None, None, :] <= chunk_win_hi[None, :, None])
+                        )
+                    scores = gl.where(valid, scaled_scores, -float("inf"))
+                    shifted_scores = gl.where(
+                        scores != -float("inf"), scores + log_scale[:, None, :], -float("inf")
+                    )
+                else:
+                    scores = gl.where(chunk_active[:, :, None], scaled_scores, -float("inf"))
+                    shifted_scores = gl.where(
+                        chunk_active[:, :, None], scores + log_scale[:, None, :], scores
+                    )
                 block_max = gl.reduce(shifted_scores, 2, max_propagate_nan)
+                tile_k_bias = (
+                    gl.where(block_max != -float("inf"), k_bias, 0.0) if has_window else k_bias
+                )
                 next_max, next_bias, old_weight, current_weight, has_block, safe_block_max = (
                     advance_tile_max_safe(
                         running_max,
                         running_bias,
                         block_max,
-                        k_bias,
+                        tile_k_bias,
                     )
                 )
                 packed, total = _softmax_tile(scores, safe_block_max, None, multiplier, has_block)
@@ -619,7 +804,9 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0912, PLR0915
                 running_max = next_max
                 running_bias = next_bias
             value_mean = gl.load(vm_slot_ptr + features[None, :])
-            numerator = _fold_safe_value_mean(numerator, chunk_denom, value_mean, chunk_active)
+            numerator = _fold_safe_value_mean(
+                numerator, chunk_denom, value_mean, None if has_window else chunk_active
+            )
 
     valid_out = output_rows[None, :] < seq_q
     offsets = out_batch64 * stride_ob + head * stride_oh + output_rows[None, :, None] * stride_om
@@ -663,8 +850,11 @@ def prepare_context(
     value: torch.Tensor,
     *,
     is_causal: bool,
+    window_left: int | None = None,
+    window_right: int | None = None,
 ) -> PreparedContext:
     """Prepare validated K/V once, independently of Q and output storage."""
+    eff_left, eff_right, _ = normalize_window_bounds(is_causal, window_left, window_right)
     key_storage = triton.cdiv(key.shape[2], 64) * 64
     with device_context(key.device):
         key_int8, key_scale, key_center = _quantization.prepare_chunk_centered_key(
@@ -686,6 +876,8 @@ def prepare_context(
         value_mean=value_mean,
         key_length=key.shape[2],
         is_causal=is_causal,
+        window_left=eff_left,
+        window_right=eff_right,
     )
 
 
@@ -719,9 +911,18 @@ def prepare_attention(
     value: torch.Tensor,
     scale: float,
     is_causal: bool,
+    *,
+    window_left: int | None = None,
+    window_right: int | None = None,
 ) -> PreparedAttention:
     """Prepare operands and allocate the reusable output before timed launches."""
-    context = prepare_context(key, value, is_causal=is_causal)
+    context = prepare_context(
+        key,
+        value,
+        is_causal=is_causal,
+        window_left=window_left,
+        window_right=window_right,
+    )
     prepared_query = prepare_query(query, scale)
     output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
     return PreparedAttention(context=context, query=prepared_query, output=output)
@@ -734,11 +935,15 @@ def _launch_window_into(
     *,
     query_start: int,
     rows: int,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch, heads, _, head_dim = query.shape
     query_storage = query.data.shape[2]
     key_storage = context.key.shape[2]
     key_chunks = context.key_center.shape[2]
+    eff_left, eff_right, window_mode = normalize_window_bounds(
+        context.is_causal, context.window_left, context.window_right
+    )
     with device_context(query.data.device):
         _dense_piper_kernel[(triton.cdiv(rows, 64), heads, batch)](
             query.data,
@@ -764,9 +969,15 @@ def _launch_window_into(
             output.stride(2),
             heads // context.key.shape[1],
             head_dim,
-            context.is_causal,
+            window_mode,
             query_storage * (head_dim // 8) > (1 << 31),
             key_storage * head_dim > (1 << 32),
+            lse_ptr=lse,
+            stride_lb=0 if lse is None else lse.stride(0),
+            stride_lh=0 if lse is None else lse.stride(1),
+            store_lse=lse is not None,
+            window_left=-1 if eff_left is None else eff_left,
+            window_right=-1 if eff_right is None else eff_right,
             num_warps=4,
             num_stages=1,
             llvm_fn_attrs=_LLVM_FN_ATTRS,
@@ -781,6 +992,7 @@ def launch_attention_into(
     *,
     query_start: int = 0,
     query_rows: int | None = None,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fill a caller-owned output for an aligned window of prepared Q."""
     batch, heads, query_length, head_dim = query.shape
@@ -799,6 +1011,12 @@ def launch_attention_into(
         dtype=query.dtype,
         device=query.data.device,
     )
+    if lse is not None:
+        validate_lse_buffer(
+            lse,
+            shape=(batch, heads, rows),
+            device=query.data.device,
+        )
     if batch == 0:
         return output
     return _launch_window_into(
@@ -807,6 +1025,7 @@ def launch_attention_into(
         output,
         query_start=query_start,
         rows=rows,
+        lse=lse,
     )
 
 
@@ -821,10 +1040,35 @@ def run_attention(
     value: torch.Tensor,
     scale: float,
     is_causal: bool,
-) -> torch.Tensor:
+    *,
+    window_left: int | None = None,
+    window_right: int | None = None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if query.shape[0] == 0:
-        return torch.empty_like(query, memory_format=torch.contiguous_format)
-    return launch_attention(prepare_attention(query, key, value, scale, is_causal))
+        empty_out = torch.empty_like(query, memory_format=torch.contiguous_format)
+        if not return_lse:
+            return empty_out
+        return empty_out, torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
+    prepared = prepare_attention(
+        query,
+        key,
+        value,
+        scale,
+        is_causal,
+        window_left=window_left,
+        window_right=window_right,
+    )
+    lse = (
+        torch.empty(query.shape[:3], device=query.device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
+    output = launch_attention_into(prepared.context, prepared.query, prepared.output, lse=lse)
+    if return_lse:
+        assert lse is not None
+        return output, lse
+    return output
 
 
 def launch_frozen_pool_kernel(
@@ -844,6 +1088,12 @@ def launch_frozen_pool_kernel(
     per_row_query_scale: bool = False,
     partial_bias: torch.Tensor | None = None,
     partial_log_denom: torch.Tensor | None = None,
+    tail_len: torch.Tensor | None = None,
+    tail_cap: int = 0,
+    window_left: int = -1,
+    window_right: int = -1,
+    logical_seq_q: int = 0,
+    window_mode: WindowMode = "none",
 ) -> None:
     """Launch RDNA4 frozen-pool prefill kernel with pre-assembled host arguments."""
     resolved_total = split_chunks if total_splits is None else total_splits
@@ -865,6 +1115,13 @@ def launch_frozen_pool_kernel(
             query_storage * (head_dim // 8) > (1 << 31),
             has_chunk_splits=resolved_chunk_splits,
             per_row_query_scale=per_row_query_scale,
+            tail_len_ptr=tail_len,
+            tail_cap=tail_cap,
+            window_left=window_left,
+            window_right=window_right,
+            logical_seq_q=logical_seq_q,
+            has_tail=tail_len is not None,
+            window_mode=window_mode,
             num_warps=4,
             num_stages=1,
             llvm_fn_attrs=_LLVM_FN_ATTRS,
@@ -888,8 +1145,14 @@ def launch_tail_prefill(
     seq_q: int,
     tail_cap: int,
     is_causal: bool,
+    window_mode: WindowMode | None = None,
+    window_left: int = -1,
+    window_right: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prefill grouped queries over quantized live tail with per-batch tail_len & offset causal."""
+    """Prefill grouped queries over quantized live tail with per-batch tail_len & offset window."""
+    resolved_mode: WindowMode = (
+        ("causal" if is_causal else "none") if window_mode is None else window_mode
+    )
     batch, q_heads, _, head_dim = output.shape
     query_storage = query_int8.shape[2]
     key_storage = tail_key_int8.shape[2]
@@ -919,7 +1182,7 @@ def launch_tail_prefill(
             output.stride(2),
             q_heads // tail_key_int8.shape[1],
             head_dim,
-            is_causal,
+            resolved_mode,
             query_storage * (head_dim // 8) > (1 << 31),
             key_storage * head_dim > (1 << 32),
             lse_ptr=lse,
@@ -928,7 +1191,9 @@ def launch_tail_prefill(
             stride_lh=lse.stride(1),
             store_lse=True,
             has_key_lengths=True,
-            offset_causal_from_key_length=is_causal,
+            offset_causal_from_key_length=resolved_mode != "none",
+            window_left=window_left,
+            window_right=window_right,
             num_warps=4,
             num_stages=1,
             llvm_fn_attrs=_LLVM_FN_ATTRS,
@@ -946,31 +1211,50 @@ def compile_amd_prefill_kernels(
     wide_pool: bool = False,
     has_chunk_splits: bool = False,
     per_row_query_scale: bool = False,
+    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    has_tail: bool = False,
     include_tail: bool = True,
     compile_fn=None,
 ) -> tuple[object, ...]:
-    """Offline-compile RDNA4 frozen-pool and optional offset-causal tail prefill kernels."""
+    """Offline-compile RDNA4 frozen-pool and optional offset-window tail prefill kernels."""
     triton_dtype = _quantization.validate_kv_compile_args(dtype, head_dim)
     options = {"num_warps": 4, "num_stages": 1, "llvm_fn_attrs": _LLVM_FN_ATTRS}
     compiler = triton.compile if compile_fn is None else compile_fn
+    frozen_mode: Literal["none", "causal", "windowed"] = (
+        "none" if window_mode is None else window_mode
+    )
+    tail_mode: Literal["none", "causal", "windowed"] = (
+        ("causal" if is_causal else "none") if window_mode is None else window_mode
+    )
 
+    frozen_constants: dict[str, object] = {
+        "query_heads_per_kv_head": 3,
+        "head_dim": head_dim,
+        "has_chunk_map": has_chunk_map,
+        "wide_query_offsets": False,
+        "has_chunk_splits": has_chunk_splits,
+        "per_row_query_scale": per_row_query_scale,
+        "has_tail": has_tail,
+        "window_mode": frozen_mode,
+    }
     frozen_overrides = _quantization.frozen_pool_pointer_signature(
         triton_dtype, wide_pool=wide_pool
     )
     frozen_overrides["partial_bias_ptr"] = "*fp32"
     frozen_overrides["partial_log_denom_ptr"] = "*fp32"
+    frozen_overrides["window_left"] = "i64"
+    frozen_overrides["window_right"] = "i64"
+    frozen_overrides["logical_seq_q"] = "i32"
+    if has_tail:
+        frozen_overrides["tail_len_ptr"] = "*i32"
+    else:
+        frozen_constants["tail_len_ptr"] = None
+        frozen_overrides["tail_len_ptr"] = "constexpr"
     if has_chunk_splits:
         frozen_overrides["output_ptr"] = "*fp32"
     frozen_source = _quantization.build_kernel_source(
         _frozen_pool_piper_kernel,
-        constants={
-            "query_heads_per_kv_head": 3,
-            "head_dim": head_dim,
-            "has_chunk_map": has_chunk_map,
-            "wide_query_offsets": False,
-            "has_chunk_splits": has_chunk_splits,
-            "per_row_query_scale": per_row_query_scale,
-        },
+        constants=frozen_constants,
         overrides=frozen_overrides,
         gluon=True,
         pointer_range_32=not wide_pool,
@@ -998,18 +1282,20 @@ def compile_amd_prefill_kernels(
         value_ptr="*i8",
         key_lengths_ptr="*i32",
         output_ptr=f"*{triton_dtype}",
+        window_left="i64",
+        window_right="i64",
     )
     tail_source = _quantization.build_kernel_source(
         _dense_piper_kernel,
         constants={
             "query_heads_per_kv_head": 3,
             "head_dim": head_dim,
-            "is_causal": is_causal,
+            "window_mode": tail_mode,
             "wide_query_offsets": False,
             "wide_context_offsets": False,
             "store_lse": True,
             "has_key_lengths": True,
-            "offset_causal_from_key_length": is_causal,
+            "offset_causal_from_key_length": tail_mode != "none",
         },
         overrides=tail_overrides,
         gluon=True,

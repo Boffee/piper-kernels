@@ -30,6 +30,8 @@ def add_attention_tuning_arguments(
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
     parser.add_argument("--dtype", choices=ATTENTION_DTYPE_NAMES, default="bfloat16")
     parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--window-left", type=int, default=None)
+    parser.add_argument("--window-right", type=int, default=None)
     parser.add_argument("--block-m", type=int, choices=BLOCK_M_VALUES, nargs="+")
     parser.add_argument("--num-warps", type=int, choices=NUM_WARPS_VALUES, nargs="+")
     parser.add_argument("--num-stages", type=int, choices=NUM_STAGES_VALUES, nargs="+")
@@ -79,4 +81,10 @@ def validate_attention_tuning_arguments(arguments: argparse.Namespace) -> None:
         raise SystemExit("causal attention requires equal query and key/value lengths")
     if not arguments.causal and getattr(arguments, "reverse_causal_blocks", None) is True:
         raise SystemExit("reverse causal-block order requires causal attention")
+    for flag_name, bound in (
+        ("--window-left", getattr(arguments, "window_left", None)),
+        ("--window-right", getattr(arguments, "window_right", None)),
+    ):
+        if bound is not None and bound < 0:
+            raise SystemExit(f"{flag_name} must be a nonnegative integer")
     validate_tuning_arguments(arguments)

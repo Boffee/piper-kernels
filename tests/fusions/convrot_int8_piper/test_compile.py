@@ -98,9 +98,10 @@ def _semantic_graph(*, dtype=torch.bfloat16, affine=True, permute=True, device="
             if permute
             else call(torch.ops.aten.transpose.int, transformed, 1, 2)
         )
-        output = call(
+        piper = call(
             torch.ops.piper_kernels.piper_attention.default, query_value, key, value, 0.125, False
         )
+        output = call(operator.getitem, piper, 0)
         graph.output(output)
     return torch.fx.GraphModule({}, graph).graph
 
@@ -154,11 +155,17 @@ def test_fake_rewrite_preserves_floating_key_value_and_padded_query(
         "group",
         "scale",
         "causal",
+        "window_left",
+        "window_right",
+        "return_lse",
+        "lse_escape",
         "escape",
         "rotation",
     ],
 )
-def test_unrecognized_or_unsupported_region_stays_unchanged(monkeypatch, invalid):
+def test_unrecognized_or_unsupported_region_stays_unchanged(  # noqa: PLR0912
+    monkeypatch, invalid
+):
     mock_cuda_target(monkeypatch, (9, 0) if invalid == "target" else (12, 0))
     graph = _semantic_graph(device="cuda:0")
     nodes = {node.name: node for node in graph.nodes}
@@ -192,9 +199,22 @@ def test_unrecognized_or_unsupported_region_stays_unchanged(monkeypatch, invalid
         attention.args = (*attention.args[:3], -0.125, attention.args[4])
     elif invalid == "causal":
         attention.args = (*attention.args[:4], True)
+    elif invalid == "window_left":
+        attention.args = (*attention.args[:5], 128, -1, False)
+    elif invalid == "window_right":
+        attention.args = (*attention.args[:5], -1, 64, False)
+    elif invalid == "return_lse":
+        attention.args = (*attention.args[:5], -1, -1, True)
+    elif invalid == "lse_escape":
+        output = next(node for node in graph.nodes if node.op == "output")
+        attn_out = next(iter(attention.users))
+        with graph.inserting_after(attention):
+            lse = graph.call_function(operator.getitem, (attention, 1))
+        output.args = ((attn_out, lse),)
     elif invalid == "escape":
         output = next(node for node in graph.nodes if node.op == "output")
-        output.args = ((attention, attention.args[0]),)
+        attn_out = next(iter(attention.users))
+        output.args = ((attn_out, attention.args[0]),)
     elif invalid == "rotation":
         negated = next(node for node in graph.nodes if node.target is torch.ops.aten.neg.default)
         negated.target = torch.ops.aten.clone.default
@@ -669,7 +689,8 @@ def test_qkv_preparation_reuse_keeps_late_tuple_users_after_attention(monkeypatc
     attention.append(data)
     data.append(scales)
     output = next(node for node in graph.nodes if node.op == "output")
-    output.args = ((attention, data, scales),)
+    attn_out = next(iter(attention.users))
+    output.args = ((attn_out, data, scales),)
     graph.lint()
     mock_cuda_target(monkeypatch, (12, 0))
 
@@ -691,7 +712,8 @@ def test_context_escape_preserves_the_query_only_rewrite(monkeypatch, escaped_op
         if node.target is torch.ops.piper_kernels.piper_attention.default
     )
     output = next(node for node in graph.nodes if node.op == "output")
-    output.args = ((attention, attention.args[escaped_operand]),)
+    attn_out = next(iter(attention.users))
+    output.args = ((attn_out, attention.args[escaped_operand]),)
     mock_cuda_target(monkeypatch, (12, 0))
     _compile.fold_attention_projections(graph)
     targets = _targets(graph)

@@ -1,8 +1,7 @@
 """Select dense Piper execution from operand-device metadata."""
 
 import sys
-from collections.abc import Callable
-from typing import Literal
+from typing import Literal, Protocol
 
 import torch
 
@@ -10,9 +9,23 @@ from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarg
 
 from ._nvidia import policy as nvidia_policy
 
-AttentionImplementation = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor, float, bool], torch.Tensor
-]
+
+class AttentionImplementation(Protocol):
+    """Callable contract for dense Piper Attention native backends."""
+
+    def __call__(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        is_causal: bool,
+        *,
+        window_left: int | None = None,
+        window_right: int | None = None,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
+
 
 try:
     from ._nvidia.triton import _run_piper_attention as nvidia_attention

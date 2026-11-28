@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 import triton
@@ -13,6 +14,8 @@ from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarg
 from . import _backend, _quantization
 from ._decode_schedule import BLOCK_QH, REDUCE_NUM_WARPS
 from ._kv_prefill import (
+    _MAX_MERGE_WAVES,
+    _MERGE_STRIDE_FIELDS,
     _merge_two_attention_waves_kernel,
     _piper_decode_splitkv_reduce_kernel,
     _piper_decode_tail_split_kernel,
@@ -22,7 +25,7 @@ from ._quantization import _div16_attrs
 from .triton import _piper_decode_frozen_split_kernel
 
 
-def compile_kv_decode_kernels(
+def compile_kv_decode_kernels(  # noqa: PLR0913
     target: object,
     *,
     dtype: torch.dtype = torch.bfloat16,
@@ -32,6 +35,8 @@ def compile_kv_decode_kernels(
     contiguous_inputs: bool = True,
     wide_pool: bool = False,
     reduce_vectorize_splits: bool = False,
+    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    has_tail: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, object, object]:
     """Compile frozen-split, tail-split, and reduce decode kernels offline."""
@@ -39,6 +44,12 @@ def compile_kv_decode_kernels(
     accel = AcceleratorTarget.from_compiler_target(target)
     backend = _backend.prefill_backend(accel)
     schedule = select_decode_schedule(accel, head_dim)
+    frozen_mode: Literal["none", "causal", "windowed"] = (
+        "none" if window_mode is None else window_mode
+    )
+    tail_mode: Literal["none", "causal", "windowed"] = (
+        ("causal" if is_causal else "none") if window_mode is None else window_mode
+    )
 
     compiler = triton.compile if compile_fn is None else compile_fn
     split_options: dict[str, object] = {
@@ -58,6 +69,8 @@ def compile_kv_decode_kernels(
             wide_pool=wide_pool,
             has_chunk_splits=True,
             per_row_query_scale=True,
+            window_mode=frozen_mode,
+            has_tail=has_tail,
             include_tail=False,
             compile_fn=compile_fn,
         )[0]
@@ -73,6 +86,8 @@ def compile_kv_decode_kernels(
             wide_pool=wide_pool,
             has_chunk_splits=True,
             per_row_query_scale=True,
+            window_mode=frozen_mode,
+            has_tail=has_tail,
             include_tail=False,
             compile_fn=compile_fn,
         )[0]
@@ -93,7 +108,31 @@ def compile_kv_decode_kernels(
             "partial_bias_ptr": "*fp32",
             "partial_log_denom_ptr": "*fp32",
             "scale": "fp32",
+            "tail_cap": "i64",
+            "window_left": "i64",
+            "window_right": "i64",
         }
+        frozen_constants: dict[str, object] = {
+            "has_chunk_map": has_chunk_map,
+            "grouped_qk": grouped_qk,
+            "pack_wmma": pack_wmma,
+            "head_dim": head_dim,
+            "block_qh": BLOCK_QH,
+            "block_n": schedule.block_n,
+            "qk_mode": schedule.frozen_qk_mode,
+            "pv_precision": schedule.pv_precision,
+            # Free a pipeline buffer stage when windowed D=128 spills at loop=2.
+            "loop_num_stages": (
+                1 if (frozen_mode == "windowed" and head_dim == 128) else schedule.loop_num_stages
+            ),
+            "has_tail": has_tail,
+            "window_mode": frozen_mode,
+        }
+        if has_tail:
+            frozen_overrides["tail_len_ptr"] = "*i32"
+        else:
+            frozen_constants["tail_len_ptr"] = None
+            frozen_overrides["tail_len_ptr"] = "constexpr"
         if wide_pool:
             frozen_overrides.update(dict.fromkeys(_quantization.POOL_SLOT_STRIDE_NAMES, "i64"))
         frozen_noncontig = frozenset(
@@ -115,17 +154,7 @@ def compile_kv_decode_kernels(
         )
         frozen_source = _quantization.build_kernel_source(
             _piper_decode_frozen_split_kernel,
-            constants={
-                "has_chunk_map": has_chunk_map,
-                "grouped_qk": grouped_qk,
-                "pack_wmma": pack_wmma,
-                "head_dim": head_dim,
-                "block_qh": BLOCK_QH,
-                "block_n": schedule.block_n,
-                "qk_mode": schedule.frozen_qk_mode,
-                "pv_precision": schedule.pv_precision,
-                "loop_num_stages": schedule.loop_num_stages,
-            },
+            constants=frozen_constants,
             overrides=frozen_overrides,
             attrs=(
                 None
@@ -143,7 +172,7 @@ def compile_kv_decode_kernels(
     tail_source = _quantization.build_kernel_source(
         _piper_decode_tail_split_kernel,
         constants={
-            "is_causal": is_causal,
+            "window_mode": tail_mode,
             "head_dim": head_dim,
             "block_qh": BLOCK_QH,
             "block_n": schedule.block_n,
@@ -160,6 +189,8 @@ def compile_kv_decode_kernels(
             "partial_bias_ptr": "*fp32",
             "partial_log_denom_ptr": "*fp32",
             "scale": "fp32",
+            "window_left": "i64",
+            "window_right": "i64",
         },
         attrs=(
             None
@@ -218,7 +249,74 @@ def compile_kv_decode_kernels(
     )
 
 
-def compile_kv_prefill_kernels(
+def compile_merge_attention_lse_kernel(  # noqa: PLR0912
+    target: object,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 128,
+    num_waves: int = 2,
+    is_contiguous: bool = True,
+    in_place_0: bool = True,
+    compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
+) -> object:
+    """Offline-compile the unified 1..8-wave LSE merge kernel for ``target``."""
+    if not 1 <= num_waves <= _MAX_MERGE_WAVES:
+        raise ValueError(f"num_waves must be in 1..{_MAX_MERGE_WAVES}, got {num_waves}")
+    if head_dim < 1:
+        raise ValueError(f"head_dim must be positive, got {head_dim}")
+    triton_dtype = (
+        "bf16" if dtype is torch.bfloat16 else ("fp16" if dtype is torch.float16 else "fp32")
+    )
+    compiler = triton.compile if compile_fn is None else compile_fn
+    block_d = min(256, max(16, triton.next_power_of_2(head_dim)))
+    exact_d = head_dim == block_d
+    constants: dict[str, object] = {
+        "block_d": block_d,
+        "exact_d": exact_d,
+        "num_waves": num_waves,
+        "is_contiguous": is_contiguous,
+        "in_place_0": in_place_0,
+    }
+    overrides: dict[str, str] = {
+        "out_dst_ptr": f"*{triton_dtype}",
+        "lse_dst_ptr": "*fp32",
+        "dim1": "i64",
+        "dim2": "i64",
+        "dim3": "i64",
+        "head_dim": "i64",
+    }
+    for wave_idx in range(_MAX_MERGE_WAVES):
+        if wave_idx < num_waves:
+            overrides[f"out_{wave_idx}_ptr"] = f"*{triton_dtype}"
+            overrides[f"lse_{wave_idx}_ptr"] = "*fp32"
+        else:
+            constants[f"out_{wave_idx}_ptr"] = None
+            constants[f"lse_{wave_idx}_ptr"] = None
+            overrides[f"out_{wave_idx}_ptr"] = "constexpr"
+            overrides[f"lse_{wave_idx}_ptr"] = "constexpr"
+    if is_contiguous:
+        for field in _MERGE_STRIDE_FIELDS:
+            constants[field] = None
+            overrides[field] = "constexpr"
+    else:
+        for wave_idx in range(_MAX_MERGE_WAVES):
+            wave_fields = _MERGE_STRIDE_FIELDS[wave_idx * 9 : (wave_idx + 1) * 9]
+            if wave_idx < num_waves:
+                for field in wave_fields:
+                    overrides[field] = "i64"
+            else:
+                for field in wave_fields:
+                    constants[field] = None
+                    overrides[field] = "constexpr"
+    merge_source = _quantization.build_kernel_source(
+        _merge_two_attention_waves_kernel,
+        constants=constants,
+        overrides=overrides,
+    )
+    return compiler(merge_source, target, {"num_warps": REDUCE_NUM_WARPS})
+
+
+def compile_kv_prefill_kernels(  # noqa: PLR0913
     target: object,
     *,
     dtype: torch.dtype = torch.bfloat16,
@@ -228,22 +326,21 @@ def compile_kv_prefill_kernels(
     wide_pool: bool = False,
     has_chunk_splits: bool = False,
     per_row_query_scale: bool = False,
+    window_mode: Literal["none", "causal", "windowed"] | None = None,
+    has_tail: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, ...]:
     """Offline-compile two-wave merge and native chunked prefill kernels for ``target``."""
-    triton_dtype = _quantization.validate_kv_compile_args(dtype, head_dim)
-    compiler = triton.compile if compile_fn is None else compile_fn
-    merge_source = _quantization.build_kernel_source(
-        _merge_two_attention_waves_kernel,
-        constants={"head_dim": head_dim},
-        overrides={
-            "out_a_ptr": f"*{triton_dtype}",
-            "lse_a_ptr": "*fp32",
-            "out_b_ptr": f"*{triton_dtype}",
-            "lse_b_ptr": "*fp32",
-        },
+    _quantization.validate_kv_compile_args(dtype, head_dim)
+    merge_compiled = compile_merge_attention_lse_kernel(
+        target,
+        dtype=dtype,
+        head_dim=head_dim,
+        num_waves=2,
+        is_contiguous=True,
+        in_place_0=True,
+        compile_fn=compile_fn,
     )
-    merge_compiled = compiler(merge_source, target, {"num_warps": REDUCE_NUM_WARPS})
 
     accel = AcceleratorTarget.from_compiler_target(target)
     backend = _backend.prefill_backend(accel)
@@ -261,6 +358,8 @@ def compile_kv_prefill_kernels(
                 wide_pool=wide_pool,
                 has_chunk_splits=has_chunk_splits,
                 per_row_query_scale=per_row_query_scale,
+                window_mode=window_mode,
+                has_tail=has_tail,
                 compile_fn=compile_fn,
             ),
         )
@@ -278,6 +377,8 @@ def compile_kv_prefill_kernels(
                 wide_pool=wide_pool,
                 has_chunk_splits=has_chunk_splits,
                 per_row_query_scale=per_row_query_scale,
+                window_mode=window_mode,
+                has_tail=has_tail,
                 compile_fn=compile_fn,
             ),
         )
