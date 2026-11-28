@@ -176,7 +176,7 @@ block-scaled accumulation, reaching **896 GB/s** (`0.0366 ms`) cold-L2 on
 
 ## Encode implementation
 
-The [persistent Gluon forward](_gluon_forward.py) runs all steps of a batch in one
+The [persistent Gluon forward](_nvidia/gluon_forward.py) runs all steps of a batch in one
 launch, packing two rows per 32-bit word (`FP16x2`) in registers and shared memory
 with normalized weights `(w / row_scale) · 0.03125`. Rows are sorted and bucket-padded
 by bitwise E4M3 block scale so every CTA decodes states once for all its rows and

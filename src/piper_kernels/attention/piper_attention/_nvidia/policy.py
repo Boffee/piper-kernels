@@ -136,6 +136,11 @@ def supports_target(target: AcceleratorTarget) -> bool:
     return target.supports_uint8_int8_mma
 
 
+def supports_quantized_query(target: AcceleratorTarget) -> bool:
+    """Return whether NVIDIA ``target`` supports native quantized-query dense Piper."""
+    return target.is_cuda_capability(12) or target.is_cuda_capability(8, 9)
+
+
 def groups_qk_scales(target: AcceleratorTarget) -> bool:
     """Return whether every plan for target reads Q32/K64 group scales.
 

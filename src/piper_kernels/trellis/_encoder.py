@@ -33,13 +33,13 @@ from triton.language.extra import libdevice
 
 from piper_kernels._triton.runtime import device_context
 
-from ._gluon_forward import FP16_SCALE, run_viterbi
 from ._layout import (
     CODE_RECIPROCAL,
     STATE_BITS,
     WRAP_GUARD_BYTES,
     TrellisLayout,
 )
+from ._nvidia.gluon_forward import FP16_SCALE, run_viterbi
 from ._reference import decode_states
 from .triton import _decode_lcg_numerator_i32
 

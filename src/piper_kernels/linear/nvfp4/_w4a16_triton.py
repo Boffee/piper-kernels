@@ -731,20 +731,15 @@ def _linear_w4a16_large_m(
     weight_per_tensor_scale: torch.Tensor | None,
     bias: torch.Tensor | None,
     high_first: bool,
-    target_info: AcceleratorTarget,
     schedule: W4A16Schedule,
 ) -> torch.Tensor:
     rows, out_features = active_2d.shape[0], weight_qdata.shape[0]
-    sm75_bf16 = (
-        target_info.is_nvidia_cuda
-        and not target_info.cuda_capability_at_least(8)
-        and active_2d.dtype is torch.bfloat16
-    )
+    dequant_fp32 = schedule.dequant_as_fp32
     dequant_weight = _dequantize_nvfp4_swizzled(
         weight_qdata,
         weight_scale,
         high_first=high_first,
-        output_dtype=torch.float32 if sm75_bf16 else active_2d.dtype,
+        output_dtype=torch.float32 if dequant_fp32 else active_2d.dtype,
         block_n=schedule.block_n,
         block_k=schedule.block_k,
         num_warps=schedule.num_warps,
@@ -755,7 +750,7 @@ def _linear_w4a16_large_m(
         if weight_per_tensor_scale is None and bias is None and active_2d.dtype is input_dtype:
             product = (
                 torch.mm(active_2d.float(), weight_t).to(input_dtype)
-                if sm75_bf16
+                if dequant_fp32
                 else torch.mm(active_2d, weight_t)
             )
             return product.reshape(*input_shape[:-1], out_features)
@@ -779,9 +774,9 @@ def _linear_w4a16_large_m(
                 active_chunk = active_2d[start:end]
                 if pre_scale is not None:
                     active_chunk = (active_chunk.float() * pre_scale).to(active_2d.dtype)
-                if active_2d.dtype is torch.float32 or sm75_bf16:
+                if active_2d.dtype is torch.float32 or dequant_fp32:
                     partial = torch.mm(
-                        active_chunk.float() if sm75_bf16 else active_chunk, weight_t
+                        active_chunk.float() if dequant_fp32 else active_chunk, weight_t
                     )
                 else:
                     partial = torch.mm(active_chunk, weight_t, out_dtype=torch.float32)
@@ -854,7 +849,6 @@ def linear_w4a16(
             weight_per_tensor_scale,
             bias,
             high_first,
-            target_info,
             schedule,
         )
 

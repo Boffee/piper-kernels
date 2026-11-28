@@ -34,7 +34,7 @@ from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.runtime import device_context
 
-from ._layout import LCG_INCREMENT, LCG_MULTIPLIER
+from .._layout import LCG_INCREMENT, LCG_MULTIPLIER
 
 FP16_SCALE = 0.03125
 """Exact 2^-5 multiplier for normalized weights and clamped INT8 codes in FP16."""

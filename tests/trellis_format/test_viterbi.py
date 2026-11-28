@@ -43,7 +43,9 @@ _BATCH = 29  # odd batch size with mixed FP8 buckets and padding slots
 
 
 def _gluon() -> ModuleType:
-    from piper_kernels.trellis import _gluon_forward  # noqa: PLC0415 - Triton is optional
+    from piper_kernels.trellis._nvidia import (  # noqa: PLC0415 - Triton is optional
+        gluon_forward as _gluon_forward,
+    )
 
     return _gluon_forward
 

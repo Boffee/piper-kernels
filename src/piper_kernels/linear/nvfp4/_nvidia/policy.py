@@ -212,13 +212,16 @@ def select_w4a16_schedule(
     """Resolve the NVIDIA W4A16 schedule for ``target``."""
     if target.is_cuda_capability(12):
         return _sm120_w4a16_schedule(num_sms, rows, input_dtype, out_features, input_features)
-    # 8 warps eliminates pre-existing 40-76 B num_warps=4 ptxas spills on SM86/SM89.
+    # 8 warps eliminates pre-existing 40-76 B num_warps=4 ptxas spills on SM86/SM89;
+    # SM75 lacks native BF16 tensor-core gemm, so dequantize to FP32 instead.
+    has_bf16_mm = target.cuda_capability_at_least(8)
     return default_w4a16_schedule(
         num_sms,
         rows,
         input_dtype,
         out_features,
         input_features,
-        allow_dot=target.cuda_capability_at_least(8),
+        allow_dot=has_bf16_mm,
         dot_num_warps=8,
+        dequant_as_fp32=(not has_bf16_mm) and input_dtype is torch.bfloat16,
     )
