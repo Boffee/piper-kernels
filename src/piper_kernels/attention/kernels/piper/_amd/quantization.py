@@ -384,8 +384,30 @@ def store_summary_vec(
         gl.store(output_ptr + offsets, summary)
 
 
+@gluon.jit
+def _compute_per_row_query_scales(
+    raw_abs_max,
+    sequence_first_row,
+    row_offsets,
+    logical_sequence_length,
+    scale_factor,
+    mask_rows: gl.constexpr,
+):
+    """Mask empty or zero-norm per-row query scales before INT8 division and base-2 storage."""
+    raw_div = raw_abs_max / GL_INT8_RANGE
+    row_indices = sequence_first_row + row_offsets
+    inactive = raw_div == 0.0
+    if mask_rows:
+        inactive = inactive | (row_indices >= logical_sequence_length)
+    return (
+        row_indices,
+        gl.where(inactive, 1.0, raw_div),
+        gl.where(inactive, 0.0, raw_div * scale_factor),
+    )
+
+
 @gluon.jit(do_not_specialize=PREP_COMMON_DO_NOT_SPECIALIZE)
-def _prepare_query_kernel(  # noqa: PLR0912, PLR0915
+def _prepare_query_kernel(
     query_ptr,
     query_int8_ptr,
     query_scale_ptr,
@@ -456,67 +478,24 @@ def _prepare_query_kernel(  # noqa: PLR0912, PLR0915
     scale_factor = softmax_scale * GL_LOG2_E
     sequence_first_row = tile_index_64 * GL_TILE_ROWS
 
-    if per_row:
-        row_stride = storage_tiles_64 * GL_TILE_ROWS
-        if head_dim == 64:
+    if head_dim == 64:
+        if per_row:
             grouped = gl.reshape(rotated, [64, 2, 64])
-            raw_div = gl.max(gl.abs(grouped), axis=2) / GL_INT8_RANGE
-            row_offsets = gl.arange(0, 64, gl.SliceLayout(1, raw_div.type.layout))  # pyright: ignore[reportAttributeAccessIssue]
-            head_offsets = gl.arange(0, 2, gl.SliceLayout(0, raw_div.type.layout))  # pyright: ignore[reportAttributeAccessIssue]
-            row_indices = sequence_first_row + row_offsets[:, None]
-            inactive = raw_div == 0.0
-            if mask_rows:
-                inactive = inactive | (row_indices >= logical_sequence_length)
-            raw_scale = gl.where(inactive, 1.0, raw_div)
-            stored_scale = gl.where(inactive, 0.0, raw_div * scale_factor)
+            row_max = gl.max(gl.abs(grouped), axis=2)
+            head_offsets = gl.arange(0, 2, gl.SliceLayout(0, row_max.type.layout))  # pyright: ignore[reportAttributeAccessIssue]
+            row_indices, raw_scale, stored_scale = _compute_per_row_query_scales(
+                row_max,
+                sequence_first_row,
+                gl.arange(0, 64, gl.SliceLayout(1, row_max.type.layout))[:, None],  # pyright: ignore[reportAttributeAccessIssue]
+                logical_sequence_length,
+                scale_factor,
+                mask_rows=mask_rows,
+            )
             query_codes = gl.reshape(round_to_int8(grouped / raw_scale[:, :, None]), [64, 128])
-            store_head_major_vec(
-                query_int8_ptr,
-                query_codes,
-                batch_head_index,
-                tile_index,
-                storage_tiles,
-                head_base,
-                heads,
-                head_dim=head_dim,
-                mask_heads=mask_heads,
-            )
-            scale_offsets = (
-                batch_head_64 + head_offsets[None, :].to(gl.int64)
-            ) * row_stride + row_indices
-            if mask_heads:
-                gl.store(
-                    query_scale_ptr + scale_offsets,
-                    stored_scale,
-                    mask=(head_base + head_offsets[None, :]) < heads,
-                )
-            else:
-                gl.store(query_scale_ptr + scale_offsets, stored_scale)
+            scale_offsets = (batch_head_64 + head_offsets[None, :].to(gl.int64)) * (
+                storage_tiles_64 * GL_TILE_ROWS
+            ) + row_indices
         else:
-            raw_div = gl.max(gl.abs(rotated), axis=1) / GL_INT8_RANGE
-            row_offsets = gl.arange(0, 64, raw_div.type.layout)  # pyright: ignore[reportAttributeAccessIssue]
-            row_indices = sequence_first_row + row_offsets
-            inactive = raw_div == 0.0
-            if mask_rows:
-                inactive = inactive | (row_indices >= logical_sequence_length)
-            raw_scale = gl.where(inactive, 1.0, raw_div)
-            stored_scale = gl.where(inactive, 0.0, raw_div * scale_factor)
-            query_codes = round_to_int8(rotated / raw_scale[:, None])
-            store_head_major_vec(
-                query_int8_ptr,
-                query_codes,
-                batch_head_index,
-                tile_index,
-                storage_tiles,
-                head_base,
-                heads,
-                head_dim=head_dim,
-                mask_heads=False,
-            )
-            gl.store(query_scale_ptr + batch_head_64 * row_stride + row_indices, stored_scale)
-    else:
-        group_stride = storage_tiles_64 * 2
-        if head_dim == 64:
             grouped = gl.reshape(rotated, [2, GL_QUERY_SCALE_ROWS, 2, 64])
             raw_scale = compute_int8_scale(gl.max(gl.max(gl.abs(grouped), axis=3), axis=1))
             group_offsets = gl.arange(0, 2, gl.SliceLayout(1, raw_scale.type.layout))
@@ -536,28 +515,30 @@ def _prepare_query_kernel(  # noqa: PLR0912, PLR0915
             query_codes = gl.reshape(
                 round_to_int8(grouped / raw_scale[:, None, :, None]), [64, 128]
             )
-            store_head_major_vec(
-                query_int8_ptr,
-                query_codes,
-                batch_head_index,
-                tile_index,
-                storage_tiles,
-                head_base,
-                heads,
-                head_dim=head_dim,
-                mask_heads=mask_heads,
+            scale_offsets = (batch_head_64 + head_offsets[None, :].to(gl.int64)) * (
+                storage_tiles_64 * 2
+            ) + (tile_index_64 * 2 + group_offsets[:, None])
+        if mask_heads:
+            gl.store(
+                query_scale_ptr + scale_offsets,
+                stored_scale,
+                mask=(head_base + head_offsets[None, :]) < heads,
             )
-            scale_offsets = (batch_head_64 + head_offsets[None, :].to(gl.int64)) * group_stride + (
-                tile_index_64 * 2 + group_offsets[:, None]
+        else:
+            gl.store(query_scale_ptr + scale_offsets, stored_scale)
+    else:
+        if per_row:
+            row_max = gl.max(gl.abs(rotated), axis=1)
+            row_indices, raw_scale, stored_scale = _compute_per_row_query_scales(
+                row_max,
+                sequence_first_row,
+                gl.arange(0, 64, row_max.type.layout),  # pyright: ignore[reportAttributeAccessIssue]
+                logical_sequence_length,
+                scale_factor,
+                mask_rows=mask_rows,
             )
-            if mask_heads:
-                gl.store(
-                    query_scale_ptr + scale_offsets,
-                    stored_scale,
-                    mask=(head_base + head_offsets[None, :]) < heads,
-                )
-            else:
-                gl.store(query_scale_ptr + scale_offsets, stored_scale)
+            query_codes = round_to_int8(rotated / raw_scale[:, None])
+            scale_offsets = batch_head_64 * (storage_tiles_64 * GL_TILE_ROWS) + row_indices
         else:
             grouped = gl.reshape(rotated, [2, GL_QUERY_SCALE_ROWS, 128])
             raw_scale = compute_int8_scale(gl.max(gl.max(gl.abs(grouped), axis=2), axis=1))
@@ -574,19 +555,22 @@ def _prepare_query_kernel(  # noqa: PLR0912, PLR0915
                 two_heads=False,
             )
             query_codes = gl.reshape(round_to_int8(grouped / raw_scale[:, None, None]), [64, 128])
-            store_head_major_vec(
-                query_int8_ptr,
-                query_codes,
-                batch_head_index,
-                tile_index,
-                storage_tiles,
-                head_base,
-                heads,
-                head_dim=head_dim,
-                mask_heads=False,
+            scale_offsets = batch_head_64 * (storage_tiles_64 * 2) + (
+                tile_index_64 * 2 + group_offsets
             )
-            scale_offsets = batch_head_64 * group_stride + (tile_index_64 * 2 + group_offsets)
-            gl.store(query_scale_ptr + scale_offsets, stored_scale)
+        gl.store(query_scale_ptr + scale_offsets, stored_scale)
+
+    store_head_major_vec(
+        query_int8_ptr,
+        query_codes,
+        batch_head_index,
+        tile_index,
+        storage_tiles,
+        head_base,
+        heads,
+        head_dim=head_dim,
+        mask_heads=mask_heads,
+    )
 
 
 def prepare_query(

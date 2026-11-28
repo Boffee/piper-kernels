@@ -15,13 +15,11 @@ from ._decode_schedule import BLOCK_QH, REDUCE_NUM_WARPS
 from ._kv_prefill import (
     _merge_two_attention_waves_kernel,
     _piper_decode_splitkv_reduce_kernel,
-)
-from ._quantization import _div16_attrs
-from .triton import (
-    _piper_decode_frozen_split_kernel,
     _piper_decode_tail_split_kernel,
     select_decode_schedule,
 )
+from ._quantization import _div16_attrs
+from .triton import _piper_decode_frozen_split_kernel
 
 
 def compile_kv_decode_kernels(
@@ -229,6 +227,7 @@ def compile_kv_prefill_kernels(
     is_causal: bool = True,
     wide_pool: bool = False,
     has_chunk_splits: bool = False,
+    per_row_query_scale: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, ...]:
     """Offline-compile two-wave merge and native chunked prefill kernels for ``target``."""
@@ -261,6 +260,7 @@ def compile_kv_prefill_kernels(
                 is_causal=is_causal,
                 wide_pool=wide_pool,
                 has_chunk_splits=has_chunk_splits,
+                per_row_query_scale=per_row_query_scale,
                 compile_fn=compile_fn,
             ),
         )
@@ -277,6 +277,7 @@ def compile_kv_prefill_kernels(
                 is_causal=is_causal,
                 wide_pool=wide_pool,
                 has_chunk_splits=has_chunk_splits,
+                per_row_query_scale=per_row_query_scale,
                 compile_fn=compile_fn,
             ),
         )

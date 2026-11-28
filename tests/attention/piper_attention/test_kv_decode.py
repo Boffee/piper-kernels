@@ -1571,6 +1571,33 @@ def _assert_decode_parity_or_ref(
             is_causal=is_causal,
         )
         _assert_prefill_quality(out[:2], lse[:2], sdpa, sdpa_lse)
+        if query.shape[0] > 2:
+            sdpa_rest, sdpa_lse_rest = _exact_fp32_attention(
+                query[2:],
+                slot_keys,
+                chunk_to_slot[2:],
+                num_chunks[2:],
+                pool.num_slots,
+                tail_key=tail_key[2:],
+                tail_value=tail_value[2:],
+                tail_len=tail_len[2:],
+                scale=head_dim**-0.5,
+                is_causal=is_causal,
+            )
+            empty_rows = sdpa_lse_rest == -float("inf")
+            assert (out[2:][empty_rows] == 0.0).all()
+            assert (lse[2:][empty_rows] == -float("inf")).all()
+            valid_rows = ~empty_rows
+            if (num_chunks[2:] <= 0).all() and valid_rows.any():
+                atol = 2e-2 if query.dtype is torch.bfloat16 else 1e-2
+                torch.testing.assert_close(
+                    out[2:][valid_rows], sdpa_rest[valid_rows], atol=atol, rtol=atol
+                )
+                torch.testing.assert_close(
+                    lse[2:][valid_rows], sdpa_lse_rest[valid_rows], atol=5e-4, rtol=5e-4
+                )
+            elif valid_rows.any():
+                _assert_prefill_quality(out[2:], lse[2:], sdpa_rest, sdpa_lse_rest)
         return
     ref_out, ref_lse = piper_attention_decode_reference(
         query,

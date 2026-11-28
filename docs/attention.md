@@ -222,8 +222,8 @@ Pool and operator contract:
     - For `seq_q < 64` (decode and speculative verification), queries are packed by KV
       head (`gqa_group * seq_q`) with exact per-row query quantization, run with
       subtile-granular Split-KV over finalized pool slots, and combined in a single
-      `_piper_decode_splitkv_reduce_kernel` reduction with the direct BF16/FP16 Split-KV
-      live tail (`_piper_decode_tail_split_kernel`, zero tail quantization launch overhead).
+      Split-KV reduction with the direct BF16/FP16 live tail (zero tail quantization
+      launch overhead).
     - For `seq_q >= 64` (multi-turn / long-prompt chunked prefill), frozen pool slots run
       chunked INT8-Q/UINT8-P alongside a K1024/V1024 chunk-centered quantized live tail
       (supporting arbitrary non-64-aligned causal offsets `active_tail - seq_q`,

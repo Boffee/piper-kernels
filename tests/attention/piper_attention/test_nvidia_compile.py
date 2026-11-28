@@ -291,7 +291,9 @@ def _compile_kv_decode_zero_spill_checked(
     contiguous_inputs: bool = True,
     wide_pool: bool = False,
 ) -> None:
-    native_cuda = target.backend == "cuda" and int(target.arch) >= 80
+    native_cuda = target.backend == "cuda" and (
+        80 <= int(target.arch) < 90 or 120 <= int(target.arch) < 130
+    )
     if native_cuda:
         monkeypatch.setattr(
             triton.knobs.runtime, "add_stages_inspection_hook", _MixedInt8StageHook(None)
@@ -582,16 +584,15 @@ def test_kv_per_row_query_quantize_compile_zero_spills(
     assert spills == 0
 
 
-@pytest.mark.parametrize("arch", [80, 86, 89, 120])
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("has_chunk_map", [False, True])
-@pytest.mark.parametrize("wide_pool", [False, True])
-def test_kv_split_prefill_compile_zero_spills(
+def _compile_kv_prefill_zero_spill_checked(
     monkeypatch: pytest.MonkeyPatch,
     arch: int,
     head_dim: int,
+    *,
     has_chunk_map: bool,
     wide_pool: bool,
+    has_chunk_splits: bool,
+    per_row_query_scale: bool,
 ) -> None:
     target = GPUTarget("cuda", arch, 32)
     monkeypatch.setattr(
@@ -608,7 +609,8 @@ def test_kv_split_prefill_compile_zero_spills(
             head_dim=head_dim,
             has_chunk_map=has_chunk_map,
             wide_pool=wide_pool,
-            has_chunk_splits=True,
+            has_chunk_splits=has_chunk_splits,
+            per_row_query_scale=per_row_query_scale,
             compile_fn=compile_fn,
         )
         compiled_out.extend(res)
@@ -620,3 +622,45 @@ def test_kv_split_prefill_compile_zero_spills(
         assert ".s32.s8.s8.s32" in ptx
         assert ".s32.u8.s8.s32" in ptx
         assert "piper_attention_u8s8_dot_marker" not in ptx
+
+
+@pytest.mark.parametrize("arch", [80, 86, 89, 120])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("has_chunk_map", [False, True])
+@pytest.mark.parametrize("wide_pool", [False, True])
+def test_kv_split_prefill_compile_zero_spills(
+    monkeypatch: pytest.MonkeyPatch,
+    arch: int,
+    head_dim: int,
+    has_chunk_map: bool,
+    wide_pool: bool,
+) -> None:
+    _compile_kv_prefill_zero_spill_checked(
+        monkeypatch,
+        arch,
+        head_dim,
+        has_chunk_map=has_chunk_map,
+        wide_pool=wide_pool,
+        has_chunk_splits=True,
+        per_row_query_scale=False,
+    )
+
+
+@pytest.mark.parametrize("arch", [80, 86, 89, 120])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("has_chunk_map", [False, True])
+def test_kv_nonsplit_per_row_prefill_compile_zero_spills(
+    monkeypatch: pytest.MonkeyPatch,
+    arch: int,
+    head_dim: int,
+    has_chunk_map: bool,
+) -> None:
+    _compile_kv_prefill_zero_spill_checked(
+        monkeypatch,
+        arch,
+        head_dim,
+        has_chunk_map=has_chunk_map,
+        wide_pool=False,
+        has_chunk_splits=False,
+        per_row_query_scale=True,
+    )

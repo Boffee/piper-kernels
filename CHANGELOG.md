@@ -45,8 +45,7 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   on RDNA4, native `.s32.s8.s8.s32`/`.s32.u8.s8.s32` MMA on NVIDIA) and merged in a
   single `_piper_decode_splitkv_reduce_kernel` wave with the direct BF16/FP16 Split-KV
   live tail (`_piper_decode_tail_split_kernel` with WGP `-cumode` and
-  `LDS_ONLY_FENCE_ATTRS` on RDNA4), superseding the standalone RDNA4 BF16x2 frozen-split
-  Gluon kernel; for `seq_q >= 64`, prefill pairs quantized INT8/UINT8 frozen slots with
+  `LDS_ONLY_FENCE_ATTRS` on RDNA4); for `seq_q >= 64`, prefill pairs quantized INT8/UINT8 frozen slots with
   K1024/V1024 chunk-centered live tails and LDS-precomputed value scales. Optimized
   `_piper_decode_splitkv_reduce_kernel` with row-tiled (`seq_q > 8`) and chunked
   split-vectorized (`seq_q <= 8`, `LDS_ONLY_FENCE_ATTRS` on RDNA4) reductions plus

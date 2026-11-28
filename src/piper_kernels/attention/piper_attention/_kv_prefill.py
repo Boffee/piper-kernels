@@ -15,20 +15,38 @@ import triton.language as tl
 from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.piper.triton import max_propagate_nan
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
     triton as qk_quantization,
 )
 from piper_kernels.linear._splitk import device_sm_count
 
 from . import _quantization
+from ._amd import policy as _amd_policy
 from ._decode_schedule import (
     BLOCK_QH,
     PREFILL_MIN_SEQ_Q,
     REDUCE_NUM_WARPS,
+    DecodeSchedule,
+    default_decode_schedule,
     select_split_counts,
 )
+from ._nvidia import policy as _nvidia_policy
 
 _LN2 = tl.constexpr(0.6931471805599453)
+_LOG2_E = tl.constexpr(1.4426950408889634)
+
+
+def select_decode_schedule(
+    target: AcceleratorTarget | None,
+    head_dim: int,
+) -> DecodeSchedule:
+    """Return the Split-KV kernel and split schedule for ``target`` and ``head_dim``."""
+    if target is not None and target.is_nvidia_cuda:
+        return _nvidia_policy.select_decode_schedule(target, head_dim)
+    if target is not None and target.is_amd_hip:
+        return _amd_policy.select_decode_schedule(target, head_dim)
+    return default_decode_schedule(head_dim)
 
 
 @triton.jit
@@ -455,6 +473,308 @@ def _launch_splitkv_reduce(
         )
 
 
+@triton.jit
+def _split_bf16_pair(value):
+    """Split finite FP32 values into rounded BF16 high bits plus exact residual."""
+    hi = value.to(tl.bfloat16)
+    return hi, (value - hi.to(tl.float32)).to(tl.bfloat16)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "kv_heads",
+        "gqa_group",
+        "q_tiles",
+        "seq_q",
+        "tail_cap",
+        "int8_splits",
+        "tail_splits",
+        "stride_plp",
+    ]
+)
+def _piper_decode_tail_split_kernel(  # noqa: PLR0912, PLR0915
+    query_ptr,
+    tail_key_ptr,
+    tail_value_ptr,
+    tail_len_ptr,
+    partial_out_ptr,
+    partial_lse_ptr,
+    partial_bias_ptr,
+    partial_log_denom_ptr,
+    scale,
+    kv_heads,
+    gqa_group,
+    q_tiles,
+    seq_q,
+    tail_cap,
+    int8_splits,
+    tail_splits,
+    stride_qb,
+    stride_qh,
+    stride_qs,
+    stride_tk_b,
+    stride_tk_h,
+    stride_tk_n,
+    stride_tv_b,
+    stride_tv_h,
+    stride_tv_n,
+    stride_pob,
+    stride_poh,
+    stride_pos,
+    stride_pop,
+    stride_plb,
+    stride_plh,
+    stride_pls,
+    stride_plp,
+    is_causal: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_qh: tl.constexpr,
+    block_n: tl.constexpr,
+    qk_precision: tl.constexpr,
+    pv_precision: tl.constexpr,
+):
+    """Evaluate one Split-KV slice of the live BF16/FP16 tail for a GQA head group."""
+    pid_q = tl.program_id(0)
+    tail_split_id = tl.program_id(1)
+    pid_bh = pid_q // q_tiles
+    q_tile = pid_q % q_tiles
+
+    b = pid_bh // kv_heads
+    kv_head = pid_bh % kv_heads
+    b64 = b.to(tl.int64)
+    kv_head64 = kv_head.to(tl.int64)
+
+    offsets_d = tl.arange(0, head_dim)
+    m_i = tl.full((block_qh,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((block_qh,), dtype=tl.float32)
+    acc = tl.zeros((block_qh, head_dim), dtype=tl.float32)
+
+    tl_raw = tl.load(tail_len_ptr + b64)
+    active_tail = tl.maximum(0, tl.minimum(tl_raw, tail_cap)).to(tl.int64)
+    total_tiles = tl.cdiv(active_tail, block_n)
+    tiles_per_split = tl.cdiv(total_tiles, tail_splits.to(tl.int64))
+    tile_start = tail_split_id.to(tl.int64) * tiles_per_split
+    tile_end = tl.minimum(total_tiles, tile_start + tiles_per_split)
+
+    if tile_start < tile_end:
+        qh_offs0 = q_tile * block_qh + tl.arange(0, block_qh)
+        qh_valid0 = qh_offs0 < gqa_group * seq_q
+        q_idx0 = qh_offs0 % seq_q
+        q_head0 = kv_head * gqa_group + qh_offs0 // seq_q
+        q_ptrs = (
+            query_ptr
+            + b64 * stride_qb
+            + q_head0.to(tl.int64)[:, None] * stride_qh
+            + q_idx0.to(tl.int64)[:, None] * stride_qs
+            + offsets_d[None, :]
+        )
+        q_raw = tl.load(q_ptrs, mask=qh_valid0[:, None], other=0.0)
+        q_dtype = tail_key_ptr.dtype.element_ty if qk_precision == "native" else tl.float32
+        q_qk = q_raw.to(q_dtype)
+        offsets_d64 = tl.arange(0, 64)
+        if head_dim == 128:
+            q_lo, q_hi = tl.split(tl.permute(tl.reshape(q_qk, (block_qh, 2, 64)), (0, 2, 1)))
+        else:
+            q_lo = q_qk
+            q_hi = q_qk
+
+        offsets_n = tl.arange(0, block_n)
+        tk_base = tail_key_ptr + b64 * stride_tk_b + kv_head64 * stride_tk_h
+        tv_base = tail_value_ptr + b64 * stride_tv_b + kv_head64 * stride_tv_h
+        scaled_log2 = scale * _LOG2_E
+        active_tail32 = active_tail.to(tl.int32)
+        cutoff = (active_tail32 - seq_q) + q_idx0
+
+        for tile_idx in tl.range(tile_start.to(tl.int32), tile_end.to(tl.int32), disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
+            rows32 = tile_idx * block_n + offsets_n
+            valid_n = rows32 < active_tail32
+            rows = rows32.to(tl.int64)
+            if head_dim == 128:
+                k_lo = tl.load(
+                    tk_base + rows[:, None] * stride_tk_n + offsets_d64[None, :],
+                    mask=valid_n[:, None],
+                    other=0.0,
+                )
+                k_hi = tl.load(
+                    tk_base + rows[:, None] * stride_tk_n + (offsets_d64[None, :] + 64),
+                    mask=valid_n[:, None],
+                    other=0.0,
+                )
+                if qk_precision == "native":
+                    scores = tl.dot(q_lo, tl.trans(k_lo.to(q_lo.dtype)))
+                    scores = tl.dot(q_hi, tl.trans(k_hi.to(q_hi.dtype)), acc=scores)
+                else:
+                    scores = tl.dot(
+                        q_lo, tl.trans(k_lo.to(tl.float32)), input_precision=qk_precision
+                    )
+                    scores = tl.dot(
+                        q_hi,
+                        tl.trans(k_hi.to(tl.float32)),
+                        acc=scores,
+                        input_precision=qk_precision,
+                    )
+            else:
+                k_tile = tl.load(
+                    tk_base + rows[:, None] * stride_tk_n + offsets_d[None, :],
+                    mask=valid_n[:, None],
+                    other=0.0,
+                )
+                if qk_precision == "native":
+                    scores = tl.dot(q_lo, tl.trans(k_tile.to(q_lo.dtype)))
+                else:
+                    scores = tl.dot(
+                        q_lo, tl.trans(k_tile.to(tl.float32)), input_precision=qk_precision
+                    )
+            scores *= scaled_log2
+            if is_causal:
+                valid_mask = valid_n[None, :] & (rows32[None, :] <= cutoff[:, None])
+            else:
+                valid_mask = valid_n[None, :]
+
+            masked_scores = tl.where(valid_mask, scores, -float("inf"))
+            m_block = tl.reduce(masked_scores, 1, max_propagate_nan)
+            has_block = m_block != -float("inf")  # pyright: ignore[reportOperatorIssue]
+            has_prev = m_i != -float("inf")
+            m_new = tl.maximum(m_i, m_block, propagate_nan=tl.PropagateNan.ALL)
+            has_any_new = m_new != -float("inf")
+            m_safe = tl.where(has_any_new, m_new, 0.0)
+            alpha = tl.where(
+                has_prev,
+                tl.math.exp2(tl.where(has_prev, m_i - m_safe, 0.0)),
+                0.0,
+            )
+            p = tl.where(
+                valid_mask & has_block[:, None],  # pyright: ignore[reportIndexIssue]
+                tl.math.exp2(tl.where(valid_mask, masked_scores - m_safe[:, None], 0.0)),
+                0.0,
+            )
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None]
+
+            v_tile = tl.load(
+                tv_base + rows[:, None] * stride_tv_n + offsets_d[None, :],
+                mask=valid_n[:, None],
+                other=0.0,
+            )
+            if pv_precision == "bf16x2":
+                if v_tile.dtype == tl.float16:
+                    acc = tl.dot(p.to(tl.float16), v_tile, acc=acc)
+                else:
+                    p_hi, p_lo = _split_bf16_pair(p)
+                    v_native = v_tile.to(tl.bfloat16)
+                    acc = tl.dot(p_hi, v_native, acc=acc)
+                    acc = tl.dot(p_lo, v_native, acc=acc)
+            else:
+                acc = tl.dot(p, v_tile.to(tl.float32), acc=acc, input_precision=pv_precision)
+            m_i = m_new
+
+    has_any = m_i != -float("inf")
+    safe_l = tl.where(has_any & (l_i != 0.0), l_i, 1.0)
+    out_split = tl.where(has_any[:, None], acc / safe_l[:, None], 0.0)
+    lse_split = tl.where(has_any, m_i, -float("inf"))
+    log_denom_split = tl.where(has_any, tl.math.log2(safe_l), 0.0)
+
+    split64 = (int8_splits + tail_split_id).to(tl.int64)
+    qh_offs = q_tile * block_qh + tl.arange(0, block_qh)
+    qh_valid = qh_offs < gqa_group * seq_q
+    q_idx = qh_offs % seq_q
+    q_head = kv_head * gqa_group + qh_offs // seq_q
+    po_ptrs = (
+        partial_out_ptr
+        + b64 * stride_pob
+        + q_head.to(tl.int64)[:, None] * stride_poh
+        + q_idx.to(tl.int64)[:, None] * stride_pos
+        + split64 * stride_pop
+        + offsets_d[None, :]
+    )
+    tl.store(po_ptrs, out_split, mask=qh_valid[:, None])
+
+    pl_offsets = (
+        b64 * stride_plb
+        + q_head.to(tl.int64) * stride_plh
+        + q_idx.to(tl.int64) * stride_pls
+        + split64 * stride_plp.to(tl.int64)
+    )
+    tl.store(partial_lse_ptr + pl_offsets, lse_split, mask=qh_valid)
+    tl.store(partial_bias_ptr + pl_offsets, 0.0, mask=qh_valid)
+    tl.store(partial_log_denom_ptr + pl_offsets, log_denom_split, mask=qh_valid)
+
+
+def launch_direct_tail_split_decode(
+    query: torch.Tensor,
+    tail_key: torch.Tensor,
+    tail_value: torch.Tensor,
+    tail_len: torch.Tensor,
+    partial_out: torch.Tensor,
+    partial_lse: torch.Tensor,
+    partial_bias: torch.Tensor,
+    partial_log_denom: torch.Tensor,
+    *,
+    scale: float,
+    kv_heads: int,
+    gqa_group: int,
+    q_tiles: int,
+    seq_q: int,
+    tail_cap: int,
+    int8_splits: int,
+    tail_splits: int,
+    is_causal: bool,
+    head_dim: int,
+    schedule: DecodeSchedule,
+) -> None:
+    """Launch Split-KV direct BF16/FP16 tail attention into ``partial_*[split >= int8_splits]``."""
+    batch = query.shape[0]
+    stride_qb = 0 if batch <= 1 else query.stride(0)
+    stride_tk_b = 0 if batch <= 1 else tail_key.stride(0)
+    stride_tv_b = 0 if batch <= 1 else tail_value.stride(0)
+    compiler_options = dict(schedule.compiler_options)
+    with device_context(query.device):
+        _piper_decode_tail_split_kernel[(batch * kv_heads * q_tiles, tail_splits)](
+            query,
+            tail_key,
+            tail_value,
+            tail_len,
+            partial_out,
+            partial_lse,
+            partial_bias,
+            partial_log_denom,
+            scale,
+            kv_heads,
+            gqa_group,
+            q_tiles,
+            seq_q,
+            tail_cap,
+            int8_splits,
+            tail_splits,
+            stride_qb,
+            query.stride(1),
+            query.stride(2),
+            stride_tk_b,
+            tail_key.stride(1),
+            tail_key.stride(2),
+            stride_tv_b,
+            tail_value.stride(1),
+            tail_value.stride(2),
+            partial_out.stride(0),
+            partial_out.stride(1),
+            partial_out.stride(2),
+            partial_out.stride(3),
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+            partial_lse.stride(3),
+            is_causal=is_causal,
+            head_dim=head_dim,
+            block_qh=BLOCK_QH,
+            block_n=schedule.block_n,
+            qk_precision=schedule.tail_qk_precision,
+            pv_precision=schedule.pv_precision,
+            num_warps=schedule.num_warps,
+            num_stages=schedule.num_stages,
+            **compiler_options,
+        )
+
+
 def _select_frozen_prefill_splits(
     device: torch.device,
     *,
@@ -470,27 +790,14 @@ def _select_frozen_prefill_splits(
     sm_count = device_sm_count(device)
     base_blocks = max(1, batch * q_heads * triton.cdiv(seq_q, 64))
     hint_chunks = max_chunks if active_chunks_hint <= 0 else min(max_chunks, active_chunks_hint)
-    if hint_chunks <= 0:
-        return 1
-    if prefill_backend == "amd":
-        from ._amd import policy as amd_policy  # noqa: PLC0415
-
-        return amd_policy.select_frozen_prefill_splits(
-            base_blocks,
-            hint_chunks,
-            sm_count,
-            batch * q_heads * seq_q * head_dim * 4,
-            allow_subchunk_single=allow_subchunk_single,
-        )
-    total_tiles = hint_chunks * 16
-    mem_cap = max(1, (64 * 1024 * 1024) // max(1, batch * q_heads * seq_q * head_dim * 4))
-    if allow_subchunk_single:
-        if base_blocks < sm_count * 3 and total_tiles >= 8:
-            return min(32, total_tiles // 4, max(1, (sm_count * 3) // base_blocks), mem_cap)
-        return 1
-    if prefill_backend == "nvidia" and base_blocks < sm_count and hint_chunks >= 2:
-        return min(16, total_tiles // 4, max(1, (sm_count * 2) // base_blocks), mem_cap)
-    return 1
+    policy = _amd_policy if prefill_backend == "amd" else _nvidia_policy
+    return policy.select_frozen_prefill_splits(
+        base_blocks,
+        hint_chunks,
+        sm_count,
+        batch * q_heads * seq_q * head_dim * 4,
+        allow_subchunk_single=allow_subchunk_single,
+    )
 
 
 def _launch_frozen_pool_prefill(
@@ -517,6 +824,7 @@ def _launch_frozen_pool_prefill(
     frozen_splits: int | None = None,
     total_splits: int | None = None,
     partial_targets: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    reduce_heads_seq: tuple[int, int] | None = None,
 ) -> None:
     """Assemble pool views and strides once and dispatch the backend frozen-pool kernel."""
     batch, q_heads, _, head_dim = output.shape
@@ -676,16 +984,25 @@ def _launch_frozen_pool_prefill(
         and partial_bias is not None
         and partial_log_denom is not None
     ):
+        reduce_heads, reduce_seq_q = (
+            (q_heads, seq_q) if reduce_heads_seq is None else reduce_heads_seq
+        )
+        reduce_shape = (batch, resolved_splits, reduce_heads, reduce_seq_q)
+        po_view = partial_out.view(*reduce_shape, head_dim).permute(0, 2, 3, 1, 4)
+        pl_view, pb_view, pld_view = (
+            t.view(reduce_shape).permute(0, 2, 3, 1)
+            for t in (partial_lse, partial_bias, partial_log_denom)
+        )
         _launch_splitkv_reduce(
-            partial_out.permute(0, 2, 3, 1, 4),
-            partial_lse.permute(0, 2, 3, 1),
-            partial_bias.permute(0, 2, 3, 1),
-            partial_log_denom.permute(0, 2, 3, 1),
-            output,
-            lse,
+            po_view,
+            pl_view,
+            pb_view,
+            pld_view,
+            output.view(batch, reduce_heads, reduce_seq_q, head_dim),
+            lse.view(batch, reduce_heads, reduce_seq_q),
             batch=batch,
-            q_heads=q_heads,
-            seq_q=seq_q,
+            q_heads=reduce_heads,
+            seq_q=reduce_seq_q,
             num_splits=resolved_splits,
             head_dim=head_dim,
             use_lds_only_fence=(prefill_backend == "amd"),
@@ -785,13 +1102,9 @@ def _run_small_q_decode(
             target=target,
             per_row_query_scale=True,
             allow_subchunk_single=True,
+            reduce_heads_seq=(q_heads, seq_q),
         )
         return output, lse
-
-    from .triton import (  # noqa: PLC0415
-        launch_direct_tail_split_decode,
-        select_decode_schedule,
-    )
 
     resolved_target = AcceleratorTarget.from_device(query.device) if target is None else target
     schedule = select_decode_schedule(resolved_target, head_dim)
@@ -945,6 +1258,7 @@ def run_chunked_prefill(
     target: AcceleratorTarget | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run native INT8-Q/UINT8-P frozen pool execution plus direct or quantized live tail."""
+    validate_prefill_backend(prefill_backend, grouped_qk=grouped_qk, pack_wmma=pack_wmma)
     batch, q_heads, seq_q, head_dim = query.shape
     num_slots = key_int8.shape[0]
     max_chunks = num_slots if chunk_to_slot is None else chunk_to_slot.shape[1]

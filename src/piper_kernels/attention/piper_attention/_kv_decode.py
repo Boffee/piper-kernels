@@ -415,6 +415,30 @@ def _piper_attention_decode_op(  # noqa: PLR0913, PLR0917
 
     assert config is not None
     if runtime.supports_device(query.device):
+        if config.prefill_backend is not None:
+            from . import _kv_prefill  # noqa: PLC0415 - GPU-only Triton dependency
+
+            return _kv_prefill.run_chunked_prefill(
+                query,
+                key_int8,
+                key_scale,
+                key_center,
+                value_int8,
+                value_scale,
+                value_mean,
+                chunk_to_slot,
+                num_chunks,
+                tail_key=tail_key,
+                tail_value=tail_value,
+                tail_len=tail_len,
+                scale=resolved_scale,
+                is_causal=is_causal,
+                grouped_qk=config.grouped_qk,
+                pack_wmma=config.pack_wmma,
+                active_chunks_hint=active_chunks_hint,
+                prefill_backend=config.prefill_backend,
+                target=config.target,
+            )
         from . import triton as _decode_triton  # noqa: PLC0415 - GPU-only Triton dependency
 
         return _decode_triton.piper_attention_decode_triton(
@@ -435,7 +459,6 @@ def _piper_attention_decode_op(  # noqa: PLR0913, PLR0917
             grouped_qk=config.grouped_qk,
             pack_wmma=config.pack_wmma,
             active_chunks_hint=active_chunks_hint,
-            prefill_backend=config.prefill_backend,
             target=config.target,
         )
 
@@ -688,21 +711,28 @@ def piper_attention_decode(  # noqa: PLR0913
         Shares one operator API, zero host readbacks,
         ``torch.compile(fullgraph=True, dynamic=True)``, and CUDA Graph capture
         across paths:
-        - For ``seq_q < 64`` (decode and MTP verification) or fallback targets
-          (e.g. SM75/SM90/SM100, ``gfx942``, ``gfx1100``, ``gfx1151``), executes
-          native GQA-grouped Split-KV Triton kernels on supported GPUs (keeping
-          queries and softmax weights in FP32 while dequantizing pool slots) or
-          the portable FP32-accumulation reference elsewhere.
-        - For ``seq_q >= 64`` on NVIDIA SM8x/SM12x and AMD RDNA4
-          (``gfx1200``/``gfx1201``), routes into INT8-Q/UINT8-P tensor-core
-          prefill over ``pool`` plus K1024/V1024 chunk-centered live tail with
-          normalized FP32 two-wave LSE merging.
-        Numerical differences at ``seq_q >= 64``: quantized Q/P prefill
-        approximates FP32 SDPA within INT8/UINT8 Piper quantization error rather
-        than matching FP32-Q/P Split-KV bitwise; K1024/V1024 tail centering
-        shares local chunk statistics across causal queries within each 1024-token
-        tail chunk; callers should keep rotated dot products ``q · k_center``,
-        ``query``, active ``tail_key``, and active value buffers finite.
+        - On NVIDIA SM8x/SM12x and AMD RDNA4 (``gfx1200``/``gfx1201``), finalized
+          ``pool`` slots always execute native GQA-packed INT8-Q/UINT8-P
+          tensor-core attention across all ``seq_q >= 1``:
+          - For ``seq_q < 64`` (decode and MTP verification), queries are packed by
+            KV head with exact per-row quantization over ``pool`` and combined in a
+            single Split-KV reduction with the direct BF16/FP16 live tail.
+          - For ``seq_q >= 64`` (chunked prefill), frozen pool slots pair with a
+            K1024/V1024 chunk-centered quantized live tail and normalized FP32
+            two-wave LSE merging.
+        - On CPU or fallback GPUs without native quantized tensor-core Piper
+          support (e.g. SM75/SM90/SM100, ``gfx942``, ``gfx1100``, ``gfx1151``),
+          ``piper_attention_decode`` keeps queries and softmax weights in FP32
+          while dequantizing pool slots, running native Triton Split-KV kernels on
+          GPU and the portable FP32-accumulation reference elsewhere.
+        Numerical contracts: on SM8x/SM12x and RDNA4, native INT8-Q/UINT8-P
+        frozen pool execution approximates FP32 SDPA within INT8/UINT8 Piper
+        quantization error across all ``seq_q >= 1`` rather than matching
+        FP32-Q/P Split-KV bitwise; at ``seq_q >= 64``, K1024/V1024 tail centering
+        also shares local chunk statistics across causal queries within each
+        1024-token tail chunk. Callers should keep rotated dot products
+        ``q · k_center``, ``query``, active ``tail_key``, and active value
+        buffers finite.
     """
     if not isinstance(pool, PiperKVChunkPool):
         raise TypeError(f"pool must be a PiperKVChunkPool, got {type(pool).__name__}")

@@ -12,9 +12,6 @@ from .._decode_schedule import (
 _RDNA4_BLOCK_N = 64
 _RDNA4_NUM_WARPS = 4
 _RDNA4_NUM_STAGES = 1
-_RDNA4_LOOP_NUM_STAGES = 1
-_RDNA4_TARGET_CTAS_PER_SM = 8
-_RDNA4_TILES_PER_CHUNK_CAP = 4
 _RDNA4_MAX_TAIL_SPLITS = 4
 _RDNA4_PREFILL_CTAS_PER_SM = 6
 _RDNA4_MIN_WAVE_SPLIT_TILES = 128
@@ -110,17 +107,19 @@ def select_decode_schedule(target: AcceleratorTarget, head_dim: int) -> DecodeSc
         ("target-features", "-cumode"),
         *amd_compiler_workarounds.LDS_ONLY_FENCE_ATTRS,
     )
+    # RDNA4 uses DecodeSchedule only for direct live-tail Split-KV decode; finalized pool
+    # slots always execute the native INT8-Q/UINT8-P Gluon prefill kernel.
     return DecodeSchedule(
         block_n=_RDNA4_BLOCK_N,
         num_warps=_RDNA4_NUM_WARPS,
         num_stages=_RDNA4_NUM_STAGES,
-        loop_num_stages=_RDNA4_LOOP_NUM_STAGES,
-        frozen_qk_mode="bf16x2",
+        loop_num_stages=_RDNA4_NUM_STAGES,
+        frozen_qk_mode="ieee",
         tail_qk_precision="native",
         pv_precision="bf16x2",
         max_splits=FAST_MAX_DECODE_SPLITS,
-        target_ctas_per_sm=_RDNA4_TARGET_CTAS_PER_SM,
-        tiles_per_chunk_cap=_RDNA4_TILES_PER_CHUNK_CAP,
+        target_ctas_per_sm=0,
+        tiles_per_chunk_cap=1,
         max_tail_splits=_RDNA4_MAX_TAIL_SPLITS,
         compiler_options=(("llvm_fn_attrs", llvm_fn_attrs),),
     )
