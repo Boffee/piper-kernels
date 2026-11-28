@@ -2,22 +2,31 @@
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import (
+    ensure_convrot_int8_linear_ops,
+    ensure_convrot_nvfp4_linear_ops,
+    ensure_nvfp4_linear_ops,
+    exact_sm120_available,
+)
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from piper_kernels import compile_options
 from piper_kernels.linear._projection_views import normalize_projection_views
-from piper_kernels.linear.convrot.int8 import _ops as int8_ops
-from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_nvfp4_ops
-from piper_kernels.linear.nvfp4 import _ops as nvfp4_ops
 
-_TARGETS = [
-    pytest.param(int8_ops.linear, id="convrot_int8"),
-    pytest.param(nvfp4_ops.linear, id="nvfp4"),
-    pytest.param(convrot_nvfp4_ops.linear, id="convrot_nvfp4"),
-]
+_TARGETS = ["convrot_int8", "nvfp4", "convrot_nvfp4"]
+
+
+def _linear_op(name: str):
+    if name == "convrot_int8":
+        ensure_convrot_int8_linear_ops()
+        return torch.ops.piper_kernels.convrot_int8_linear
+    if name == "nvfp4":
+        ensure_nvfp4_linear_ops()
+        return torch.ops.piper_kernels.nvfp4_linear
+    ensure_convrot_nvfp4_linear_ops()
+    return torch.ops.piper_kernels.convrot_nvfp4_linear
 
 
 @pytest.mark.parametrize("device", ["meta", pytest.param("cuda", marks=pytest.mark.gpu)])
@@ -32,9 +41,9 @@ def test_mixed_linear_formats_share_one_batched_input_cast(device):
 
         fp4_args = (fp4_weight, fp4_scale, None, None, None, True)
         return (
-            project(int8_ops.linear, int8_weight, int8_scale, None, 64),
-            project(nvfp4_ops.linear, *fp4_args),
-            project(convrot_nvfp4_ops.linear, *fp4_args, 64),
+            project(_linear_op("convrot_int8"), int8_weight, int8_scale, None, 64),
+            project(_linear_op("nvfp4"), *fp4_args),
+            project(_linear_op("convrot_nvfp4"), *fp4_args, 64),
         )
 
     with torch.device(device):
@@ -67,12 +76,12 @@ def _graph(target, source_shape=(2, 3, 64), *, reshape=torch.ops.aten.reshape.de
     rows = source.meta["val"].numel() // source_shape[-1]
     flattened = graph.call_function(reshape, (source, (-1, source_shape[-1])))
     flattened.meta["val"] = source.meta["val"].reshape(rows, source_shape[-1])
-    if target is int8_ops.linear:
+    if target == "convrot_int8":
         args = (flattened, weight, scale, None, 64)
     else:
         args = (flattened, weight, scale, None, None, None, True)
-        args += (64, True) if target is convrot_nvfp4_ops.linear else (True,)
-    linear = graph.call_function(target._opoverload, args)
+        args += (64, True) if target == "convrot_nvfp4" else (True,)
+    linear = graph.call_function(_linear_op(target).default, args)
     linear.meta["val"] = torch.empty((rows, 128), dtype=torch.bfloat16)
     leading_dimensions = tuple(
         graph.call_function(torch.ops.aten.sym_size.int, (source, index))
@@ -153,7 +162,7 @@ def test_external_consumers_keep_their_shapes(target, consumer):
     "failure", ["feature_axis", "leading_order", "noncontiguous", "dtype", "missing_metadata"]
 )
 def test_unsupported_reshape_layouts_remain_unchanged(failure):
-    graph, source, flattened, linear, restored = _graph(int8_ops.linear)
+    graph, source, flattened, linear, restored = _graph("convrot_int8")
     if failure == "feature_axis":
         flattened.args = (source, (3, 128))
         flattened.meta["val"] = source.meta["val"].reshape(3, 128)
@@ -172,7 +181,7 @@ def test_unsupported_reshape_layouts_remain_unchanged(failure):
 
 
 def test_attention_head_reshape_is_preserved():
-    graph, _, _, linear, restored = _graph(int8_ops.linear)
+    graph, _, _, linear, restored = _graph("convrot_int8")
     output = list(graph.nodes)[-1]
     with graph.inserting_before(output):
         heads = graph.call_function(torch.ops.aten.reshape.default, (restored, (2, 3, 2, 64)))

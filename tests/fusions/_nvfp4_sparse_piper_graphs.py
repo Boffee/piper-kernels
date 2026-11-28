@@ -6,7 +6,11 @@ import operator
 
 import pytest
 import torch
-from _accelerators import mock_cuda_target
+from _accelerators import (
+    ensure_convrot_nvfp4_linear_ops,
+    ensure_nvfp4_linear_ops,
+    mock_cuda_target,
+)
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import compile_options
@@ -63,6 +67,7 @@ def _semantic_linear(
         torch.empty((), device="cuda", dtype=torch.float32),
     )
     if group_size is None:
+        ensure_nvfp4_linear_ops()
         target = torch.ops.piper_kernels.nvfp4_linear.default
         args: tuple[object, ...] = (
             input,
@@ -75,6 +80,7 @@ def _semantic_linear(
             high_first,
         )
     else:
+        ensure_convrot_nvfp4_linear_ops()
         target = torch.ops.piper_kernels.convrot_nvfp4_linear.default
         args = (
             input,

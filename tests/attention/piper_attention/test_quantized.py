@@ -1,12 +1,12 @@
 """Quantized dense Q keeps metadata validation and native attention semantics."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
 import torch
-from _accelerators import forbid_device_probes, mock_cuda_target
+from _accelerators import forbid_device_probes, forbid_triton_driver, mock_cuda_target
 from _compile_capture import TargetCapturePass
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -16,7 +16,6 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as qk_quantization
 from piper_kernels.attention.piper_attention import _backend
 from piper_kernels.attention.piper_attention import _quantized_dispatch as dispatch
-from piper_kernels.attention.piper_attention._amd import gluon as amd
 from piper_kernels.attention.piper_attention._nvidia import policy as nvidia_policy
 from piper_kernels.attention.piper_attention._nvidia import triton as nvidia
 
@@ -65,13 +64,14 @@ def _inputs(
     return [query, scale, key, value, query_length, causal]
 
 
+@contextmanager
 def _forbid_runtime(monkeypatch):
     forbidden = Mock(side_effect=AssertionError("metadata path entered native execution"))
     forbid_device_probes(monkeypatch, "metadata path entered native execution")
-    monkeypatch.setattr(nvidia, "_prepare_piper_context", forbidden)
-    monkeypatch.setattr(amd, "prepare_context", forbidden)
     monkeypatch.setattr(qk_quantization, "prepare_query", forbidden)
     monkeypatch.setattr(torch.cuda, "synchronize", forbidden)
+    with forbid_triton_driver("metadata path entered native execution"):
+        yield
 
 
 @pytest.mark.parametrize("device", ["cpu", "meta", "cuda:0"])
@@ -89,8 +89,7 @@ def test_metadata_validation_accepts_ragged_gqa_without_tensor_operations(
             causal=causal,
             granularity=granularity,
         )
-    _forbid_runtime(monkeypatch)
-    with _NoTensorOperations():
+    with _forbid_runtime(monkeypatch), _NoTensorOperations():
         shape = dispatch._validate_quantized_query(*operands)
     assert shape == (2, 6, 65, 64)
 
@@ -101,8 +100,7 @@ def test_metadata_validation_accepts_ragged_gqa_without_tensor_operations(
 def test_fake_impl_only_allocates_logical_output(monkeypatch, device, dtype, batch):
     with FakeTensorMode() if device == "cuda:0" else nullcontext():
         operands = _inputs(device=device, dtype=dtype, batch=batch)
-        _forbid_runtime(monkeypatch)
-        with _OutputAllocationOnly() as operations:
+        with _forbid_runtime(monkeypatch), _OutputAllocationOnly() as operations:
             output = dispatch._piper_attention_from_quantized_query_fake(*operands)
     assert len(operations.allocations) == 1
     assert output.shape == (batch, 6, 65, 64)
@@ -114,8 +112,8 @@ def test_fake_impl_only_allocates_logical_output(monkeypatch, device, dtype, bat
 def test_registered_fake_boundary_does_not_select_or_prepare_a_backend(monkeypatch):
     with FakeTensorMode():
         operands = _inputs(device="cuda:0")
-        _forbid_runtime(monkeypatch)
-        output = dispatch._piper_attention_from_quantized_query_op(*operands)
+        with _forbid_runtime(monkeypatch):
+            output = dispatch._piper_attention_from_quantized_query_op(*operands)
     assert isinstance(output, FakeTensor)
     assert output.shape == (2, 6, 65, 64)
     assert output.dtype is torch.bfloat16
@@ -126,8 +124,7 @@ def test_registered_fake_boundary_does_not_select_or_prepare_a_backend(monkeypat
 def test_scale_contents_are_caller_preconditions(monkeypatch, scale_value):
     operands = _inputs(device="cpu")
     operands[1].fill_(scale_value)
-    _forbid_runtime(monkeypatch)
-    with _OutputAllocationOnly() as operations:
+    with _forbid_runtime(monkeypatch), _OutputAllocationOnly() as operations:
         output = dispatch._piper_attention_from_quantized_query_fake(*operands)
     assert len(operations.allocations) == 1
     assert output.shape == (2, 6, 65, 64)
@@ -226,8 +223,11 @@ def test_malformed_metadata_rejected_before_device_or_tensor_operations(  # noqa
             operands = _inputs(key_length=0)
         elif invalid == "causal_length":
             operands[-1] = True
-    _forbid_runtime(monkeypatch)
-    with _NoTensorOperations(), pytest.raises((ValueError, TypeError)):
+    with (
+        _forbid_runtime(monkeypatch),
+        _NoTensorOperations(),
+        pytest.raises((ValueError, TypeError)),
+    ):
         dispatch._piper_attention_from_quantized_query_fake(*operands)
 
 
@@ -235,8 +235,11 @@ def test_malformed_metadata_rejected_before_device_or_tensor_operations(  # noqa
 def test_invalid_logical_length_rejected_without_tensor_operations(monkeypatch, query_length):
     operands = _inputs()
     operands[-2] = query_length
-    _forbid_runtime(monkeypatch)
-    with _NoTensorOperations(), pytest.raises((ValueError, TypeError)):
+    with (
+        _forbid_runtime(monkeypatch),
+        _NoTensorOperations(),
+        pytest.raises((ValueError, TypeError)),
+    ):
         dispatch._piper_attention_from_quantized_query_fake(*operands)
 
 
@@ -244,11 +247,11 @@ def test_invalid_logical_length_rejected_without_tensor_operations(monkeypatch, 
 def test_gradient_flags_follow_inference_contract(monkeypatch, operand):
     operands = _inputs()
     operands[operand].requires_grad_(True)
-    _forbid_runtime(monkeypatch)
-    with _NoTensorOperations(), pytest.raises(RuntimeError, match="inference"):
-        dispatch._validate_quantized_query(*operands)
-    with torch.no_grad(), _NoTensorOperations():
-        assert dispatch._validate_quantized_query(*operands) == (2, 6, 65, 64)
+    with _forbid_runtime(monkeypatch):
+        with _NoTensorOperations(), pytest.raises(RuntimeError, match="inference"):
+            dispatch._validate_quantized_query(*operands)
+        with torch.no_grad(), _NoTensorOperations():
+            assert dispatch._validate_quantized_query(*operands) == (2, 6, 65, 64)
 
 
 @pytest.mark.parametrize("architecture", ["sm80", "sm89", "sm90", "sm100", "sm120", "sm121"])
@@ -295,10 +298,10 @@ _CUDA_CAPABILITIES = {
 def test_unsupported_native_target_fails_before_kv_preparation(monkeypatch, architecture):
     with FakeTensorMode():
         operands = _inputs(device="cuda:0")
-    _forbid_runtime(monkeypatch)
-    mock_cuda_target(monkeypatch, _CUDA_CAPABILITIES[architecture])
-    with pytest.raises(RuntimeError):
-        dispatch._piper_attention_from_quantized_query_op._init_fn(*operands)
+    with _forbid_runtime(monkeypatch):
+        mock_cuda_target(monkeypatch, _CUDA_CAPABILITIES[architecture])
+        with _NoTensorOperations(), pytest.raises(RuntimeError):
+            dispatch._piper_attention_from_quantized_query_op._init_fn(*operands)
 
 
 @pytest.mark.parametrize(
@@ -309,22 +312,27 @@ def test_mismatched_scale_granularity_fails_before_kv_preparation(
 ):
     with FakeTensorMode():
         operands = _inputs(device="cuda:0", granularity=granularity)
-    _forbid_runtime(monkeypatch)
-    mock_cuda_target(monkeypatch, _CUDA_CAPABILITIES[architecture])
-    with pytest.raises(RuntimeError, match=f"{granularity} Q/K scales are unavailable"):
-        dispatch._piper_attention_from_quantized_query_op._init_fn(*operands)
+    with _forbid_runtime(monkeypatch):
+        mock_cuda_target(monkeypatch, _CUDA_CAPABILITIES[architecture])
+        with (
+            _NoTensorOperations(),
+            pytest.raises(RuntimeError, match=f"{granularity} Q/K scales are unavailable"),
+        ):
+            dispatch._piper_attention_from_quantized_query_op._init_fn(*operands)
 
 
 def test_empty_batch_returns_output_without_a_backend_probe(monkeypatch):
-    _forbid_runtime(monkeypatch)
-    cpu_output = dispatch._piper_attention_from_quantized_query_op(*_inputs(device="cpu", batch=0))
-    assert cpu_output.shape == (0, 6, 65, 64)
-    assert cpu_output.dtype is torch.bfloat16
-    assert cpu_output.is_contiguous()
+    with _forbid_runtime(monkeypatch):
+        cpu_output = dispatch._piper_attention_from_quantized_query_op(
+            *_inputs(device="cpu", batch=0)
+        )
+        assert cpu_output.shape == (0, 6, 65, 64)
+        assert cpu_output.dtype is torch.bfloat16
+        assert cpu_output.is_contiguous()
 
-    with FakeTensorMode():
-        cuda_operands = _inputs(device="cuda:0", batch=0)
-        cuda_output = dispatch._piper_attention_from_quantized_query_op._init_fn(*cuda_operands)
+        with FakeTensorMode():
+            cuda_operands = _inputs(device="cuda:0", batch=0)
+            cuda_output = dispatch._piper_attention_from_quantized_query_op._init_fn(*cuda_operands)
     assert cuda_output.shape == (0, 6, 65, 64)
     assert cuda_output.dtype is torch.bfloat16
     assert cuda_output.device == cuda_operands[0].device

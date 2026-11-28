@@ -7,6 +7,7 @@ import torch
 from _accelerators import forbid_device_probes
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn import functional as F  # noqa: N812
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels import piper_attention
 from piper_kernels._triton.targets import AcceleratorTarget
@@ -16,7 +17,6 @@ from piper_kernels.attention.piper_attention import _quantized_dispatch as dispa
 from piper_kernels.attention.piper_attention._nvidia import policy
 from piper_kernels.attention.piper_attention._nvidia import triton as nvidia
 from piper_kernels.fusions.convrot_int8_piper import key, value
-from piper_kernels.linear.convrot.int8 import _ops as linear_ops
 
 from .test_query import _NATIVE, _operands
 
@@ -149,16 +149,18 @@ def test_value_uses_per_token_scales_and_correct_centering(head_dim, sequence, c
 
 @pytest.mark.gpu
 @_NATIVE
-def test_causal_value_does_not_reduce_or_depend_on_future_rows(monkeypatch):
+def test_causal_value_does_not_reduce_or_depend_on_future_rows():
+    class ForbidDequantizedInputMean(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if str(func) == "piper_kernels.convrot_int8_dequantized_input_mean.default":
+                raise AssertionError("V1024 must not compute a global mean")
+            return func(*args, **(kwargs or {}))
+
     operands = _operands("cuda", sequence=1057)
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("V1024 must not compute a global mean")
-
-    monkeypatch.setattr(linear_ops, "dequantized_input_mean", forbidden)
-    first = value._project_value_op(*operands[:4], head_dim=64, is_causal=True)
-    operands[0][:, 1024:].zero_()
-    second = value._project_value_op(*operands[:4], head_dim=64, is_causal=True)
+    with ForbidDequantizedInputMean():
+        first = value._project_value_op(*operands[:4], head_dim=64, is_causal=True)
+        operands[0][:, 1024:].zero_()
+        second = value._project_value_op(*operands[:4], head_dim=64, is_causal=True)
     for index in (1, 2):
         torch.testing.assert_close(
             first[index][:, :, :1024], second[index][:, :, :1024], atol=0, rtol=0

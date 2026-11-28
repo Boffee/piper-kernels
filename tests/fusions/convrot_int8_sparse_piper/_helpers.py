@@ -1,33 +1,20 @@
 """Hardware coverage gates for the currently validated sparse-fusion backend."""
 
-import torch
-
-from piper_kernels.fusions.convrot_int8_piper import _backend as dense_backend
-from piper_kernels.fusions.convrot_int8_sparse_piper import _backend
+from _accelerators import (
+    convrot_int8_dense_projection_available,
+    convrot_int8_sparse_output_available,
+    convrot_int8_sparse_projection_available,
+)
 
 
 def projection_available(head_dim: int = 128) -> bool:
-    return (
-        torch.cuda.is_available()
-        and _backend.select_projection_backend(torch.empty(0, device="cuda"), head_dim=head_dim)
-        is not None
-    )
+    return convrot_int8_sparse_projection_available(head_dim)
 
 
 def dense_projection_available(head_dim: int = 128) -> bool:
     """Dense Piper projections cover fewer targets than the sparse fusion (not SM8x)."""
-    return (
-        torch.cuda.is_available()
-        and dense_backend.select_projection_backend(
-            torch.empty(0, device="cuda"), head_dim=head_dim
-        )
-        is not None
-    )
+    return convrot_int8_dense_projection_available(head_dim)
 
 
 def output_available(head_dim: int = 128) -> bool:
-    return (
-        torch.cuda.is_available()
-        and _backend.select_output_backend(torch.empty(0, 0, 0, head_dim, device="cuda"))
-        is not None
-    )
+    return convrot_int8_sparse_output_available(head_dim)

@@ -2,10 +2,10 @@
 
 import pytest
 import torch
-from _accelerators import mock_cuda_target
+from _accelerators import ensure_convrot_int8_linear_ops, mock_cuda_target
 
-from piper_kernels.fusions.convrot_int8_piper import _compile, _output_compile, output
-from piper_kernels.linear.convrot.int8 import _ops
+from piper_kernels import compile_options
+from piper_kernels.fusions.convrot_int8_piper import output
 
 from .test_compile import (
     _available,
@@ -15,6 +15,15 @@ from .test_compile import (
     _qkv_semantic_graph,
     _QKVAttention,
 )
+
+
+def _run_post_grad_passes(graph: torch.fx.Graph, *, attention_output: bool = False) -> None:
+    passes = compile_options(linear=False, attention=True, attention_output=attention_output)[
+        "post_grad_custom_pre_pass"
+    ]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=True)
 
 
 class _QKVOutput(_QKVAttention):
@@ -37,7 +46,8 @@ class _QKVOutput(_QKVAttention):
         merged = attended.transpose(1, 2).reshape(
             hidden.shape[0], hidden.shape[1], 4 * self.head_dim
         )
-        return _ops.linear(
+        ensure_convrot_int8_linear_ops()
+        return torch.ops.piper_kernels.convrot_int8_linear(
             merged,
             self.output_weight,
             self.output_weight_scale,
@@ -72,7 +82,8 @@ def test_compiler_folds_complete_dense_attention_output(head_dim, causal, dtype,
             args = _qkv_inputs(model, sequence, sequence if causal else sequence + 32, dtype)
             actual = compiled(*args)
             attended = _explicit_qkv(model, args).transpose(1, 2).reshape(2, sequence, -1)
-            expected = _ops.linear(
+            ensure_convrot_int8_linear_ops()
+            expected = torch.ops.piper_kernels.convrot_int8_linear(
                 attended,
                 model.output_weight,
                 model.output_weight_scale,
@@ -92,6 +103,7 @@ def test_compiler_folds_complete_dense_attention_output(head_dim, causal, dtype,
 
 
 def _semantic_output_graph(device="cuda:0"):
+    ensure_convrot_int8_linear_ops()
     graph = _qkv_semantic_graph(device=device)
     old_output = next(node for node in graph.nodes if node.op == "output")
     attention = old_output.args[0]
@@ -151,10 +163,10 @@ def test_output_rewrite_preserves_unsupported_or_escaping_regions(monkeypatch, u
             linear.args[1].meta["val"] = torch.empty(80, 128, device="cuda:0", dtype=torch.int8)
     elif unsupported == "metadata":
         linear.args[2].meta["val"] = None
-    _compile.fold_attention_projections(graph)
+    _run_post_grad_passes(graph, attention_output=False)
     if unsupported == "backend":
         mock_cuda_target(monkeypatch, (7, 0))
-    _compile.fold_attention_output(graph)
+    _run_post_grad_passes(graph, attention_output=True)
     graph.lint()
     targets = [node.target for node in graph.nodes]
     assert (
@@ -168,7 +180,7 @@ def test_output_rewrite_preserves_unsupported_or_escaping_regions(monkeypatch, u
 def test_output_rewrite_keeps_a_different_logical_query_extent(monkeypatch):
     mock_cuda_target(monkeypatch, (12, 0))
     graph, _, transposed, linear, _ = _semantic_output_graph()
-    _compile.fold_attention_projections(graph)
+    _run_post_grad_passes(graph, attention_output=False)
     attention = next(
         node
         for node in graph.nodes
@@ -187,4 +199,10 @@ def test_output_rewrite_keeps_a_different_logical_query_extent(monkeypatch):
         reshaped.meta["val"] = cloned.meta["val"].reshape(2, 96, 256)
         linear.meta["val"] = torch.empty(2, 96, 80, device="cuda:0", dtype=torch.bfloat16)
     graph.lint()
-    assert not _output_compile.fold_attention_output(graph)
+    _run_post_grad_passes(graph, attention_output=True)
+    targets = [node.target for node in graph.nodes]
+    assert (
+        torch.ops.piper_kernels.convrot_int8_piper_projected_query_attention_output.default
+        not in targets
+    )
+    assert torch.ops.piper_kernels.convrot_int8_linear.default in targets

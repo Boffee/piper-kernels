@@ -2,11 +2,11 @@
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import ensure_nvfp4_linear_ops, exact_sm120_available
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import compile_options
-from piper_kernels.linear.nvfp4 import _ops, reference
+from piper_kernels.linear.nvfp4 import reference
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor, _layout
 
@@ -25,7 +25,8 @@ def test_empty_reference_preparation_and_projection(dtype, dynamic, group_size, 
     assert prepared[2].item() == (0 if dynamic else 0.25)
     meta_value = value.to("meta")
     meta_scale = None if scale is None else scale.to("meta")
-    fake = _ops.prepare_input(
+    ensure_nvfp4_linear_ops()
+    fake = torch.ops.piper_kernels.nvfp4_prepare_input(
         meta_value, meta_scale, dynamic, activation, group_size=group_size or None
     )
     for metadata, output in zip(fake, prepared, strict=True):
@@ -68,12 +69,15 @@ def test_empty_cuda_linear_matches_dense(dtype, dynamic, group_size, compiled, p
     def projections(value):
         if not prepared:
             return F.linear(value, weight), F.linear(value, weight, bias)
-        encoded = _ops.prepare_input(value, scale, dynamic, group_size=group_size or None)
+        ensure_nvfp4_linear_ops()
+        encoded = torch.ops.piper_kernels.nvfp4_prepare_input(
+            value, scale, dynamic, group_size=group_size or None
+        )
         operands = (*encoded, weight.qdata, weight.scale, weight.per_tensor_scale)
         shape = (*value.shape[:-1], 128)
         return (
-            _ops.linear_prepared(*operands, None, dtype).reshape(shape),
-            _ops.linear_prepared(*operands, bias, dtype).reshape(shape),
+            torch.ops.piper_kernels.nvfp4_linear_prepared(*operands, None, dtype).reshape(shape),
+            torch.ops.piper_kernels.nvfp4_linear_prepared(*operands, bias, dtype).reshape(shape),
         )
 
     options = compile_options()

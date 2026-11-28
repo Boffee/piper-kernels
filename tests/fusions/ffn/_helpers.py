@@ -7,12 +7,12 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
+from _accelerators import ensure_convrot_int8_linear_ops
 from _compile_capture import FunctionalTargetCapturePass
 from torch._dynamo.utils import ReinplaceCounters
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import compile_options
-from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.nvfp4 import reference as nvfp4_reference
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -100,12 +100,14 @@ def materialized_int8(
     gate_input_scale: torch.Tensor | None = None,
     down_input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    up = int8_ops.linear(operands.input, *operands.up.arguments(), None, up_input_scale)
+    ensure_convrot_int8_linear_ops()
+    linear = torch.ops.piper_kernels.convrot_int8_linear
+    up = linear(operands.input, *operands.up.arguments(), None, up_input_scale)
     if operands.activation == "gelu_tanh":
-        return int8_ops.linear(up, *operands.down.arguments(), "gelu_tanh", down_input_scale)
+        return linear(up, *operands.down.arguments(), "gelu_tanh", down_input_scale)
     assert operands.gate is not None
-    gate = int8_ops.linear(operands.input, *operands.gate.arguments(), None, gate_input_scale)
-    return int8_ops.linear(
+    gate = linear(operands.input, *operands.gate.arguments(), None, gate_input_scale)
+    return linear(
         torch.cat((up, gate), dim=-1),
         *operands.down.arguments(),
         "swiglu",

@@ -4,15 +4,11 @@ from __future__ import annotations
 
 import pytest
 import torch
+from _accelerators import ensure_convrot_int8_linear_ops
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from piper_kernels import SparsePiperAttention
-from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
-from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
-    _sparse_piper_attention_from_quantized_op,
-)
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
-from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 
 from .._accuracy import assert_fusion_output_close
 from ._helpers import output_available
@@ -83,13 +79,15 @@ def _arguments(
             logical_sequence_length=sequence_length,
             sparse_key_blocks=sparse_key_blocks,
         )
-        expected = linear_backend.require_linear_backend(materialized_attention).linear(
+        ensure_convrot_int8_linear_ops()
+        expected = torch.ops.piper_kernels.convrot_int8_linear(
             materialized_attention.reshape(batch, sequence_length, _HEADS * _HEAD_DIM),
             weight,
             scale,
             projected_bias,
             _HEADS * _HEAD_DIM,
-            input_scale=input_scale,
+            None,
+            input_scale,
         )
     return arguments, expected
 
@@ -121,7 +119,7 @@ def _padded_arguments(
     coarse_key_blocks = sequence_length // 64 if coarse else None
     if coarse:
         assert coarse_gate is not None
-        materialized_attention = _sparse_piper_attention_from_quantized_op(
+        materialized_attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized(
             *attention_arguments,
             block_lengths,
             sparse_query_blocks,
@@ -130,13 +128,14 @@ def _padded_arguments(
             coarse_key_blocks=coarse_key_blocks,
         )
     else:
-        materialized_attention = _sparse_piper_attention_from_quantized_op(
+        materialized_attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized(
             *attention_arguments,
             block_lengths,
             sparse_query_blocks,
         )
     weight, scale, bias, group_size = projection_arguments
-    expected = linear_backend.require_linear_backend(materialized_attention).linear(
+    ensure_convrot_int8_linear_ops()
+    expected = torch.ops.piper_kernels.convrot_int8_linear(
         materialized_attention.flatten(2),
         weight,
         scale,
@@ -334,29 +333,26 @@ def test_attention_output_projects_a_bounded_coarse_gate(
     gate_scale = gate_scale[:gate_features].contiguous()
     assert gate_bias is not None
     gate_bias = gate_bias[:gate_features].contiguous()
-    coarse_gate = (
-        linear_backend.require_linear_backend(gate_input_qdata)
-        .linear_prepared(
-            gate_input_qdata,
-            gate_input_scale,
-            gate_weight,
-            gate_scale,
-            gate_bias,
-            torch.bfloat16,
-        )
-        .unflatten(-1, (_HEADS, _HEAD_DIM))
-    )
+    ensure_convrot_int8_linear_ops()
+    coarse_gate = torch.ops.piper_kernels.convrot_int8_linear_prepared(
+        gate_input_qdata,
+        gate_input_scale,
+        gate_weight,
+        gate_scale,
+        gate_bias,
+        torch.bfloat16,
+    ).unflatten(-1, (_HEADS, _HEAD_DIM))
     query_blocks = (sequence_length + 63) // 64
     coarse_scale = _HEAD_DIM**-0.5
     coarse_key_blocks = query_blocks
-    materialized_attention = _sparse_piper_attention_from_quantized_op(
+    materialized_attention = torch.ops.piper_kernels.sparse_piper_attention_from_quantized(
         *attention_arguments,
         coarse_gate=coarse_gate,
         coarse_scale=coarse_scale,
         coarse_key_blocks=coarse_key_blocks,
     )
     output_weight, output_scale, output_bias, output_group_size = output_arguments
-    expected = linear_backend.require_linear_backend(materialized_attention).linear(
+    expected = torch.ops.piper_kernels.convrot_int8_linear(
         materialized_attention.flatten(2),
         output_weight,
         output_scale,
@@ -418,7 +414,7 @@ def test_attention_output_fake_kernel_propagates_shape(dtype: torch.dtype) -> No
         torch.empty((2, 3, 128, 192), device="meta", dtype=torch.int8),
         torch.empty((2, 3, 3, 1), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 3, 128), device="meta", dtype=torch.bfloat16),
-        _SparsePiperRatioProfile((500_000, 1_000_000, 750_000)),
+        SparsePiperAttention((0.5, 1.0, 0.75))._ratio_profile,
         2,
         191,
         0,
@@ -450,7 +446,7 @@ def test_attention_output_fake_kernel_uses_padded_storage_length() -> None:
         torch.empty((2, 3, 128, 192), device="meta", dtype=torch.int8),
         torch.empty((2, 3, 3, 1), device="meta", dtype=torch.float32),
         torch.empty((2, 3, 3, 128), device="meta", dtype=torch.bfloat16),
-        _SparsePiperRatioProfile((500_000, 1_000_000, 750_000)),
+        SparsePiperAttention((0.5, 1.0, 0.75))._ratio_profile,
         2,
         132,
         0,
@@ -497,7 +493,7 @@ def test_inplace_fake_validates_forced_metadata_without_tensor_operations() -> N
         torch.empty((1, 1, 64, 128), device="meta", dtype=torch.int8),
         torch.empty((1, 1, 2, 1), device="meta"),
         torch.empty((1, 1, 2, 64), device="meta", dtype=torch.bfloat16),
-        _SparsePiperRatioProfile((500_000,)),
+        SparsePiperAttention((0.5,))._ratio_profile,
         1,
         65,
         0,

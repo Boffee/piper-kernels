@@ -2,13 +2,12 @@
 
 import pytest
 import torch
+from _accelerators import ensure_convrot_int8_linear_ops
 from _compile_capture import FunctionalTargetCapturePass, TargetCapturePass
 from torch._dynamo.utils import ReinplaceCounters
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import compile_options, piper_attention
-from piper_kernels.fusions.ffn import _convrot_int8 as int8_ffn
-from piper_kernels.linear.convrot.int8 import _ops
 
 from ..convrot_int8_piper.test_compile import _available
 from ..convrot_int8_sparse_piper._helpers import output_available as _sparse_output_available
@@ -19,20 +18,20 @@ from ..ffn._helpers import (
     make_int8_gated_update_arguments,
 )
 
-_kernels = torch.ops.piper_kernels
-_ATTENTION_OUTPUT = _kernels.convrot_int8_piper_projected_query_attention_output.default
-_ATTENTION_RESIDUAL_ADD = (
-    _kernels.convrot_int8_piper_projected_query_attention_residual_add_.default
+_ATTENTION_OUTPUT_OP = "convrot_int8_piper_projected_query_attention_output"
+_ATTENTION_RESIDUAL_ADD_OP = "convrot_int8_piper_projected_query_attention_residual_add_"
+_SPARSE_ATTENTION_OUTPUT_OP = "convrot_int8_sparse_piper_projected_query_attention_output"
+_SPARSE_ATTENTION_RESIDUAL_ADD_OP = (
+    "convrot_int8_sparse_piper_projected_query_attention_residual_add_"
 )
-_SPARSE_ATTENTION_OUTPUT = (
-    _kernels.convrot_int8_sparse_piper_projected_query_attention_output.default
-)
-_SPARSE_ATTENTION_RESIDUAL_ADD = (
-    _kernels.convrot_int8_sparse_piper_projected_query_attention_residual_add_.default
-)
-_FFN = int8_ffn.convrot_int8_ffn_op._opoverload
-_FFN_UPDATE = int8_ffn.convrot_int8_ffn_update_op._opoverload
-_RESIDUAL_ADD = _kernels.residual_add_.default
+_FFN_OP = "convrot_int8_ffn"
+_FFN_UPDATE_OP = "convrot_int8_ffn_update_"
+_RESIDUAL_ADD_OP = "residual_add_"
+
+
+def _target_count(capture: TargetCapturePass, op_name: str) -> int:
+    packet = getattr(torch.ops.piper_kernels, op_name, None)
+    return 0 if packet is None else capture.targets.count(packet.default)
 
 
 class _Ffn(Int8SwiGluFfn):
@@ -105,23 +104,25 @@ class _ResidualBlock(torch.nn.Module):
         rows = hidden.view(-1, self.width)
         normalized = F.rms_norm(rows, (self.width,), eps=1e-6).view(hidden.shape)
         normalized = normalized * (1 + scale[gate_indices]) + shift[gate_indices]
+        ensure_convrot_int8_linear_ops()
+        linear = torch.ops.piper_kernels.convrot_int8_linear
         query = self._heads(
-            _ops.linear(normalized, self.query_weight, self.query_scale, None, 256, None, None),
+            linear(normalized, self.query_weight, self.query_scale, None, 256, None, None),
             self.heads,
             cos,
             sin,
         )
         key = self._heads(
-            _ops.linear(normalized, self.key_weight, self.key_scale, None, 256, None, None),
+            linear(normalized, self.key_weight, self.key_scale, None, 256, None, None),
             self.kv_heads,
             cos,
             sin,
         )
-        value = _ops.linear(normalized, self.value_weight, self.value_scale, None, 256, None, None)
+        value = linear(normalized, self.value_weight, self.value_scale, None, 256, None, None)
         value = value.view(hidden.shape[0], hidden.shape[1], self.kv_heads, self.head_dim)
         attended = piper_attention(query, key, value.transpose(1, 2), scale=0.125)
         merged = attended.transpose(1, 2).reshape(hidden.shape[0], hidden.shape[1], -1)
-        attention = _ops.linear(merged, self.output_weight, self.output_scale, None, 64, None, None)
+        attention = linear(merged, self.output_weight, self.output_scale, None, 64, None, None)
         residual = hidden + attention_gate[gate_indices] * attention
         if self.cross is not None:
             residual = residual + attention_gate[gate_indices] * self.cross(normalized)
@@ -223,11 +224,11 @@ def test_copy_back_block_updates_its_input_in_place(residual_updates_first):
     _assert_updates_input_in_place(model, compiled)
 
     # Dense attention adds in two head slices; see convrot_int8_piper/test_head_slices.py.
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
-    assert capture.targets.count(_FFN_UPDATE) == 1
-    assert _ATTENTION_OUTPUT not in capture.targets
-    assert _FFN not in capture.targets
-    assert _RESIDUAL_ADD not in capture.targets
+    assert _target_count(capture, _ATTENTION_RESIDUAL_ADD_OP) == 2
+    assert _target_count(capture, _FFN_UPDATE_OP) == 1
+    assert _target_count(capture, _ATTENTION_OUTPUT_OP) == 0
+    assert _target_count(capture, _FFN_OP) == 0
+    assert _target_count(capture, _RESIDUAL_ADD_OP) == 0
 
 
 @pytest.mark.gpu
@@ -264,10 +265,10 @@ def test_sparse_attention_output_is_computed_inside_its_residual_add():
     assert ReinplaceCounters.get_total_missed() == 0
     # Half the output projection's input is not a whole ConvRot group, so the add runs
     # as one slice; see convrot_int8_sparse_piper/test_head_slices.py.
-    assert capture.targets.count(_SPARSE_ATTENTION_RESIDUAL_ADD) == 1
-    assert capture.targets.count(_FFN_UPDATE) == 1
-    assert _SPARSE_ATTENTION_OUTPUT not in capture.targets
-    assert _RESIDUAL_ADD not in capture.targets
+    assert _target_count(capture, _SPARSE_ATTENTION_RESIDUAL_ADD_OP) == 1
+    assert _target_count(capture, _FFN_UPDATE_OP) == 1
+    assert _target_count(capture, _SPARSE_ATTENTION_OUTPUT_OP) == 0
+    assert _target_count(capture, _RESIDUAL_ADD_OP) == 0
 
 
 @pytest.mark.gpu
@@ -279,10 +280,10 @@ def test_unfused_attention_output_stays_materialized_before_its_add():
 
     _assert_updates_input_in_place(model, compiled)
 
-    assert capture.targets.count(_RESIDUAL_ADD) == 1
-    assert capture.targets.count(_FFN_UPDATE) == 1
-    assert _ATTENTION_RESIDUAL_ADD not in capture.targets
-    assert _FFN not in capture.targets
+    assert _target_count(capture, _RESIDUAL_ADD_OP) == 1
+    assert _target_count(capture, _FFN_UPDATE_OP) == 1
+    assert _target_count(capture, _ATTENTION_RESIDUAL_ADD_OP) == 0
+    assert _target_count(capture, _FFN_OP) == 0
 
 
 @pytest.mark.gpu
@@ -294,9 +295,9 @@ def test_every_gated_update_on_the_path_to_the_copy_adds_in_place():
 
     _assert_updates_input_in_place(model, compiled)
 
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
-    assert capture.targets.count(_RESIDUAL_ADD) == 1
-    assert capture.targets.count(_FFN_UPDATE) == 1
+    assert _target_count(capture, _ATTENTION_RESIDUAL_ADD_OP) == 2
+    assert _target_count(capture, _RESIDUAL_ADD_OP) == 1
+    assert _target_count(capture, _FFN_UPDATE_OP) == 1
 
 
 def _compiled_without_rewrite(model, *arguments):
@@ -330,9 +331,9 @@ def test_ffn_output_read_elsewhere_stays_materialized_before_its_add():
     assert result.data_ptr() == base.data_ptr()
     assert _relative_l2(base, expected) < 0.01
     assert _relative_l2(ffn, expected_ffn) < 0.01
-    assert capture.targets.count(_RESIDUAL_ADD) == 2
-    assert _FFN_UPDATE not in capture.targets
-    assert capture.targets.count(_FFN) == 1
+    assert _target_count(capture, _RESIDUAL_ADD_OP) == 2
+    assert _target_count(capture, _FFN_UPDATE_OP) == 0
+    assert _target_count(capture, _FFN_OP) == 1
 
 
 @pytest.mark.gpu
@@ -354,8 +355,8 @@ def test_input_read_after_an_update_is_copied_instead_of_overwritten():
     assert _relative_l2(hidden, expected) < 0.03
     # Inductor copies the input before the attention add, then adds into that copy.
     assert ReinplaceCounters.get_total_missed() == 1
-    assert capture.targets.count(_ATTENTION_RESIDUAL_ADD) == 2
-    assert capture.targets.count(_FFN_UPDATE) == 1
+    assert _target_count(capture, _ATTENTION_RESIDUAL_ADD_OP) == 2
+    assert _target_count(capture, _FFN_UPDATE_OP) == 1
 
 
 @pytest.mark.gpu
@@ -371,9 +372,9 @@ def test_block_without_copy_back_keeps_its_input():
         compiled(hidden, cos, sin, gate_indices)
 
     torch.testing.assert_close(hidden, original, atol=0, rtol=0)
-    assert _ATTENTION_RESIDUAL_ADD not in capture.targets
-    assert _ATTENTION_OUTPUT in capture.targets
-    assert _FFN_UPDATE in capture.targets
+    assert _target_count(capture, _ATTENTION_RESIDUAL_ADD_OP) == 0
+    assert _target_count(capture, _ATTENTION_OUTPUT_OP) == 1
+    assert _target_count(capture, _FFN_UPDATE_OP) == 1
 
 
 def test_compile_options_merge_residual_updates_and_disable_buffer_reuse():

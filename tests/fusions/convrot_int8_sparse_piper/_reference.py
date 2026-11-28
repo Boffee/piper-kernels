@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+from _accelerators import ensure_convrot_int8_linear_ops
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
@@ -13,7 +14,6 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 )
 from piper_kernels.attention.kernels.qk_quantization.int8.sage._rotation import SIGNED_HADAMARD_MASK
 from piper_kernels.attention.kernels.sparse_piper.layout import padded_sequence_length
-from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 _BLOCK_ROWS = 64
 
@@ -188,7 +188,8 @@ def _materialized_fp32_qk(
     batch, sequence_length, _input_features = input_qdata.shape
     head_dim = norm_weight.shape[0]
     heads = weight_qdata.shape[0] // head_dim
-    projected = int8_ops.linear_prepared(
+    ensure_convrot_int8_linear_ops()
+    projected = torch.ops.piper_kernels.convrot_int8_linear_prepared(
         input_qdata,
         input_scale,
         weight_qdata,
@@ -327,7 +328,8 @@ def composed_value_projection(
     """Materialize the FP32 operations fused by K64 tile-centered value projection."""
     batch, sequence_length, _input_features = input_qdata.shape
     heads = weight_qdata.shape[0] // head_dim
-    projected = int8_ops.linear_prepared(
+    ensure_convrot_int8_linear_ops()
+    projected = torch.ops.piper_kernels.convrot_int8_linear_prepared(
         input_qdata,
         input_scale,
         weight_qdata,

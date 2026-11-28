@@ -4,16 +4,18 @@ import operator
 
 import pytest
 import torch
-from _accelerators import mock_cuda_target
+from _accelerators import (
+    convrot_int8_dense_projection_available,
+    ensure_convrot_int8_linear_ops,
+    mock_cuda_target,
+)
 from _compile_capture import TargetCapturePass
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.node import map_arg
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import compile_options, piper_attention
-from piper_kernels.attention.piper_attention import _quantized_dispatch
 from piper_kernels.fusions.convrot_int8_piper import (
-    _backend,
     _compile,
     query,
 )
@@ -23,12 +25,12 @@ from piper_kernels.fusions.convrot_int8_piper import (
 from piper_kernels.fusions.convrot_int8_piper import (
     value as value_projection,
 )
-from piper_kernels.linear.convrot.int8 import _ops
 
 from .test_query import _qk_quantization
 
 
 def _semantic_graph(*, dtype=torch.bfloat16, affine=True, permute=True, device="cpu"):
+    ensure_convrot_int8_linear_ops()
     graph = torch.fx.Graph()
 
     def placeholder(name, shape, tensor_dtype=dtype):
@@ -239,10 +241,7 @@ def test_output_pipeline_is_explicit_and_preserves_pass_order():
 
 
 def _available():
-    return (
-        torch.cuda.is_available()
-        and _backend.select_projection_backend(torch.empty((), device="cuda")) is not None
-    )
+    return convrot_int8_dense_projection_available()
 
 
 class _QueryAttention(torch.nn.Module):
@@ -270,7 +269,8 @@ class _QueryAttention(torch.nn.Module):
         self.register_buffer("input_scale", torch.tensor(0.08, device="cuda") if static else None)
 
     def forward(self, hidden, key, value, cos, sin):
-        projected = _ops.linear(
+        ensure_convrot_int8_linear_ops()
+        projected = torch.ops.piper_kernels.convrot_int8_linear(
             hidden, self.weight, self.weight_scale, self.bias, 256, None, self.input_scale
         )
         shaped = projected.view(hidden.shape[0], hidden.shape[1], self.heads, self.head_dim)
@@ -297,8 +297,11 @@ def _inputs(model, *, sequence=65, key_length=97, dtype=torch.bfloat16):
 
 
 def _explicit_fused(model, arguments):
+    ensure_convrot_int8_linear_ops()
     hidden, key, value, cos, sin = arguments
-    qdata, scales = _ops.prepare_input(hidden, 256, None, model.input_scale)
+    qdata, scales = torch.ops.piper_kernels.convrot_int8_prepare_input(
+        hidden, 256, None, model.input_scale
+    )
     prepared_query, query_scales = query._project_query_op(
         qdata,
         scales,
@@ -313,7 +316,7 @@ def _explicit_fused(model, arguments):
         head_dim=model.head_dim,
         qk_quantization=_qk_quantization(),
     )
-    return _quantized_dispatch._piper_attention_from_quantized_query_op(
+    return torch.ops.piper_kernels.piper_attention_from_quantized_query(
         prepared_query, query_scales, key, value, hidden.shape[1], model.causal
     )
 
@@ -413,7 +416,8 @@ class _QKVAttention(_QueryAttention):
         self.register_buffer("value_weight_scale", self.key_weight_scale.clone())
 
     def forward(self, hidden, context, cos, sin, key_cos, key_sin):
-        key = _ops.linear(
+        ensure_convrot_int8_linear_ops()
+        key = torch.ops.piper_kernels.convrot_int8_linear(
             context, self.key_weight, self.key_weight_scale, None, 256, None, self.input_scale
         )
         key = key.view(context.shape[0], context.shape[1], 2, self.head_dim)
@@ -425,7 +429,7 @@ class _QKVAttention(_QueryAttention):
             + torch.cat((-second, first), -1) * key_sin.to(context.dtype)[None, :, None]
         )
         key = torch.cat((rotary, key[..., self.rotary_dim :]), -1).transpose(1, 2)
-        value = _ops.linear(
+        value = torch.ops.piper_kernels.convrot_int8_linear(
             context, self.value_weight, self.value_weight_scale, None, 256, None, self.input_scale
         )
         value = value.view(context.shape[0], context.shape[1], 2, self.head_dim).transpose(1, 2)
@@ -440,9 +444,14 @@ def _qkv_inputs(model, sequence, key_length, dtype):
 
 
 def _explicit_qkv(model, arguments):
+    ensure_convrot_int8_linear_ops()
     hidden, context, cos, sin, key_cos, key_sin = arguments
-    qdata, qs = _ops.prepare_input(hidden, 256, None, model.input_scale)
-    data, scales = _ops.prepare_input(context, 256, None, model.input_scale)
+    qdata, qs = torch.ops.piper_kernels.convrot_int8_prepare_input(
+        hidden, 256, None, model.input_scale
+    )
+    data, scales = torch.ops.piper_kernels.convrot_int8_prepare_input(
+        context, 256, None, model.input_scale
+    )
     q, qscale = query._project_query_op(
         qdata,
         qs,
@@ -477,7 +486,7 @@ def _explicit_qkv(model, arguments):
         head_dim=model.head_dim,
         is_causal=model.causal,
     )
-    return _quantized_dispatch._piper_attention_from_quantized_op(
+    return torch.ops.piper_kernels.piper_attention_from_quantized(
         q,
         qscale,
         k,

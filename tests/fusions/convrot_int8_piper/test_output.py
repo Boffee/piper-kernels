@@ -2,10 +2,9 @@
 
 import pytest
 import torch
+from _accelerators import ensure_convrot_int8_linear_ops
 
-from piper_kernels.attention.piper_attention import _quantized_dispatch as attention
 from piper_kernels.fusions.convrot_int8_piper import _backend, key, output, query, value
-from piper_kernels.linear.convrot.int8 import _ops
 
 from .test_query import _NATIVE, _operands, _qk_quantization
 
@@ -59,11 +58,12 @@ def _reference(args, head_dim):
     q, qs = query._project_query_op(
         *args[:10], head_dim=head_dim, qk_quantization=_qk_quantization(args[0].device)
     )
-    attended = attention._piper_attention_from_quantized_op(
+    ensure_convrot_int8_linear_ops()
+    attended = torch.ops.piper_kernels.piper_attention_from_quantized(
         q, qs, *args[10:17], args[0].shape[1], *args[17:20]
     )
     rows = attended.transpose(1, 2).reshape(args[0].shape[0], args[0].shape[1], -1)
-    return _ops.linear(rows, *args[20:24], None, args[24])
+    return torch.ops.piper_kernels.convrot_int8_linear(rows, *args[20:24], None, args[24])
 
 
 def _assert_output_close(actual: torch.Tensor, expected: torch.Tensor) -> None:

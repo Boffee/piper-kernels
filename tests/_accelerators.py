@@ -1,5 +1,6 @@
 """Accelerator gates and public hardware-probe mocks shared by tests."""
 
+import importlib.util
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -8,6 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels._triton.targets import AcceleratorTarget
 
@@ -94,6 +96,106 @@ def trellis_encoder_available() -> bool:
         torch.cuda.get_device_properties(torch.device("cuda")).shared_memory_per_block_optin
         >= 96 * 1024 + 128
     )
+
+
+def _triton_available() -> bool:
+    return importlib.util.find_spec("triton") is not None
+
+
+def sm89_available() -> bool:
+    """Return whether the default CUDA device is an NVIDIA SM89 GPU."""
+    return torch.cuda.is_available() and AcceleratorTarget.from_device(
+        torch.device("cuda")
+    ).is_cuda_capability(8, 9)
+
+
+def nvidia_cuda_available() -> bool:
+    """Return whether the default CUDA device is an NVIDIA CUDA GPU."""
+    return (
+        torch.cuda.is_available()
+        and AcceleratorTarget.from_device(torch.device("cuda")).is_nvidia_cuda
+    )
+
+
+def sparse_piper_native_available(head_dim: int = 128) -> bool:
+    """Return whether the default device supports native sparse Piper attention kernels."""
+    return _triton_available() and (
+        exact_sm120_available() or sm8x_available() or (rdna4_available() and head_dim in (64, 128))
+    )
+
+
+def convrot_int8_sparse_projection_available(head_dim: int = 128) -> bool:
+    """Return whether the default device supports fused ConvRot INT8 sparse Q/K/V projections."""
+    return sparse_piper_native_available(head_dim)
+
+
+def convrot_int8_dense_projection_available(head_dim: int = 128) -> bool:
+    """Return whether the default device supports fused ConvRot INT8 dense Q/K/V projections."""
+    return (
+        _triton_available()
+        and head_dim in (64, 128)
+        and (exact_sm120_available() or sm89_available() or rdna4_available())
+    )
+
+
+def convrot_int8_sparse_output_available(head_dim: int = 128) -> bool:
+    """Return whether the default device supports fused ConvRot INT8 sparse attention output."""
+    return convrot_int8_sparse_projection_available(head_dim) and convrot_int8_w8a8_available()
+
+
+def ensure_convrot_int8_linear_ops() -> None:
+    """Register ConvRot INT8 linear custom ops via public ``F.linear`` if not yet loaded."""
+    if hasattr(torch.ops.piper_kernels, "convrot_int8_linear"):
+        return
+    from piper_kernels.weights.convrot.int8 import (  # noqa: PLC0415 - keep import lazy
+        ConvRotInt8Tensor,
+    )
+
+    weight = ConvRotInt8Tensor.from_quantized(
+        torch.empty(32, 64, dtype=torch.int8, device="meta"),
+        torch.empty(32, 1, dtype=torch.float32, device="meta"),
+        group_size=64,
+        logical_dtype=torch.bfloat16,
+    )
+    with torch.no_grad():
+        F.linear(torch.empty(0, 64, dtype=torch.bfloat16, device="meta"), weight)
+
+
+def ensure_nvfp4_linear_ops() -> None:
+    """Register NVFP4 linear custom ops via public ``F.linear`` without ConvRot registration."""
+    if hasattr(torch.ops.piper_kernels, "nvfp4_linear"):
+        return
+    from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor  # noqa: PLC0415 - keep import lazy
+
+    weight = PiperNVFP4Tensor.from_quantized(
+        torch.empty(128, 32, dtype=torch.uint8, device="meta"),
+        torch.empty(32, 16, dtype=torch.float8_e4m3fn, device="meta"),
+        logical_dtype=torch.bfloat16,
+        is_swizzled_scales=True,
+        act_quant="dynamic",
+    )
+    with torch.no_grad():
+        F.linear(torch.empty(0, 64, dtype=torch.bfloat16, device="meta"), weight)
+
+
+def ensure_convrot_nvfp4_linear_ops() -> None:
+    """Register ConvRot NVFP4 linear custom ops via public ``F.linear`` if not yet loaded."""
+    if hasattr(torch.ops.piper_kernels, "convrot_nvfp4_linear"):
+        return
+    from piper_kernels.weights.convrot.nvfp4 import (  # noqa: PLC0415 - keep import lazy
+        ConvRotNVFP4Tensor,
+    )
+
+    weight = ConvRotNVFP4Tensor.from_quantized(
+        torch.empty(128, 32, dtype=torch.uint8, device="meta"),
+        torch.empty(32, 16, dtype=torch.float8_e4m3fn, device="meta"),
+        group_size=16,
+        logical_dtype=torch.bfloat16,
+        is_swizzled_scales=True,
+        act_quant="dynamic",
+    )
+    with torch.no_grad():
+        F.linear(torch.empty(0, 64, dtype=torch.bfloat16, device="meta"), weight)
 
 
 def uint8_int8_mma_available() -> bool:
