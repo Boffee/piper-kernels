@@ -2,9 +2,9 @@
 
 import pytest
 import torch
+from _accelerators import ensure_convrot_int8_linear_ops
 
 from piper_kernels import compile_options
-from piper_kernels.linear.convrot.int8 import _ops
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
@@ -94,8 +94,11 @@ def test_linear_validates_replaced_scale_storage(scale):
 
 @pytest.mark.parametrize("device", _DEVICES)
 def test_static_preparation_does_not_alias_checkpoint_scale(device):
+    ensure_convrot_int8_linear_ops()
     input_scale = torch.tensor(0.03125, device=device)
-    _, row_scales = _ops.prepare_input(torch.zeros(2, 64, device=device), 64, None, input_scale)
+    _, row_scales = torch.ops.piper_kernels.convrot_int8_prepare_input(
+        torch.zeros(2, 64, device=device), 64, None, input_scale
+    )
     assert row_scales.untyped_storage().data_ptr() != input_scale.untyped_storage().data_ptr()
     torch.testing.assert_close(row_scales, input_scale.expand(2), rtol=0, atol=0)
     row_scales.zero_()

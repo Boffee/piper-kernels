@@ -2,12 +2,11 @@
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import ensure_nvfp4_linear_ops, exact_sm120_available
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import compile_options
-from piper_kernels.linear.nvfp4 import _ops as _nvfp4_ops  # noqa: F401 - registers custom ops
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 
@@ -25,6 +24,7 @@ def _linear(
     global_scale: torch.fx.Node,
     activation_scale: torch.fx.Node | None,
 ) -> torch.fx.Node:
+    ensure_nvfp4_linear_ops()
     node = graph.call_function(
         torch.ops.piper_kernels.nvfp4_linear.default,
         args=(input, qdata, scale, global_scale, activation_scale, None, False, False),
@@ -115,6 +115,7 @@ def test_pass_leaves_eligible_singleton_semantic() -> None:
 
 @pytest.mark.parametrize("case", ["missing-metadata", "wrong-dtype", "wrong-width"])
 def test_pass_fails_closed_for_malformed_semantic_linears(case: str) -> None:
+    ensure_nvfp4_linear_ops()
     graph = torch.fx.Graph()
     input_value = torch.empty(17, 240 if case == "wrong-width" else 256, device="meta")
     input = (  # noqa: A001

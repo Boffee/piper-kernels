@@ -4,6 +4,7 @@ from typing import TypedDict, Unpack
 
 import pytest
 import torch
+from _accelerators import ensure_convrot_int8_linear_ops
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
@@ -23,7 +24,6 @@ from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fus
 from piper_kernels.fusions.convrot_int8_sparse_piper import query as fused_query
 from piper_kernels.fusions.convrot_int8_sparse_piper import value as fused_value
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
-from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 from .._accuracy import assert_fusion_output_close
@@ -608,8 +608,9 @@ def _run_explicit_fused_projection(  # noqa: PLR0913
     force_tile_ids: torch.Tensor | None = None,
     force_tile_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    ensure_convrot_int8_linear_ops()
     query_input, key_input, value_input = (
-        int8_ops.prepare_input(
+        torch.ops.piper_kernels.convrot_int8_prepare_input(
             hidden_states,
             projection.weight.group_size,
             input_scale=projection.weight.act_per_tensor_scale,

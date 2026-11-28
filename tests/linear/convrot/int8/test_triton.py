@@ -7,14 +7,13 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from _accelerators import exact_sm120_available
+from _accelerators import ensure_convrot_int8_linear_ops, exact_sm120_available
 from torch import nn
 
 from piper_kernels import compile_options
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend
-from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 from piper_kernels.linear.convrot.int8 import triton as int8_kernels
 from piper_kernels.linear.convrot.int8._nvidia.policy import (
     baseline_execution_plan,
@@ -1540,13 +1539,15 @@ def test_semantic_linear_fake_kernel_traces_large_shapes_under_fullgraph_compile
     scale = torch.empty(out_features, 1, dtype=torch.float32, device="meta")
     bias = torch.empty(out_features, dtype=torch.bfloat16, device="meta") if with_bias else None
 
+    ensure_convrot_int8_linear_ops()
+
     def call(
         value: torch.Tensor,
         packed: torch.Tensor,
         weight_scale: torch.Tensor,
         linear_bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        return int8_ops.linear(
+        return torch.ops.piper_kernels.convrot_int8_linear(
             value,
             packed,
             weight_scale,
@@ -1602,8 +1603,9 @@ def test_cuda_semantic_linear_custom_ops_pass_opcheck(
     )
     scale = torch.rand(out_features, 1, dtype=torch.float32, device="cuda") * 0.01
     bias = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
+    ensure_convrot_int8_linear_ops()
     result = torch.library.opcheck(
-        int8_ops.linear,
+        torch.ops.piper_kernels.convrot_int8_linear.default,
         (activation, qdata, scale, bias, group_size, activation_fn),
     )
 

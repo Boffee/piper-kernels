@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from _accelerators import ensure_convrot_int8_linear_ops
 from lib.sparse_piper import reference_value_storage
 
 from piper_kernels.attention.kernels.sparse_piper.layout import (
@@ -13,7 +14,6 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
     padded_sequence_length,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import value as value_fusion
-from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 from ._helpers import projection_available
 from ._reference import composed_value_projection
@@ -173,8 +173,9 @@ def test_fused_value_tile_means_respect_internal_block_lengths(input_features: i
     operands = _random_operands(sequence_length=128, input_features=input_features)
     block_lengths = torch.tensor([64, 17], device="cuda", dtype=torch.int32)
 
+    ensure_convrot_int8_linear_ops()
     actual = value_fusion._project_value_op(*operands.as_tuple(), block_lengths)
-    projected = int8_ops.linear_prepared(
+    projected = torch.ops.piper_kernels.convrot_int8_linear_prepared(
         *operands.as_tuple(),
         None,
         torch.float32,
@@ -209,10 +210,11 @@ def test_fused_value_projection_supports_full_blocks_batches_and_odd_heads() -> 
 @pytest.mark.skipif(not projection_available(), reason="requires fused sparse projection support")
 def test_fused_value_mean_stays_below_the_tile_int8_error_floor() -> None:
     operands = _random_operands(sequence_length=192, input_features=256, heads=3)
+    ensure_convrot_int8_linear_ops()
     _value, value_scale_multiplier, value_mean = value_fusion._project_value_op(
         *operands.as_tuple()
     )
-    materialized = int8_ops.linear_prepared(
+    materialized = torch.ops.piper_kernels.convrot_int8_linear_prepared(
         *operands.as_tuple(),
         None,
         torch.bfloat16,

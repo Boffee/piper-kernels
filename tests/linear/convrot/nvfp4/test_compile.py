@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import (
+    ensure_convrot_nvfp4_linear_ops,
+    ensure_nvfp4_linear_ops,
+    exact_sm120_available,
+)
 from _compile_capture import TargetCapturePass
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import compile_options
-from piper_kernels.linear.convrot.nvfp4 import (
-    _ops as _convrot_nvfp4_ops,  # noqa: F401 - registers custom ops
-)
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
@@ -37,10 +38,12 @@ def _linear(
 ) -> torch.fx.Node:
     args = (input, qdata, scale, global_scale, activation_scale, None, dynamic)
     if group_size is None:
+        ensure_nvfp4_linear_ops()
         node = graph.call_function(
             torch.ops.piper_kernels.nvfp4_linear.default, (*args, high_first)
         )
     else:
+        ensure_convrot_nvfp4_linear_ops()
         node = graph.call_function(
             torch.ops.piper_kernels.convrot_nvfp4_linear.default, (*args, group_size, high_first)
         )

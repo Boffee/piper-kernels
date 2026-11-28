@@ -8,7 +8,6 @@ from collections.abc import Iterator
 from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from datetime import timedelta
-from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,7 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from _accelerators import mock_triton_driver
+from _accelerators import mock_cuda_target, mock_triton_driver
 from _compile_capture import FunctionalTargetCapturePass
 from torch import nn
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -1155,28 +1154,27 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
         dispatch as nvidia_dispatch,
     )
 
-    qdata = torch.empty((1, 128, 128), dtype=torch.int8)
-    scale = torch.empty((1, 128), dtype=torch.float32)
-    weight = torch.empty((256, 128), dtype=torch.int8)
-    weight_scale = torch.empty((256, 1), dtype=torch.float32)
-    cos = torch.empty((128, 64), dtype=torch.float32)
-    sin = torch.empty((128, 64), dtype=torch.float32)
-    k_out = key_ops.allocate_key_output(qdata, 1, 2, 128, 128, 0)
-    v_out = value_ops.allocate_value_output(qdata, 1, 2, 128, 128, ValueFormat.TRANSPOSED)
+    with FakeTensorMode():
+        qdata = torch.empty((1, 128, 128), device="cuda:0", dtype=torch.int8)
+        scale = torch.empty((1, 128), device="cuda:0", dtype=torch.float32)
+        weight = torch.empty((256, 128), device="cuda:0", dtype=torch.int8)
+        weight_scale = torch.empty((256, 1), device="cuda:0", dtype=torch.float32)
+        cos = torch.empty((128, 64), device="cuda:0", dtype=torch.float32)
+        sin = torch.empty((128, 64), device="cuda:0", dtype=torch.float32)
+        k_out = key_ops.allocate_key_output(qdata, 1, 2, 128, 128, 0)
+        v_out = value_ops.allocate_value_output(qdata, 1, 2, 128, 128, ValueFormat.TRANSPOSED)
+        triton_qdata = torch.empty((1, 128, 144), device="cuda:0", dtype=torch.int8)
+        triton_weight = torch.empty((256, 144), device="cuda:0", dtype=torch.int8)
 
     sm120 = AcceleratorTarget("cuda", "sm120")
-    sm89 = AcceleratorTarget("cuda", "sm89")
-    orig_default_plan = nvidia_dispatch.default_execution_plan
-    sm120_key_plan = orig_default_plan(
+    sm120_key_plan = nvidia_dispatch.default_execution_plan(
         qdata, weight, operation="key", head_dim=128, rotary_dim=64, target=sm120
     )
-    sm120_value_plan = orig_default_plan(
+    sm120_value_plan = nvidia_dispatch.default_execution_plan(
         qdata, weight, operation="value", head_dim=128, target=sm120
     )
 
-    monkeypatch.setattr(
-        nvidia_dispatch, "default_execution_plan", partial(orig_default_plan, target=sm120)
-    )
+    mock_cuda_target(monkeypatch, (12, 0))
     assert (
         nvidia_dispatch.partial_row_block_size(
             qdata, weight, operation="key", head_dim=128, rotary_dim=64
@@ -1204,7 +1202,7 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         == 128
     )
-    with pytest.raises(ValueError, match="Triton execution plan"):
+    with FakeTensorMode(), pytest.raises(ValueError, match="Triton execution plan"):
         nvidia_dispatch.project_key(
             qdata,
             scale,
@@ -1221,7 +1219,7 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
             start_row_block=1,
             num_row_blocks=1,
         )
-    with pytest.raises(ValueError, match="Triton execution plan"):
+    with FakeTensorMode(), pytest.raises(ValueError, match="Triton execution plan"):
         nvidia_dispatch.project_value(
             qdata,
             scale,
@@ -1235,11 +1233,7 @@ def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
             num_row_blocks=1,
         )
 
-    monkeypatch.setattr(
-        nvidia_dispatch, "default_execution_plan", partial(orig_default_plan, target=sm89)
-    )
-    triton_qdata = torch.empty((1, 128, 144), dtype=torch.int8)
-    triton_weight = torch.empty((256, 144), dtype=torch.int8)
+    mock_cuda_target(monkeypatch, (8, 9))
     assert (
         nvidia_dispatch.partial_row_block_size(
             triton_qdata, triton_weight, operation="key", head_dim=128, rotary_dim=64

@@ -12,14 +12,15 @@ from typing import Literal
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
+from _accelerators import (
+    ensure_convrot_int8_linear_ops,
+    ensure_nvfp4_linear_ops,
+    exact_sm120_available,
+)
 from _compile_capture import TargetCapturePass
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import compile_options
-from piper_kernels.fusions.ffn._compile import fold_ffns
-from piper_kernels.linear.convrot.int8 import _ops as int8_ops
-from piper_kernels.linear.nvfp4 import _ops as _nvfp4_ops  # noqa: F401 - registers nvfp4_linear
 
 from ._helpers import (
     Activation,
@@ -39,6 +40,13 @@ from ._helpers import (
 _POST_GRAD_PRE_PASS = "post_grad_custom_pre_pass"
 _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
 _SM120 = pytest.mark.skipif(not exact_sm120_available(), reason="requires exact NVIDIA SM120")
+
+
+def _run_ffn_pass(graph: torch.fx.Graph) -> None:
+    passes = compile_options(linear=False, ffn=True)[_POST_GRAD_PRE_PASS]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=True)
 
 
 def test_compile_options_install_idempotent_and_preserve_unrelated_options() -> None:
@@ -352,7 +360,8 @@ def test_convrot_int8_static_ffn_feeds_unfused_projection_and_cache_isolation() 
     with torch.inference_mode():
         gate, value = model.gate(source), model.value(source)
         weight = model.down.weight
-        down = int8_ops.linear(
+        ensure_convrot_int8_linear_ops()
+        down = torch.ops.piper_kernels.convrot_int8_linear(
             torch.cat((value, gate), dim=-1),
             weight.qdata,
             weight.scale,
@@ -715,6 +724,7 @@ def _add_int8_linear_node(
     out_features: int,
     device: str,
 ) -> torch.fx.Node:
+    ensure_convrot_int8_linear_ops()
     weight = graph.placeholder(f"{name}_w")
     weight.meta["val"] = torch.empty(out_features, in_features, dtype=torch.int8, device=device)
     scale = graph.placeholder(f"{name}_s")
@@ -740,6 +750,7 @@ def _add_nvfp4_meta_linear_node(
     rows: int,
     features: int,
 ) -> torch.fx.Node:
+    ensure_nvfp4_linear_ops()
     weight = graph.placeholder(f"{name}_q")
     weight.meta["val"] = torch.empty(features, features // 2, dtype=torch.uint8, device="meta")
     scale = graph.placeholder(f"{name}_s")
@@ -892,7 +903,7 @@ def test_schema_bound_activation_matching_accepts_kwargs_and_checks_alpha(
 
         down = _add_nvfp4_meta_linear_node(graph, "down", activated, rows, features)
         graph.output(down)
-        fold_ffns(graph)
+        _run_ffn_pass(graph)
         targets = [node.target for node in graph.nodes if node.op == "call_function"]
 
     ffn_op = getattr(torch.ops.piper_kernels, "nvfp4_ffn", None)
@@ -966,7 +977,7 @@ def test_schema_bound_gated_updates_accept_kwargs_and_check_alpha(
         )
         output.meta["val"] = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
         graph.output(output)
-        fold_ffns(graph)
+        _run_ffn_pass(graph)
         target_names = [str(node.target) for node in graph.nodes if node.op == "call_function"]
 
     assert ("piper_kernels.convrot_int8_ffn_update_.default" in target_names) is should_fold_update
@@ -1010,7 +1021,7 @@ def test_nvfp4_swiglu_coalesces_duplicate_autocast_inputs(external_consumer: boo
         )
         down = _add_nvfp4_meta_linear_node(graph, "down", activated, rows, features)
         graph.output((down, cast_val) if external_consumer else down)
-        fold_ffns(graph)
+        _run_ffn_pass(graph)
         graph.lint()
         target_names = [str(node.target) for node in graph.nodes if node.op == "call_function"]
 

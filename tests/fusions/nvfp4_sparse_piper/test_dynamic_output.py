@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import pytest
 import torch
-from _accelerators import exact_sm120_available
-
-from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
-    _sparse_piper_attention_from_quantized_op,
+from _accelerators import (
+    ensure_convrot_nvfp4_linear_ops,
+    ensure_nvfp4_linear_ops,
+    exact_sm120_available,
 )
+
 from piper_kernels.fusions.nvfp4_sparse_piper import output
-from piper_kernels.linear.convrot.nvfp4 import _ops as convrot_ops
-from piper_kernels.linear.nvfp4 import _ops
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
 from .._accuracy import assert_fusion_output_close
@@ -61,10 +60,16 @@ def test_dynamic_output_reuses_storage_and_replays(
     }
 
     def reference() -> torch.Tensor:
-        attended = _sparse_piper_attention_from_quantized_op(*attention_args, output_dtype=dtype)
+        attended = torch.ops.piper_kernels.sparse_piper_attention_from_quantized(
+            *attention_args, output_dtype=dtype
+        )
         if group_size is None:
-            return _ops.linear(attended.flatten(2), *projection_args, True, high_first)
-        return convrot_ops.linear(
+            ensure_nvfp4_linear_ops()
+            return torch.ops.piper_kernels.nvfp4_linear(
+                attended.flatten(2), *projection_args, True, high_first
+            )
+        ensure_convrot_nvfp4_linear_ops()
+        return torch.ops.piper_kernels.convrot_nvfp4_linear(
             attended.flatten(2), *projection_args, True, group_size, high_first
         )
 

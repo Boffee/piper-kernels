@@ -6,14 +6,26 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from _accelerators import forbid_device_probes, mock_cuda_target, mock_rocm_target
+from _accelerators import (
+    ensure_convrot_int8_linear_ops,
+    forbid_device_probes,
+    mock_cuda_target,
+    mock_rocm_target,
+)
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from piper_kernels import compile_options
 from piper_kernels._input_activations import apply_input_activation
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as sparse_output
-from piper_kernels.fusions.ffn import _compile as ffn_compile
 from piper_kernels.fusions.ffn import _convrot_int8 as ffn
 from piper_kernels.linear.convrot.int8 import _backend, reference
+
+
+def _run_ffn_pass(graph: torch.fx.Graph) -> None:
+    passes = compile_options(linear=False, ffn=True)["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=True)
 
 
 @pytest.fixture
@@ -176,6 +188,7 @@ def test_ffn_core_supports_one_source_gelu_topology(operations, chunk_rows):
 
 
 def _semantic_ffn_graph(device, output_features=20):
+    ensure_convrot_int8_linear_ops()
     graph = torch.fx.Graph()
 
     def placeholder(name, shape, dtype):
@@ -231,7 +244,7 @@ def test_ffn_compiler_uses_backend_support_not_device_family(
         forbid_device_probes(monkeypatch, "device probe")
     with FakeTensorMode():
         module, _value = _semantic_ffn_graph(device)
-        ffn_compile.fold_ffns(module.graph)
+        _run_ffn_pass(module.graph)
     targets = [node.target for node in module.graph.nodes]
     assert (torch.ops.piper_kernels.convrot_int8_ffn.default in targets) is supported
     assert targets.count(torch.ops.piper_kernels.convrot_int8_linear.default) == (
@@ -254,7 +267,7 @@ def test_ffn_compiler_preserves_unfused_consumers(monkeypatch, argument_count):
             )
         consumer.meta = down.meta.copy()
         output.args = (consumer,)
-        ffn_compile.fold_ffns(graph)
+        _run_ffn_pass(graph)
         graph.lint()
     assert len(consumer.args) == argument_count
     assert consumer.args[0].target == torch.ops.piper_kernels.convrot_int8_ffn.default

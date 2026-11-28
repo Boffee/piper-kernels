@@ -7,11 +7,16 @@ from _compile_capture import FunctionalTargetCapturePass
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from piper_kernels import compile_options
-from piper_kernels.fusions.residual_updates import _compile as residual_compile
-from piper_kernels.fusions.residual_updates._graph import RESIDUAL_ADD
 
 _aten = torch.ops.aten
 _AUTO_FUNCTIONALIZED = torch.ops.higher_order.auto_functionalized
+
+
+def _run_residual_pass(graph: torch.fx.Graph) -> None:
+    passes = compile_options(linear=False, residual_updates=True)["post_grad_custom_pre_pass"]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph, is_inference=True)
 
 
 def _metadata(*shape, dtype=torch.bfloat16):
@@ -72,13 +77,13 @@ def test_gated_sums_from_the_copied_input_become_chained_adds(
         updates, python_indexing=python_indexing, gate_first=gate_first
     )
 
-    residual_compile.fold_residual_updates(graph)
+    _run_residual_pass(graph)
 
     adds = _adds(graph)
     assert len(adds) == updates
     base = hidden
     for add in adds:
-        assert add.args == (RESIDUAL_ADD,)
+        assert add.args == (torch.ops.piper_kernels.residual_add_.default,)
         assert add.kwargs["base"] is base
         assert add.kwargs["python_indexing"] is python_indexing
         (base,) = add.users
@@ -100,7 +105,7 @@ def test_sums_stay_unless_each_can_add_into_the_copied_input(monkeypatch, suppor
     mock_triton_driver(monkeypatch, backend="cuda", arch=120 if supported else 60)
     graph, _ = _copy_back_graph(2, **graph_options)
 
-    residual_compile.fold_residual_updates(graph)
+    _run_residual_pass(graph)
 
     assert not _adds(graph)
     assert sum(node.target is _aten.add.Tensor for node in graph.nodes) == 2
@@ -123,4 +128,5 @@ def test_cpu_block_keeps_its_sums_and_runs():
         torch.compile(block, fullgraph=True, options=options)(hidden, update, gate, indices)
 
     torch.testing.assert_close(hidden, expected, rtol=0.02, atol=0.02)
-    assert RESIDUAL_ADD not in capture.targets
+    residual_add = getattr(torch.ops.piper_kernels, "residual_add_", None)
+    assert residual_add is None or residual_add.default not in capture.targets

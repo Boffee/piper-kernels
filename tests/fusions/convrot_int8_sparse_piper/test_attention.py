@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from _accelerators import ensure_convrot_int8_linear_ops
 from lib.sparse_piper import reference_value_storage
 from torch.nn import functional as F  # noqa: N812
 
@@ -14,11 +15,7 @@ from piper_kernels.attention.sparse_piper_attention._backend import require_atte
 from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MINMAX_ROUTING,
 )
-from piper_kernels.attention.sparse_piper_attention._quantized_dispatch import (
-    _sparse_piper_attention_from_quantized_op,
-)
 from piper_kernels.fusions.convrot_int8_sparse_piper import key, query, value
-from piper_kernels.linear.convrot.int8 import _ops as int8_ops
 
 from ._helpers import projection_available
 
@@ -158,7 +155,7 @@ def _run_sparse_piper_attention_from_quantized(
     logical_sequence_length: int,
     sparse_key_blocks: int,
 ) -> torch.Tensor:
-    return _sparse_piper_attention_from_quantized_op(
+    return torch.ops.piper_kernels.sparse_piper_attention_from_quantized(
         *prepared_query,
         *prepared_key,
         *prepared_value,
@@ -177,7 +174,8 @@ def _materialize_qk(
 ) -> torch.Tensor:
     batch, sequence_length, _input_features = operands.input_qdata.shape
     heads = weight.shape[0] // _HEAD_DIM
-    projected = int8_ops.linear_prepared(
+    ensure_convrot_int8_linear_ops()
+    projected = torch.ops.piper_kernels.convrot_int8_linear_prepared(
         operands.input_qdata,
         operands.input_scale,
         weight,
@@ -198,7 +196,8 @@ def _materialize_qk(
 
 def _materialize_value(operands: _Operands) -> torch.Tensor:
     batch, sequence_length, _input_features = operands.input_qdata.shape
-    return int8_ops.linear_prepared(
+    ensure_convrot_int8_linear_ops()
+    return torch.ops.piper_kernels.convrot_int8_linear_prepared(
         operands.input_qdata,
         operands.input_scale,
         operands.value_weight,

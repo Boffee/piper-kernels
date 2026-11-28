@@ -7,10 +7,17 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.nn import functional
 
 from piper_kernels import compile_options
-from piper_kernels.conv3d.convrot.int8._compile import fuse_padding
+from piper_kernels.conv3d.convrot.int8 import conv3d as _conv3d  # noqa: F401 - registers custom op
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 
 _CONV = torch.ops.piper_kernels.convrot_int8_conv3d.default
+
+
+def _run_padding_pass(graph: torch.fx.Graph) -> None:
+    passes = compile_options(linear=False, conv3d=True)["pre_grad_custom_pass"]
+    assert isinstance(passes, tuple)
+    for compiler_pass in passes:
+        compiler_pass(graph)
 
 
 def _weight(device="cpu"):
@@ -69,7 +76,7 @@ def test_padding_rewrite_preserves_outputs_and_unmatched_operations(pattern, dev
     with torch.no_grad():
         gm = torch._dynamo.export(run, assume_static_by_default=static)(x, weight).graph_module
         expected = gm(x, weight)
-        fuse_padding(gm.graph)
+        _run_padding_pass(gm.graph)
         gm.recompile()
         torch.testing.assert_close(gm(x, weight), expected, atol=0, rtol=0)
         pads = [n for n in gm.graph.nodes if n.target is torch._C._nn.pad]
@@ -113,7 +120,7 @@ def test_padding_fusion_preserves_autocast_rounding(device, scope):
         expected = run(x, weight, bias)
         torch.testing.assert_close(compiled(x, weight, bias), expected, atol=0, rtol=0)
         gm = torch._dynamo.export(run, assume_static_by_default=True)(x, weight, bias).graph_module
-        fuse_padding(gm.graph)
+        _run_padding_pass(gm.graph)
         assert all(n.target is not torch._C._nn.pad for n in gm.graph.nodes)
 
 
@@ -132,7 +139,7 @@ def test_padding_options_composition_and_no_float_weight_rewrite():
             torch.randn(1, 64, 2, 4, 4), torch.randn(16, 64, 3, 3, 3)
         ).graph_module
         original = str(gm.graph)
-        fuse_padding(gm.graph)
+        _run_padding_pass(gm.graph)
         assert str(gm.graph) == original
 
 
@@ -172,7 +179,7 @@ def test_padding_fusion_requires_proven_reflection_bounds(symbolic):
     guards = list(shape_env.guards)
     deferred_asserts = dict(shape_env.deferred_runtime_asserts)
     with torch.no_grad():
-        fuse_padding(graph)
+        _run_padding_pass(graph)
     # An invalid or unknown bound cannot become valid just because the tracing
     # example happens to fit. Matching must not introduce shape guards/asserts.
     assert conv.args[0] is padded

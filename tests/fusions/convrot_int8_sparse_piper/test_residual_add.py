@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from piper_kernels import SparsePiperAttention
-from piper_kernels.attention.sparse_piper_attention._contracts import _SparsePiperRatioProfile
 from piper_kernels.fusions.convrot_int8_sparse_piper import output as output_fusion
 
 from ._helpers import output_available
@@ -124,7 +123,7 @@ def _fake_arguments(base: torch.Tensor) -> tuple[object, ...]:
         torch.empty((2, 3, 128, 192), dtype=torch.int8, **meta),
         torch.empty((2, 3, 3, 1), dtype=torch.float32, **meta),
         torch.empty((2, 3, 3, 128), dtype=torch.bfloat16, **meta),
-        _SparsePiperRatioProfile((500_000, 1_000_000, 750_000)),
+        SparsePiperAttention((0.5, 1.0, 0.75))._ratio_profile,
         2,
         132,
         0,
@@ -163,7 +162,7 @@ def _fake_slice_arguments(profile_heads: int) -> tuple[object, ...]:
     """The padded fake arguments with a profile of ``profile_heads`` 50% heads."""
     base = torch.empty((2, 192, _OUTPUT_FEATURES), device="meta", dtype=torch.bfloat16)
     arguments = list(_fake_arguments(base))
-    arguments[22] = _SparsePiperRatioProfile((500_000,) * profile_heads)
+    arguments[22] = SparsePiperAttention((0.5,) * profile_heads)._ratio_profile
     return tuple(arguments)
 
 
