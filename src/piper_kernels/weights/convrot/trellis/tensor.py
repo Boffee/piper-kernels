@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 import torch
 from torch._guards import detect_fake_mode
@@ -17,17 +17,15 @@ from piper_kernels.trellis._layout import (
 )
 from piper_kernels.weights._dispatch import (
     QuantizedWeight,
-    register_conversion_ops,
+    require_untransposed,
     unsupported_operation_dispatch,
 )
 from piper_kernels.weights._matmul import register_matrix_ops
-from piper_kernels.weights._views import register_view_ops, require_untransposed
+from piper_kernels.weights._views import register_view_ops
 from piper_kernels.weights.convrot._rotation import validate_group_size
 from piper_kernels.weights.convrot.int8._quantization import dequantize_weight
 
 if TYPE_CHECKING:
-    from torch.distributed.device_mesh import DeviceMesh
-
     from piper_kernels.trellis import TrellisHessian, TrellisStorage
 
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -229,14 +227,20 @@ class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatib
     """
 
     _format_name: ClassVar[str] = "ConvRot Trellis"
-    _update_format_name: ClassVar[str] = "ConvRot Trellis"
     _contiguous_memory_format_only: ClassVar[bool] = True
+    _validates_storage_in_new: ClassVar[bool] = True
 
     tensor_data_names: ClassVar[list[str]] = ["bitstreams", "block_scales", "scale"]
     tensor_attribute_names: ClassVar[list[str]] = ["block_size", "group_size", "dtype"]
     optional_tensor_data_names: ClassVar[list[str]] = ["row_widths"]
-    row_widths: torch.Tensor | None = None
     optional_tensor_attribute_names: ClassVar[list[str]] = ["transposed"]
+
+    bitstreams: torch.Tensor
+    block_scales: torch.Tensor
+    scale: torch.Tensor
+    block_size: int
+    group_size: int
+    row_widths: torch.Tensor | None = None
     transposed: bool = False
 
     def __new__(
@@ -249,20 +253,26 @@ class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatib
         dtype: torch.dtype = torch.bfloat16,
         row_widths: torch.Tensor | None = None,
         transposed: bool = False,
+        *,
+        _validate: bool = True,
     ) -> ConvRotTrellisTensor:
-        if type(transposed) is not bool:
-            raise TypeError("ConvRot Trellis transposed must be bool")
-        rows, in_features, _ = validate_storage(
-            bitstreams,
-            block_scales,
-            scale,
-            block_size,
-            group_size,
-            dtype,
-            row_widths=row_widths,
-            require_contiguous=True,
-        )
-        return torch.Tensor._make_wrapper_subclass(
+        if _validate:
+            if type(transposed) is not bool:
+                raise TypeError("ConvRot Trellis transposed must be bool")
+            rows, in_features, _ = validate_storage(
+                bitstreams,
+                block_scales,
+                scale,
+                block_size,
+                group_size,
+                dtype,
+                row_widths=row_widths,
+                require_contiguous=True,
+            )
+        else:
+            rows = block_scales.shape[0]
+            in_features = block_scales.shape[1] * block_size
+        tensor = torch.Tensor._make_wrapper_subclass(
             cls,
             (in_features, rows) if transposed else (rows, in_features),
             strides=(1, max(1, in_features)) if transposed else None,
@@ -270,28 +280,14 @@ class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatib
             dtype=dtype,
             requires_grad=False,
         )
-
-    def __init__(
-        self,
-        bitstreams: torch.Tensor,
-        block_scales: torch.Tensor,
-        scale: torch.Tensor,
-        block_size: int,
-        group_size: int,
-        dtype: torch.dtype = torch.bfloat16,
-        row_widths: torch.Tensor | None = None,
-        transposed: bool = False,
-    ) -> None:
-        super().__init__()
-        if self.dtype is not dtype:
-            raise RuntimeError(f"ConvRot Trellis wrapper dtype mismatch: {self.dtype} != {dtype}")
-        self.bitstreams = bitstreams
-        self.block_scales = block_scales
-        self.scale = scale
-        self.block_size = block_size
-        self.group_size = group_size
-        self.row_widths = row_widths
-        self.transposed = transposed
+        tensor.bitstreams = bitstreams
+        tensor.block_scales = block_scales
+        tensor.scale = scale
+        tensor.block_size = block_size
+        tensor.group_size = group_size
+        tensor.row_widths = row_widths
+        tensor.transposed = transposed
+        return cast(ConvRotTrellisTensor, tensor)
 
     def _transpose(self) -> Self:
         """Reverse the logical axes while retaining canonical rowwise storage."""
@@ -344,6 +340,7 @@ class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatib
             group_size,
             logical_dtype,
             None if row_widths is None else row_widths.contiguous(),
+            _validate=False,
         )
 
     @classmethod
@@ -471,30 +468,6 @@ class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatib
             result = dequantize_weight(values, self.scale, self.group_size, output_dtype)
         return result.t() if self.transposed else result
 
-    def _stable_hash_for_caching(self) -> str:
-        """Return a metadata fingerprint for AOTAutograd's cross-process cache."""
-        return repr(
-            (
-                type(self).__qualname__,
-                "piper_kernels::convrot_int8_linear",
-                tuple(self.shape),
-                self.stride(),
-                str(self.device),
-                str(self.dtype),
-                tuple(self.bitstreams.shape),
-                self.bitstreams.stride(),
-                tuple(self.block_scales.shape),
-                self.block_scales.stride(),
-                tuple(self.scale.shape),
-                self.scale.stride(),
-                None if self.row_widths is None else tuple(self.row_widths.shape),
-                None if self.row_widths is None else self.row_widths.stride(),
-                self.block_size,
-                self.group_size,
-                self.transposed,
-            )
-        )
-
     def _validate_storage_for_export(self) -> None:
         require_untransposed(self, "storage export")
         validate_storage(
@@ -508,51 +481,16 @@ class ConvRotTrellisTensor(QuantizedWeight):  # pyright: ignore[reportIncompatib
             require_contiguous=True,
         )
 
-    def _copy_storage_tensors(self, operation: str) -> dict[str, torch.Tensor]:
-        require_untransposed(self, operation)
-        validate_storage(
-            self.bitstreams,
-            self.block_scales,
-            self.scale,
-            self.block_size,
-            self.group_size,
-            self.dtype,
-            row_widths=self.row_widths,
-            require_contiguous=True,
-        )
-        names, _ = self.__tensor_flatten__()
-        return {name: getattr(self, name) for name in names}
-
-    def _update_target(self, operation: str) -> tuple[Any, tuple[object, ...]]:
-        raise NotImplementedError(f"ConvRot Trellis does not support in-place {operation}")
-
-    def fsdp_pre_all_gather(
-        self,
-        mesh: DeviceMesh,
-    ) -> tuple[tuple[torch.Tensor, ...], object]:
-        del mesh
-        raise NotImplementedError("ConvRot Trellis does not support FSDP2")
-
-    def fsdp_post_all_gather(
-        self,
-        all_gather_outputs: tuple[torch.Tensor, ...],
-        metadata: object,
-        param_dtype: torch.dtype,
-        *,
-        out: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]] | None:
-        del all_gather_outputs, metadata, param_dtype, out
-        raise NotImplementedError("ConvRot Trellis does not support FSDP2")
-
 
 register_view_ops(ConvRotTrellisTensor)
 register_matrix_ops(ConvRotTrellisTensor)
-register_conversion_ops(ConvRotTrellisTensor, format_name=ConvRotTrellisTensor._format_name)
 ConvRotTrellisTensor.implements(
     [
         torch.ops.aten.add_.Tensor,
         torch.ops.aten.addmm_.default,
         torch.ops.aten.embedding.default,
+        torch.ops.aten.new_zeros.default,
+        torch.ops.aten.split.Tensor,
     ]
 )(unsupported_operation_dispatch)
 

@@ -293,6 +293,9 @@ def test_unsupported_block1_operations_raise_not_implemented() -> None:
     weight = _make_weight(4, 256, block_size=256, group_size=64)
     x = torch.randn(2, 256, dtype=torch.bfloat16)
 
+    assert not hasattr(weight, "fsdp_pre_all_gather")
+    assert not hasattr(weight, "fsdp_post_all_gather")
+
     for call in (
         lambda: F.embedding(torch.tensor([0, 2]), weight),
         lambda: weight.add_(torch.zeros(4, 256, dtype=torch.bfloat16)),
@@ -303,8 +306,9 @@ def test_unsupported_block1_operations_raise_not_implemented() -> None:
             torch.zeros(4, 2, dtype=torch.bfloat16),
             torch.zeros(2, 256, dtype=torch.bfloat16),
         ),
-        lambda: weight.fsdp_pre_all_gather(None),  # type: ignore[arg-type]
-        lambda: weight.fsdp_post_all_gather((), None, torch.bfloat16),
+        lambda: weight.split(2, dim=0),
+        lambda: weight.new_zeros((2, 256)),
+        lambda: weight.view(-1),
         lambda: weight[:2],
         lambda: F.linear(torch.randn(2, 4, dtype=torch.bfloat16), weight.t()),
         lambda: torch.addmm(torch.zeros(4), x, weight.t(), alpha=0.5, beta=1),

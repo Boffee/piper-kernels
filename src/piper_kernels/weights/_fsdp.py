@@ -4,58 +4,58 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, ClassVar, TypeGuard, cast
 
 import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
-from piper_kernels.weights._dispatch import require_untransposed
+from piper_kernels.weights._dispatch import QuantizedWeight, require_untransposed
 
 if TYPE_CHECKING:
-    from torch._ops import OpOverload
     from torch.distributed.device_mesh import DeviceMesh
 
-    from piper_kernels.weights._dispatch import QuantizedWeight
     from piper_kernels.weights.convrot.int8.tensor import ConvRotInt8Tensor
     from piper_kernels.weights.nvfp4.tensor import PiperNVFP4Tensor
+
 
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-class _FlatQuantizedWeightView(torch.Tensor):
-    """Opaque 1-D storage handle returned for ``weight.view(-1)`` during FSDP2 setup."""
+class FSDPWeightMixin:
+    """Opt-in FSDP2 protocol hooks for quantized weights with 2-D row-sharded storage."""
 
-    def __new__(cls, source: torch.Tensor) -> _FlatQuantizedWeightView:
-        # Avoid holding a reference to source so state-dict swaps can reclaim stale shards.
-        return cast(
-            _FlatQuantizedWeightView,
-            torch.Tensor._make_wrapper_subclass(
-                cls,
-                (source.numel(),),
-                dtype=source.dtype,
-                device=source.device,
-                requires_grad=False,
-            ),
+    _supports_flat_1d_view: ClassVar[bool] = True
+
+    qdata: torch.Tensor
+    scale: torch.Tensor
+
+    def fsdp_pre_all_gather(
+        self,
+        mesh: DeviceMesh,
+    ) -> tuple[tuple[torch.Tensor, ...], object]:
+        """Expose sharded storage tensors and metadata for PyTorch FSDP2."""
+        return fsdp_pre_all_gather(cast("_FSDPWeight", self), mesh)
+
+    def fsdp_post_all_gather(
+        self,
+        all_gather_outputs: tuple[torch.Tensor, ...],
+        metadata: object,
+        param_dtype: torch.dtype,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]] | None:
+        """Reconstruct or refresh an unsharded weight from FSDP2 all-gather outputs."""
+        return fsdp_post_all_gather(
+            cast("_FSDPWeight", self),
+            all_gather_outputs,
+            metadata,
+            param_dtype,
+            out=out,
         )
 
-    def __repr__(self, *, tensor_contents: object = None) -> str:
-        _ = tensor_contents
-        return (
-            f"{type(self).__name__}(shape={tuple(self.shape)}, "
-            f"dtype={self.dtype}, device={self.device})"
-        )
 
-    @classmethod
-    def __torch_dispatch__(
-        cls,
-        func: OpOverload,
-        _types: tuple[type, ...],
-        _args: tuple[object, ...],
-        _kwargs: dict[str, object] | None = None,
-    ) -> object:
-        raise NotImplementedError(
-            f"1-D flat views of Piper quantized weights do not support {func}"
-        )
+if TYPE_CHECKING:
+    type _FSDPWeight = ConvRotInt8Tensor | PiperNVFP4Tensor
 
 
 @dataclass(frozen=True)
@@ -72,21 +72,6 @@ class _FSDPAllGatherMetadata:
     single_rank_scale: torch.Tensor | None = None
 
 
-class _NVFP4Layout(Protocol):
-    BLOCK_SIZE: int
-    SCALE_ROW_TILE: int
-
-    def qdata_shape(self, rows: int, features: int) -> tuple[int, int]: ...
-
-    def scale_shape(self, rows: int, features: int) -> tuple[int, int]: ...
-
-
-def _nvfp4_layout() -> _NVFP4Layout:
-    from piper_kernels.weights.nvfp4 import _layout  # noqa: PLC0415
-
-    return cast(_NVFP4Layout, _layout)
-
-
 def _is_int8_weight(weight: object) -> TypeGuard[ConvRotInt8Tensor]:
     from piper_kernels.weights.convrot.int8.tensor import ConvRotInt8Tensor  # noqa: PLC0415
 
@@ -101,15 +86,21 @@ def _is_nvfp4_weight(weight: object) -> TypeGuard[PiperNVFP4Tensor]:
     return isinstance(weight, PiperNVFP4Tensor)
 
 
-def _canonical_scale_shape(weight: QuantizedWeight, rows: int, features: int) -> tuple[int, int]:
+def _canonical_scale_shape(weight: _FSDPWeight, rows: int, features: int) -> tuple[int, int]:
     if _is_int8_weight(weight):
         return (rows, 1)
     if not _is_nvfp4_weight(weight):
         raise TypeError(f"unsupported quantized weight type {type(weight).__name__}")
-    return (
-        _nvfp4_layout().scale_shape(rows, features)
-        if weight.is_swizzled_scales
-        else (rows, features // weight.block_size)
+    from piper_kernels.weights.nvfp4._layout import canonical_scale_shape  # noqa: PLC0415
+
+    return cast(
+        tuple[int, int],
+        canonical_scale_shape(
+            rows,
+            features,
+            is_swizzled_scales=weight.is_swizzled_scales,
+            block_size=weight.block_size,
+        ),
     )
 
 
@@ -127,7 +118,7 @@ def _validate_optional_scalar(
         )
 
 
-def _require_fsdp_weight(weight: QuantizedWeight, operation: str) -> torch.Tensor:
+def _require_fsdp_weight(weight: _FSDPWeight, operation: str) -> torch.Tensor:
     """Validate 2-D untransposed storage and return canonical 2-D scale storage."""
     if weight.ndim != 2:
         raise NotImplementedError(f"{type(weight).__name__} {operation} requires a 2-D weight")
@@ -148,35 +139,13 @@ def _require_fsdp_weight(weight: QuantizedWeight, operation: str) -> torch.Tenso
     if not _is_nvfp4_weight(weight):
         raise TypeError(f"unsupported quantized weight type {type(weight).__name__}")
 
-    layout = _nvfp4_layout()
-    rows, features = weight.shape
-    if weight.block_size != layout.BLOCK_SIZE or features % layout.BLOCK_SIZE:
-        raise NotImplementedError(
-            f"{type(weight).__name__} {operation} requires complete 16-value quantization blocks"
-        )
-    if weight.qdata.dtype is not torch.uint8 or tuple(weight.qdata.shape) != layout.qdata_shape(
-        rows, features
-    ):
-        raise NotImplementedError(
-            f"{type(weight).__name__} {operation} requires canonical packed UINT8 data"
-        )
-    if weight.scale.dtype is not torch.float8_e4m3fn or weight.scale.device != weight.device:
-        raise NotImplementedError(
-            f"{type(weight).__name__} {operation} requires FP8 E4M3 scales on the weight device"
-        )
-    _validate_optional_scalar(
-        weight.per_tensor_scale, weight.device, label=f"{type(weight).__name__} {operation}"
-    )
-    _validate_optional_scalar(
-        weight.act_per_tensor_scale, weight.device, label=f"{type(weight).__name__} {operation}"
-    )
-    expected_2d = _canonical_scale_shape(weight, rows, features)
-    if tuple(weight.scale.shape) not in (expected_2d, (expected_2d[0] * expected_2d[1],)):
-        raise NotImplementedError(
-            f"{type(weight).__name__} {operation} requires canonical or flat block-scale storage"
-        )
-    return (
-        weight.scale if tuple(weight.scale.shape) == expected_2d else weight.scale.view(expected_2d)
+    from piper_kernels.weights.nvfp4._layout import validate_nvfp4_weight  # noqa: PLC0415
+
+    return validate_nvfp4_weight(
+        weight,
+        allowed_ndims=(2,),
+        error_type=NotImplementedError,
+        prefix=f"{type(weight).__name__} {operation}",
     )
 
 
@@ -212,7 +181,7 @@ def _copy_optional_tensors(
 
 
 def fsdp_pre_all_gather(
-    weight: QuantizedWeight,
+    weight: _FSDPWeight,
     mesh: DeviceMesh,
 ) -> tuple[tuple[torch.Tensor, ...], _FSDPAllGatherMetadata]:
     """Return all-gather payloads and metadata for PyTorch FSDP2."""
@@ -223,15 +192,18 @@ def fsdp_pre_all_gather(
     reswizzle = False
     scale_to_gather = canonical_scale
     if not _is_int8_weight(weight) and _is_nvfp4_weight(weight) and world_size > 1:
-        layout = _nvfp4_layout()
-        reswizzle = weight.is_swizzled_scales and local_rows % layout.SCALE_ROW_TILE != 0
-        if reswizzle:
-            from piper_kernels.weights.nvfp4._layout import from_blocked  # noqa: PLC0415
+        from piper_kernels.weights.nvfp4._layout import (  # noqa: PLC0415
+            BLOCK_SIZE,
+            SCALE_ROW_TILE,
+            from_blocked,
+        )
 
+        reswizzle = weight.is_swizzled_scales and local_rows % SCALE_ROW_TILE != 0
+        if reswizzle:
             scale_to_gather = from_blocked(
                 canonical_scale.view(torch.uint8),
                 local_rows,
-                features // layout.BLOCK_SIZE,
+                features // BLOCK_SIZE,
             ).contiguous()
 
     # PyTorch FSDP2 forwards only all_gather_inputs[0] when world_size == 1.
@@ -272,7 +244,7 @@ def _unpack_all_gather_outputs(
 
 
 def _prepare_refresh_scale(
-    target_weight: QuantizedWeight,
+    target_weight: _FSDPWeight,
     gathered_scale: torch.Tensor,
     metadata: _FSDPAllGatherMetadata,
     device: torch.device,
@@ -327,7 +299,7 @@ def _refresh_unsharded_param(
             f"expected unsharded parameter of type {metadata.cls.__name__}, "
             f"got {type(target).__name__}"
         )
-    target_weight = cast("QuantizedWeight", target)
+    target_weight = cast("_FSDPWeight", target)
     if tuple(target_weight.shape) != (full_rows, metadata.features):
         raise ValueError(
             f"unsharded parameter shape mismatch: expected {(full_rows, metadata.features)}, "
@@ -372,7 +344,7 @@ def _refresh_unsharded_param(
 
 
 def _validate_all_gather_outputs(
-    weight: QuantizedWeight,
+    weight: _FSDPWeight,
     qdata_full: torch.Tensor,
     gathered_scale: torch.Tensor,
     metadata: _FSDPAllGatherMetadata,
@@ -387,8 +359,9 @@ def _validate_all_gather_outputs(
         expected_scale_dtype = torch.float32
         expected_target_scale_shape: tuple[int, int] = expected_scale_shape
     elif _is_nvfp4_weight(weight):
-        layout = _nvfp4_layout()
-        expected_qdata_shape = layout.qdata_shape(full_rows, metadata.features)
+        from piper_kernels.weights.nvfp4._layout import BLOCK_SIZE, qdata_shape  # noqa: PLC0415
+
+        expected_qdata_shape = cast(tuple[int, int], qdata_shape(full_rows, metadata.features))
         expected_qdata_dtype = torch.uint8
         expected_target_scale_shape = _canonical_scale_shape(weight, full_rows, metadata.features)
         if metadata.reswizzle_nvfp4_scales:
@@ -396,7 +369,7 @@ def _validate_all_gather_outputs(
                 raise ValueError(
                     "reswizzle_nvfp4_scales requires a weight with swizzled NVFP4 scales"
                 )
-            expected_scale_shape = (full_rows, metadata.features // layout.BLOCK_SIZE)
+            expected_scale_shape = (full_rows, metadata.features // BLOCK_SIZE)
             expected_scale_dtype = torch.uint8
         else:
             expected_scale_shape = expected_target_scale_shape
@@ -438,7 +411,7 @@ def _validate_all_gather_outputs(
 
 
 def fsdp_post_all_gather(
-    weight: QuantizedWeight,
+    weight: _FSDPWeight,
     all_gather_outputs: tuple[torch.Tensor, ...],
     metadata: object,
     param_dtype: torch.dtype,
@@ -497,13 +470,21 @@ def fsdp_post_all_gather(
     return cast(torch.Tensor, unsharded), extra_inner_tensors
 
 
+def _nvfp4_split_scale_row_tile(weight: _FSDPWeight) -> int:
+    if _is_int8_weight(weight) or not (_is_nvfp4_weight(weight) and weight.is_swizzled_scales):
+        return 0
+    from piper_kernels.weights.nvfp4._layout import SCALE_ROW_TILE  # noqa: PLC0415
+
+    return SCALE_ROW_TILE
+
+
 def _split_dispatch(
     func: Callable[..., object],
     _types: tuple[type, ...],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> list[torch.Tensor]:
-    weight = cast("QuantizedWeight", args[0])
+    weight = cast("_FSDPWeight", args[0])
     split_size = args[1] if len(args) > 1 else kwargs["split_size"]
     dim = args[2] if len(args) > 2 else kwargs.get("dim", 0)
     canonical_scale = _require_fsdp_weight(weight, "split")
@@ -525,12 +506,8 @@ def _split_dispatch(
             f"(got split_size={split_size})"
         )
 
-    if _is_int8_weight(weight):
-        swizzled = False
-        scale_row_tile = 0
-    else:
-        swizzled = _is_nvfp4_weight(weight) and weight.is_swizzled_scales
-        scale_row_tile = _nvfp4_layout().SCALE_ROW_TILE if swizzled else 0
+    scale_row_tile = _nvfp4_split_scale_row_tile(weight)
+    swizzled = scale_row_tile > 0
     if swizzled and split_size < rows and split_size % scale_row_tile != 0:
         from piper_kernels.weights.sharding import shard_quantized_weight  # noqa: PLC0415
 
@@ -574,7 +551,7 @@ def _new_zeros_dispatch(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    weight = cast("QuantizedWeight", args[0])
+    weight = cast("_FSDPWeight", args[0])
     size = tuple(args[1] if len(args) > 1 else kwargs["size"])
     dtype = kwargs.get("dtype")
     layout = kwargs.get("layout")
@@ -608,8 +585,10 @@ def _new_zeros_dispatch(
         int8_weight = True
         qdata_dims: tuple[int, int] = (rows, features)
     elif _is_nvfp4_weight(weight):
+        from piper_kernels.weights.nvfp4._layout import qdata_shape  # noqa: PLC0415
+
         int8_weight = False
-        qdata_dims = _nvfp4_layout().qdata_shape(rows, features)
+        qdata_dims = cast(tuple[int, int], qdata_shape(rows, features))
     else:
         raise TypeError(f"unsupported quantized weight type {type(weight).__name__}")
     qdata = torch.zeros(
@@ -656,7 +635,7 @@ def register_fsdp_ops(cls: type[QuantizedWeight]) -> None:
 
 
 __all__ = [
-    "_FlatQuantizedWeightView",
+    "FSDPWeightMixin",
     "fsdp_post_all_gather",
     "fsdp_pre_all_gather",
     "register_fsdp_ops",

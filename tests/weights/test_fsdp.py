@@ -31,8 +31,10 @@ from torch.distributed.tensor.parallel import (
 from torch.nn import functional as F  # noqa: N812
 
 from piper_kernels import compile_options, piper_attention
+from piper_kernels.weights import QuantizedWeight
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
+from piper_kernels.weights.convrot.trellis import ConvRotTrellisTensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 from piper_kernels.weights.sharding import shard_quantized_weight
 
@@ -135,6 +137,35 @@ def _assert_weight_close(actual: Any, expected: Any) -> None:
 # ---------------------------------------------------------------------------
 # Single-process CPU unit tests
 # ---------------------------------------------------------------------------
+
+
+def test_trellis_weight_omits_fsdp_and_update_mixins() -> None:
+    trellis_weight = ConvRotTrellisTensor.from_quantized(
+        torch.randint(0, 256, (8, 4, 8), dtype=torch.uint8),
+        torch.ones((8, 4), dtype=torch.float8_e4m3fn),
+        torch.full((8, 1), 0.25, dtype=torch.float32),
+        block_size=16,
+        group_size=16,
+        logical_dtype=torch.bfloat16,
+    )
+    for target in (QuantizedWeight, trellis_weight):
+        assert not hasattr(target, "fsdp_pre_all_gather")
+        assert not hasattr(target, "fsdp_post_all_gather")
+        assert not hasattr(target, "_update_target")
+
+    for cls in (ConvRotInt8Tensor, PiperNVFP4Tensor, ConvRotNVFP4Tensor):
+        weight = _make_weight(cls, rows=32, features=128)
+        assert hasattr(weight, "fsdp_pre_all_gather")
+        assert hasattr(weight, "fsdp_post_all_gather")
+
+    for call in (
+        lambda: trellis_weight.split(4, dim=0),
+        lambda: trellis_weight.split(8, dim=0),
+        lambda: trellis_weight.new_zeros((4, 64)),
+        lambda: trellis_weight.view(-1),
+    ):
+        with pytest.raises(NotImplementedError):
+            call()
 
 
 @pytest.mark.parametrize(("cls", "swizzled", "high_first"), _FORMATS)

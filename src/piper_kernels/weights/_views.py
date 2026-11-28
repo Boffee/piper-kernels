@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch._prims_common import infer_size
@@ -14,8 +14,48 @@ from piper_kernels.weights._dispatch import (
     unsupported_operation_dispatch,
 )
 from piper_kernels.weights._dispatch import (
+    # Retained for linear/* callers until Wave 2 migrates them to weights._dispatch.
     require_untransposed as require_untransposed,  # noqa: PLC0414 - shared export
 )
+
+if TYPE_CHECKING:
+    from torch._ops import OpOverload
+
+
+class _FlatQuantizedWeightView(torch.Tensor):
+    """Opaque 1-D storage handle returned for ``weight.view(-1)`` during FSDP2 setup."""
+
+    def __new__(cls, source: torch.Tensor) -> _FlatQuantizedWeightView:
+        # Avoid holding a reference to source so state-dict swaps can reclaim stale shards.
+        return cast(
+            _FlatQuantizedWeightView,
+            torch.Tensor._make_wrapper_subclass(
+                cls,
+                (source.numel(),),
+                dtype=source.dtype,
+                device=source.device,
+                requires_grad=False,
+            ),
+        )
+
+    def __repr__(self, *, tensor_contents: object = None) -> str:
+        _ = tensor_contents
+        return (
+            f"{type(self).__name__}(shape={tuple(self.shape)}, "
+            f"dtype={self.dtype}, device={self.device})"
+        )
+
+    @classmethod
+    def __torch_dispatch__(
+        cls,
+        func: OpOverload,
+        _types: tuple[type, ...],
+        _args: tuple[object, ...],
+        _kwargs: dict[str, object] | None = None,
+    ) -> object:
+        raise NotImplementedError(
+            f"1-D flat views of Piper quantized weights do not support {func}"
+        )
 
 
 def _transpose_dispatch(
@@ -57,16 +97,13 @@ def _same_shape_view_dispatch(
     shape = infer_size(size, tensor.numel())
     if shape == tuple(tensor.shape):
         return _alias(func, args, kwargs)
-    if len(shape) == 1:
-        weight = cast("QuantizedWeight", tensor)
-        if weight.ndim != 2:
+    if len(shape) == 1 and tensor._supports_flat_1d_view:
+        if tensor.ndim != 2:
             raise NotImplementedError(
-                f"{type(weight).__name__} 1-D flat view requires a 2-D weight"
+                f"{type(tensor).__name__} 1-D flat view requires a 2-D weight"
             )
-        require_untransposed(weight, "1-D flat view")
-        from piper_kernels.weights._fsdp import _FlatQuantizedWeightView  # noqa: PLC0415
-
-        return _FlatQuantizedWeightView(weight)
+        require_untransposed(tensor, "1-D flat view")
+        return _FlatQuantizedWeightView(tensor)
     raise NotImplementedError(
         f"{type(tensor).__name__} only supports same-shape views; "
         f"cannot view {tuple(tensor.shape)} as {shape}"
@@ -179,4 +216,4 @@ def register_view_ops(cls: type[QuantizedWeight]) -> None:
     cls.implements(aten.select.int)(unsupported_operation_dispatch)
 
 
-__all__ = ["register_view_ops", "require_untransposed"]
+__all__ = ["_FlatQuantizedWeightView", "register_view_ops", "require_untransposed"]

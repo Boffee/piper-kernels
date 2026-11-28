@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import Any, ClassVar, Self, TypeVar, cast
 
 import torch
 
 from piper_kernels._validation import validate_finite_float
 from piper_kernels.stochastic_quantization import signed_seed
-from piper_kernels.weights._views import require_untransposed
+from piper_kernels.weights._dispatch import QuantizedWeight, require_untransposed
 
-if TYPE_CHECKING:
-    from piper_kernels.weights._dispatch import QuantizedWeight
-
-_WeightT = TypeVar("_WeightT", bound="QuantizedWeight")
+_WeightT = TypeVar("_WeightT", bound=QuantizedWeight)
 
 
 def validate_real_scalar(
@@ -172,6 +169,70 @@ def run_add_(
     return weight
 
 
+class UpdatableWeightMixin:
+    """Opt-in in-place ``add_`` and ``addmm_`` updates for quantized weights."""
+
+    _update_format_name: ClassVar[str]
+
+    def _update_target(self, _operation: str) -> tuple[Any, tuple[object, ...]]:
+        raise NotImplementedError
+
+    def addmm_(
+        self,
+        mat1: torch.Tensor,
+        mat2: torch.Tensor,
+        *,
+        beta: float = 1.0,
+        alpha: float = 1.0,
+        rounding_seed: int | None = None,
+    ) -> Self:
+        """Update and requantize in place; ``alpha``/``beta`` finite real, optional uint64 seed."""
+        target, prefix = self._update_target("addmm_")
+        return cast(
+            Self,
+            run_addmm_(
+                cast(QuantizedWeight, self),
+                mat1,
+                mat2,
+                operation=f"{self._update_format_name} addmm_",
+                apply=lambda left, right: target.addmm_(
+                    *prefix,
+                    left,
+                    right,
+                    beta=beta,
+                    alpha=alpha,
+                    rounding_seed=rounding_seed,
+                ),
+            ),
+        )
+
+    def add_(
+        self,
+        other: object,
+        *,
+        beta: float = 1.0,
+        alpha: float = 1.0,
+        rounding_seed: int | None = None,
+    ) -> Self:
+        """Requantize ``beta * weight + alpha * other``; finite real scalars, uint64 seed."""
+        target, prefix = self._update_target("add_")
+        return cast(
+            Self,
+            run_add_(
+                cast(QuantizedWeight, self),
+                other,
+                operation=f"{self._update_format_name} add_",
+                apply=lambda update: target.add_(
+                    *prefix,
+                    update,
+                    beta=beta,
+                    alpha=alpha,
+                    rounding_seed=rounding_seed,
+                ),
+            ),
+        )
+
+
 def register_update_ops(cls: type[QuantizedWeight], *, format_name: str) -> None:
     """Register ``aten.addmm_.default`` and ``aten.add_.Tensor`` to delegate to methods."""
 
@@ -182,12 +243,13 @@ def register_update_ops(cls: type[QuantizedWeight], *, format_name: str) -> None
         kwargs: dict[str, Any],
     ) -> torch.Tensor:
         weight, mat1, mat2 = args
-        if not isinstance(weight, cls):
+        if not isinstance(weight, cls) or not isinstance(weight, UpdatableWeightMixin):
             raise TypeError(
                 f"{format_name} addmm_ weight must be {cls.__name__}, got {type(weight)}"
             )
-        return cast("QuantizedWeight", weight).addmm_(
-            mat1, mat2, beta=kwargs.get("beta", 1), alpha=kwargs.get("alpha", 1)
+        return cast(
+            torch.Tensor,
+            weight.addmm_(mat1, mat2, beta=kwargs.get("beta", 1), alpha=kwargs.get("alpha", 1)),
         )
 
     def _add_dispatch(
@@ -197,15 +259,16 @@ def register_update_ops(cls: type[QuantizedWeight], *, format_name: str) -> None
         kwargs: dict[str, Any],
     ) -> torch.Tensor:
         weight, update = args
-        if not isinstance(weight, cls):
+        if not isinstance(weight, cls) or not isinstance(weight, UpdatableWeightMixin):
             raise TypeError(f"{format_name} add_ weight must be {cls.__name__}, got {type(weight)}")
-        return cast("QuantizedWeight", weight).add_(update, alpha=kwargs.get("alpha", 1))
+        return cast(torch.Tensor, weight.add_(update, alpha=kwargs.get("alpha", 1)))
 
     cls.implements(torch.ops.aten.addmm_.default)(_addmm_dispatch)
     cls.implements(torch.ops.aten.add_.Tensor)(_add_dispatch)
 
 
 __all__ = [
+    "UpdatableWeightMixin",
     "narrow_rounding_seed",
     "register_update_ops",
     "run_add_",

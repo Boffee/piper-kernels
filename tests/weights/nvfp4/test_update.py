@@ -479,3 +479,41 @@ def test_updates_reject_invalid_coefficients_before_mutation(
         weight.scale._version,
         weight.per_tensor_scale._version,
     )
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=gpu)])
+@pytest.mark.parametrize("operation", ["add", "addmm"])
+@pytest.mark.parametrize("group_size", [0, 64])
+def test_flat_1d_scale_updates_match_2d_and_reject_non_scalar_global_scale(
+    device, operation, group_size
+):
+    weight_2d = _weight(group_size, rows=32, features=128, device=device)
+    weight_1d = type(weight_2d).from_storage(
+        {**weight_2d.as_storage()[0], "scale": weight_2d.scale.clone().reshape(-1)},
+        weight_2d.as_storage()[1],
+    )
+    weight_1d.qdata = weight_2d.qdata.clone()
+    assert weight_1d.per_tensor_scale is not None
+    weight_1d.per_tensor_scale = weight_2d.per_tensor_scale.clone()
+    operands = _operands(weight_2d, operation, rank=8)
+
+    scale_storage = weight_1d.scale
+    _apply(weight_2d, operands, operation, seed=77)
+    _apply(weight_1d, operands, operation, seed=77)
+
+    assert weight_1d.scale is scale_storage
+    assert weight_1d.scale.ndim == 1
+    assert torch.equal(weight_1d.qdata, weight_2d.qdata)
+    assert torch.equal(
+        weight_1d.scale.view(torch.uint8), weight_2d.scale.reshape(-1).view(torch.uint8)
+    )
+    torch.testing.assert_close(
+        weight_1d.per_tensor_scale, weight_2d.per_tensor_scale, rtol=0, atol=0
+    )
+
+    bad = _weight(group_size, rows=32, features=128, device=device)
+    bad.per_tensor_scale = torch.ones((1,), device=device, dtype=torch.float32)
+    qdata_version = bad.qdata._version
+    with pytest.raises(ValueError, match="per_tensor_scale"):
+        _apply(bad, operands, operation)
+    assert bad.qdata._version == qdata_version

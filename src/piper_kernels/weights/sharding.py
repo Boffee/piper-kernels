@@ -11,8 +11,7 @@ from piper_kernels.trellis._layout import (
     stored_bytes_bounds,
     validate_block_size,
 )
-from piper_kernels.weights._dispatch import QuantizedWeight
-from piper_kernels.weights._views import require_untransposed
+from piper_kernels.weights._dispatch import QuantizedWeight, require_untransposed
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
 from piper_kernels.weights.convrot.trellis.tensor import (
     ConvRotTrellisTensor,
@@ -150,37 +149,22 @@ def _validate_partition(weight: QuantizedWeight, dim: int, start: int, length: i
 
 def _nvfp4_scales(weight: PiperNVFP4Tensor, dim: int, start: int, length: int) -> torch.Tensor:
     rows, features = weight.shape
-    if weight.block_size != _layout.BLOCK_SIZE or features % _layout.BLOCK_SIZE:
-        raise NotImplementedError("NVFP4 sharding requires complete 16-value quantization blocks")
-    if weight.qdata.dtype is not torch.uint8 or weight.scale.dtype is not torch.float8_e4m3fn:
-        raise NotImplementedError("NVFP4 sharding requires packed UINT8 data and FP8 E4M3 scales")
+    canonical_scale = _layout.validate_nvfp4_weight(
+        weight,
+        allowed_ndims=(2,),
+        error_type=NotImplementedError,
+        prefix="NVFP4 sharding",
+    )
     if dim == 1 and (start % weight.block_size or length % weight.block_size):
         raise ValueError("NVFP4 input-channel shards must align to 16-value quantization blocks")
-    for scale in (weight.per_tensor_scale, weight.act_per_tensor_scale):
-        if scale is not None and (
-            scale.ndim != 0 or scale.dtype is not torch.float32 or scale.device != weight.device
-        ):
-            raise NotImplementedError(
-                "NVFP4 sharding requires scalar FP32 global scales on the weight device"
-            )
-    scale_shape = (
-        _layout.scale_shape(rows, features)
-        if weight.is_swizzled_scales
-        else (rows, features // weight.block_size)
-    )
-    if (
-        tuple(weight.scale.shape) not in (scale_shape, (scale_shape[0] * scale_shape[1],))
-        or weight.scale.device != weight.device
-    ):
-        raise NotImplementedError("NVFP4 sharding requires canonical or flat block-scale storage")
 
     # Rearrange bytes so this also works on CPUs with limited FP8 operations.
     # Only block scales are unpacked; the FP4 weight payload stays quantized.
-    scale_bytes = weight.scale.view(torch.uint8)
+    scale_bytes = canonical_scale.view(torch.uint8)
     plain = (
         _layout.from_blocked(scale_bytes, rows, features // weight.block_size)
         if weight.is_swizzled_scales
-        else scale_bytes.view(rows, features // weight.block_size)
+        else scale_bytes
     )
     divisor = weight.block_size if dim == 1 else 1
     selected = plain.narrow(dim, start // divisor, length // divisor)
