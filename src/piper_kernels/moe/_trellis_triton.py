@@ -17,7 +17,7 @@ from piper_kernels.trellis._layout import WRAP_GUARD_BYTES, TrellisLayout
 from piper_kernels.trellis.triton import _le_step_bits_4, compute_row_offsets_2d
 
 from . import _schedule
-from ._routing_triton import A16ChunkRouting, _resolve_slot
+from ._routing_triton import A16ChunkRouting, _resolve_slot, _unpack_2d_tile_pid, moe_2d_tile_grid
 
 _WRAP_GUARD_BYTES = tl.constexpr(WRAP_GUARD_BYTES)
 _BATCH_BLOCK_M_TL = tl.constexpr(_schedule.BATCH_BLOCK_M)
@@ -206,6 +206,7 @@ def _store_moe_trellis_row(
         "num_slots",
         "num_pairs",
         "top_k",
+        "grid_tiles",
         "split_k",
     ]
 )
@@ -235,6 +236,7 @@ def trellis_moe_gemv_kernel(
     num_slots,
     num_pairs,
     top_k,
+    grid_tiles,
     split_k,
     tile_steps: tl.constexpr,
     block_m: tl.constexpr,
@@ -258,10 +260,10 @@ def trellis_moe_gemv_kernel(
     """Fused in-register LE Trellis -> A16 Split-K GEMV for ``m1`` and bucketed ``batched`` MoE."""
     tl.static_assert((block_n == 1) | (block_n == 2))
     n_tiles = tl.cdiv(out_features, block_n)
-    pid_0 = tl.program_id(0)
-    pid_n_tile = pid_0 % n_tiles
-    pid_tile = pid_0 // n_tiles
-    pid_k = tl.program_id(1)
+    pid_n_tile, pid_tile = _unpack_2d_tile_pid(n_tiles)
+    if pid_tile >= grid_tiles:
+        return
+    pid_k = tl.program_id(2)
     n0 = pid_n_tile * block_n
 
     if batched:
@@ -394,6 +396,7 @@ def launch_trellis_proj(
     per_expert_input: bool,
     is_splitk: bool,
     schedule: _schedule.TrellisMoeSchedule,
+    is_amd_hip: bool = False,
 ) -> None:
     blocks_per_row = block_scales.shape[2]
     tile_steps = triton.next_power_of_2(block_size)
@@ -440,7 +443,13 @@ def launch_trellis_proj(
     has_tail_bytes = per_slot_2d or (qdata.numel() % 4 != 0)
     x_mul4 = block_size % 4 == 0 and in_features % 4 == 0
 
-    grid = (triton.cdiv(out_features, schedule.block_n) * grid_tiles, split_k)
+    grid = moe_2d_tile_grid(
+        triton.cdiv(out_features, schedule.block_n),
+        grid_tiles,
+        num_warps=schedule.num_warps,
+        is_amd_hip=is_amd_hip,
+        split_k=split_k,
+    )
     with device_context(x_rot.device):
         trellis_moe_gemv_kernel[grid](
             x_rot,
@@ -468,6 +477,7 @@ def launch_trellis_proj(
             num_slots,
             routing.num_pairs,
             routing.top_k,
+            grid_tiles,
             split_k,
             tile_steps=tile_steps,
             block_m=schedule.block_m,

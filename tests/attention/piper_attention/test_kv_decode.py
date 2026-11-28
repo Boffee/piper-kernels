@@ -3127,7 +3127,26 @@ def test_gpu_chunked_prefill_masked_pos_inf_kbias_and_two_wave_pos_inf(head_dim:
     c2s_0 = torch.tensor([[0]], device=device, dtype=torch.int32)
     nc_1 = torch.tensor([1], device=device, dtype=torch.int32)
     o_frozen_only, l_frozen_only = piper_attention_decode(q_big, pool, c2s_0, nc_1, return_lse=True)
-    tl_32 = torch.tensor([32], device=device, dtype=torch.int32)
+    assert torch.isfinite(o_frozen_only).all()
+    assert torch.isfinite(l_frozen_only).all()
+
+    torch.manual_seed(1505 + head_dim)
+    tl_64 = torch.tensor([64], device=device, dtype=torch.int32)
+    o_tail_large, l_tail_large = piper_attention_decode(
+        q_big,
+        pool,
+        empty_c2s,
+        zero_nc,
+        tail_key=torch.randn((1, 1, 64, head_dim), device=device, dtype=torch.bfloat16),
+        tail_value=tv_one[:, :, :64],
+        tail_len=tl_64,
+        is_causal=False,
+        return_lse=True,
+    )
+    assert torch.isfinite(o_tail_large).all()
+    assert torch.isfinite(l_tail_large).all()
+    torch.testing.assert_close(o_tail_large, torch.ones_like(o_tail_large), atol=1e-2, rtol=1e-2)
+
     o_mix_seq_gt, l_mix_seq_gt = piper_attention_decode(
         q_big,
         pool,
@@ -3135,7 +3154,7 @@ def test_gpu_chunked_prefill_masked_pos_inf_kbias_and_two_wave_pos_inf(head_dim:
         nc_1,
         tail_key=tk_big[:, :, :32],
         tail_value=tv_one[:, :, :32],
-        tail_len=tl_32,
+        tail_len=torch.tensor([32], device=device, dtype=torch.int32),
         is_causal=True,
         return_lse=True,
     )
@@ -3153,14 +3172,14 @@ def test_gpu_chunked_prefill_masked_pos_inf_kbias_and_two_wave_pos_inf(head_dim:
     # 3. Two-wave merge: +inf LSE in exactly one wave dominates a finite opposite wave, whereas
     #    +inf in both waves stays indeterminate NaN (matching Split-KV and reference semantics).
     k_pos = torch.full((1, 1, KV_CHUNK_TOKENS, head_dim), 1e34, device=device, dtype=torch.bfloat16)
-    v_pos = torch.ones_like(k_pos)
-    freeze_kv_chunks_(k_pos, v_pos, pool, torch.tensor([1], device=device, dtype=torch.int32))
+    freeze_kv_chunks_(
+        k_pos, torch.ones_like(k_pos), pool, torch.tensor([1], device=device, dtype=torch.int32)
+    )
     c2s_1 = torch.tensor([[1]], device=device, dtype=torch.int32)
     q_med = torch.full((1, 1, 64, head_dim), 1e6, device=device, dtype=torch.bfloat16)
     torch.manual_seed(1511 + head_dim)
     tk_fin = torch.randn((1, 1, 64, head_dim), device=device, dtype=torch.bfloat16)
     tv_fin = torch.zeros_like(tk_fin)
-    tl_64 = torch.tensor([64], device=device, dtype=torch.int32)
     o_a_split, l_a_split = piper_attention_decode(
         q_med[:, :, :1],
         pool,

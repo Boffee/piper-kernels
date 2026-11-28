@@ -298,9 +298,13 @@ def _run_a16_chunk(
     with device_context(device):
         launch_proj(False, active_x_chunk, routing, up_target, split_k_up)
         if split_k_up > 1:
-            moe_splitk_reduce_kernel[
-                (triton.cdiv(up_gate_out, _schedule.NVFP4_REDUCE_BLOCK_N) * num_pairs,)
-            ](
+            reduce_grid = _routing_triton.moe_2d_tile_grid(
+                triton.cdiv(up_gate_out, _schedule.NVFP4_REDUCE_BLOCK_N),
+                num_pairs,
+                num_warps=4,
+                is_amd_hip=target.is_amd_hip,
+            )
+            moe_splitk_reduce_kernel[reduce_grid](
                 up_target,
                 None,
                 up_row_scale,
@@ -323,9 +327,13 @@ def _run_a16_chunk(
                 swap_halves=False,
                 num_warps=4,
             )
-        moe_m1_activate_rotate_kernel[
-            (triton.cdiv(intermediate_size, _schedule.ACTIVATE_BLOCK_SIZE) * num_pairs,)
-        ](
+        activate_grid = _routing_triton.moe_2d_tile_grid(
+            triton.cdiv(intermediate_size, _schedule.ACTIVATE_BLOCK_SIZE),
+            num_pairs,
+            num_warps=4,
+            is_amd_hip=target.is_amd_hip,
+        )
+        moe_m1_activate_rotate_kernel[activate_grid](
             mid,
             act,
             out_chunk,
@@ -334,6 +342,7 @@ def _run_a16_chunk(
             intermediate_size,
             num_experts,
             num_slots,
+            num_pairs,
             block_size=_schedule.ACTIVATE_BLOCK_SIZE,
             group_size=group_size,
             activation_fn=activation_fn,
@@ -505,15 +514,20 @@ def _run_nvfp4_prefill_chunk(
     act_dtype = torch.float32 if group_size > 0 else out_chunk.dtype
     act = torch.empty((num_pairs, intermediate_size), device=device, dtype=act_dtype)
     with device_context(device):
-        moe_m1_activate_rotate_kernel[
-            (triton.cdiv(intermediate_size, _schedule.ACTIVATE_BLOCK_SIZE) * num_pairs,)
-        ](
+        activate_grid = _routing_triton.moe_2d_tile_grid(
+            triton.cdiv(intermediate_size, _schedule.ACTIVATE_BLOCK_SIZE),
+            num_pairs,
+            num_warps=4,
+            is_amd_hip=target.is_amd_hip,
+        )
+        moe_m1_activate_rotate_kernel[activate_grid](
             mid,
             act,
             out_chunk,
             compact_to_pair,
             None,
             intermediate_size,
+            num_pairs,
             num_pairs,
             num_pairs,
             block_size=_schedule.ACTIVATE_BLOCK_SIZE,
@@ -744,6 +758,7 @@ def _dispatch_nvfp4_moe(
                 cast_fp32_to_bf16=sched.cast_fp32_to_bf16 if is_batched_sched else False,
                 use_sm120_e2m1x2=sched.use_sm120_e2m1x2,
                 single_dot=sched.single_dot if is_batched_sched else False,
+                is_amd_hip=resolved_target.is_amd_hip,
             )
 
         _run_a16_chunk(
@@ -864,11 +879,16 @@ def _run_int8_chunk(
             swap_halves=(swap_halves and split_k_up == 1),
             aligned_nk=up_aligned_nk,
             accumulator_seed=up_seed,
+            is_amd_hip=target.is_amd_hip,
         )
         if split_k_up > 1:
-            moe_splitk_reduce_kernel[
-                (triton.cdiv(up_gate_out, _schedule.INT8_REDUCE_BLOCK_N) * num_pairs,)
-            ](
+            reduce_grid = _routing_triton.moe_2d_tile_grid(
+                triton.cdiv(up_gate_out, _schedule.INT8_REDUCE_BLOCK_N),
+                num_pairs,
+                num_warps=4,
+                is_amd_hip=target.is_amd_hip,
+            )
+            moe_splitk_reduce_kernel[reduce_grid](
                 up_target,
                 input_s_chunk,
                 up_gate_scale,
@@ -933,6 +953,7 @@ def _run_int8_chunk(
             swap_halves=False,
             aligned_nk=down_aligned_nk,
             accumulator_seed=down_seed,
+            is_amd_hip=target.is_amd_hip,
         )
         moe_m1_weighted_reduce_kernel[
             (triton.cdiv(hidden_size, _schedule.WEIGHTED_REDUCE_BLOCK_N), chunk_rows)
@@ -1697,6 +1718,7 @@ def _dispatch_trellis_moe(
             per_expert_input=per_expert_input,
             is_splitk=per_expert_input or split_k > 1,
             schedule=schedule,
+            is_amd_hip=resolved_target.is_amd_hip,
         )
 
     for active_chunk, ids_chunk, weights_chunk, out_chunk in _iter_a16_chunks(

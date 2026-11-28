@@ -243,6 +243,7 @@ def _compile_activate_rotate(
         "intermediate_size": "i32",
         "num_experts": "i32",
         "num_slots": "i32",
+        "num_pairs": "i32",
     }
     constexprs: dict[str, object] = {
         "block_size": _schedule.ACTIVATE_BLOCK_SIZE,
@@ -1226,6 +1227,7 @@ def _compile_trellis_kernels(
         "num_slots": "i32",
         "num_pairs": "i32",
         "top_k": "i32",
+        "grid_tiles": "i32",
         "split_k": "i32",
     }
     gemv_constexprs: dict[str, object] = {

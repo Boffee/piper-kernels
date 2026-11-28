@@ -23,7 +23,13 @@ from piper_kernels.linear.nvfp4._w4a16_triton import (
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 from . import _schedule
-from ._routing_triton import A16ChunkRouting, _resolve_slot, _swizzle_grouped_pid
+from ._routing_triton import (
+    A16ChunkRouting,
+    _resolve_slot,
+    _swizzle_grouped_pid,
+    _unpack_2d_tile_pid,
+    moe_2d_tile_grid,
+)
 
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(nvfp4_layout.BLOCK_SIZE)
 _NVFP4_QDATA_BLOCK_SIZE_TL = tl.constexpr(nvfp4_layout.QDATA_BLOCK_SIZE)
@@ -55,12 +61,12 @@ def nvfp4_moe_m1_gemv_kernel(
     is_splitk: tl.constexpr,
     use_sm120_e2m1x2: tl.constexpr = False,
 ):
-    """Single-token slot-indirect NVFP4 W4A16 GEMV across ``(N * top_k, split_k)``."""
+    """Single-token slot-indirect NVFP4 W4A16 GEMV across ``(N * top_k_x, grid_y, split_k)``."""
     n_tiles = tl.cdiv(out_features, block_n)
-    pid_0 = tl.program_id(0)
-    pid_n = pid_0 % n_tiles
-    k_idx = pid_0 // n_tiles
-    pid_k = tl.program_id(1)
+    pid_n, k_idx = _unpack_2d_tile_pid(n_tiles)
+    if k_idx >= top_k:
+        return
+    pid_k = tl.program_id(2)
     slot = _resolve_slot(
         topk_ids_ptr,
         expert_to_slot_ptr,
@@ -519,6 +525,7 @@ def launch_nvfp4_proj(
     cast_fp32_to_bf16: bool,
     use_sm120_e2m1x2: bool = False,
     single_dot: bool = False,
+    is_amd_hip: bool = False,
 ) -> None:
     scale_u8 = scale.view(torch.uint8)
     packed_k = in_features // 2
@@ -556,7 +563,14 @@ def launch_nvfp4_proj(
                 num_stages=1,
             )
         else:
-            nvfp4_moe_m1_gemv_kernel[(n_tiles * routing.top_k, split_k)](
+            grid = moe_2d_tile_grid(
+                n_tiles,
+                routing.top_k,
+                num_warps=num_warps,
+                is_amd_hip=is_amd_hip,
+                split_k=split_k,
+            )
+            nvfp4_moe_m1_gemv_kernel[grid](
                 x,
                 qdata,
                 scale_u8,

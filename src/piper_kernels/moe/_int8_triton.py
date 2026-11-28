@@ -16,7 +16,13 @@ from piper_kernels._triton.runtime import device_context
 from piper_kernels.linear.convrot.int8.triton import _accumulate_int8_tile
 
 from . import _schedule
-from ._routing_triton import _resolve_slot, _swap_halves_col, _swizzle_grouped_pid
+from ._routing_triton import (
+    _resolve_slot,
+    _swap_halves_col,
+    _swizzle_grouped_pid,
+    _unpack_2d_tile_pid,
+    moe_2d_tile_grid,
+)
 
 
 @triton.jit(do_not_specialize=["split_k"])
@@ -45,12 +51,12 @@ def int8_moe_m1_matmul_kernel(
     aligned_nk: tl.constexpr,
     accumulator_seed: tl.constexpr = 0,
 ):
-    """Single-token slot-indirect ConvRot INT8 projection across ``(N * top_k, split_k)``."""
+    """Single-token ConvRot INT8 projection across ``(N * top_k_x, grid_y, split_k)``."""
     n_tiles = tl.cdiv(out_features, block_n)
-    pid_0 = tl.program_id(0)
-    pid_n = pid_0 % n_tiles
-    k_idx = pid_0 // n_tiles
-    pid_k = tl.program_id(1)
+    pid_n, k_idx = _unpack_2d_tile_pid(n_tiles)
+    if k_idx >= top_k:
+        return
+    pid_k = tl.program_id(2)
     offs_n = pid_n * block_n + tl.arange(0, block_n)
     offs_n_i64 = offs_n.to(tl.int64)
     slot = _resolve_slot(
@@ -339,6 +345,7 @@ def launch_int8_proj(
     swap_halves: bool,
     aligned_nk: bool,
     accumulator_seed: int,
+    is_amd_hip: bool = False,
 ) -> None:
     with device_context(x_q.device):
         if tile_slots is not None:
@@ -370,7 +377,14 @@ def launch_int8_proj(
                 num_warps=4,
             )
         else:
-            int8_moe_m1_matmul_kernel[(out_tiles * top_k, split_k)](
+            grid = moe_2d_tile_grid(
+                out_tiles,
+                top_k,
+                num_warps=4,
+                is_amd_hip=is_amd_hip,
+                split_k=split_k,
+            )
+            int8_moe_m1_matmul_kernel[grid](
                 x_q,
                 w_q,
                 topk_ids_flat,
