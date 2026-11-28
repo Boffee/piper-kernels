@@ -111,11 +111,6 @@ def compile_w4a16_kernels(  # noqa: PLR0913
         target=target_info,
     )
     if schedule.mode == "dequant":
-        sm75_bf16 = (
-            target_info.is_nvidia_cuda
-            and not target_info.cuda_capability_at_least(8)
-            and active_dtype is torch.bfloat16
-        )
         compiled_large: dict[str, triton.compiler.CompiledKernel] = {
             "dequant": compile_fn(
                 ASTSource(
@@ -123,7 +118,7 @@ def compile_w4a16_kernels(  # noqa: PLR0913
                     {
                         "weight_ptr": "*u8",
                         "weight_scale_ptr": "*u8",
-                        "output_ptr": "*fp32" if sm75_bf16 else active_ty,
+                        "output_ptr": "*fp32" if schedule.dequant_as_fp32 else active_ty,
                         "out_features": "i32",
                         "packed_k": "i32",
                         "scale_column_blocks": "i32",

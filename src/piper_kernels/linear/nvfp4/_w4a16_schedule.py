@@ -38,6 +38,7 @@ class W4A16Schedule:
     use_dot: bool = False
     single_dot: bool = False
     use_sm120_e2m1x2: bool = False
+    dequant_as_fp32: bool = False
     split_k: int = 1
     group_m: int = 0
 
@@ -109,9 +110,18 @@ def default_w4a16_schedule(
     *,
     allow_dot: bool = True,
     dot_num_warps: int = 4,
+    dequant_as_fp32: bool = False,
 ) -> W4A16Schedule:
     """Resolve the baseline portable W4A16 schedule for generic GPU targets."""
     if rows > W4A16_GEMV_MAX_ROWS:
+        if dequant_as_fp32:
+            return W4A16Schedule(
+                mode="dequant",
+                block_n=W4A16_DEQUANT_BLOCK_N,
+                block_k=W4A16_DEQUANT_BLOCK_K,
+                num_warps=4,
+                dequant_as_fp32=True,
+            )
         return DEFAULT_DEQUANT_SCHEDULE
     weight_bytes = out_features * (input_features // 2)
     if rows == 1:

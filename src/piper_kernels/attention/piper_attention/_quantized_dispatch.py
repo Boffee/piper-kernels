@@ -24,11 +24,7 @@ from ._validation import PreparedContext, PreparedQuery
 
 def supports_quantized_query(target: AcceleratorTarget) -> bool:
     """Require native dense attention: SM12x or RDNA4 Q32/K64 groups, or SM89 per-thread scales."""
-    return (
-        target.is_cuda_capability(12)
-        or target.is_cuda_capability(8, 9)
-        or _backend.supports_amd_target(target)
-    )
+    return nvidia_policy.supports_quantized_query(target) or _backend.supports_amd_target(target)
 
 
 def select_qk_quantization(target: AcceleratorTarget) -> QKQuantizationGranularity:

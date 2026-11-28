@@ -24,9 +24,9 @@ def _require_encoder_device(device: torch.device) -> None:
     supported = target.is_nvidia_cuda and runtime.supports_device(device)
     if supported:
         try:
-            from . import _gluon_forward  # noqa: PLC0415 - Triton/Gluon is optional
+            from ._nvidia import gluon_forward  # noqa: PLC0415 - Triton/Gluon is optional
 
-            supported = _gluon_forward.supports_device(device)
+            supported = gluon_forward.supports_device(device)
         except ImportError:
             supported = False
     if not supported:

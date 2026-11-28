@@ -306,7 +306,8 @@ _NVIDIA_SM80_TARGETS = [GPUTarget("cuda", architecture, 32) for architecture in 
 
 @pytest.mark.parametrize("target", _NVIDIA_SM80_TARGETS, ids=lambda target: f"cuda-{target.arch}")
 def test_encoder_triton_kernels_compile(target: GPUTarget) -> None:
-    from piper_kernels.trellis import _encoder, _gluon_forward  # noqa: PLC0415
+    from piper_kernels.trellis import _encoder  # noqa: PLC0415
+    from piper_kernels.trellis._nvidia import gluon_forward as _gluon_forward  # noqa: PLC0415
 
     sources = [
         (
@@ -392,7 +393,7 @@ def test_encoder_persistent_forward_compiles(
 ) -> None:
     from triton.experimental.gluon._runtime import GluonASTSource  # noqa: PLC0415
 
-    from piper_kernels.trellis import _gluon_forward  # noqa: PLC0415
+    from piper_kernels.trellis._nvidia import gluon_forward as _gluon_forward  # noqa: PLC0415
 
     widths = step_widths * (256 // len(step_widths))
     arguments = _gluon_forward._compile_args(
