@@ -29,35 +29,21 @@ from ._decode_schedule import (
     BLOCK_QH,
     CENTER_CHUNK,
     KEY_SCALES_GROUPED,
-    PREFILL_MIN_SEQ_Q,
-    REDUCE_NUM_WARPS,
     VALUE_TILE_TOKENS,
-    DecodeSchedule,
-    default_decode_schedule,
     select_split_counts,
 )
 from ._kv_prefill import (
-    _piper_decode_splitkv_reduce_kernel,
+    _launch_splitkv_reduce,
+    launch_direct_tail_split_decode,
     pool_slot_strides,
     run_chunked_prefill,
-    validate_prefill_backend,
+    select_decode_schedule,
 )
-from ._nvidia import policy as _nvidia_policy
 
 _TL_CENTER_CHUNK = tl.constexpr(CENTER_CHUNK)
 _TL_VALUE_TILE_TOKENS = tl.constexpr(VALUE_TILE_TOKENS)
 _TL_KEY_SCALES_GROUPED = tl.constexpr(KEY_SCALES_GROUPED)
 _LOG2_E = tl.constexpr(1.4426950408889634)
-
-
-def select_decode_schedule(
-    target: AcceleratorTarget | None,
-    head_dim: int,
-) -> DecodeSchedule:
-    """Return the Split-KV kernel and split schedule for ``target`` and ``head_dim``."""
-    if target is not None and target.is_nvidia_cuda:
-        return _nvidia_policy.select_decode_schedule(target, head_dim)
-    return default_decode_schedule(head_dim)
 
 
 @triton.jit
@@ -395,201 +381,6 @@ def _piper_decode_frozen_split_kernel(  # noqa: PLR0915
     tl.store(partial_log_denom_ptr + pl_offsets, log_denom_split, mask=qh_valid)
 
 
-@triton.jit(
-    do_not_specialize=[
-        "kv_heads",
-        "gqa_group",
-        "q_tiles",
-        "seq_q",
-        "tail_cap",
-        "int8_splits",
-        "tail_splits",
-    ]
-)
-def _piper_decode_tail_split_kernel(  # noqa: PLR0915
-    query_ptr,
-    tail_key_ptr,
-    tail_value_ptr,
-    tail_len_ptr,
-    partial_out_ptr,
-    partial_lse_ptr,
-    partial_bias_ptr,
-    partial_log_denom_ptr,
-    scale,
-    kv_heads,
-    gqa_group,
-    q_tiles,
-    seq_q,
-    tail_cap,
-    int8_splits,
-    tail_splits,
-    stride_qb,
-    stride_qh,
-    stride_qs,
-    stride_tk_b,
-    stride_tk_h,
-    stride_tk_n,
-    stride_tv_b,
-    stride_tv_h,
-    stride_tv_n,
-    stride_pob,
-    stride_poh,
-    stride_pos,
-    stride_pop,
-    stride_plb,
-    stride_plh,
-    stride_pls,
-    is_causal: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_qh: tl.constexpr,
-    block_n: tl.constexpr,
-    qk_precision: tl.constexpr,
-    pv_precision: tl.constexpr,
-):
-    """Evaluate one Split-KV slice of the live BF16/FP16 tail for a GQA head group."""
-    pid_q = tl.program_id(0)
-    tail_split_id = tl.program_id(1)
-    pid_bh = pid_q // q_tiles
-    q_tile = pid_q % q_tiles
-
-    b = pid_bh // kv_heads
-    kv_head = pid_bh % kv_heads
-    b64 = b.to(tl.int64)
-    kv_head64 = kv_head.to(tl.int64)
-
-    offsets_d = tl.arange(0, head_dim)
-    m_i = tl.full((block_qh,), -float("inf"), dtype=tl.float32)
-    l_i = tl.zeros((block_qh,), dtype=tl.float32)
-    acc = tl.zeros((block_qh, head_dim), dtype=tl.float32)
-
-    tl_raw = tl.load(tail_len_ptr + b64)
-    active_tail = tl.maximum(0, tl.minimum(tl_raw, tail_cap)).to(tl.int64)
-    total_tiles = tl.cdiv(active_tail, block_n)
-    tiles_per_split = tl.cdiv(total_tiles, tail_splits.to(tl.int64))
-    tile_start = tail_split_id.to(tl.int64) * tiles_per_split
-    tile_end = tl.minimum(total_tiles, tile_start + tiles_per_split)
-
-    if tile_start < tile_end:
-        qh_offs0 = q_tile * block_qh + tl.arange(0, block_qh)
-        qh_valid0 = qh_offs0 < gqa_group * seq_q
-        q_idx0 = qh_offs0 % seq_q
-        q_head0 = kv_head * gqa_group + qh_offs0 // seq_q
-        q_ptrs = (
-            query_ptr
-            + b64 * stride_qb
-            + q_head0.to(tl.int64)[:, None] * stride_qh
-            + q_idx0.to(tl.int64)[:, None] * stride_qs
-            + offsets_d[None, :]
-        )
-        q_f32 = tl.load(q_ptrs, mask=qh_valid0[:, None], other=0.0).to(tl.float32)
-        offsets_d64 = tl.arange(0, 64)
-        if head_dim == 128:
-            q_lo, q_hi = tl.split(tl.permute(tl.reshape(q_f32, (block_qh, 2, 64)), (0, 2, 1)))
-        else:
-            q_lo = q_f32
-            q_hi = q_f32
-
-        offsets_n = tl.arange(0, block_n)
-        tk_base = tail_key_ptr + b64 * stride_tk_b + kv_head64 * stride_tk_h
-        tv_base = tail_value_ptr + b64 * stride_tv_b + kv_head64 * stride_tv_h
-        scaled_log2 = scale * _LOG2_E
-        active_tail32 = active_tail.to(tl.int32)
-        cutoff = (active_tail32 - seq_q) + q_idx0
-
-        for tile_idx in tl.range(tile_start.to(tl.int32), tile_end.to(tl.int32), disable_licm=True):  # pyright: ignore[reportGeneralTypeIssues]
-            rows32 = tile_idx * block_n + offsets_n
-            valid_n = rows32 < active_tail32
-            rows = rows32.to(tl.int64)
-            if head_dim == 128:
-                k_lo = tl.load(
-                    tk_base + rows[:, None] * stride_tk_n + offsets_d64[None, :],
-                    mask=valid_n[:, None],
-                    other=0.0,
-                )
-                scores = tl.dot(q_lo, tl.trans(k_lo.to(tl.float32)), input_precision=qk_precision)
-                k_hi = tl.load(
-                    tk_base + rows[:, None] * stride_tk_n + (offsets_d64[None, :] + 64),
-                    mask=valid_n[:, None],
-                    other=0.0,
-                )
-                scores = tl.dot(
-                    q_hi, tl.trans(k_hi.to(tl.float32)), acc=scores, input_precision=qk_precision
-                )
-            else:
-                k_tile = tl.load(
-                    tk_base + rows[:, None] * stride_tk_n + offsets_d[None, :],
-                    mask=valid_n[:, None],
-                    other=0.0,
-                )
-                scores = tl.dot(
-                    q_f32, tl.trans(k_tile.to(tl.float32)), input_precision=qk_precision
-                )
-            scores *= scaled_log2
-            if is_causal:
-                valid_mask = valid_n[None, :] & (rows32[None, :] <= cutoff[:, None])
-            else:
-                valid_mask = valid_n[None, :]
-
-            masked_scores = tl.where(valid_mask, scores, -float("inf"))
-            m_block = tl.reduce(masked_scores, 1, max_propagate_nan)
-            has_block = m_block != -float("inf")  # pyright: ignore[reportOperatorIssue]
-            has_prev = m_i != -float("inf")
-            m_new = tl.maximum(m_i, m_block, propagate_nan=tl.PropagateNan.ALL)
-            has_any_new = m_new != -float("inf")
-            m_safe = tl.where(has_any_new, m_new, 0.0)
-            alpha = tl.where(
-                has_prev,
-                tl.math.exp2(tl.where(has_prev, m_i - m_safe, 0.0)),
-                0.0,
-            )
-            p = tl.where(
-                valid_mask & has_block[:, None],  # pyright: ignore[reportIndexIssue]
-                tl.math.exp2(tl.where(valid_mask, masked_scores - m_safe[:, None], 0.0)),
-                0.0,
-            )
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            acc = acc * alpha[:, None]
-
-            v_tile = tl.load(
-                tv_base + rows[:, None] * stride_tv_n + offsets_d[None, :],
-                mask=valid_n[:, None],
-                other=0.0,
-            )
-            acc = tl.dot(p, v_tile.to(tl.float32), acc=acc, input_precision=pv_precision)
-            m_i = m_new
-
-    has_any = m_i != -float("inf")
-    safe_l = tl.where(has_any & (l_i != 0.0), l_i, 1.0)
-    out_split = tl.where(has_any[:, None], acc / safe_l[:, None], 0.0)
-    lse_split = tl.where(has_any, m_i, -float("inf"))
-    log_denom_split = tl.where(has_any, tl.math.log2(safe_l), 0.0)
-
-    split64 = (int8_splits + tail_split_id).to(tl.int64)
-    qh_offs = q_tile * block_qh + tl.arange(0, block_qh)
-    qh_valid = qh_offs < gqa_group * seq_q
-    q_idx = qh_offs % seq_q
-    q_head = kv_head * gqa_group + qh_offs // seq_q
-    po_ptrs = (
-        partial_out_ptr
-        + b64 * stride_pob
-        + q_head.to(tl.int64)[:, None] * stride_poh
-        + q_idx.to(tl.int64)[:, None] * stride_pos
-        + split64 * stride_pop
-        + offsets_d[None, :]
-    )
-    tl.store(po_ptrs, out_split, mask=qh_valid[:, None])
-
-    pl_offsets = (
-        b64 * stride_plb
-        + q_head.to(tl.int64) * stride_plh
-        + q_idx.to(tl.int64) * stride_pls
-        + split64
-    )
-    tl.store(partial_lse_ptr + pl_offsets, lse_split, mask=qh_valid)
-    tl.store(partial_bias_ptr + pl_offsets, 0.0, mask=qh_valid)
-    tl.store(partial_log_denom_ptr + pl_offsets, log_denom_split, mask=qh_valid)
-
-
 def piper_attention_decode_triton(
     query: torch.Tensor,
     key_int8: torch.Tensor,
@@ -612,11 +403,8 @@ def piper_attention_decode_triton(
     prefill_backend: Literal["amd", "nvidia"] | None = None,
     target: AcceleratorTarget | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Execute GQA-grouped Split-KV decode or quantized chunked prefill on GPU."""
+    """Execute native INT8-Q/UINT8-P or fallback Split-KV decode and prefill on GPU."""
     if prefill_backend is not None:
-        validate_prefill_backend(prefill_backend, grouped_qk=grouped_qk, pack_wmma=pack_wmma)
-    batch, q_heads, seq_q, head_dim = query.shape
-    if seq_q >= PREFILL_MIN_SEQ_Q and prefill_backend is not None:
         return run_chunked_prefill(
             query,
             key_int8,
@@ -638,6 +426,7 @@ def piper_attention_decode_triton(
             prefill_backend=prefill_backend,
             target=target,
         )
+    batch, q_heads, seq_q, head_dim = query.shape
     num_slots, kv_heads, _, _ = key_int8.shape
     gqa_group = q_heads // kv_heads
 
@@ -714,7 +503,6 @@ def piper_attention_decode_triton(
                 num_chunks,
                 batch=batch,
             )
-
             _piper_decode_frozen_split_kernel[(batch * kv_heads * q_tiles, int8_splits)](
                 query,
                 key_i8_s,
@@ -773,10 +561,7 @@ def piper_attention_decode_triton(
             assert tail_key is not None
             assert tail_value is not None
             assert tail_len is not None
-            stride_tk_b = 0 if batch <= 1 else tail_key.stride(0)
-            stride_tv_b = 0 if batch <= 1 else tail_value.stride(0)
-
-            _piper_decode_tail_split_kernel[(batch * kv_heads * q_tiles, tail_splits)](
+            launch_direct_tail_split_decode(
                 query,
                 tail_key,
                 tail_value,
@@ -785,66 +570,31 @@ def piper_attention_decode_triton(
                 partial_lse,
                 partial_bias,
                 partial_log_denom,
-                scale,
-                kv_heads,
-                gqa_group,
-                q_tiles,
-                seq_q,
-                tail_cap,
-                int8_splits,
-                tail_splits,
-                stride_qb,
-                query.stride(1),
-                query.stride(2),
-                stride_tk_b,
-                tail_key.stride(1),
-                tail_key.stride(2),
-                stride_tv_b,
-                tail_value.stride(1),
-                tail_value.stride(2),
-                partial_out.stride(0),
-                partial_out.stride(1),
-                partial_out.stride(2),
-                partial_out.stride(3),
-                partial_lse.stride(0),
-                partial_lse.stride(1),
-                partial_lse.stride(2),
+                scale=scale,
+                kv_heads=kv_heads,
+                gqa_group=gqa_group,
+                q_tiles=q_tiles,
+                seq_q=seq_q,
+                tail_cap=tail_cap,
+                int8_splits=int8_splits,
+                tail_splits=tail_splits,
                 is_causal=is_causal,
                 head_dim=head_dim,
-                block_qh=BLOCK_QH,
-                block_n=schedule.block_n,
-                qk_precision=schedule.tail_qk_precision,
-                pv_precision=schedule.pv_precision,
-                num_warps=schedule.num_warps,
-                num_stages=schedule.num_stages,
-                **compiler_options,
+                schedule=schedule,
             )
 
-        _piper_decode_splitkv_reduce_kernel[(batch * q_heads * seq_q,)](
+        _launch_splitkv_reduce(
             partial_out,
             partial_lse,
             partial_bias,
             partial_log_denom,
             output,
             lse,
-            q_heads,
-            seq_q,
-            num_splits,
-            partial_out.stride(0),
-            partial_out.stride(1),
-            partial_out.stride(2),
-            partial_out.stride(3),
-            partial_lse.stride(0),
-            partial_lse.stride(1),
-            partial_lse.stride(2),
-            1,
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            lse.stride(0),
-            lse.stride(1),
+            batch=batch,
+            q_heads=q_heads,
+            seq_q=seq_q,
+            num_splits=num_splits,
             head_dim=head_dim,
-            num_warps=REDUCE_NUM_WARPS,
         )
 
     return output, lse
@@ -859,6 +609,7 @@ def compile_kv_decode_kernels(
     is_causal: bool = True,
     contiguous_inputs: bool = True,
     wide_pool: bool = False,
+    reduce_vectorize_splits: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, object, object]:
     """Compile frozen-split, tail-split, and reduce decode kernels offline."""
@@ -872,6 +623,7 @@ def compile_kv_decode_kernels(
         is_causal=is_causal,
         contiguous_inputs=contiguous_inputs,
         wide_pool=wide_pool,
+        reduce_vectorize_splits=reduce_vectorize_splits,
         compile_fn=compile_fn,
     )
 
@@ -885,6 +637,7 @@ def compile_kv_prefill_kernels(
     is_causal: bool = True,
     wide_pool: bool = False,
     has_chunk_splits: bool = False,
+    per_row_query_scale: bool = False,
     compile_fn: Callable[[object, object, dict[str, object]], object] | None = None,
 ) -> tuple[object, ...]:
     """Offline-compile two-wave merge and native chunked prefill kernels for ``target``."""
@@ -898,6 +651,7 @@ def compile_kv_prefill_kernels(
         is_causal=is_causal,
         wide_pool=wide_pool,
         has_chunk_splits=has_chunk_splits,
+        per_row_query_scale=per_row_query_scale,
         compile_fn=compile_fn,
     )
 

@@ -269,6 +269,28 @@ def select_decode_schedule(target: AcceleratorTarget, head_dim: int) -> DecodeSc
     return default_decode_schedule(head_dim)
 
 
+def select_frozen_prefill_splits(
+    base_blocks: int,
+    hint_chunks: int,
+    sm_count: int,
+    bytes_per_split: int,
+    *,
+    allow_subchunk_single: bool = False,
+) -> int:
+    """Select NVIDIA frozen chunk-prefill split count capped by occupancy and 64 MiB partials."""
+    if hint_chunks <= 0:
+        return 1
+    total_tiles = hint_chunks * 16
+    mem_cap = max(1, (64 * 1024 * 1024) // max(1, bytes_per_split))
+    if allow_subchunk_single:
+        if base_blocks < sm_count * 3 and total_tiles >= 8:
+            return min(32, total_tiles // 4, max(1, (sm_count * 3) // base_blocks), mem_cap)
+        return 1
+    if base_blocks < sm_count and hint_chunks >= 2:
+        return min(16, total_tiles // 4, max(1, (sm_count * 2) // base_blocks), mem_cap)
+    return 1
+
+
 def select_prefill_config(
     target: AcceleratorTarget,
     *,
@@ -283,8 +305,9 @@ def select_prefill_config(
             # Free one pipeline buffer register when unmapped FP32 split partials spill at loop=2.
             loop_stages = 1 if (has_chunk_splits and not has_chunk_map) else 3
             return 64, 4, False, 3, loop_stages
-        loop_stages = 2 if (not is_tail and has_chunk_map) else 1
-        return 64, 4, True, 2, loop_stages
+        if not is_tail:
+            return 64, 8, True, 2, 2
+        return 64, 4, True, 2, 1
     if not is_tail:
         num_warps = 8 if head_dim == 128 else 4
         return 64, num_warps, head_dim == 128, 1, 1

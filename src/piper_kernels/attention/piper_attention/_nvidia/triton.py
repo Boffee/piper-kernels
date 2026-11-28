@@ -205,23 +205,23 @@ def _fold_chunk_value_mean(
     split_pv_head_dim: tl.constexpr,
     head_dim: tl.constexpr,
     guard_zero: tl.constexpr,
+    active_mask=None,
 ):
     """Fold one K1024 chunk's softmax mass times its V mean into the FP32 numerator."""
     chunk_weight_codes = (chunk_denom * _P_UINT8_RANGE)[:, None]
+    zero_guard = ((chunk_denom > 0.0) if active_mask is None else active_mask)[:, None]
     if split_pv_head_dim:
         half_head_dim: tl.constexpr = head_dim // 2
         accumulator_low, accumulator_high = numerator
         value_mean_low = tl.load(value_mean_base + offsets_vd)
         delta_low = chunk_weight_codes * value_mean_low[None, :]
         if guard_zero:
-            zero_guard = (chunk_denom > 0.0)[:, None]
             accumulator_low = accumulator_low + tl.where(zero_guard, delta_low, 0.0)
         else:
             accumulator_low = accumulator_low + delta_low
         value_mean_high = tl.load(value_mean_base + half_head_dim + offsets_vd)
         delta_high = chunk_weight_codes * value_mean_high[None, :]
         if guard_zero:
-            zero_guard = (chunk_denom > 0.0)[:, None]
             accumulator_high = accumulator_high + tl.where(zero_guard, delta_high, 0.0)
         else:
             accumulator_high = accumulator_high + delta_high
@@ -230,7 +230,6 @@ def _fold_chunk_value_mean(
         value_mean = tl.load(value_mean_base + offsets_d)
         delta = chunk_weight_codes * value_mean[None, :]
         if guard_zero:
-            zero_guard = (chunk_denom > 0.0)[:, None]
             delta = tl.where(zero_guard, delta, 0.0)
         return numerator + delta
 

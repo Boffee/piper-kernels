@@ -267,6 +267,12 @@ def quantize_tile_centered_key_tile(
     )
 
 
+@triton.jit
+def _max_propagate_nan(a, b):
+    """Max reducer that propagates NaNs across lanes."""
+    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
 # Per-row scale strides follow the sequence length; specializing on their
 # divisibility would compile a new variant per length class for no benefit.
 @triton.jit(do_not_specialize=["query_length", "stride_sb", "stride_sh"])
@@ -285,8 +291,9 @@ def quantize_query_per_thread_kernel(
     stride_sb,
     stride_sh,
     head_dim: tl.constexpr,
+    per_row: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ):
-    """Quantize one per-thread Q scale group (4 rows per thread, stride 8)."""
+    """Quantize one per-thread Q scale group (per-row or 4 rows per thread, stride 8)."""
     # A head or sequence stride can fit INT32 while its row offset does not.
     scale_group = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
@@ -306,9 +313,17 @@ def quantize_query_per_thread_kernel(
         other=0.0,
     ).to(tl.float32)
     values = rotate_signed_hadamard_heads(values, head_dim)
-    maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
-    scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
-    quantized = round_to_int8(values / scale)
+    if per_row:
+        row_max = tl.reduce(tl.abs(values), 1, _max_propagate_nan)
+        raw_scale = row_max / 127.0  # pyright: ignore[reportOperatorIssue]
+        safe_div = tl.where(raw_scale == 0.0, 1.0, raw_scale)
+        quantized = round_to_int8(values / safe_div[:, None])
+        stored_scale = raw_scale * (softmax_scale * _LOG2_E)
+    else:
+        maximum = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
+        scale = maximum / 127.0 + _SCALE_EPSILON  # pyright: ignore[reportOperatorIssue]
+        quantized = round_to_int8(values / scale)
+        stored_scale = scale * (softmax_scale * _LOG2_E)
     tl.store(
         output_ptr
         + batch * stride_ob
@@ -320,7 +335,7 @@ def quantize_query_per_thread_kernel(
     )
     tl.store(
         scale_ptr + batch * stride_sb + head * stride_sh + offsets_n,
-        scale * (softmax_scale * _LOG2_E),
+        stored_scale,
         mask=offsets_n < query_length,
     )
 
@@ -533,6 +548,7 @@ def prepare_query(
     softmax_scale: float,
     *,
     grouped: bool,
+    per_row: bool = False,
     storage_query_length: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate and quantize Q with the selected SageAttention granularity.
@@ -541,6 +557,8 @@ def prepare_query(
     input length. Padded rows and scale groups are zero so an aligned attention
     launch cannot let padding change real-row quantization.
     """
+    if grouped and per_row:
+        raise ValueError("per_row cannot be combined with grouped=True")
     batch, heads, query_length, head_dim = query.shape
     storage_length = query_length if storage_query_length is None else storage_query_length
     if storage_length < query_length:
@@ -607,6 +625,7 @@ def prepare_query(
                 query_scale.stride(0),
                 query_scale.stride(1),
                 head_dim=head_dim,
+                per_row=per_row,
                 num_warps=4,
             )
         return query_int8, query_scale

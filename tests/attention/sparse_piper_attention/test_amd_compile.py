@@ -181,6 +181,7 @@ def _compile_preparation(
     mask_rows=False,
     mask_heads=False,
     aligned_16b=True,
+    per_row=False,
 ):
     kernels = {
         "query": amd_gluon._prepare_query_kernel,
@@ -197,6 +198,8 @@ def _compile_preparation(
     }
     if "emit_summaries" in kernel.arg_names:
         constants["emit_summaries"] = emit_summaries
+    if "per_row" in kernel.arg_names:
+        constants["per_row"] = per_row
 
     pointer_types = {
         "query_ptr": f"*{input_dtype}",
@@ -309,6 +312,27 @@ def test_vectorized_preparation_odd_heads_unaligned_and_fp32_smoke(kind, archite
         mask_rows=True,
         mask_heads=True,
         aligned_16b=False,
+    )
+    assert compiled.asm["hsaco"]
+    assert compiled.metadata.global_scratch_size == 0
+    assert re.search(r"amdhsa_private_segment_fixed_size\s+0\b", compiled.asm["amdgcn"])
+    if rocm_fences_only_lds():
+        assert "global_inv" not in compiled.asm["amdgcn"]
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_vectorized_per_row_query_compiles_zero_spills(head_dim):
+    _kernel, compiled = _compile_preparation(
+        "gfx1201",
+        "query",
+        head_dim=head_dim,
+        input_dtype="bf16",
+        emit_summaries=False,
+        mask_block_lengths=False,
+        mask_rows=True,
+        mask_heads=(head_dim == 64),
+        aligned_16b=True,
+        per_row=True,
     )
     assert compiled.asm["hsaco"]
     assert compiled.metadata.global_scratch_size == 0

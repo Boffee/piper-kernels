@@ -37,6 +37,22 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
+- Unified `piper_attention_decode` on NVIDIA SM8x/SM12x and AMD RDNA4
+  (`gfx1200`/`gfx1201`) so finalized `PiperKVChunkPool` slots always execute native
+  INT8-Q/UINT8-P tensor-core attention across all `seq_q >= 1`: for `seq_q < 64`,
+  queries are GQA-packed (`gqa_group * seq_q`) with exact per-row query quantization,
+  dispatched with subtile-granular Split-KV over frozen slots (`v_wmma_i32_16x16x16_iu8`
+  on RDNA4, native `.s32.s8.s8.s32`/`.s32.u8.s8.s32` MMA on NVIDIA) and merged in a
+  single `_piper_decode_splitkv_reduce_kernel` wave with the direct BF16/FP16 Split-KV
+  live tail (`_piper_decode_tail_split_kernel` with WGP `-cumode` and
+  `LDS_ONLY_FENCE_ATTRS` on RDNA4); for `seq_q >= 64`, prefill pairs quantized INT8/UINT8 frozen slots with
+  K1024/V1024 chunk-centered live tails and LDS-precomputed value scales. Optimized
+  `_piper_decode_splitkv_reduce_kernel` with row-tiled (`seq_q > 8`) and chunked
+  split-vectorized (`seq_q <= 8`, `LDS_ONLY_FENCE_ATTRS` on RDNA4) reductions plus
+  reduce-aware short-context RDNA4 split guards. Verified with
+  zero VGPR/SGPR/scratch spills offline and live on AMD RX 9070 XT (`gfx1201`),
+  offline on `gfx1200`, and offline compile checks on `gfx942`/`sm8x`/`sm120`; live
+  NVIDIA, non-RDNA4 AMD, and Windows execution remain unexercised locally.
 - **Breaking:** Upgraded ConvRot Trellis storage and kernels to the little-endian
   **Trellis v2** layout with 2 trailing wrap guard bytes per block (`stored_bytes =
   code_bytes + 2`, 24-bit per-block overhead including one FP8 scale, variable-row
