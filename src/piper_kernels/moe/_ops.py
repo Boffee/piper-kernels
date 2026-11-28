@@ -16,7 +16,6 @@ import torch
 from torch._guards import detect_fake_mode
 from torch._subclasses.fake_tensor import FakeTensor
 
-from piper_kernels._input_activations import parse_input_activation
 from piper_kernels._triton import runtime
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.trellis._layout import (
@@ -68,6 +67,8 @@ class _MoEOperands:
     up_gate_block_size: int = 0
     down_block_size: int = 0
     act_quant: str | None = None
+    gate_bound: float | None = None
+    up_bound: float | None = None
 
     def weight_tensors(self) -> tuple[torch.Tensor | None, ...]:
         return (
@@ -117,6 +118,8 @@ class _MoEOperands:
             self.up_gate_block_size,
             self.down_block_size,
             self.act_quant,
+            self.gate_bound,
+            self.up_bound,
         )
         if inplace:
             assert self.out is not None
@@ -147,6 +150,8 @@ class _MoEOperands:
             self.up_gate_block_size,
             self.down_block_size,
             self.act_quant,
+            self.gate_bound,
+            self.up_bound,
         )
 
 
@@ -317,12 +322,16 @@ class _WeightStorage(Protocol):
     def down_block_size(self) -> int: ...
     @property
     def act_quant(self) -> str | None: ...
+    @property
+    def gate_bound(self) -> float | None: ...
+    @property
+    def up_bound(self) -> float | None: ...
 
 
 def _validate_weight_storage(
     ops: _WeightStorage,
 ) -> tuple[_MoEWeightKind, int, int, int, torch.device]:
-    parse_input_activation(ops.activation_fn, name="MoE")
+    reference.validate_moe_activation_bounds(ops.activation_fn, ops.gate_bound, ops.up_bound)
     if not isinstance(ops.gate_first, bool) or not isinstance(ops.high_first, bool):
         raise TypeError("MoE gate_first and high_first must be booleans")
     if ops.act_quant is not None and (type(ops.act_quant) is not str or ops.act_quant != "dynamic"):
@@ -392,7 +401,9 @@ def _validate_weight_storage(
                 f"for INT32 accumulation, got hidden_size={hidden_size}, "
                 f"intermediate_size={intermediate_size}"
             )
-        up_gate_out = intermediate_size * (2 if ops.activation_fn == "swiglu" else 1)
+        up_gate_out = intermediate_size * (
+            2 if reference.is_gated_activation(ops.activation_fn) else 1
+        )
         _validate_trellis_projection(
             name="up_gate",
             qdata=ops.up_gate_qdata,
@@ -449,7 +460,9 @@ def _validate_weight_storage(
                 raise ValueError(
                     f"ConvRot NVFP4 MoE dimensions must be divisible by group_size {group_size}"
                 )
-        up_gate_out = intermediate_size * (2 if ops.activation_fn == "swiglu" else 1)
+        up_gate_out = intermediate_size * (
+            2 if reference.is_gated_activation(ops.activation_fn) else 1
+        )
         expected_up_scale = (num_slots, *nvfp4_layout.scale_shape(up_gate_out, hidden_size))
         expected_down_scale = (
             num_slots,
@@ -499,7 +512,9 @@ def _validate_weight_storage(
                 f"for INT32 accumulation, got hidden_size={hidden_size}, "
                 f"intermediate_size={intermediate_size}"
             )
-        up_gate_out = intermediate_size * (2 if ops.activation_fn == "swiglu" else 1)
+        up_gate_out = intermediate_size * (
+            2 if reference.is_gated_activation(ops.activation_fn) else 1
+        )
         if (
             ops.down_qdata.dtype is not torch.int8
             or ops.up_gate_scale.dtype is not torch.float32
@@ -859,6 +874,8 @@ def _run_moe_ffn(ops: _MoEOperands) -> torch.Tensor:
             up_gate_block_size=ops.up_gate_block_size,
             down_block_size=ops.down_block_size,
             act_quant=ops.act_quant,
+            gate_bound=ops.gate_bound,
+            up_bound=ops.up_bound,
         )
 
     return reference.moe_ffn_reference(
@@ -889,6 +906,8 @@ def _run_moe_ffn(ops: _MoEOperands) -> torch.Tensor:
         up_gate_block_size=ops.up_gate_block_size,
         down_block_size=ops.down_block_size,
         act_quant=ops.act_quant,
+        gate_bound=ops.gate_bound,
+        up_bound=ops.up_bound,
     )
 
 
@@ -920,6 +939,8 @@ def moe_ffn(
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
     act_quant: str | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> torch.Tensor:
     """Execute a slot-indirect quantized MoE FFN and return a fresh output tensor."""
     return _run_moe_ffn(
@@ -952,6 +973,8 @@ def moe_ffn(
             up_gate_block_size,
             down_block_size,
             act_quant,
+            gate_bound,
+            up_bound,
         )
     )
 
@@ -984,6 +1007,8 @@ def _moe_ffn_fake(
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
     act_quant: str | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> torch.Tensor:
     ops = _MoEOperands(
         input,
@@ -1014,6 +1039,8 @@ def _moe_ffn_fake(
         up_gate_block_size,
         down_block_size,
         act_quant,
+        gate_bound,
+        up_bound,
     )
     _reject_autograd(ops)
     _validate_op_operands(ops)
@@ -1050,6 +1077,8 @@ def moe_ffn_(
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
     act_quant: str | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     """Execute a slot-indirect quantized MoE FFN into caller-owned ``out``."""
     _run_moe_ffn(
@@ -1082,6 +1111,8 @@ def moe_ffn_(
             up_gate_block_size,
             down_block_size,
             act_quant,
+            gate_bound,
+            up_bound,
         )
     )
 
@@ -1116,6 +1147,8 @@ def _moe_ffn_inplace_fake(
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
     act_quant: str | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     ops = _MoEOperands(
         input,
@@ -1146,6 +1179,8 @@ def _moe_ffn_inplace_fake(
         up_gate_block_size,
         down_block_size,
         act_quant,
+        gate_bound,
+        up_bound,
     )
     _reject_autograd(ops)
     _validate_op_operands(ops)
@@ -1180,6 +1215,8 @@ def _moe_ffn_autograd(
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
     act_quant: str | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> torch.Tensor:
     ops = _MoEOperands(
         input,
@@ -1210,6 +1247,8 @@ def _moe_ffn_autograd(
         up_gate_block_size,
         down_block_size,
         act_quant,
+        gate_bound,
+        up_bound,
     )
     _reject_autograd(ops)
     with torch._C._AutoDispatchBelowAutograd():
@@ -1248,6 +1287,8 @@ def _moe_ffn_inplace_autograd(
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
     act_quant: str | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     ops = _MoEOperands(
         input,
@@ -1278,6 +1319,8 @@ def _moe_ffn_inplace_autograd(
         up_gate_block_size,
         down_block_size,
         act_quant,
+        gate_bound,
+        up_bound,
     )
     _reject_autograd(ops)
     # Validate eagerly above ADInplaceOrView so rejected calls leave out._version intact.

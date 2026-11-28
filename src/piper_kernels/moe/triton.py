@@ -26,6 +26,7 @@ from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 from . import _int8_triton, _nvfp4_triton, _policy, _schedule, _trellis_triton
 from ._int8_triton import (
+    int8_moe_activate_quant_kernel,
     int8_moe_batched_matmul_kernel,
     int8_moe_grouped_gemm_kernel,
     int8_moe_m1_matmul_kernel,
@@ -51,6 +52,7 @@ from ._routing_triton import (
     moe_splitk_reduce_kernel,
 )
 from ._trellis_triton import trellis_moe_gemv_kernel
+from .reference import is_gated_activation
 
 if TYPE_CHECKING:
     from triton.backends.compiler import GPUTarget
@@ -262,6 +264,8 @@ def _run_a16_chunk(
     down_global_scale: torch.Tensor | None,
     post_scale_only: bool,
     launch_proj: Callable[[bool, torch.Tensor, A16ChunkRouting, torch.Tensor, int], None],
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     device = active_x_chunk.device
     chunk_rows = active_x_chunk.shape[0]
@@ -329,7 +333,6 @@ def _run_a16_chunk(
                 has_global_scale=up_global_scale is not None,
                 post_scale_only=post_scale_only,
                 has_row_scale=has_row_scale,
-                swap_halves=False,
                 num_warps=4,
             )
         activate_grid = moe_2d_tile_grid(
@@ -348,10 +351,14 @@ def _run_a16_chunk(
             num_experts,
             num_slots,
             num_pairs,
+            0.0 if gate_bound is None else float(gate_bound),
+            0.0 if up_bound is None else float(up_bound),
             block_size=_schedule.ACTIVATE_BLOCK_SIZE,
             group_size=group_size,
-            activation_fn=activation_fn,
+            is_gated=is_gated_activation(activation_fn),
             gate_first=gate_first,
+            has_gate_bound=gate_bound is not None,
+            has_up_bound=up_bound is not None,
             accelerator_backend=target.backend,
             has_slot_map=has_slot_map,
             num_warps=4,
@@ -447,6 +454,8 @@ def _run_nvfp4_prefill_chunk(
     up_scale_stride: int,
     down_scale_cols: int,
     down_scale_stride: int,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     device = active_x_chunk.device
     chunk_rows = active_x_chunk.shape[0]
@@ -531,10 +540,14 @@ def _run_nvfp4_prefill_chunk(
             num_pairs,
             num_pairs,
             num_pairs,
+            0.0 if gate_bound is None else float(gate_bound),
+            0.0 if up_bound is None else float(up_bound),
             block_size=_schedule.ACTIVATE_BLOCK_SIZE,
             group_size=group_size,
-            activation_fn=activation_fn,
+            is_gated=is_gated_activation(activation_fn),
             gate_first=gate_first,
+            has_gate_bound=gate_bound is not None,
+            has_up_bound=up_bound is not None,
             accelerator_backend=target.backend,
             has_slot_map=False,
             num_warps=4,
@@ -602,6 +615,8 @@ def _run_nvfp4_w4a4_prefill_chunk(
     up_scale_stride: int,
     down_scale_cols: int,
     down_scale_stride: int,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     device = src_chunk.device
     chunk_rows = src_chunk.shape[0]
@@ -696,6 +711,8 @@ def _run_nvfp4_w4a4_prefill_chunk(
         gate_first=gate_first,
         high_first=high_first,
         accelerator_backend=target.backend,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
     )
     del mid
 
@@ -757,6 +774,8 @@ def _dispatch_nvfp4_moe(
     gate_first: bool,
     high_first: bool,
     active_slots_hint: int,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     device = input_2d.device
     rows, hidden_size = input_2d.shape
@@ -814,6 +833,8 @@ def _dispatch_nvfp4_moe(
                     up_scale_stride=up_scale_stride,
                     down_scale_cols=down_scale_cols,
                     down_scale_stride=down_scale_stride,
+                    gate_bound=gate_bound,
+                    up_bound=up_bound,
                 )
             return
         for active_chunk, ids_chunk, weights_chunk, out_chunk in _iter_a16_chunks(
@@ -842,6 +863,8 @@ def _dispatch_nvfp4_moe(
                 up_scale_stride=up_scale_stride,
                 down_scale_cols=down_scale_cols,
                 down_scale_stride=down_scale_stride,
+                gate_bound=gate_bound,
+                up_bound=up_bound,
             )
         return
 
@@ -977,6 +1000,8 @@ def _dispatch_nvfp4_moe(
             down_global_scale=down_global_scale,
             post_scale_only=post_scale_only,
             launch_proj=_launch_nvfp4_step,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
 
 
@@ -993,13 +1018,11 @@ def _run_int8_chunk(
     out_chunk: torch.Tensor,
     *,
     target: AcceleratorTarget,
-    int8_backend: LinearBackend,
-    down_prep_plan: LinearExecutionPlan,
     batched: bool,
     accumulate: bool,
     group_size: int,
     activation_fn: str,
-    swap_halves: bool,
+    gate_first: bool,
     block_k: int,
     num_stages: int,
     compiler_options: dict[str, object],
@@ -1011,6 +1034,8 @@ def _run_int8_chunk(
     down_aligned_nk: bool,
     up_tiles: int,
     down_tiles: int,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     device = input_q_chunk.device
     chunk_rows = input_q_chunk.shape[0]
@@ -1030,12 +1055,7 @@ def _run_int8_chunk(
         tile_slots = tile_pair_ids = None
         block_m = _schedule.INT8_GEMM_BLOCK_M
 
-    # Batched INT8 skips missed rows when split_k_up == 1; zero mid before preparing down.
-    mid = (
-        torch.zeros((num_pairs, up_gate_out), device=device, dtype=out_chunk.dtype)
-        if batched and split_k_up == 1
-        else torch.empty((num_pairs, up_gate_out), device=device, dtype=out_chunk.dtype)
-    )
+    mid = torch.empty((num_pairs, up_gate_out), device=device, dtype=out_chunk.dtype)
     up_target = (
         torch.empty((split_k_up, num_pairs, up_gate_out), device=device, dtype=torch.int32)
         if split_k_up > 1
@@ -1068,7 +1088,6 @@ def _run_int8_chunk(
             has_slot_map=has_slot_map,
             per_expert_input=False,
             is_splitk=split_k_up > 1,
-            swap_halves=(swap_halves and split_k_up == 1),
             aligned_nk=up_aligned_nk,
             accumulator_seed=up_seed,
             is_amd_hip=target.is_amd_hip,
@@ -1100,18 +1119,30 @@ def _run_int8_chunk(
                 has_global_scale=False,
                 post_scale_only=True,
                 has_row_scale=False,
-                swap_halves=swap_halves,
                 num_warps=4,
             )
 
-    act_q, act_s = int8_backend.prepare_input_with_plan(
+    act_q = torch.empty((num_pairs, intermediate_size), device=device, dtype=torch.int8)
+    act_s = torch.empty((num_pairs,), device=device, dtype=torch.float32)
+    _int8_triton.launch_int8_activate_quant(
         mid,
-        intermediate_size,
-        group_size,
+        topk_ids_flat,
+        expert_to_slot,
+        act_q,
+        act_s,
+        intermediate_size=intermediate_size,
+        group_size=group_size,
+        num_experts=num_experts,
+        num_slots=num_slots,
         activation_fn=activation_fn,
-        execution_plan=down_prep_plan,
-        target=target,
+        gate_first=gate_first,
+        has_slot_map=has_slot_map,
+        use_compact_map=False,
+        accelerator_backend=target.backend,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
     )
+    del mid
     down_partial = torch.empty(
         (split_k_down, num_pairs, hidden_size), device=device, dtype=torch.int32
     )
@@ -1142,7 +1173,6 @@ def _run_int8_chunk(
             has_slot_map=has_slot_map,
             per_expert_input=True,
             is_splitk=True,
-            swap_halves=False,
             aligned_nk=down_aligned_nk,
             accumulator_seed=down_seed,
             is_amd_hip=target.is_amd_hip,
@@ -1200,7 +1230,6 @@ def _run_prefill_int8_proj(
     num_warps: int,
     num_stages: int,
     compiler_options: dict[str, object],
-    swap_halves: bool,
     accumulator_seed: int,
 ) -> None:
     if block_scales is None:
@@ -1222,7 +1251,6 @@ def _run_prefill_int8_proj(
             num_warps=num_warps,
             num_stages=num_stages,
             compiler_options=compiler_options,
-            swap_halves=swap_halves,
             aligned_nk=(out_features % block_n == 0 and in_features % block_k == 0),
             accumulator_seed=accumulator_seed,
         )
@@ -1298,7 +1326,6 @@ def _run_prefill_int8_proj(
                 num_warps=num_warps,
                 num_stages=num_stages,
                 compiler_options=compiler_options,
-                swap_halves=swap_halves,
                 aligned_nk=(n_rows % block_n == 0 and in_features % block_k == 0),
                 accumulator_seed=accumulator_seed,
                 slot_start=slot_start,
@@ -1322,11 +1349,10 @@ def _run_int8_prefill_chunk(
     out_chunk: torch.Tensor,
     *,
     target: AcceleratorTarget,
-    int8_backend: LinearBackend,
     accumulate: bool,
     group_size: int,
     activation_fn: str,
-    swap_halves: bool,
+    gate_first: bool,
     active_slots_hint: int,
     up_gate_block_scales: torch.Tensor | None = None,
     up_gate_row_widths: torch.Tensor | None = None,
@@ -1336,6 +1362,8 @@ def _run_int8_prefill_chunk(
     down_row_widths: torch.Tensor | None = None,
     down_slot_offsets: torch.Tensor | None = None,
     down_block_size: int = 0,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     device = input_q_chunk.device
     chunk_rows = input_q_chunk.shape[0]
@@ -1394,8 +1422,7 @@ def _run_int8_prefill_chunk(
         top_k,
         has_scale=True,
     )
-    # Zero mid so inactive compacted tail rows produce finite zeroed activations.
-    mid = torch.zeros((num_pairs, up_gate_out), device=device, dtype=out_chunk.dtype)
+    mid = torch.empty((num_pairs, up_gate_out), device=device, dtype=out_chunk.dtype)
     _run_prefill_int8_proj(
         x_compact,
         x_scale_compact,
@@ -1420,20 +1447,28 @@ def _run_int8_prefill_chunk(
         num_warps=num_warps,
         num_stages=num_stages,
         compiler_options=compiler_options,
-        swap_halves=swap_halves,
         accumulator_seed=up_seed,
     )
     del x_compact, x_scale_compact
-    down_prep_plan = int8_backend.policy.select_execution_plan(
-        target, in_features=intermediate_size, rows=num_pairs, out_features=None
-    )
-    act_q, act_s = int8_backend.prepare_input_with_plan(
+    act_q = torch.empty((num_pairs, intermediate_size), device=device, dtype=torch.int8)
+    act_s = torch.empty((num_pairs,), device=device, dtype=torch.float32)
+    _int8_triton.launch_int8_activate_quant(
         mid,
-        intermediate_size,
-        group_size,
+        compact_to_pair,
+        None,
+        act_q,
+        act_s,
+        intermediate_size=intermediate_size,
+        group_size=group_size,
+        num_experts=num_pairs,
+        num_slots=num_pairs,
         activation_fn=activation_fn,
-        execution_plan=down_prep_plan,
-        target=target,
+        gate_first=gate_first,
+        has_slot_map=False,
+        use_compact_map=True,
+        accelerator_backend=target.backend,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
     )
     del mid
     down_out = torch.empty((num_pairs, hidden_size), device=device, dtype=torch.float32)
@@ -1461,7 +1496,6 @@ def _run_int8_prefill_chunk(
         num_warps=num_warps,
         num_stages=num_stages,
         compiler_options=compiler_options,
-        swap_halves=False,
         accumulator_seed=down_seed,
     )
     del act_q, act_s
@@ -1533,9 +1567,10 @@ def _dispatch_int8_prefill_chunks(
     down_row_widths: torch.Tensor | None = None,
     down_slot_offsets: torch.Tensor | None = None,
     down_block_size: int = 0,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     rows, hidden_size = input_2d.shape
-    swap_halves = activation_fn == "swiglu" and gate_first
     prep_q_full = None if prepared_data is None else prepared_data.reshape(rows, hidden_size)
     prep_s_full = None if prepared_scale is None else prepared_scale.reshape(rows)
     up_prep_plan = (
@@ -1566,11 +1601,10 @@ def _dispatch_int8_prefill_chunks(
             expert_to_slot,
             out_2d[start:end],
             target=resolved_target,
-            int8_backend=int8_backend,
             accumulate=accumulate,
             group_size=group_size,
             activation_fn=activation_fn,
-            swap_halves=swap_halves,
+            gate_first=gate_first,
             active_slots_hint=active_slots_hint,
             up_gate_block_scales=up_gate_block_scales,
             up_gate_row_widths=up_gate_row_widths,
@@ -1580,6 +1614,8 @@ def _dispatch_int8_prefill_chunks(
             down_row_widths=down_row_widths,
             down_slot_offsets=down_slot_offsets,
             down_block_size=down_block_size,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
 
 
@@ -1602,6 +1638,8 @@ def _dispatch_int8_moe(
     activation_fn: str,
     gate_first: bool,
     active_slots_hint: int,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     from piper_kernels.linear.convrot.int8 import _backend as int8_backend_mod  # noqa: PLC0415
 
@@ -1643,10 +1681,11 @@ def _dispatch_int8_moe(
             activation_fn=activation_fn,
             gate_first=gate_first,
             active_slots_hint=active_slots_hint,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
         return
 
-    swap_halves = activation_fn == "swiglu" and gate_first
     up_prep_plan = (
         None
         if prepared_data is not None
@@ -1655,12 +1694,6 @@ def _dispatch_int8_moe(
     batched = regime == "batched"
     expected_tiles = _schedule.expected_bucket_tiles(
         chunk_rows * top_k, num_slots, active_slots_hint, batched=batched
-    )
-    down_prep_plan = int8_backend.policy.select_execution_plan(
-        resolved_target,
-        in_features=intermediate_size,
-        rows=chunk_rows * top_k,
-        out_features=None,
     )
     launch_schedule = _policy.select_int8_launch_schedule(resolved_target)
     block_k = launch_schedule.block_k
@@ -1726,13 +1759,11 @@ def _dispatch_int8_moe(
             expert_to_slot,
             out_2d[start:end],
             target=resolved_target,
-            int8_backend=int8_backend,
-            down_prep_plan=down_prep_plan,
             batched=batched,
             accumulate=accumulate,
             group_size=group_size,
             activation_fn=activation_fn,
-            swap_halves=swap_halves,
+            gate_first=gate_first,
             block_k=block_k,
             num_stages=num_stages,
             compiler_options=compiler_options,
@@ -1744,6 +1775,8 @@ def _dispatch_int8_moe(
             down_aligned_nk=down_aligned_nk,
             up_tiles=up_tiles,
             down_tiles=down_tiles,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
 
 
@@ -1773,6 +1806,8 @@ def _dispatch_trellis_moe(
     activation_fn: str,
     gate_first: bool,
     active_slots_hint: int,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> None:
     from piper_kernels.linear.convrot.int8 import _backend as int8_backend_mod  # noqa: PLC0415
 
@@ -1828,6 +1863,8 @@ def _dispatch_trellis_moe(
             down_row_widths=down_row_widths,
             down_slot_offsets=down_slot_offsets,
             down_block_size=down_block_size,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
         return
 
@@ -1982,6 +2019,8 @@ def _dispatch_trellis_moe(
             down_global_scale=None,
             post_scale_only=True,
             launch_proj=_launch_trellis_step,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
 
 
@@ -2016,6 +2055,8 @@ def moe_ffn(
     up_gate_block_size: int = 0,
     down_block_size: int = 0,
     act_quant: str | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> torch.Tensor:
     """Execute single-token, small-batch, or prefill quantized MoE kernels on GPU."""
     device = input.device
@@ -2056,6 +2097,8 @@ def moe_ffn(
             activation_fn=activation_fn,
             gate_first=gate_first,
             active_slots_hint=active_slots_hint,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
     elif up_gate_qdata.dtype is torch.int8:
         _dispatch_int8_moe(
@@ -2076,6 +2119,8 @@ def moe_ffn(
             activation_fn=activation_fn,
             gate_first=gate_first,
             active_slots_hint=active_slots_hint,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
     else:
         _dispatch_nvfp4_moe(
@@ -2099,6 +2144,8 @@ def moe_ffn(
             gate_first=gate_first,
             high_first=high_first,
             active_slots_hint=active_slots_hint,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
     return result
 
@@ -2126,6 +2173,8 @@ def compile_moe_kernels(
     variable_rows: bool = False,
     has_slot_offsets: bool = False,
     bytes_per_block: int | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compiler: TritonCompileFn | None = None,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     """Compile quantized MoE Triton kernels matching runtime regime and chunking selection."""
@@ -2153,12 +2202,15 @@ def compile_moe_kernels(
         variable_rows=variable_rows,
         has_slot_offsets=has_slot_offsets,
         bytes_per_block=bytes_per_block,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
         compiler=compiler,
     )
 
 
 __all__ = [
     "compile_moe_kernels",
+    "int8_moe_activate_quant_kernel",
     "int8_moe_batched_matmul_kernel",
     "int8_moe_grouped_gemm_kernel",
     "int8_moe_m1_matmul_kernel",

@@ -11,18 +11,238 @@ import torch
 import triton
 import triton.language as tl
 
+from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels._triton.primitives import splitk_tile_bounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels.linear.convrot.int8.triton import _accumulate_int8_tile
+from piper_kernels.weights.convrot.int8.triton import _quantize_int8, int8_scale_from_max
+from piper_kernels.weights.convrot.triton import rotate_hadamard_groups
 
 from . import _schedule
 from ._routing_triton import (
     _resolve_slot,
-    _swap_halves_col,
     _swizzle_grouped_pid,
     _unpack_2d_tile_pid,
     moe_2d_tile_grid,
 )
+from .reference import is_gated_activation
+
+
+@triton.jit
+def _load_activate_rotate_int8_tile(
+    mid_ptr,
+    pair_idx,
+    k_offs,
+    k_valid,
+    intermediate_size,
+    gate_bound,
+    up_bound,
+    group_size: tl.constexpr,
+    is_gated: tl.constexpr,
+    gate_first: tl.constexpr,
+    has_gate_bound: tl.constexpr,
+    has_up_bound: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    inter_i64 = intermediate_size.to(tl.int64)
+    k_offs_i64 = k_offs.to(tl.int64)
+    if is_gated:
+        base = pair_idx * (inter_i64 * 2) + k_offs_i64
+        first = tl.load(mid_ptr + base, mask=k_valid, other=0.0).to(tl.float32)
+        second = tl.load(mid_ptr + base + inter_i64, mask=k_valid, other=0.0).to(tl.float32)
+        gate = first if gate_first else second
+        up = second if gate_first else first
+        if has_gate_bound:
+            gate = tl.minimum(gate, gate_bound)
+        if has_up_bound:
+            up = tl.clamp(up, -up_bound, up_bound)
+        vals = swiglu(up, gate)
+    else:
+        vals = tl.load(
+            mid_ptr + pair_idx * inter_i64 + k_offs_i64,
+            mask=k_valid,
+            other=0.0,
+        ).to(tl.float32)
+        vals = gelu_tanh(vals, accelerator_backend)
+    vals = tl.where(k_valid, vals, 0.0)
+    return rotate_hadamard_groups(vals, block_k, group_size, normalize=True)
+
+
+@triton.jit(do_not_specialize=["num_pairs", "gate_bound", "up_bound"])
+def int8_moe_activate_quant_kernel(
+    mid_ptr,
+    routing_ids_ptr,
+    expert_to_slot_ptr,
+    q_out_ptr,
+    scale_out_ptr,
+    intermediate_size,
+    num_experts,
+    num_slots,
+    num_pairs,
+    gate_bound,
+    up_bound,
+    block_k: tl.constexpr,
+    group_size: tl.constexpr,
+    single_tile: tl.constexpr,
+    is_gated: tl.constexpr,
+    gate_first: tl.constexpr,
+    has_gate_bound: tl.constexpr,
+    has_up_bound: tl.constexpr,
+    has_slot_map: tl.constexpr,
+    use_compact_map: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+):
+    """Apply MoE activation (with optional bounds), ConvRot Hadamard rotation, and INT8 quant."""
+    pair = tl.program_id(0).to(tl.int64)
+    if pair >= num_pairs:
+        return
+    if use_compact_map:
+        orig_pair = tl.load(routing_ids_ptr + pair)
+        is_inactive = orig_pair < 0
+    else:
+        slot = _resolve_slot(
+            routing_ids_ptr,
+            expert_to_slot_ptr,
+            pair,
+            num_experts,
+            num_slots,
+            has_slot_map,
+        )
+        is_inactive = slot < 0
+    if is_inactive:
+        tl.store(scale_out_ptr + pair, tl.full((), 1e-30, tl.float32))
+        return
+
+    reciprocal_scale: tl.constexpr = accelerator_backend == "hip"
+    inter_i64 = intermediate_size.to(tl.int64)
+    if single_tile:
+        k_offs = tl.arange(0, block_k)
+        k_valid = k_offs < intermediate_size
+        vals = _load_activate_rotate_int8_tile(
+            mid_ptr,
+            pair,
+            k_offs,
+            k_valid,
+            intermediate_size,
+            gate_bound,
+            up_bound,
+            group_size,
+            is_gated,
+            gate_first,
+            has_gate_bound,
+            has_up_bound,
+            accelerator_backend,
+            block_k,
+        )
+        row_amax = tl.max(tl.abs(vals), axis=0)
+        row_scale = tl.maximum(
+            int8_scale_from_max(row_amax, reciprocal_scale=reciprocal_scale),
+            1e-30,
+        )
+        tl.store(scale_out_ptr + pair, row_scale)
+        quantized = _quantize_int8(vals, row_scale, accelerator_backend)
+        tl.store(q_out_ptr + pair * inter_i64 + k_offs.to(tl.int64), quantized, mask=k_valid)
+        return
+
+    row_amax = tl.full((), 0.0, dtype=tl.float32)
+    for k_base in range(0, intermediate_size, block_k):
+        k_offs = k_base + tl.arange(0, block_k)
+        k_valid = k_offs < intermediate_size
+        vals = _load_activate_rotate_int8_tile(
+            mid_ptr,
+            pair,
+            k_offs,
+            k_valid,
+            intermediate_size,
+            gate_bound,
+            up_bound,
+            group_size,
+            is_gated,
+            gate_first,
+            has_gate_bound,
+            has_up_bound,
+            accelerator_backend,
+            block_k,
+        )
+        row_amax = tl.maximum(row_amax, tl.max(tl.abs(vals), axis=0))
+
+    row_scale = tl.maximum(
+        int8_scale_from_max(row_amax, reciprocal_scale=reciprocal_scale),
+        1e-30,
+    )
+    tl.store(scale_out_ptr + pair, row_scale)
+    for k_base in range(0, intermediate_size, block_k):
+        k_offs = k_base + tl.arange(0, block_k)
+        k_valid = k_offs < intermediate_size
+        vals = _load_activate_rotate_int8_tile(
+            mid_ptr,
+            pair,
+            k_offs,
+            k_valid,
+            intermediate_size,
+            gate_bound,
+            up_bound,
+            group_size,
+            is_gated,
+            gate_first,
+            has_gate_bound,
+            has_up_bound,
+            accelerator_backend,
+            block_k,
+        )
+        quantized = _quantize_int8(vals, row_scale, accelerator_backend)
+        tl.store(q_out_ptr + pair * inter_i64 + k_offs.to(tl.int64), quantized, mask=k_valid)
+
+
+def launch_int8_activate_quant(
+    mid: torch.Tensor,
+    routing_ids: torch.Tensor,
+    expert_to_slot: torch.Tensor | None,
+    q_out: torch.Tensor,
+    scale_out: torch.Tensor,
+    *,
+    intermediate_size: int,
+    group_size: int,
+    num_experts: int,
+    num_slots: int,
+    activation_fn: str,
+    gate_first: bool,
+    has_slot_map: bool,
+    use_compact_map: bool,
+    accelerator_backend: str,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
+) -> None:
+    num_pairs = mid.shape[0]
+    if num_pairs == 0:
+        return
+    single_tile, block_k, num_warps = _schedule.select_int8_activate_schedule(intermediate_size)
+    with device_context(mid.device):
+        int8_moe_activate_quant_kernel[(num_pairs,)](
+            mid,
+            routing_ids,
+            expert_to_slot,
+            q_out,
+            scale_out,
+            intermediate_size,
+            num_experts,
+            num_slots,
+            num_pairs,
+            0.0 if gate_bound is None else float(gate_bound),
+            0.0 if up_bound is None else float(up_bound),
+            block_k=block_k,
+            group_size=group_size,
+            single_tile=single_tile,
+            is_gated=is_gated_activation(activation_fn),
+            gate_first=gate_first,
+            has_gate_bound=gate_bound is not None,
+            has_up_bound=up_bound is not None,
+            has_slot_map=has_slot_map,
+            use_compact_map=use_compact_map,
+            accelerator_backend=accelerator_backend,
+            num_warps=num_warps,
+        )
 
 
 @triton.jit(do_not_specialize=["split_k"])
@@ -47,7 +267,6 @@ def int8_moe_m1_matmul_kernel(
     per_expert_input: tl.constexpr,
     is_splitk: tl.constexpr,
     dequant_output: tl.constexpr,
-    swap_halves: tl.constexpr,
     aligned_nk: tl.constexpr,
     accumulator_seed: tl.constexpr = 0,
 ):
@@ -68,13 +287,6 @@ def int8_moe_m1_matmul_kernel(
         has_slot_map,
     )
     if slot < 0:
-        if not is_splitk:
-            zeros = tl.zeros((block_n,), dtype=tl.float32).to(output_ptr.dtype.element_ty)
-            tl.store(
-                output_ptr + k_idx.to(tl.int64) * out_features + offs_n_i64,
-                zeros,
-                mask=offs_n < out_features,
-            )
         return
 
     offs_m = tl.arange(0, block_m)
@@ -115,11 +327,11 @@ def int8_moe_m1_matmul_kernel(
     else:
         out_vals = centered
 
-    col_out = _swap_halves_col(offs_n_i64, out_features, swap_halves)
-
     row_idx = pid_k.to(tl.int64) * top_k + k_idx if is_splitk else k_idx.to(tl.int64)
     out_ptrs = (
-        output_ptr + row_idx * out_features + tl.broadcast_to(col_out[None, :], (block_m, block_n))
+        output_ptr
+        + row_idx * out_features
+        + tl.broadcast_to(offs_n_i64[None, :], (block_m, block_n))
     )
     row0_mask = (offs_m[:, None] == 0) & (offs_n[None, :] < out_features)
     tl.store(out_ptrs, out_vals, mask=row0_mask)
@@ -145,7 +357,6 @@ def int8_moe_batched_matmul_kernel(
     per_expert_input: tl.constexpr,
     is_splitk: tl.constexpr,
     dequant_output: tl.constexpr,
-    swap_halves: tl.constexpr,
     aligned_nk: tl.constexpr,
     accumulator_seed: tl.constexpr = 0,
 ):
@@ -216,13 +427,11 @@ def int8_moe_batched_matmul_kernel(
     else:
         out_vals = centered
 
-    col_out = _swap_halves_col(offs_n_i64, out_features, swap_halves)
-
     dst_rows = tl.where(
         row_valid, pid_k.to(tl.int64) * num_pairs + pair_ids if is_splitk else pair_ids, 0
     )
     tl.store(
-        output_ptr + dst_rows[:, None] * out_features + col_out[None, :],
+        output_ptr + dst_rows[:, None] * out_features + offs_n_i64[None, :],
         out_vals,
         mask=row_valid[:, None] & (offs_n[None, :] < out_features),
     )
@@ -245,7 +454,6 @@ def int8_moe_grouped_gemm_kernel(
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     group_m: tl.constexpr,
-    swap_halves: tl.constexpr,
     aligned_nk: tl.constexpr,
     accumulator_seed: tl.constexpr = 0,
     slot_start=0,
@@ -307,10 +515,8 @@ def int8_moe_grouped_gemm_kernel(
         output_ptr.dtype.element_ty
     )
 
-    col_out = _swap_halves_col(offs_n_global_i64, out_features, swap_halves)
-
     tl.store(
-        output_ptr + (m_start + offs_m_i64)[:, None] * out_features + col_out[None, :],
+        output_ptr + (m_start + offs_m_i64)[:, None] * out_features + offs_n_global_i64[None, :],
         out_vals,
         mask=m_valid[:, None] & n_valid[None, :],
     )
@@ -342,7 +548,6 @@ def launch_int8_proj(
     has_slot_map: bool,
     per_expert_input: bool,
     is_splitk: bool,
-    swap_halves: bool,
     aligned_nk: bool,
     accumulator_seed: int,
     is_amd_hip: bool = False,
@@ -369,7 +574,6 @@ def launch_int8_proj(
                 per_expert_input=per_expert_input,
                 is_splitk=is_splitk,
                 dequant_output=not is_splitk,
-                swap_halves=swap_halves,
                 aligned_nk=aligned_nk,
                 accumulator_seed=accumulator_seed,
                 **compiler_options,
@@ -405,7 +609,6 @@ def launch_int8_proj(
                 per_expert_input=per_expert_input,
                 is_splitk=is_splitk,
                 dequant_output=not is_splitk,
-                swap_halves=swap_halves,
                 aligned_nk=aligned_nk,
                 accumulator_seed=accumulator_seed,
                 **compiler_options,
@@ -433,7 +636,6 @@ def launch_int8_grouped_gemm(
     num_warps: int,
     num_stages: int,
     compiler_options: dict[str, object],
-    swap_halves: bool,
     aligned_nk: bool,
     accumulator_seed: int,
     slot_start: int = 0,
@@ -461,7 +663,6 @@ def launch_int8_grouped_gemm(
             block_n=block_n,
             block_k=block_k,
             group_m=_schedule.PREFILL_GROUP_M,
-            swap_halves=swap_halves,
             aligned_nk=aligned_nk,
             accumulator_seed=accumulator_seed,
             slot_start=slot_start,

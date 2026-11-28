@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 import sys
@@ -28,8 +29,10 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler.compiler import LazyDict
 
 from piper_kernels import compile_options
+from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.nvfp4 import reference as nvfp4_ref
 from piper_kernels.moe import (
+    MoEActivation,
     MoEWeights,
     PreparedMoEInput,
     moe_ffn,
@@ -52,7 +55,7 @@ MoEFormat = Literal[
     "convrot_trellis",
 ]
 TrellisLayoutKind = Literal["uniform", "var2d", "var1d"]
-ActivationKind = Literal["swiglu", "gelu_tanh"]
+ActivationKind = MoEActivation
 
 _TRELLIS_MOE_GPU_AVAILABLE = trellis_moe_available()
 _NVFP4_MOE_GPU_AVAILABLE = w4a16_nvfp4_available()
@@ -113,7 +116,7 @@ def _make_dense_weights(
     seed: int = 101,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    up_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_out = intermediate_size * (2 if moe_reference.is_gated_activation(activation_fn) else 1)
     up_gate_hp = (
         torch.randn((num_slots, up_out, hidden_size), generator=generator, dtype=dtype)
         * (hidden_size**-0.5)
@@ -211,7 +214,7 @@ def _make_trellis_proj_slab(
     )
 
 
-def _make_trellis_moe_weights(
+def _make_trellis_moe_weights(  # noqa: PLR0913 - test fixture mirrors MoEWeights fields
     num_slots: int,
     hidden_size: int,
     intermediate_size: int,
@@ -223,10 +226,12 @@ def _make_trellis_moe_weights(
     device: str | torch.device = "cpu",
     layouts: tuple[TrellisLayoutKind, TrellisLayoutKind] = ("uniform", "uniform"),
     seed: int = 101,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> MoEWeights:
     up_layout, down_layout = layouts
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    up_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_out = intermediate_size * (2 if moe_reference.is_gated_activation(activation_fn) else 1)
     resolved_up_bs = resolve_block_size(hidden_size)
     resolved_dn_bs = resolve_block_size(intermediate_size)
     up_qd, up_bs, up_sc, up_rw, up_so = _make_trellis_proj_slab(
@@ -264,6 +269,8 @@ def _make_trellis_moe_weights(
         down_slot_offsets=dn_so,
         up_gate_block_size=resolved_up_bs,
         down_block_size=resolved_dn_bs,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
     )
 
 
@@ -315,10 +322,12 @@ def _decode_trellis_moe_weights_to_int8(weights: MoEWeights) -> MoEWeights:
         group_size=weights.group_size,
         activation_fn=weights.activation_fn,
         gate_first=weights.gate_first,
+        gate_bound=weights.gate_bound,
+        up_bound=weights.up_bound,
     )
 
 
-def _make_moe_weights(
+def _make_moe_weights(  # noqa: PLR0913 - test fixture mirrors MoEWeights fields
     num_slots: int,
     hidden_size: int,
     intermediate_size: int,
@@ -330,6 +339,8 @@ def _make_moe_weights(
     dtype: torch.dtype = torch.bfloat16,
     device: str | torch.device = "cpu",
     seed: int = 101,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> MoEWeights:
     if weight_format == "convrot_trellis":
         return _make_trellis_moe_weights(
@@ -342,6 +353,8 @@ def _make_moe_weights(
             dtype=dtype,
             device=device,
             seed=seed,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
     up_gate_hp, down_hp = _make_dense_weights(
         num_slots,
@@ -359,6 +372,8 @@ def _make_moe_weights(
         group_size=group_size,
         activation_fn=activation_fn,
         gate_first=gate_first,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
     )
 
 
@@ -426,6 +441,8 @@ def _reference_for_weights(
         up_gate_block_size=weights.up_gate_block_size,
         down_block_size=weights.down_block_size,
         act_quant=resolved_act_quant,  # type: ignore[arg-type]
+        gate_bound=weights.gate_bound,
+        up_bound=weights.up_bound,
     )
 
 
@@ -546,9 +563,14 @@ def _oracle_slot_output(
                 weights, weights.down_qdata[slot].cpu(), weights.down_scale[slot].cpu(), down_gs
             )
             mid = F.linear(x_row.float(), up_t.dequantize(torch.float32))
-    if weights.activation_fn == "swiglu":
+    if moe_reference.is_gated_activation(weights.activation_fn):
         first, second = mid.chunk(2, dim=-1)
-        activated = F.silu(first) * second if weights.gate_first else first * F.silu(second)
+        gate, up = (first, second) if weights.gate_first else (second, first)
+        if weights.gate_bound is not None:
+            gate = torch.clamp(gate, max=weights.gate_bound)
+        if weights.up_bound is not None:
+            up = torch.clamp(up, min=-weights.up_bound, max=weights.up_bound)
+        activated = F.silu(gate) * up
     else:
         activated = F.gelu(mid, approximate="tanh")
     if weights.weight_format == "convrot_int8":
@@ -2573,7 +2595,7 @@ def test_gpu_moe_matches_reference_int8(
     reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
 )
 def test_gpu_moe_tails_splitk_multirow_and_deepseek_anchor() -> None:
-    # 1. Mid-tile swap_halves + unaligned block_k tails (I=80 g=16 and I=192 g=64)
+    # 1. Mid-tile gate_first=True + unaligned block_k tails (I=80 g=16 and I=192 g=64)
     if _INT8_MOE_GPU_AVAILABLE:
         for hidden_size, intermediate_size, group_size in ((128, 80, 16), (256, 192, 64)):
             w_int8 = _make_moe_weights(
@@ -6860,3 +6882,777 @@ def test_gpu_nvfp4_w4a4_hybrid_regimes_dense_tile_and_extreme_scales(
         expected_ext = _reference_for_weights(x_huge, w_extreme, ids_gs, wts_gs).to("cuda")
         assert torch.isfinite(actual_ext).all()
         torch.testing.assert_close(actual_ext, expected_ext, rtol=1e-4, atol=1e-4)
+
+
+def test_swiglu_clamped_validation_bounds_out_version_and_linear_isolation() -> None:
+    torch.manual_seed(1100)
+    w_base = _make_moe_weights(
+        2, 64, 64, weight_format="nvfp4_w4a16", dtype=torch.float32, seed=1101
+    )
+    x = torch.randn((2, 64), dtype=torch.float32)
+    ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+    wts = torch.full((2, 2), 0.5, dtype=torch.float32)
+
+    # Plain swiglu / gelu_tanh reject non-None bounds.
+    for plain_act in ("swiglu", "gelu_tanh"):
+        up_hp, down_hp = _make_dense_weights(
+            2, 64, 64, activation_fn=plain_act, dtype=torch.float32, seed=1102
+        )
+        for bad_pair in ((1.0, None), (None, 1.0), (1.0, 1.0)):
+            with pytest.raises(ValueError, match="does not accept"):
+                MoEWeights.from_hp(
+                    up_hp,
+                    down_hp,
+                    weight_format="nvfp4_w4a16",
+                    activation_fn=plain_act,
+                    gate_bound=bad_pair[0],
+                    up_bound=bad_pair[1],
+                )
+            with pytest.raises(ValueError, match="does not accept"):
+                torch.ops.piper_kernels.moe_ffn(
+                    x,
+                    ids,
+                    wts,
+                    w_base.up_gate_qdata,
+                    w_base.up_gate_scale,
+                    w_base.down_qdata,
+                    w_base.down_scale,
+                    w_base.up_gate_global_scale,
+                    w_base.down_global_scale,
+                    activation_fn=plain_act,
+                    gate_bound=bad_pair[0],
+                    up_bound=bad_pair[1],
+                )
+            with pytest.raises(ValueError, match="does not accept"):
+                moe_triton.compile_moe_kernels(
+                    GPUTarget("cuda", 120, 32),
+                    activation_fn=plain_act,
+                    gate_bound=bad_pair[0],
+                    up_bound=bad_pair[1],
+                )
+
+    # swiglu_clamped requires both bounds and validates positive finite real scalars.
+    up_hp, down_hp = _make_dense_weights(
+        2, 64, 64, activation_fn="swiglu_clamped", dtype=torch.float32, seed=1103
+    )
+    for missing_pair in ((None, None), (2.0, None), (None, 2.0)):
+        with pytest.raises(ValueError, match="requires both"):
+            MoEWeights.from_hp(
+                up_hp,
+                down_hp,
+                weight_format="nvfp4_w4a16",
+                activation_fn="swiglu_clamped",
+                gate_bound=missing_pair[0],
+                up_bound=missing_pair[1],
+            )
+        with pytest.raises(ValueError, match="requires both"):
+            MoEWeights.from_quantized(
+                w_base.up_gate_qdata,
+                w_base.up_gate_scale,
+                w_base.down_qdata,
+                w_base.down_scale,
+                logical_dtype=torch.float32,
+                up_gate_global_scale=w_base.up_gate_global_scale,
+                down_global_scale=w_base.down_global_scale,
+                activation_fn="swiglu_clamped",
+                gate_bound=missing_pair[0],
+                up_bound=missing_pair[1],
+            )
+
+    for bad_val in (0.0, -1.0, math.inf, -math.inf, math.nan):
+        with pytest.raises(ValueError, match="finite and positive"):
+            MoEWeights.from_hp(
+                up_hp,
+                down_hp,
+                weight_format="nvfp4_w4a16",
+                activation_fn="swiglu_clamped",
+                gate_bound=bad_val,
+                up_bound=2.0,
+            )
+        with pytest.raises(ValueError, match="finite and positive"):
+            moe_reference.moe_ffn_reference(
+                x,
+                ids,
+                wts,
+                w_base.up_gate_qdata,
+                w_base.up_gate_scale,
+                w_base.down_qdata,
+                w_base.down_scale,
+                w_base.up_gate_global_scale,
+                w_base.down_global_scale,
+                activation_fn="swiglu_clamped",
+                gate_bound=2.0,
+                up_bound=bad_val,
+            )
+
+    for bad_type in (True, False, 1j, "1.0", torch.tensor(1.0)):
+        with pytest.raises(TypeError):
+            MoEWeights.from_quantized(
+                w_base.up_gate_qdata,
+                w_base.up_gate_scale,
+                w_base.down_qdata,
+                w_base.down_scale,
+                logical_dtype=torch.float32,
+                up_gate_global_scale=w_base.up_gate_global_scale,
+                down_global_scale=w_base.down_global_scale,
+                activation_fn="swiglu_clamped",
+                gate_bound=bad_type,  # type: ignore[arg-type]
+                up_bound=2.0,
+            )
+
+    # Rejected inplace custom_op preserves caller out bytes and out._version.
+    out = torch.full((2, 64), 3.25, dtype=torch.float32)
+    expected_out = out.clone()
+    prev_version = out._version
+    with torch.no_grad(), pytest.raises(ValueError, match="finite and positive"):
+        torch.ops.piper_kernels.moe_ffn_(
+            x,
+            ids,
+            wts,
+            w_base.up_gate_qdata,
+            w_base.up_gate_scale,
+            w_base.down_qdata,
+            w_base.down_scale,
+            out,
+            w_base.up_gate_global_scale,
+            w_base.down_global_scale,
+            activation_fn="swiglu_clamped",
+            gate_bound=-2.0,
+            up_bound=2.0,
+        )
+    assert out._version == prev_version
+    assert torch.equal(out, expected_out)
+    with torch.inference_mode():
+        inf_out = torch.full((2, 64), 3.25, dtype=torch.float32)
+        expected_inf = inf_out.clone()
+        with pytest.raises(ValueError, match="finite and positive"):
+            torch.ops.piper_kernels.moe_ffn_(
+                x,
+                ids,
+                wts,
+                w_base.up_gate_qdata,
+                w_base.up_gate_scale,
+                w_base.down_qdata,
+                w_base.down_scale,
+                inf_out,
+                w_base.up_gate_global_scale,
+                w_base.down_global_scale,
+                activation_fn="swiglu_clamped",
+                gate_bound=-2.0,
+                up_bound=2.0,
+            )
+        assert torch.equal(inf_out, expected_inf)
+
+    # Linear ConvRot INT8 must continue rejecting MoE-only "swiglu_clamped".
+    lin_w = ConvRotInt8Tensor.from_hp(torch.randn(32, 64, dtype=torch.float32), group_size=64)
+    lin_x = torch.randn(2, 128, dtype=torch.float32)
+    with pytest.raises(ValueError, match="unsupported input activation"):
+        convrot_int8_linear(lin_x, lin_w, activation_fn="swiglu_clamped")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="unsupported input activation"):
+        torch.ops.piper_kernels.convrot_int8_prepare_input(lin_x, 64, "swiglu_clamped")
+
+
+def test_swiglu_clamped_faketensor_all_formats() -> None:
+    torch.manual_seed(1105)
+    ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+    x_bf16 = torch.randn(2, 64, dtype=torch.bfloat16)
+    wts_bf16 = torch.full((2, 2), 0.5, dtype=torch.bfloat16)
+    for weight_format, group_size in (
+        ("nvfp4", 0),
+        ("convrot_nvfp4", 64),
+        ("nvfp4_w4a16", 0),
+        ("convrot_nvfp4_w4a16", 64),
+        ("convrot_int8", 64),
+        ("convrot_trellis", 64),
+    ):
+        real_w = _make_moe_weights(
+            2,
+            64,
+            64,
+            weight_format=weight_format,
+            group_size=group_size,
+            activation_fn="swiglu_clamped",
+            gate_bound=5.0,
+            up_bound=6.0,
+            dtype=torch.bfloat16,
+            seed=1104 + group_size,
+        )
+        with FakeTensorMode() as fake_mode:
+            fake_x = fake_mode.from_tensor(x_bf16)
+            fake_ids = fake_mode.from_tensor(ids)
+            fake_wts = fake_mode.from_tensor(wts_bf16)
+            fake_w = MoEWeights.from_quantized(
+                fake_mode.from_tensor(real_w.up_gate_qdata),
+                fake_mode.from_tensor(real_w.up_gate_scale),
+                fake_mode.from_tensor(real_w.down_qdata),
+                fake_mode.from_tensor(real_w.down_scale),
+                logical_dtype=torch.bfloat16,
+                up_gate_global_scale=(
+                    None
+                    if real_w.up_gate_global_scale is None
+                    else fake_mode.from_tensor(real_w.up_gate_global_scale)
+                ),
+                down_global_scale=(
+                    None
+                    if real_w.down_global_scale is None
+                    else fake_mode.from_tensor(real_w.down_global_scale)
+                ),
+                group_size=real_w.group_size,
+                activation_fn="swiglu_clamped",
+                gate_first=True,
+                up_gate_block_scales=(
+                    None
+                    if real_w.up_gate_block_scales is None
+                    else fake_mode.from_tensor(real_w.up_gate_block_scales)
+                ),
+                down_block_scales=(
+                    None
+                    if real_w.down_block_scales is None
+                    else fake_mode.from_tensor(real_w.down_block_scales)
+                ),
+                up_gate_block_size=real_w.up_gate_block_size,
+                down_block_size=real_w.down_block_size,
+                act_quant=real_w.act_quant,
+                gate_bound=5.0,
+                up_bound=6.0,
+            )
+            with forbid_triton_driver():
+                fake_out = moe_ffn(fake_x, fake_w, fake_ids, fake_wts)
+            assert fake_out.shape == (2, 64)
+            assert fake_out.dtype is torch.bfloat16
+
+
+def test_swiglu_clamped_semantics_asymmetry_and_gate_first_reference() -> None:
+    # Construct exact gate/up values testing:
+    # - gate < -gate_bound stays UNCLAMPED (strictly differs from silu(-gate_bound) * up)
+    # - gate > gate_bound is capped at gate_bound
+    # - up < -up_bound and up > up_bound are symmetrically clamped to [-up_bound, up_bound]
+    torch.manual_seed(1110)
+    hidden_size, inter_size = 64, 64
+    gate_bound, up_bound = 2.0, 3.5
+
+    # Drive mid = x @ W_up_gate^T directly with orthogonal-unit slice on first 4 coords.
+    up_gate_hp = torch.zeros((1, 2 * inter_size, hidden_size), dtype=torch.float32)
+    down_hp = torch.eye(hidden_size, inter_size, dtype=torch.float32).unsqueeze(0)
+
+    # Row 0: gate = -10.0 (< -gate_bound -> unclamped!), up = 8.0 (> up_bound -> clamped to 3.5)
+    # Row 1: gate = +10.0 (> gate_bound -> capped to 2.0), up = -8.0 (< -up_bound -> -3.5)
+    # Row 2: gate = -1.5 (inside), up = 2.0 (inside)
+    # Row 3: gate = +1.5 (inside), up = -2.0 (inside)
+    gate_vals = torch.tensor([-10.0, 10.0, -1.5, 1.5], dtype=torch.float32)
+    up_vals = torch.tensor([8.0, -8.0, 2.0, -2.0], dtype=torch.float32)
+    for idx in range(4):
+        up_gate_hp[0, idx, idx] = gate_vals[idx]
+        up_gate_hp[0, inter_size + idx, idx] = up_vals[idx]
+
+    w_gf_true = MoEWeights.from_hp(
+        up_gate_hp,
+        down_hp,
+        weight_format="nvfp4_w4a16",
+        activation_fn="swiglu_clamped",
+        gate_first=True,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
+    )
+    # Swap gate and up halves and set gate_first=False -> storage and output must match identically.
+    up_gate_swapped = torch.cat(
+        [up_gate_hp[:, inter_size:], up_gate_hp[:, :inter_size]], dim=1
+    ).contiguous()
+    w_gf_false = MoEWeights.from_hp(
+        up_gate_swapped,
+        down_hp,
+        weight_format="nvfp4_w4a16",
+        activation_fn="swiglu_clamped",
+        gate_first=False,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
+    )
+
+    x = torch.zeros((1, hidden_size), dtype=torch.float32)
+    x[0, :4] = 1.0
+    ids = torch.tensor([[0]], dtype=torch.int64)
+    wts = torch.tensor([[1.0]], dtype=torch.float32)
+
+    out_true = moe_ffn(x, w_gf_true, ids, wts)
+    out_false = moe_ffn(x, w_gf_false, ids, wts)
+    ref_true = _reference_for_weights(x, w_gf_true, ids, wts)
+    oracle_true = _independent_moe_oracle(x, w_gf_true, ids, wts)
+    torch.testing.assert_close(out_true, ref_true, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(out_true, oracle_true, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(out_true, out_false, rtol=1e-5, atol=1e-5)
+
+    # Explicitly confirm gate < -gate_bound was NOT clamped to -gate_bound on coordinate 0:
+    expected_unclamped_neg_gate = float(F.silu(torch.tensor(-10.0)) * up_bound)
+    wrong_clamped_neg_gate = float(F.silu(torch.tensor(-gate_bound)) * up_bound)
+    assert abs(float(out_true[0, 0].item()) - expected_unclamped_neg_gate) < 1e-4
+    assert abs(float(out_true[0, 0].item()) - wrong_clamped_neg_gate) > 0.25
+
+
+def test_swiglu_clamped_symfloat_dynamic_compile_and_compile_hashes() -> None:
+    torch.manual_seed(1120)
+    weights = _make_moe_weights(
+        3,
+        64,
+        64,
+        weight_format="nvfp4_w4a16",
+        activation_fn="swiglu_clamped",
+        gate_bound=3.0,
+        up_bound=4.0,
+        dtype=torch.float32,
+        seed=1121,
+    )
+    x = torch.randn((3, 64), dtype=torch.float32) * 3.0
+    ids = torch.tensor([[0, 1], [1, 2], [2, 0]], dtype=torch.int64)
+    wts = torch.full((3, 2), 0.5, dtype=torch.float32)
+
+    def _op_fn(inp: torch.Tensor, bound: float) -> torch.Tensor:
+        return torch.ops.piper_kernels.moe_ffn(
+            inp,
+            ids,
+            wts,
+            weights.up_gate_qdata,
+            weights.up_gate_scale,
+            weights.down_qdata,
+            weights.down_scale,
+            weights.up_gate_global_scale,
+            weights.down_global_scale,
+            activation_fn="swiglu_clamped",
+            gate_first=True,
+            gate_bound=bound,
+            up_bound=bound,
+        )
+
+    torch._dynamo.reset()
+    compiled_op = torch.compile(_op_fn, backend="eager", fullgraph=True, dynamic=True)
+    for bound in (2.0, 5.5, 9.25):
+        actual = compiled_op(x, bound)
+        expected = moe_reference.moe_ffn_reference(
+            x,
+            ids,
+            wts,
+            weights.up_gate_qdata,
+            weights.up_gate_scale,
+            weights.down_qdata,
+            weights.down_scale,
+            weights.up_gate_global_scale,
+            weights.down_global_scale,
+            activation_fn="swiglu_clamped",
+            gate_first=True,
+            gate_bound=bound,
+            up_bound=bound,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+    compiled_err_types = (ValueError, RuntimeError, torch._dynamo.exc.TorchDynamoException)
+    for bad_bound in (0.0, -1.0, math.inf, -math.inf, math.nan):
+        with pytest.raises(compiled_err_types):
+            compiled_op(x, bad_bound)
+        torch._dynamo.reset()
+        cold = torch.compile(_op_fn, backend="eager", fullgraph=True, dynamic=True)
+        with pytest.raises(compiled_err_types):
+            cold(x, bad_bound)
+
+    def _public_fn(inp: torch.Tensor, inp_ids: torch.Tensor, inp_wts: torch.Tensor) -> torch.Tensor:
+        return moe_ffn(inp, weights, inp_ids, inp_wts)
+
+    torch._dynamo.reset()
+    pub_counter = CompileCounter()
+    compiled_pub = torch.compile(_public_fn, backend=pub_counter, fullgraph=True, dynamic=True)
+    for rows in (5, 7, 11):
+        xr = torch.randn((rows, 64), dtype=torch.float32) * 2.5
+        ir = torch.randint(0, 3, (rows, 2), dtype=torch.int64)
+        wr = torch.full((rows, 2), 0.5, dtype=torch.float32)
+        torch.testing.assert_close(
+            compiled_pub(xr, ir, wr),
+            _reference_for_weights(xr, weights, ir, wr),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+    assert pub_counter.frame_count == 1
+    torch._dynamo.reset()
+
+    # Kernel hash invariance across (gate_bound, up_bound) values vs swiglu specialization.
+    sm120 = GPUTarget("cuda", 120, 32)
+    for fmt, gs, rows, key in (
+        ("nvfp4_w4a16", 0, 1, "activate_rotate"),
+        ("convrot_nvfp4", 64, 64, "nvfp4_activate_quant"),
+        ("convrot_int8", 64, 64, "int8_activate_quant"),
+        ("convrot_int8", 64, 1, "int8_activate_quant"),
+    ):
+        c_plain = moe_triton.compile_moe_kernels(
+            sm120,
+            weight_format=fmt,
+            group_size=gs,
+            rows=rows,
+            top_k=2,
+            activation_fn="swiglu",
+        )
+        c_b1 = moe_triton.compile_moe_kernels(
+            sm120,
+            weight_format=fmt,
+            group_size=gs,
+            rows=rows,
+            top_k=2,
+            activation_fn="swiglu_clamped",
+            gate_bound=6.0,
+            up_bound=6.0,
+        )
+        c_b2 = moe_triton.compile_moe_kernels(
+            sm120,
+            weight_format=fmt,
+            group_size=gs,
+            rows=rows,
+            top_k=2,
+            activation_fn="swiglu_clamped",
+            gate_bound=11.0,
+            up_bound=13.0,
+        )
+        assert c_b1[key].hash == c_b2[key].hash
+        assert c_b1[key].hash != c_plain[key].hash
+
+
+@pytest.mark.parametrize("target", _NVIDIA_TARGETS)
+@pytest.mark.parametrize("gate_first", [True, False])
+def test_offline_nvidia_swiglu_clamped_and_wide_int8_zero_spills(
+    target: GPUTarget,
+    gate_first: bool,
+) -> None:
+    format_cases: list[tuple[MoEFormat, int, int]] = [
+        ("convrot_int8", 64, 1),
+        ("convrot_int8", 64, 8),
+        ("convrot_int8", 64, 64),
+        ("convrot_trellis", 64, 1),
+        ("convrot_trellis", 64, 64),
+    ]
+    if target.arch >= 120:
+        format_cases.extend(
+            [
+                ("nvfp4_w4a16", 0, 1),
+                ("convrot_nvfp4_w4a16", 64, 64),
+                ("nvfp4", 0, 64),
+                ("convrot_nvfp4", 64, 64),
+            ]
+        )
+    for weight_format, group_size, rows in format_cases:
+        _compile_nvidia_and_assert_clean(
+            target,
+            weight_format=weight_format,
+            logical_dtype=torch.bfloat16,
+            rows=rows,
+            top_k=4,
+            hidden_size=256,
+            intermediate_size=256,
+            group_size=group_size,
+            activation_fn="swiglu_clamped",
+            gate_first=gate_first,
+            gate_bound=7.0,
+            up_bound=7.0,
+        )
+
+    # Wide intermediate_size up to 131_056 must compile int8_activate_quant with 0 spills.
+    for inter_size, gs in ((130_816, 256), (131_056, 16)):
+        for act in ("swiglu", "swiglu_clamped", "gelu_tanh"):
+            bounds = (
+                {"gate_bound": 7.0, "up_bound": 7.0}
+                if act == "swiglu_clamped"
+                else {"gate_bound": None, "up_bound": None}
+            )
+            for rows in (1, 64):
+                compiled = _compile_nvidia_and_assert_clean(
+                    target,
+                    weight_format="convrot_int8",
+                    logical_dtype=torch.bfloat16,
+                    rows=rows,
+                    top_k=2,
+                    hidden_size=256,
+                    intermediate_size=inter_size,
+                    group_size=gs,
+                    activation_fn=act,
+                    gate_first=gate_first,
+                    **bounds,
+                )
+                assert "int8_activate_quant" in compiled
+
+
+@pytest.mark.parametrize(("arch", "warp_size"), _AMD_TARGETS)
+@pytest.mark.parametrize("gate_first", [True, False])
+def test_offline_amd_swiglu_clamped_and_wide_int8_compile(
+    arch: str,
+    warp_size: int,
+    gate_first: bool,
+) -> None:
+    target = GPUTarget("hip", arch, warp_size)
+    for weight_format, rows in (
+        ("convrot_int8", 1),
+        ("convrot_int8", 8),
+        ("convrot_int8", 64),
+        ("convrot_trellis", 1),
+        ("convrot_trellis", 64),
+    ):
+        compiled = moe_triton.compile_moe_kernels(
+            target,
+            weight_format=weight_format,
+            logical_dtype=torch.bfloat16,
+            rows=rows,
+            top_k=4,
+            hidden_size=256,
+            intermediate_size=256,
+            group_size=64,
+            activation_fn="swiglu_clamped",
+            gate_first=gate_first,
+            gate_bound=7.0,
+            up_bound=7.0,
+        )
+        for name, kernel in compiled.items():
+            check_spills = not name.startswith(("int8_matmul", "int8_grouped"))
+            _assert_clean_amd_compile(kernel, arch, check_vgpr_spills=check_spills)
+
+    for inter_size, gs in ((130_816, 256), (131_056, 16)):
+        for act in ("swiglu", "swiglu_clamped", "gelu_tanh"):
+            bounds = (
+                {"gate_bound": 7.0, "up_bound": 7.0}
+                if act == "swiglu_clamped"
+                else {"gate_bound": None, "up_bound": None}
+            )
+            for rows in (1, 64):
+                compiled = moe_triton.compile_moe_kernels(
+                    target,
+                    weight_format="convrot_int8",
+                    logical_dtype=torch.bfloat16,
+                    rows=rows,
+                    top_k=2,
+                    hidden_size=256,
+                    intermediate_size=inter_size,
+                    group_size=gs,
+                    activation_fn=act,
+                    gate_first=gate_first,
+                    **bounds,
+                )
+                assert "int8_activate_quant" in compiled
+                _assert_clean_amd_compile(
+                    compiled["int8_activate_quant"], arch, check_vgpr_spills=True
+                )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _TRELLIS_MOE_GPU_AVAILABLE, reason="requires GPU Triton MoE backend")
+@pytest.mark.parametrize(
+    ("weight_format", "group_size"),
+    [
+        ("nvfp4_w4a16", 0),
+        ("convrot_nvfp4_w4a16", 64),
+        ("nvfp4", 0),
+        ("convrot_nvfp4", 64),
+        ("convrot_int8", 64),
+        ("convrot_trellis", 64),
+    ],
+)
+@pytest.mark.parametrize("rows", [1, 4, 64])
+@pytest.mark.parametrize("gate_first", [True, False])
+def test_gpu_swiglu_clamped_parity_all_formats_and_regimes(
+    weight_format: MoEFormat,
+    group_size: int,
+    rows: int,
+    gate_first: bool,
+) -> None:
+    if weight_format in ("nvfp4", "convrot_nvfp4", "nvfp4_w4a16", "convrot_nvfp4_w4a16") and (
+        not _NVFP4_MOE_GPU_AVAILABLE
+    ):
+        pytest.skip("requires NVIDIA SM12x")
+    if weight_format == "convrot_int8" and not _INT8_MOE_GPU_AVAILABLE:
+        pytest.skip("requires INT8 GPU MoE backend")
+
+    torch.manual_seed(1200 + rows + group_size + int(gate_first))
+    num_slots, hidden_size, inter_size, top_k = 3, 256, 256, 2
+    gate_bound, up_bound = 0.75, 1.25
+    weights = _make_moe_weights(
+        num_slots,
+        hidden_size,
+        inter_size,
+        weight_format=weight_format,
+        group_size=group_size,
+        activation_fn="swiglu_clamped",
+        gate_first=gate_first,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
+        dtype=torch.bfloat16,
+        device="cuda",
+        seed=1210 + rows + int(gate_first),
+    )
+    # Input scale 2.5 pushes mid strongly past both +L and -L on gate and up.
+    x = torch.randn((rows, hidden_size), device="cuda", dtype=torch.bfloat16) * 2.5
+    ids = torch.randint(0, num_slots, (rows, top_k), device="cuda", dtype=torch.int64)
+    wts = torch.softmax(torch.randn((rows, top_k), device="cuda"), dim=-1).to(torch.bfloat16)
+
+    actual = moe_ffn(x, weights, ids, wts)
+    if weight_format == "convrot_trellis" and rows >= 17:
+        # ConvRot Trellis prefill executes via the INT8 grouped-GEMM path.
+        int8_equiv = _decode_trellis_moe_weights_to_int8(weights)
+        expected = _reference_for_weights(x, int8_equiv, ids, wts)
+        _assert_matches_reference(
+            actual, expected, weight_format="convrot_int8", dtype=torch.bfloat16
+        )
+    else:
+        ref_act_quant = (
+            None if (weights.act_quant == "dynamic" and rows < 17) else weights.act_quant
+        )
+        expected = _reference_for_weights(x, weights, ids, wts, act_quant=ref_act_quant)
+        _assert_matches_reference(
+            actual, expected, weight_format=weight_format, dtype=torch.bfloat16
+        )
+
+    # Confirm clamp materially altered output relative to unclamped swiglu.
+    unclamped = MoEWeights.from_quantized(
+        weights.up_gate_qdata,
+        weights.up_gate_scale,
+        weights.down_qdata,
+        weights.down_scale,
+        logical_dtype=weights.logical_dtype,
+        up_gate_global_scale=weights.up_gate_global_scale,
+        down_global_scale=weights.down_global_scale,
+        group_size=weights.group_size,
+        activation_fn="swiglu",
+        gate_first=weights.gate_first,
+        high_first=weights.high_first,
+        up_gate_block_scales=weights.up_gate_block_scales,
+        down_block_scales=weights.down_block_scales,
+        up_gate_row_widths=weights.up_gate_row_widths,
+        down_row_widths=weights.down_row_widths,
+        up_gate_slot_offsets=weights.up_gate_slot_offsets,
+        down_slot_offsets=weights.down_slot_offsets,
+        up_gate_block_size=weights.up_gate_block_size,
+        down_block_size=weights.down_block_size,
+        act_quant=weights.act_quant,
+    )
+    out_unclamped = moe_ffn(x, unclamped, ids, wts)
+    assert float((actual.float() - out_unclamped.float()).abs().max().item()) > 0.5
+
+    # Verify prepare_moe_input reuse matches direct execution.
+    prep = prepare_moe_input(x, weights)
+    actual_prep = moe_ffn(x, weights, ids, wts, prepared_input=prep)
+    torch.testing.assert_close(actual_prep, actual, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _INT8_MOE_GPU_AVAILABLE, reason="requires INT8 GPU MoE backend")
+def test_gpu_int8_decoupled_wide_tiled_misses_splitk_compile_and_cuda_graph() -> None:
+    torch.manual_seed(1300)
+    # 1) Wide intermediate_size=6144 (> 4096 threshold) exercises 2-pass single_tile=False kernel.
+    for gate_first in (True, False):
+        w_wide = _make_moe_weights(
+            2,
+            256,
+            6144,
+            weight_format="convrot_int8",
+            group_size=64,
+            activation_fn="swiglu_clamped",
+            gate_first=gate_first,
+            gate_bound=1.5,
+            up_bound=2.0,
+            dtype=torch.bfloat16,
+            device="cuda",
+            seed=1301 + int(gate_first),
+        )
+        for rows in (1, 4, 32):
+            xw = torch.randn((rows, 256), device="cuda", dtype=torch.bfloat16) * 3.5
+            idsw = torch.randint(0, 2, (rows, 2), device="cuda", dtype=torch.int64)
+            wtsw = torch.full((rows, 2), 0.5, device="cuda", dtype=torch.bfloat16)
+            actual_w, launches_w = _record_triton_launches(
+                lambda xw=xw, w_wide=w_wide, idsw=idsw, wtsw=wtsw: moe_ffn(xw, w_wide, idsw, wtsw)
+            )
+            assert "int8_moe_activate_quant_kernel" in launches_w
+            assert "rotate_quantize_rows_kernel" not in launches_w[1:]
+            expected_w = _reference_for_weights(xw, w_wide, idsw, wtsw)
+            _assert_matches_reference(
+                actual_w, expected_w, weight_format="convrot_int8", dtype=torch.bfloat16
+            )
+
+    # 2) Missed slots + split_k_up > 1 + accumulate=False/True verify mid=torch.empty safety.
+    w_sk = _make_moe_weights(
+        2,
+        4096,
+        512,
+        weight_format="convrot_int8",
+        group_size=64,
+        activation_fn="swiglu_clamped",
+        gate_first=True,
+        gate_bound=2.0,
+        up_bound=2.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+        seed=1310,
+    )
+    slot_map = torch.tensor([0, -1, 1], device="cuda", dtype=torch.int64)
+    for rows in (1, 4, 24):
+        xs = torch.randn((rows, 4096), device="cuda", dtype=torch.bfloat16) * 2.5
+        ids_miss = torch.tensor([[1, 2]] * rows, device="cuda", dtype=torch.int64)
+        ids_all_miss = torch.full((rows, 2), 1, device="cuda", dtype=torch.int64)
+        wtss = torch.tensor([[0.7, 0.3]] * rows, device="cuda", dtype=torch.bfloat16)
+
+        actual_m = moe_ffn(xs, w_sk, ids_miss, wtss, expert_to_slot=slot_map)
+        expected_m = _reference_for_weights(xs, w_sk, ids_miss, wtss, expert_to_slot=slot_map)
+        _assert_matches_reference(
+            actual_m, expected_m, weight_format="convrot_int8", dtype=torch.bfloat16
+        )
+
+        out_acc = torch.full((rows, 4096), 1.5, device="cuda", dtype=torch.bfloat16)
+        ref_acc = _reference_for_weights(
+            xs, w_sk, ids_all_miss, wtss, expert_to_slot=slot_map, out=out_acc, accumulate=True
+        )
+        moe_ffn(xs, w_sk, ids_all_miss, wtss, expert_to_slot=slot_map, out=out_acc, accumulate=True)
+        torch.testing.assert_close(out_acc, ref_acc.to("cuda"), rtol=1e-4, atol=1e-4)
+
+    # 3) GPU torch.compile(fullgraph=True, dynamic=True) & CUDA graph replay with swiglu_clamped.
+    w_cg = _make_moe_weights(
+        3,
+        256,
+        256,
+        weight_format="convrot_int8",
+        group_size=64,
+        activation_fn="swiglu_clamped",
+        gate_first=True,
+        gate_bound=1.5,
+        up_bound=2.5,
+        dtype=torch.bfloat16,
+        device="cuda",
+        seed=1320,
+    )
+
+    def _gpu_fn(inp: torch.Tensor, inp_ids: torch.Tensor, inp_wts: torch.Tensor) -> torch.Tensor:
+        return moe_ffn(inp, w_cg, inp_ids, inp_wts)
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    compiled_gpu = torch.compile(_gpu_fn, backend=counter, fullgraph=True, dynamic=True)
+    for rows in (5, 7, 24):
+        xg = torch.randn((rows, 256), device="cuda", dtype=torch.bfloat16) * 2.5
+        ig = torch.randint(0, 3, (rows, 2), device="cuda", dtype=torch.int64)
+        wg = torch.full((rows, 2), 0.5, device="cuda", dtype=torch.bfloat16)
+        _assert_matches_reference(
+            compiled_gpu(xg, ig, wg),
+            _reference_for_weights(xg, w_cg, ig, wg),
+            weight_format="convrot_int8",
+            dtype=torch.bfloat16,
+        )
+    assert counter.frame_count == 1
+    torch._dynamo.reset()
+
+    for rows in (1, 24):
+        x_buf = torch.randn((rows, 256), device="cuda", dtype=torch.bfloat16) * 3.0
+        ids_buf = torch.randint(0, 3, (rows, 2), device="cuda", dtype=torch.int64)
+        wts_buf = torch.full((rows, 2), 0.5, device="cuda", dtype=torch.bfloat16)
+        out_buf = torch.empty_like(x_buf)
+        # Warm up Triton compilation before graph capture.
+        moe_ffn(x_buf, w_cg, ids_buf, wts_buf, out=out_buf)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            moe_ffn(x_buf, w_cg, ids_buf, wts_buf, out=out_buf)
+        x_buf.copy_(torch.randn_like(x_buf) * 3.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_matches_reference(
+            out_buf,
+            _reference_for_weights(x_buf, w_cg, ids_buf, wts_buf),
+            weight_format="convrot_int8",
+            dtype=torch.bfloat16,
+        )

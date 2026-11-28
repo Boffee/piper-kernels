@@ -9,7 +9,6 @@ from typing import Literal
 import torch
 from torch._guards import detect_fake_mode
 
-from piper_kernels._input_activations import InputActivation, parse_input_activation
 from piper_kernels._triton import runtime
 from piper_kernels.trellis._layout import (
     TrellisLayout,
@@ -19,7 +18,12 @@ from piper_kernels.trellis._layout import (
 from piper_kernels.weights.convrot._rotation import rotate_groups, validate_group_size
 
 from . import _ops
-from .reference import _autocast_disabled
+from .reference import (
+    MoEActivation,
+    _autocast_disabled,
+    is_gated_activation,
+    validate_moe_activation_bounds,
+)
 
 type MoEActQuant = Literal["dynamic"]
 type MoEWeightFormat = Literal[
@@ -76,7 +80,7 @@ class MoEWeights:
     up_gate_global_scale: torch.Tensor | None = None
     down_global_scale: torch.Tensor | None = None
     group_size: int = 0
-    activation_fn: InputActivation = "swiglu"
+    activation_fn: MoEActivation = "swiglu"
     gate_first: bool = True
     high_first: bool = False
     up_gate_block_scales: torch.Tensor | None = None
@@ -88,12 +92,19 @@ class MoEWeights:
     up_gate_block_size: int = 0
     down_block_size: int = 0
     act_quant: MoEActQuant | None = None
+    gate_bound: float | None = None
+    up_bound: float | None = None
 
     def __post_init__(self) -> None:
         if self.logical_dtype not in _SUPPORTED_LOGICAL_DTYPES:
             raise ValueError(
                 f"MoE logical_dtype must be float16, bfloat16, or float32, got {self.logical_dtype}"
             )
+        resolved_gate_bound, resolved_up_bound = validate_moe_activation_bounds(
+            self.activation_fn, self.gate_bound, self.up_bound
+        )
+        object.__setattr__(self, "gate_bound", resolved_gate_bound)
+        object.__setattr__(self, "up_bound", resolved_up_bound)
         _ops._validate_weight_storage(self)
 
     @property
@@ -146,7 +157,7 @@ class MoEWeights:
         up_gate_global_scale: torch.Tensor | None = None,
         down_global_scale: torch.Tensor | None = None,
         group_size: int = 0,
-        activation_fn: InputActivation = "swiglu",
+        activation_fn: MoEActivation = "swiglu",
         gate_first: bool = True,
         high_first: bool = False,
         up_gate_block_scales: torch.Tensor | None = None,
@@ -158,6 +169,8 @@ class MoEWeights:
         up_gate_block_size: int = 0,
         down_block_size: int = 0,
         act_quant: MoEActQuant | None = None,
+        gate_bound: float | None = None,
+        up_bound: float | None = None,
     ) -> MoEWeights:
         """Wrap existing expert-major quantized storage without copying."""
         has_trellis = (
@@ -208,25 +221,29 @@ class MoEWeights:
             up_gate_block_size=up_gate_block_size,
             down_block_size=down_block_size,
             act_quant=act_quant,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
 
     @classmethod
-    def from_hp(
+    def from_hp(  # noqa: PLR0913 - flat quantization entry mirrors MoEWeights fields
         cls,
         up_gate_hp: torch.Tensor,
         down_hp: torch.Tensor,
         *,
         weight_format: MoEWeightFormat = "nvfp4_w4a16",
         group_size: int = 0,
-        activation_fn: InputActivation = "swiglu",
+        activation_fn: MoEActivation = "swiglu",
         gate_first: bool = True,
         high_first: bool = False,
         compute_per_tensor_scale: bool = True,
         bits_per_weight: float | None = None,
         bytes_per_block: int | None = None,
+        gate_bound: float | None = None,
+        up_bound: float | None = None,
     ) -> MoEWeights:
         """Quantize ``[S, up_gate_out, H]`` and ``[S, H, I]`` weights into slot storage."""
-        _validate_from_hp_inputs(
+        resolved_gate_bound, resolved_up_bound = _validate_from_hp_inputs(
             up_gate_hp,
             down_hp,
             weight_format=weight_format,
@@ -237,6 +254,8 @@ class MoEWeights:
             compute_per_tensor_scale=compute_per_tensor_scale,
             bits_per_weight=bits_per_weight,
             bytes_per_block=bytes_per_block,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
         if weight_format == "convrot_trellis":
             return _quantize_hp_trellis(
@@ -248,6 +267,8 @@ class MoEWeights:
                 high_first=high_first,
                 bits_per_weight=bits_per_weight,
                 bytes_per_block=bytes_per_block,
+                gate_bound=resolved_gate_bound,
+                up_bound=resolved_up_bound,
             )
         if weight_format == "convrot_int8":
             return _quantize_hp_int8(
@@ -257,6 +278,8 @@ class MoEWeights:
                 activation_fn=activation_fn,
                 gate_first=gate_first,
                 high_first=high_first,
+                gate_bound=resolved_gate_bound,
+                up_bound=resolved_up_bound,
             )
         return _quantize_hp_nvfp4(
             up_gate_hp,
@@ -267,23 +290,27 @@ class MoEWeights:
             high_first=high_first,
             compute_per_tensor_scale=compute_per_tensor_scale,
             act_quant="dynamic" if weight_format in ("nvfp4", "convrot_nvfp4") else None,
+            gate_bound=resolved_gate_bound,
+            up_bound=resolved_up_bound,
         )
 
 
-def _validate_from_hp_inputs(
+def _validate_from_hp_inputs(  # noqa: PLR0913 - validates all MoEWeights.from_hp kwargs
     up_gate_hp: torch.Tensor,
     down_hp: torch.Tensor,
     *,
     weight_format: MoEWeightFormat,
     group_size: int,
-    activation_fn: InputActivation,
+    activation_fn: MoEActivation,
     gate_first: bool,
     high_first: bool,
     compute_per_tensor_scale: bool,
     bits_per_weight: float | None,
     bytes_per_block: int | None,
-) -> None:
-    parse_input_activation(activation_fn, name="MoE")
+    gate_bound: float | None,
+    up_bound: float | None,
+) -> tuple[float | None, float | None]:
+    resolved_bounds = validate_moe_activation_bounds(activation_fn, gate_bound, up_bound)
     if weight_format not in _SUPPORTED_WEIGHT_FORMATS:
         raise ValueError(f"Unsupported MoE weight_format {weight_format!r}")
     if (
@@ -313,7 +340,7 @@ def _validate_from_hp_inputs(
     if up_gate_hp.device != down_hp.device or up_gate_hp.device.type == "meta":
         raise ValueError("MoE from_hp weights must share a non-meta device")
     num_slots, hidden_size, intermediate_size = down_hp.shape
-    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_gate_out = intermediate_size * (2 if is_gated_activation(activation_fn) else 1)
     if (
         num_slots != up_gate_hp.shape[0]
         or hidden_size <= 0
@@ -321,6 +348,7 @@ def _validate_from_hp_inputs(
         or tuple(up_gate_hp.shape) != (num_slots, up_gate_out, hidden_size)
     ):
         raise ValueError("MoE from_hp up_gate_hp and down_hp shapes are incompatible")
+    return resolved_bounds
 
 
 def _quantize_hp_trellis(
@@ -328,11 +356,13 @@ def _quantize_hp_trellis(
     down_hp: torch.Tensor,
     *,
     group_size: int,
-    activation_fn: InputActivation,
+    activation_fn: MoEActivation,
     gate_first: bool,
     high_first: bool,
     bits_per_weight: float | None,
     bytes_per_block: int | None,
+    gate_bound: float | None,
+    up_bound: float | None,
 ) -> MoEWeights:
     if high_first:
         raise ValueError("ConvRot Trellis MoE weights do not support high_first")
@@ -390,6 +420,8 @@ def _quantize_hp_trellis(
             ),
             up_gate_block_size=up_layout.block_size,
             down_block_size=down_layout.block_size,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
     from piper_kernels.trellis import TrellisStorage  # noqa: PLC0415
 
@@ -425,6 +457,8 @@ def _quantize_hp_trellis(
         down_block_scales=torch.stack([item.block_scales for item in down_items]).contiguous(),
         up_gate_block_size=up_layout.block_size,
         down_block_size=down_layout.block_size,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
     )
 
 
@@ -433,9 +467,11 @@ def _quantize_hp_int8(
     down_hp: torch.Tensor,
     *,
     group_size: int,
-    activation_fn: InputActivation,
+    activation_fn: MoEActivation,
     gate_first: bool,
     high_first: bool,
+    gate_bound: float | None,
+    up_bound: float | None,
 ) -> MoEWeights:
     if high_first:
         raise ValueError("ConvRot INT8 MoE weights do not support high_first")
@@ -467,6 +503,8 @@ def _quantize_hp_int8(
             group_size=group_size,
             activation_fn=activation_fn,
             gate_first=gate_first,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
         )
     from piper_kernels.weights.convrot.int8._quantization import quantize_weight  # noqa: PLC0415
 
@@ -486,6 +524,8 @@ def _quantize_hp_int8(
         group_size=group_size,
         activation_fn=activation_fn,
         gate_first=gate_first,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
     )
 
 
@@ -554,11 +594,13 @@ def _quantize_hp_nvfp4(
     down_hp: torch.Tensor,
     *,
     group_size: int,
-    activation_fn: InputActivation,
+    activation_fn: MoEActivation,
     gate_first: bool,
     high_first: bool,
     compute_per_tensor_scale: bool,
     act_quant: MoEActQuant | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
 ) -> MoEWeights:
     from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout  # noqa: PLC0415
 
@@ -598,6 +640,8 @@ def _quantize_hp_nvfp4(
         gate_first=gate_first,
         high_first=high_first,
         act_quant=act_quant,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
     )
 
 
@@ -782,12 +826,15 @@ def moe_ffn(
             weights.up_gate_block_size,
             weights.down_block_size,
             weights.act_quant,
+            weights.gate_bound,
+            weights.up_bound,
         )
     )
 
 
 __all__ = [
     "MoEActQuant",
+    "MoEActivation",
     "MoEWeightFormat",
     "MoEWeights",
     "PreparedMoEInput",

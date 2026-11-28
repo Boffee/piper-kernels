@@ -7,6 +7,14 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Added
 
+- Hard-clamped SwiGLU (`activation_fn="swiglu_clamped"`, requiring positive finite
+  `gate_bound` and `up_bound` floats to evaluate
+  `silu(min(gate, gate_bound)) * clamp(up, -up_bound, up_bound)`) in `MoEWeights` and
+  `moe_ffn` across all MoE weight formats and `gate_first` orders, along with a fused
+  ConvRot INT8 MoE activate-rotate-quantize path replacing dense linear input-preparation
+  reuse. Verified live on RTX 5090 (`sm120`), CPU/`meta`, and offline compilation across
+  `sm75`/`sm80`/`sm120`/`sm121` and `gfx942`/`gfx1100`/`gfx1151`/`gfx1201`; live
+  non-SM120 CUDA, ROCm, multi-GPU, and Windows execution remain unexercised locally.
 - Native NVIDIA Blackwell SM12x (`sm120`/`sm121`) NVFP4 W4A4 grouped-GEMM prefill in
   `piper_kernels.moe` via `MoEWeights.from_hp(..., weight_format="nvfp4" | "convrot_nvfp4")`
   and `MoEWeights.from_quantized(..., act_quant="dynamic")` without adding custom ops. Shares

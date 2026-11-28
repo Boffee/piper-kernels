@@ -17,16 +17,6 @@ from piper_kernels._input_activations.triton import gelu_tanh, swiglu
 from piper_kernels.linear.nvfp4._w4a16_triton import _split_global_scale
 from piper_kernels.weights.convrot.triton import rotate_hadamard_groups
 
-
-@triton.jit
-def _swap_halves_col(offs_n_i64, out_features, swap_halves: tl.constexpr):
-    """Map column offsets to swap upper/lower SwiGLU halves when gate precedes up."""
-    if not swap_halves:
-        return offs_n_i64
-    half_n = out_features // 2
-    return tl.where(offs_n_i64 < half_n, offs_n_i64 + half_n, offs_n_i64 - half_n)
-
-
 _CUDA_MAX_GRID_X = 0x7FFF_FFFF
 _HIP_MAX_WORKITEMS_X = 0xFFFF_FFFF
 # Conservative wave64 bound covers both wave32 (RDNA) and wave64 (CDNA) HIP targets.
@@ -153,7 +143,7 @@ def moe_bucket_tokens_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["num_pairs"])
+@triton.jit(do_not_specialize=["num_pairs", "gate_bound", "up_bound"])
 def moe_m1_activate_rotate_kernel(
     mid_ptr,
     act_ptr,
@@ -164,14 +154,18 @@ def moe_m1_activate_rotate_kernel(
     num_experts,
     num_slots,
     num_pairs,
+    gate_bound,
+    up_bound,
     block_size: tl.constexpr,
     group_size: tl.constexpr,
-    activation_fn: tl.constexpr,
+    is_gated: tl.constexpr,
     gate_first: tl.constexpr,
+    has_gate_bound: tl.constexpr,
+    has_up_bound: tl.constexpr,
     accelerator_backend: tl.constexpr,
     has_slot_map: tl.constexpr,
 ):
-    """Apply SwiGLU or GeLU-tanh and optional ConvRot transform for active slots."""
+    """Apply SwiGLU (optionally bounded) or GeLU-tanh and optional ConvRot transform."""
     n_tiles = tl.cdiv(intermediate_size, block_size)
     tile_idx, k_idx = _unpack_2d_tile_pid(n_tiles)
     if k_idx >= num_pairs:
@@ -189,15 +183,21 @@ def moe_m1_activate_rotate_kernel(
 
     offs = tile_idx * block_size + tl.arange(0, block_size)
     valid = offs < intermediate_size
-    up_gate_stride = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_gate_stride = intermediate_size * (2 if is_gated else 1)
     k_base = k_idx.to(tl.int64) * up_gate_stride
 
-    if activation_fn == "swiglu":
+    if is_gated:
         first = tl.load(mid_ptr + k_base + offs, mask=valid, other=0.0).to(tl.float32)
         second = tl.load(mid_ptr + k_base + intermediate_size + offs, mask=valid, other=0.0).to(
             tl.float32
         )
-        act = swiglu(second, first) if gate_first else swiglu(first, second)
+        gate = first if gate_first else second
+        up = second if gate_first else first
+        if has_gate_bound:
+            gate = tl.minimum(gate, gate_bound)
+        if has_up_bound:
+            up = tl.clamp(up, -up_bound, up_bound)
+        act = swiglu(up, gate)
     else:
         vals = tl.load(mid_ptr + k_base + offs, mask=valid, other=0.0).to(tl.float32)
         act = gelu_tanh(vals, accelerator_backend)
@@ -290,7 +290,6 @@ def moe_splitk_reduce_kernel(
     has_global_scale: tl.constexpr = False,
     post_scale_only: tl.constexpr = True,
     has_row_scale: tl.constexpr = False,
-    swap_halves: tl.constexpr = False,
 ):
     """Deterministically reduce Split-K up/gate partials across active slots."""
     n_tiles = tl.cdiv(out_features, block_n)
@@ -309,13 +308,6 @@ def moe_splitk_reduce_kernel(
         has_slot_map,
     )
     if slot < 0:
-        if is_int8:
-            zeros = tl.zeros((block_n,), dtype=tl.float32).to(output_ptr.dtype.element_ty)
-            tl.store(
-                output_ptr + k_idx.to(tl.int64) * out_features + offs_n_i64,
-                zeros,
-                mask=n_valid,
-            )
         return
 
     split_stride = tl.full((), num_pairs, tl.int64) * out_features
@@ -340,8 +332,7 @@ def moe_splitk_reduce_kernel(
         scale_by_token=is_int8,
     )
     out_val = reduced.to(output_ptr.dtype.element_ty) if is_int8 else reduced
-    col_out = _swap_halves_col(offs_n_i64, out_features, swap_halves)
-    tl.store(output_ptr + k_idx.to(tl.int64) * out_features + col_out, out_val, mask=n_valid)
+    tl.store(output_ptr + k_idx.to(tl.int64) * out_features + offs_n_i64, out_val, mask=n_valid)
 
 
 @triton.jit(do_not_specialize=["split_k"])

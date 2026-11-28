@@ -62,6 +62,19 @@ PREFILL_INT8_DENSE_BLOCK_K = 64
 
 WEIGHTED_REDUCE_BLOCK_N = 128
 ACTIVATE_BLOCK_SIZE = 256
+INT8_ACTIVATE_MIN_BLOCK_K = 256
+INT8_ACTIVATE_SINGLE_TILE_MAX_WIDTH = 4096
+INT8_ACTIVATE_TILED_BLOCK_K = 1024
+
+
+def select_int8_activate_schedule(intermediate_size: int) -> tuple[bool, int, int]:
+    """Return ``(single_tile, block_k, num_warps)`` for ``int8_moe_activate_quant_kernel``."""
+    if intermediate_size <= INT8_ACTIVATE_SINGLE_TILE_MAX_WIDTH:
+        width = max(INT8_ACTIVATE_MIN_BLOCK_K, intermediate_size)
+        block_k = 1 << (width - 1).bit_length()
+        num_warps = 8 if block_k >= 4096 else 4
+        return True, block_k, num_warps
+    return False, INT8_ACTIVATE_TILED_BLOCK_K, 4
 
 
 @dataclass(frozen=True, slots=True)

@@ -13,7 +13,6 @@ import triton
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
-from piper_kernels._input_activations import parse_input_activation
 from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels._triton.primitives import (
     TRITON_FLOAT_POINTER_TYPES,
@@ -33,6 +32,7 @@ from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
 from . import _policy, _schedule
 from ._int8_triton import (
+    int8_moe_activate_quant_kernel,
     int8_moe_batched_matmul_kernel,
     int8_moe_grouped_gemm_kernel,
     int8_moe_m1_matmul_kernel,
@@ -57,6 +57,7 @@ from ._routing_triton import (
     moe_splitk_reduce_kernel,
 )
 from ._trellis_triton import trellis_moe_gemv_kernel
+from .reference import is_gated_activation, validate_moe_activation_bounds
 
 
 def _bind_opt_ptrs(
@@ -194,7 +195,6 @@ def _compile_splitk_reduce(
     has_global_scale: bool = False,
     post_scale_only: bool = True,
     has_row_scale: bool = False,
-    swap_halves: bool = False,
     compile_fn: TritonCompileFn,
 ) -> triton.compiler.CompiledKernel:
     eff_global_scale = False if is_int8 else has_global_scale
@@ -217,7 +217,6 @@ def _compile_splitk_reduce(
         "has_global_scale": eff_global_scale,
         "post_scale_only": True if is_int8 else post_scale_only,
         "has_row_scale": eff_row_scale,
-        "swap_halves": swap_halves if is_int8 else False,
     }
     _bind_opt_ptrs(
         sig,
@@ -245,6 +244,8 @@ def _compile_activate_rotate(
     accelerator_backend: str,
     has_slot_map: bool,
     use_compact_map: bool = False,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compile_fn: TritonCompileFn,
 ) -> triton.compiler.CompiledKernel:
     eff_slot_map = False if use_compact_map else has_slot_map
@@ -258,12 +259,16 @@ def _compile_activate_rotate(
         "num_experts": "i32",
         "num_slots": "i32",
         "num_pairs": "i32",
+        "gate_bound": "fp32",
+        "up_bound": "fp32",
     }
     constexprs: dict[str, object] = {
         "block_size": _schedule.ACTIVATE_BLOCK_SIZE,
         "group_size": group_size,
-        "activation_fn": activation_fn,
+        "is_gated": is_gated_activation(activation_fn),
         "gate_first": gate_first,
+        "has_gate_bound": gate_bound is not None,
+        "has_up_bound": up_bound is not None,
         "accelerator_backend": accelerator_backend,
         "has_slot_map": eff_slot_map,
     }
@@ -272,6 +277,56 @@ def _compile_activate_rotate(
         ASTSource(moe_m1_activate_rotate_kernel, sig, constexprs=constexprs),
         target,
         {"num_warps": 4},
+    )
+
+
+def _compile_int8_activate_quant(
+    target: GPUTarget,
+    accel: AcceleratorTarget,
+    *,
+    out_ty: str,
+    intermediate_size: int,
+    group_size: int,
+    activation_fn: str,
+    gate_first: bool,
+    has_slot_map: bool,
+    use_compact_map: bool,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
+    compile_fn: TritonCompileFn,
+) -> triton.compiler.CompiledKernel:
+    eff_slot_map = False if use_compact_map else has_slot_map
+    idx_ty = "*i32" if use_compact_map else "*i64"
+    single_tile, block_k, num_warps = _schedule.select_int8_activate_schedule(intermediate_size)
+    sig: dict[str, str] = {
+        "mid_ptr": out_ty,
+        "routing_ids_ptr": idx_ty,
+        "q_out_ptr": "*i8",
+        "scale_out_ptr": "*fp32",
+        "intermediate_size": "i32",
+        "num_experts": "i32",
+        "num_slots": "i32",
+        "num_pairs": "i32",
+        "gate_bound": "fp32",
+        "up_bound": "fp32",
+    }
+    constexprs: dict[str, object] = {
+        "block_k": block_k,
+        "group_size": group_size,
+        "single_tile": single_tile,
+        "is_gated": is_gated_activation(activation_fn),
+        "gate_first": gate_first,
+        "has_gate_bound": gate_bound is not None,
+        "has_up_bound": up_bound is not None,
+        "has_slot_map": eff_slot_map,
+        "use_compact_map": use_compact_map,
+        "accelerator_backend": accel.backend,
+    }
+    _bind_opt_ptrs(sig, constexprs, expert_to_slot_ptr="*i64" if eff_slot_map else None)
+    return compile_fn(
+        ASTSource(int8_moe_activate_quant_kernel, sig, constexprs=constexprs),
+        target,
+        {"num_warps": num_warps},
     )
 
 
@@ -494,14 +549,17 @@ def _compile_int8_prefill_kernels(
     out_ty: str,
     hidden_size: int,
     intermediate_size: int,
+    group_size: int,
     activation_fn: str,
     gate_first: bool,
     has_slot_map: bool,
     accumulate: bool,
     slot_window: bool = False,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compile_fn: TritonCompileFn,
 ) -> dict[str, triton.compiler.CompiledKernel]:
-    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_gate_out = intermediate_size * (2 if is_gated_activation(activation_fn) else 1)
     schedule = _policy.select_int8_prefill_schedule(
         accel,
         chunk_rows=rows,
@@ -519,7 +577,6 @@ def _compile_int8_prefill_kernels(
     down_seed = rdna4_int8_accumulator_seed(
         accel, intermediate_size, expected_tiles * triton.cdiv(hidden_size, schedule.block_n)
     )
-    swap_halves = activation_fn == "swiglu" and gate_first
     sig = {
         "input_ptr": "*i8",
         "weight_ptr": "*i8",
@@ -561,7 +618,6 @@ def _compile_int8_prefill_kernels(
                 "block_n": schedule.block_n,
                 "block_k": schedule.block_k,
                 "group_m": _schedule.PREFILL_GROUP_M,
-                "swap_halves": swap_halves,
                 "aligned_nk": (
                     up_gate_out % schedule.block_n == 0 and hidden_size % schedule.block_k == 0
                 ),
@@ -572,6 +628,20 @@ def _compile_int8_prefill_kernels(
         target,
         opts,
     )
+    compiled["int8_activate_quant"] = _compile_int8_activate_quant(
+        target,
+        accel,
+        out_ty=out_ty,
+        intermediate_size=intermediate_size,
+        group_size=group_size,
+        activation_fn=activation_fn,
+        gate_first=gate_first,
+        has_slot_map=has_slot_map,
+        use_compact_map=True,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
+        compile_fn=compile_fn,
+    )
     compiled["int8_grouped_down"] = compile_fn(
         ASTSource(
             int8_moe_grouped_gemm_kernel,
@@ -581,7 +651,6 @@ def _compile_int8_prefill_kernels(
                 "block_n": schedule.block_n,
                 "block_k": schedule.block_k,
                 "group_m": _schedule.PREFILL_GROUP_M,
-                "swap_halves": False,
                 "aligned_nk": (
                     hidden_size % schedule.block_n == 0
                     and intermediate_size % schedule.block_k == 0
@@ -615,6 +684,8 @@ def _compile_nvfp4_prefill_kernels(
     has_slot_map: bool,
     has_global_scale: bool,
     accumulate: bool,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compile_fn: TritonCompileFn,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     active_dtype = torch.float32 if group_size > 0 else logical_dtype
@@ -669,7 +740,7 @@ def _compile_nvfp4_prefill_kernels(
         accumulate=accumulate,
         compile_fn=compile_fn,
     )
-    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_gate_out = intermediate_size * (2 if is_gated_activation(activation_fn) else 1)
     grouped_attrs = _nvfp4_aligned_attrs(
         nvfp4_moe_grouped_gemm_kernel.arg_names,
         sig,
@@ -691,6 +762,8 @@ def _compile_nvfp4_prefill_kernels(
         accelerator_backend=accel.backend,
         has_slot_map=has_slot_map,
         use_compact_map=True,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
         compile_fn=compile_fn,
     )
     return compiled
@@ -761,6 +834,8 @@ def _compile_nvfp4_w4a4_prefill_kernels(
     has_slot_map: bool,
     has_global_scale: bool,
     accumulate: bool,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compile_fn: TritonCompileFn,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     schedule = _policy.select_nvfp4_w4a4_prefill_schedule(
@@ -841,6 +916,8 @@ def _compile_nvfp4_w4a4_prefill_kernels(
         "sc_out_ptr": "*fp8e4nv",
         "row_scale_ptr": "*fp32",
         "intermediate_size": "i32",
+        "gate_bound": "fp32",
+        "up_bound": "fp32",
     }
     aq_attrs = _div16_attrs(
         nvfp4_moe_activate_quant_kernel.arg_names,
@@ -854,9 +931,11 @@ def _compile_nvfp4_w4a4_prefill_kernels(
             constexprs={
                 "block_k": _schedule.NVFP4_W4A4_QUANT_BLOCK_K,
                 "group_size": group_size,
-                "is_swiglu": activation_fn == "swiglu",
+                "is_gated": is_gated_activation(activation_fn),
                 "gate_first": gate_first,
                 "high_first": high_first,
+                "has_gate_bound": gate_bound is not None,
+                "has_up_bound": up_bound is not None,
                 "accelerator_backend": accel.backend,
             },
             attrs=aq_attrs,
@@ -864,7 +943,7 @@ def _compile_nvfp4_w4a4_prefill_kernels(
         target,
         {"num_warps": 4},
     )
-    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_gate_out = intermediate_size * (2 if is_gated_activation(activation_fn) else 1)
     compiled["nvfp4_w4a4_grouped_up"] = _compile_nvfp4_w4a4_grouped_gemm(
         target,
         schedule=schedule,
@@ -895,20 +974,22 @@ def _compile_int8_kernels(
     out_ty: str,
     hidden_size: int,
     intermediate_size: int,
+    group_size: int,
     activation_fn: str,
     gate_first: bool,
     has_slot_map: bool,
     split_k: int,
     accumulate: bool,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compile_fn: TritonCompileFn,
 ) -> dict[str, triton.compiler.CompiledKernel]:
-    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_gate_out = intermediate_size * (2 if is_gated_activation(activation_fn) else 1)
     schedule = _policy.select_int8_launch_schedule(accel)
     block_k = schedule.block_k
     num_stages = schedule.num_stages
     compiler_options = amd_compiler_workarounds.lds_only_fence_options(schedule.lds_only_fences)
     is_splitk = split_k > 1
-    swap_halves = activation_fn == "swiglu" and gate_first
     seed_rows = (num_pairs if batched else 1) * _schedule.INT8_GEMM_BLOCK_M
     up_seed = splitk_accumulator_seed(
         accel,
@@ -986,7 +1067,6 @@ def _compile_int8_kernels(
                     "per_expert_input": False,
                     "is_splitk": is_splitk,
                     "dequant_output": not is_splitk,
-                    "swap_halves": (swap_halves and not is_splitk),
                     "aligned_nk": (
                         up_gate_out % _schedule.INT8_GEMM_BLOCK_N == 0
                         and hidden_size % block_k == 0
@@ -1009,7 +1089,6 @@ def _compile_int8_kernels(
                     "per_expert_input": True,
                     "is_splitk": True,
                     "dequant_output": False,
-                    "swap_halves": False,
                     "aligned_nk": (
                         hidden_size % _schedule.INT8_GEMM_BLOCK_N == 0
                         and intermediate_size % block_k == 0
@@ -1020,6 +1099,20 @@ def _compile_int8_kernels(
             target,
             {"num_stages": num_stages, "num_warps": 4, **compiler_options},
         ),
+        "int8_activate_quant": _compile_int8_activate_quant(
+            target,
+            accel,
+            out_ty=out_ty,
+            intermediate_size=intermediate_size,
+            group_size=group_size,
+            activation_fn=activation_fn,
+            gate_first=gate_first,
+            has_slot_map=has_slot_map,
+            use_compact_map=False,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
+            compile_fn=compile_fn,
+        ),
     }
     if is_splitk:
         compiled_int8["int8_reduce"] = _compile_splitk_reduce(
@@ -1027,7 +1120,6 @@ def _compile_int8_kernels(
             out_ty=out_ty,
             is_int8=True,
             has_slot_map=has_slot_map,
-            swap_halves=swap_halves,
             compile_fn=compile_fn,
         )
     compiled_int8["weighted_reduce"] = _compile_weighted_reduce(
@@ -1060,6 +1152,8 @@ def _compile_a16_epilogue(
     has_row_scale: bool,
     is_splitk: bool,
     accumulate: bool,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compile_fn: TritonCompileFn,
 ) -> None:
     if is_splitk:
@@ -1083,6 +1177,8 @@ def _compile_a16_epilogue(
         accelerator_backend=accel.backend,
         has_slot_map=has_slot_map,
         use_compact_map=False,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
         compile_fn=compile_fn,
     )
     compiled["weighted_reduce"] = _compile_weighted_reduce(
@@ -1116,6 +1212,8 @@ def _compile_nvfp4_kernels(
     has_global_scale: bool,
     split_k: int,
     accumulate: bool,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compile_fn: TritonCompileFn,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     active_dtype = torch.float32 if group_size > 0 else logical_dtype
@@ -1190,7 +1288,7 @@ def _compile_nvfp4_kernels(
         weight_global_scale_ptr="*fp32" if has_global_scale else None,
     )
 
-    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_gate_out = intermediate_size * (2 if is_gated_activation(activation_fn) else 1)
     up_attrs = _nvfp4_aligned_attrs(
         kernel_fn.arg_names,
         nvfp4_signature,
@@ -1253,6 +1351,8 @@ def _compile_nvfp4_kernels(
         has_row_scale=False,
         is_splitk=is_splitk,
         accumulate=accumulate,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
         compile_fn=compile_fn,
     )
     return compiled_nvfp4
@@ -1269,6 +1369,7 @@ def _compile_trellis_prefill_kernels(
     out_ty: str,
     hidden_size: int,
     intermediate_size: int,
+    group_size: int,
     block_size: int,
     variable_rows: bool,
     has_slot_offsets: bool,
@@ -1277,6 +1378,8 @@ def _compile_trellis_prefill_kernels(
     gate_first: bool,
     has_slot_map: bool,
     accumulate: bool,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compile_fn: TritonCompileFn,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     compiled = _compile_int8_prefill_kernels(
@@ -1289,17 +1392,20 @@ def _compile_trellis_prefill_kernels(
         out_ty=out_ty,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        group_size=group_size,
         activation_fn=activation_fn,
         gate_first=gate_first,
         has_slot_map=has_slot_map,
         accumulate=accumulate,
         slot_window=True,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
         compile_fn=compile_fn,
     )
 
     tile_steps = triton.next_power_of_2(block_size)
     per_slot_2d = variable_rows and not has_slot_offsets
-    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_gate_out = intermediate_size * (2 if is_gated_activation(activation_fn) else 1)
     if variable_rows:
         needs_w2 = True
         stream_bytes = 1
@@ -1381,6 +1487,8 @@ def _compile_trellis_kernels(
     has_slot_map: bool,
     split_k: int,
     accumulate: bool,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compile_fn: TritonCompileFn,
     rows: int = 1,
     top_k: int = 1,
@@ -1397,7 +1505,7 @@ def _compile_trellis_kernels(
         expected_slots=expected_slots,
     )
     is_splitk = split_k > 1
-    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_gate_out = intermediate_size * (2 if is_gated_activation(activation_fn) else 1)
     per_slot_2d = variable_rows and not has_slot_offsets
     if variable_rows:
         needs_w2 = True
@@ -1514,6 +1622,8 @@ def _compile_trellis_kernels(
         has_row_scale=True,
         is_splitk=is_splitk,
         accumulate=accumulate,
+        gate_bound=gate_bound,
+        up_bound=up_bound,
         compile_fn=compile_fn,
     )
     return compiled
@@ -1545,6 +1655,8 @@ def _compile_prefill_kernels_dispatch(
     has_slot_map: bool,
     has_global_scale: bool,
     accumulate: bool,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compile_fn: TritonCompileFn,
 ) -> dict[str, triton.compiler.CompiledKernel] | None:
     if is_trellis and has_int8_backend:
@@ -1558,6 +1670,7 @@ def _compile_prefill_kernels_dispatch(
             out_ty=out_ty,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            group_size=group_size,
             block_size=block_size,
             variable_rows=variable_rows,
             has_slot_offsets=has_slot_offsets,
@@ -1566,6 +1679,8 @@ def _compile_prefill_kernels_dispatch(
             gate_first=gate_first,
             has_slot_map=has_slot_map,
             accumulate=accumulate,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
             compile_fn=compile_fn,
         )
     if has_int8_backend:
@@ -1579,10 +1694,13 @@ def _compile_prefill_kernels_dispatch(
             out_ty=out_ty,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            group_size=group_size,
             activation_fn=activation_fn,
             gate_first=gate_first,
             has_slot_map=has_slot_map,
             accumulate=accumulate,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
             compile_fn=compile_fn,
         )
     if is_nvfp4_w4a4:
@@ -1603,6 +1721,8 @@ def _compile_prefill_kernels_dispatch(
             has_slot_map=has_slot_map,
             has_global_scale=has_global_scale,
             accumulate=accumulate,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
             compile_fn=compile_fn,
         )
     if not is_trellis:
@@ -1624,6 +1744,8 @@ def _compile_prefill_kernels_dispatch(
             has_slot_map=has_slot_map,
             has_global_scale=has_global_scale,
             accumulate=accumulate,
+            gate_bound=gate_bound,
+            up_bound=up_bound,
             compile_fn=compile_fn,
         )
     return None
@@ -1652,6 +1774,8 @@ def compile_moe_kernels(
     variable_rows: bool = False,
     has_slot_offsets: bool = False,
     bytes_per_block: int | None = None,
+    gate_bound: float | None = None,
+    up_bound: float | None = None,
     compiler: TritonCompileFn | None = None,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     """Compile quantized MoE Triton kernels matching runtime regime and chunking selection."""
@@ -1667,7 +1791,9 @@ def compile_moe_kernels(
         or active_slots_hint < 0
     ):
         raise ValueError("MoE dimensions, rows, top_k, num_slots, and split_k must be positive")
-    parse_input_activation(activation_fn, name="MoE")
+    resolved_gate_bound, resolved_up_bound = validate_moe_activation_bounds(
+        activation_fn, gate_bound, up_bound
+    )
     accel = AcceleratorTarget.from_compiler_target(target)
     _validate_compile_format(
         accel,
@@ -1682,7 +1808,7 @@ def compile_moe_kernels(
         bytes_per_block=bytes_per_block,
     )
 
-    up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
+    up_gate_out = intermediate_size * (2 if is_gated_activation(activation_fn) else 1)
     is_int8 = weight_format == "convrot_int8"
     is_trellis = weight_format == "convrot_trellis"
     is_nvfp4_w4a4 = weight_format in ("nvfp4", "convrot_nvfp4")
@@ -1735,6 +1861,8 @@ def compile_moe_kernels(
             has_slot_map=has_slot_map,
             has_global_scale=has_global_scale,
             accumulate=accumulate,
+            gate_bound=resolved_gate_bound,
+            up_bound=resolved_up_bound,
             compile_fn=compile_fn,
         )
         if prefill_compiled is not None:
@@ -1768,6 +1896,8 @@ def compile_moe_kernels(
             has_slot_map=has_slot_map,
             split_k=split_k,
             accumulate=accumulate,
+            gate_bound=resolved_gate_bound,
+            up_bound=resolved_up_bound,
             compile_fn=compile_fn,
             rows=a16_rows,
             top_k=top_k,
@@ -1783,11 +1913,14 @@ def compile_moe_kernels(
             out_ty=out_ty,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            group_size=group_size,
             activation_fn=activation_fn,
             gate_first=gate_first,
             has_slot_map=has_slot_map,
             split_k=split_k,
             accumulate=accumulate,
+            gate_bound=resolved_gate_bound,
+            up_bound=resolved_up_bound,
             compile_fn=compile_fn,
         )
     else:
@@ -1808,6 +1941,8 @@ def compile_moe_kernels(
             has_global_scale=has_global_scale,
             split_k=split_k,
             accumulate=accumulate,
+            gate_bound=resolved_gate_bound,
+            up_bound=resolved_up_bound,
             compile_fn=compile_fn,
         )
     if batched:
