@@ -285,66 +285,143 @@ def test_fold_quantized_all_gather_fx_shapes_and_symint(
         assert targets.count(_c10d.wait_tensor.default) == 2
 
 
-def test_distributed_fx_schema_binds_keyword_arguments(fake_triton_device: None) -> None:
-    """``_distributed._fx`` binds aten/c10d arguments by schema rather than positional count."""
+def test_distributed_all_gather_schema_binds_keyword_arguments(fake_triton_device: None) -> None:
+    """All-gather compiler rewrites bind aten/c10d arguments by schema, not position."""
     with FakeTensorMode():
-        graph = torch.fx.Graph()
-        x = graph.placeholder("x")
+        ag_graph = torch.fx.Graph()
+        x = ag_graph.placeholder("x")
         x.meta["val"] = torch.empty((2, 64, 128), device=_DEVICE, dtype=torch.bfloat16)
 
-        ag = graph.call_function(
+        ag = ag_graph.call_function(
             _c10d.all_gather_into_tensor.default,
             args=(x,),
             kwargs={"group_size": 2, "group_name": "0"},
         )
         ag_val = torch.empty((4, 64, 128), device=_DEVICE, dtype=torch.bfloat16)
         ag.meta["val"] = ag_val
-        wait_ag = graph.call_function(_c10d.wait_tensor.default, kwargs={"tensor": ag})
+        wait_ag = ag_graph.call_function(_c10d.wait_tensor.default, kwargs={"tensor": ag})
         wait_ag.meta["val"] = ag_val
-        split_ag = graph.call_function(
+        split_ag = ag_graph.call_function(
             _aten.split.Tensor, args=(wait_ag,), kwargs={"split_size": 2, "dim": 0}
         )
         chunks_ag = tuple(
             torch.empty((2, 64, 128), device=_DEVICE, dtype=torch.bfloat16) for _ in range(2)
         )
         split_ag.meta["val"] = chunks_ag
-        g0 = graph.call_function(operator.getitem, args=(split_ag, 0))
-        g1 = graph.call_function(operator.getitem, args=(split_ag, 1))
+        g0 = ag_graph.call_function(operator.getitem, args=(split_ag, 0))
+        g1 = ag_graph.call_function(operator.getitem, args=(split_ag, 1))
         g0.meta["val"], g1.meta["val"] = chunks_ag
-        cat_ag = graph.call_function(_aten.cat.default, kwargs={"tensors": [g0, g1], "dim": 1})
-        full_val = torch.empty((2, 128, 128), device=_DEVICE, dtype=torch.bfloat16)
-        cat_ag.meta["val"] = full_val
-
-        ag_match = distributed_fx.match_sequence_all_gather(cat_ag)
-        assert ag_match is not None
-        assert ag_match.input_node is x
-        assert ag_match.group_size == 2
-        assert ag_match.group_name == "0"
-
-        split_rs = graph.call_function(
-            _aten.split.Tensor, args=(cat_ag,), kwargs={"split_size": 64, "dim": 1}
+        cat_ag = ag_graph.call_function(_aten.cat.default, kwargs={"tensors": [g0, g1], "dim": 1})
+        cat_ag.meta["val"] = torch.empty((2, 128, 128), device=_DEVICE, dtype=torch.bfloat16)
+        prep = ag_graph.call_function(
+            _ops.convrot_int8_prepare_input.default,
+            args=(cat_ag, 64, None),
         )
-        split_rs.meta["val"] = chunks_ag
-        r0 = graph.call_function(operator.getitem, args=(split_rs, 0))
-        r1 = graph.call_function(operator.getitem, args=(split_rs, 1))
-        r0.meta["val"], r1.meta["val"] = chunks_ag
-        cat_rs = graph.call_function(_aten.cat.default, kwargs={"tensors": [r0, r1], "dim": 0})
-        cat_rs.meta["val"] = ag_val
-        rs = graph.call_function(
+        q_full = torch.empty((2, 128, 128), device=_DEVICE, dtype=torch.int8)
+        s_full = torch.empty((2, 128), device=_DEVICE, dtype=torch.float32)
+        prep.meta["val"] = (q_full, s_full)
+        q_item = ag_graph.call_function(operator.getitem, args=(prep, 0))
+        s_item = ag_graph.call_function(operator.getitem, args=(prep, 1))
+        q_item.meta["val"], s_item.meta["val"] = q_full, s_full
+        ag_graph.output((q_item, s_item))
+
+        _run_post_grad_pass(ag_graph, linear=True)
+        ag_graph.lint()
+        ag_targets = [n.target for n in ag_graph.nodes if n.op == "call_function"]
+        assert _c10d.all_gather_into_tensor.default not in ag_targets
+        assert _c10d.all_gather_into_tensor_coalesced.default in ag_targets
+        assert ag_targets.count(_c10d.wait_tensor.default) == 2
+
+
+def test_distributed_reduce_scatter_schema_binds_keyword_arguments(
+    fake_triton_device: None,
+) -> None:
+    """Reduce-scatter compiler rewrites bind aten/c10d arguments by schema, not position."""
+    with FakeTensorMode():
+        rs_graph = torch.fx.Graph()
+        names = (
+            "iq",
+            "isc",
+            "qw",
+            "qs",
+            "cos",
+            "sin",
+            "k0",
+            "k1",
+            "k2",
+            "v0",
+            "v1",
+            "v2",
+            "v3",
+            "ow",
+            "os",
+        )
+        p = {name: rs_graph.placeholder(name) for name in names}
+        attn_out = rs_graph.call_function(
+            _ops.convrot_int8_piper_projected_query_attention_output.default,
+            args=(
+                p["iq"],
+                p["isc"],
+                p["qw"],
+                p["qs"],
+                None,
+                p["cos"],
+                p["sin"],
+                1e-5,
+                0.088,
+                None,
+                p["k0"],
+                p["k1"],
+                p["k2"],
+                p["v0"],
+                p["v1"],
+                p["v2"],
+                p["v3"],
+                256,
+                False,
+                torch.bfloat16,
+                p["ow"],
+                p["os"],
+                None,
+                64,
+                None,
+            ),
+            kwargs={"head_dim": 64},
+        )
+        attn_out.meta["val"] = torch.empty((2, 256, 128), device=_DEVICE, dtype=torch.bfloat16)
+        split_rs = rs_graph.call_function(
+            _aten.split.Tensor, args=(attn_out,), kwargs={"split_size": 128, "dim": 1}
+        )
+        chunks_rs = tuple(
+            torch.empty((2, 128, 128), device=_DEVICE, dtype=torch.bfloat16) for _ in range(2)
+        )
+        split_rs.meta["val"] = chunks_rs
+        r0 = rs_graph.call_function(operator.getitem, args=(split_rs, 0))
+        r1 = rs_graph.call_function(operator.getitem, args=(split_rs, 1))
+        r0.meta["val"], r1.meta["val"] = chunks_rs
+        cat_rs = rs_graph.call_function(_aten.cat.default, kwargs={"tensors": [r0, r1], "dim": 0})
+        cat_rs.meta["val"] = torch.empty((4, 128, 128), device=_DEVICE, dtype=torch.bfloat16)
+        rs = rs_graph.call_function(
             _c10d.reduce_scatter_tensor.default,
             args=(cat_rs,),
             kwargs={"reduce_op": "sum", "group_size": 2, "group_name": "0"},
         )
-        rs_val = torch.empty((2, 64, 128), device=_DEVICE, dtype=torch.bfloat16)
+        rs_val = torch.empty((2, 128, 128), device=_DEVICE, dtype=torch.bfloat16)
         rs.meta["val"] = rs_val
-        wait_rs = graph.call_function(_c10d.wait_tensor.default, kwargs={"tensor": rs})
+        wait_rs = rs_graph.call_function(_c10d.wait_tensor.default, kwargs={"tensor": rs})
         wait_rs.meta["val"] = rs_val
+        rs_graph.output(wait_rs)
 
-        rs_match = distributed_fx.match_sequence_reduce_scatter(wait_rs)
-        assert rs_match is not None
-        assert rs_match.input_node is cat_ag
-        assert rs_match.group_size == 2
-        assert rs_match.group_name == "0"
+        _run_post_grad_pass(rs_graph, attention_output=True)
+        rs_graph.lint()
+        rs_targets = [n.target for n in rs_graph.nodes if n.op == "call_function"]
+        assert _c10d.reduce_scatter_tensor.default not in rs_targets
+        assert any(
+            n.target is _ops.convrot_int8_piper_projected_query_attention_output.default
+            and n.kwargs.get("comm_group_size") == 2
+            and n.kwargs.get("comm_group_name") == "0"
+            for n in rs_graph.nodes
+        )
 
 
 def test_fold_quantized_all_gather_fx_noop_and_shared(fake_triton_device: None) -> None:

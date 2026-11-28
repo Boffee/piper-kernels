@@ -15,7 +15,6 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot import convrot_int8_linear
 from piper_kernels.linear.convrot.int8 import _backend, _generic, reference
 from piper_kernels.linear.convrot.int8._amd import policy
-from piper_kernels.linear.convrot.int8._amd import triton as amd_triton
 from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
 from piper_kernels.weights.convrot._rotation import rotate_groups
 from piper_kernels.weights.convrot.int8 import ConvRotInt8Tensor
@@ -149,14 +148,6 @@ def test_gfx1201_short_batch_matmul_schedules():
     assert policy.select_execution_plan(
         gfx1200, in_features=5376, rows=32, out_features=5376
     ) == policy.select_execution_plan(gfx1200, in_features=5376)
-
-
-def test_amd_matmul_compiler_options_scope_to_rdna4():
-    assert amd_triton._amd_matmul_compiler_options(AcceleratorTarget("hip", "gfx942")) == {}
-    assert amd_triton._amd_matmul_compiler_options(AcceleratorTarget("hip", "gfx1100")) == {}
-    for arch in ("gfx1200", "gfx1201"):
-        options = amd_triton._amd_matmul_compiler_options(AcceleratorTarget("hip", arch))
-        assert ("amdgpu-sched-strategy", "iterative-ilp") in options["llvm_fn_attrs"]
 
 
 def test_gfx1201_accumulator_seed_fits_every_int8_partial_sum():

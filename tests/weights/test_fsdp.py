@@ -139,7 +139,7 @@ def _assert_weight_close(actual: Any, expected: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_trellis_weight_omits_fsdp_and_update_mixins() -> None:
+def test_trellis_weight_omits_fsdp_hooks_and_rejects_updates() -> None:
     trellis_weight = ConvRotTrellisTensor.from_quantized(
         torch.randint(0, 256, (8, 4, 8), dtype=torch.uint8),
         torch.ones((8, 4), dtype=torch.float8_e4m3fn),
@@ -151,14 +151,31 @@ def test_trellis_weight_omits_fsdp_and_update_mixins() -> None:
     for target in (QuantizedWeight, trellis_weight):
         assert not hasattr(target, "fsdp_pre_all_gather")
         assert not hasattr(target, "fsdp_post_all_gather")
-        assert not hasattr(target, "_update_target")
 
     for cls in (ConvRotInt8Tensor, PiperNVFP4Tensor, ConvRotNVFP4Tensor):
         weight = _make_weight(cls, rows=32, features=128)
         assert hasattr(weight, "fsdp_pre_all_gather")
         assert hasattr(weight, "fsdp_post_all_gather")
 
+    snapshot = (
+        trellis_weight.bitstreams.clone(),
+        trellis_weight.block_scales.clone(),
+        trellis_weight.scale.clone(),
+    )
+    versions = (
+        trellis_weight.bitstreams._version,
+        trellis_weight.block_scales._version,
+        trellis_weight.scale._version,
+    )
+    delta = torch.zeros(8, 64, dtype=torch.bfloat16)
+    left = torch.zeros(8, 2, dtype=torch.bfloat16)
+    right = torch.zeros(2, 64, dtype=torch.bfloat16)
+
     for call in (
+        lambda: trellis_weight.add_(delta),
+        lambda: trellis_weight.addmm_(left, right),
+        lambda: torch.ops.aten.add_.Tensor(trellis_weight, delta),
+        lambda: torch.ops.aten.addmm_.default(trellis_weight, left, right),
         lambda: trellis_weight.split(4, dim=0),
         lambda: trellis_weight.split(8, dim=0),
         lambda: trellis_weight.new_zeros((4, 64)),
@@ -166,6 +183,15 @@ def test_trellis_weight_omits_fsdp_and_update_mixins() -> None:
     ):
         with pytest.raises(NotImplementedError):
             call()
+
+    assert torch.equal(trellis_weight.bitstreams, snapshot[0])
+    assert torch.equal(trellis_weight.block_scales, snapshot[1])
+    assert torch.equal(trellis_weight.scale, snapshot[2])
+    assert (
+        trellis_weight.bitstreams._version,
+        trellis_weight.block_scales._version,
+        trellis_weight.scale._version,
+    ) == versions
 
 
 @pytest.mark.parametrize(("cls", "swizzled", "high_first"), _FORMATS)
