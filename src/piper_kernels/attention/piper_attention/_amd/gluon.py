@@ -135,10 +135,11 @@ def _softmax_tile(scores, block_max, scale, multiplier, row_active=None):
 
 
 @gluon.jit
-def _fold_safe_value_mean(numerator, chunk_denom, value_mean):
+def _fold_safe_value_mean(numerator, chunk_denom, value_mean, chunk_has_block=None):
     """Fold non-empty K1024 value means into the FP32 numerator."""
+    active = (chunk_denom > 0.0) if chunk_has_block is None else chunk_has_block
     return numerator + gl.where(
-        (chunk_denom > 0.0)[:, :, None],
+        active[:, :, None],
         (chunk_denom * 255.0)[:, :, None] * value_mean[:, None, :],
         0.0,
     )
@@ -419,9 +420,11 @@ def _dense_piper_kernel(  # noqa: PLR0912, PLR0915
         "stride_om",
         "stride_lb",
         "stride_lh",
+        "split_chunks",
+        "total_splits",
     ]
 )
-def _frozen_pool_piper_kernel(  # noqa: PLR0915
+def _frozen_pool_piper_kernel(  # noqa: PLR0912, PLR0915
     query_ptr,
     query_scale_ptr,
     key_int8_ptr,
@@ -452,14 +455,28 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0915
     stride_om,
     stride_lb,
     stride_lh,
+    split_chunks,
+    partial_bias_ptr,
+    partial_log_denom_ptr,
+    total_splits,
     query_heads_per_kv_head: gl.constexpr,
     head_dim: gl.constexpr,
     has_chunk_map: gl.constexpr,
     wide_query_offsets: gl.constexpr,
+    has_chunk_splits: gl.constexpr = False,
+    per_row_query_scale: gl.constexpr = False,
 ):
     """Prefill Q blocks directly against finalized 1024-token slots in PiperKVChunkPool."""
     head = gl.program_id(1).to(gl.int64)
-    batch = gl.program_id(2).to(gl.int64)
+    if has_chunk_splits:
+        batch_split = gl.program_id(2)
+        split_id = batch_split % split_chunks
+        batch = (batch_split // split_chunks).to(gl.int64)
+        out_batch64 = batch * total_splits.to(gl.int64) + split_id.to(gl.int64)
+    else:
+        batch = gl.program_id(2).to(gl.int64)
+        out_batch64 = batch
+        split_id = 0
     batch_head = batch * heads + head
     kv_head = head // query_heads_per_kv_head
     query_block = gl.program_id(0)
@@ -479,19 +496,42 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0915
         wide_query_offsets,
         head_dim,
     )
-    query_scale = gl.load(
-        query_scale_ptr + batch_head * (query_storage // 32) + query_block * 2 + rows[None, :] // 32
-    )
+    if per_row_query_scale:
+        query_scale = gl.load(query_scale_ptr + batch_head * query_storage + output_rows[None, :])
+    else:
+        query_scale = gl.load(
+            query_scale_ptr
+            + batch_head * (query_storage // 32)
+            + query_block * 2
+            + rows[None, :] // 32
+        )
     numerator = gl.zeros([1, 64, head_dim], gl.float32, MMA_LAYOUT)
     denominator = gl.zeros([1, 64], gl.float32, row_layout)
     running_max = gl.full([1, 64], -float("inf"), gl.float32, row_layout)
     running_bias = gl.zeros([1, 64], gl.float32, row_layout)
 
     active_chunks = gl.minimum(gl.maximum(gl.load(num_chunks_ptr + batch), 0), max_chunks)
+    if has_chunk_splits:
+        total_tiles = active_chunks * _GL_TILES_PER_CHUNK
+        tiles_per_split = (total_tiles + split_chunks - 1) // split_chunks
+        tile_start = gl.minimum(total_tiles, split_id * tiles_per_split)
+        tile_end = gl.minimum(total_tiles, tile_start + tiles_per_split)
+        has_work = tile_start < tile_end
+        chunk_start = gl.where(has_work, tile_start // _GL_TILES_PER_CHUNK, 0)
+        chunk_end = gl.where(has_work, (tile_end - 1) // _GL_TILES_PER_CHUNK + 1, 0)
+        first_tile = gl.where(has_work, tile_start % _GL_TILES_PER_CHUNK, 0)
+        last_tile = gl.where(has_work, (tile_end - 1) % _GL_TILES_PER_CHUNK + 1, 0)
+    else:
+        chunk_start = 0
+        chunk_end = active_chunks
+        first_tile = 0
+        last_tile = _GL_TILES_PER_CHUNK
     kv_stride_ki: gl.constexpr = 1024 * head_dim
     kv_stride_ks: gl.constexpr = 16
     kv_stride_vs: gl.constexpr = 1024
-    for chunk in range(active_chunks):
+    smem_log = gl.allocate_shared_memory(gl.float32, [1024], gl.SwizzledSharedLayout(1, 1, 1, [0]))
+    smem_vs = gl.allocate_shared_memory(gl.float32, [1024], gl.SwizzledSharedLayout(1, 1, 1, [0]))
+    for chunk in range(chunk_start, chunk_end):
         if has_chunk_map:
             slot = gl.load(
                 chunk_to_slot_ptr + batch * stride_cs_b + chunk.to(gl.int64) * stride_cs_c
@@ -507,6 +547,13 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0915
             vs_slot_ptr = value_scale_ptr + slot64 * stride_vs_s + kv_head * kv_stride_vs
             vm_slot_ptr = value_mean_ptr + slot64 * stride_vm_s + kv_head * head_dim
 
+            lin_layout: gl.constexpr = gl.BlockedLayout([8], [32], [4], [0])
+            chunk_vs_lin = gl.load(vs_slot_ptr + gl.arange(0, 1024, lin_layout))
+            smem_log.store(
+                gl.where(chunk_vs_lin == 0.0, _GL_LOG2_SCALE_EPSILON, gl.log2(chunk_vs_lin))
+            )
+            smem_vs.store(chunk_vs_lin * 255.0)
+
             k_bias = qk_fp32_center_bias(
                 query_ptr + batch_head * query_storage * head_dim,
                 query_block,
@@ -519,7 +566,13 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0915
             )
             chunk_active = k_bias != -float("inf")
             chunk_denom = gl.zeros([1, 64], gl.float32, row_layout)
-            for tile in range(_GL_TILES_PER_CHUNK):
+            if has_chunk_splits:
+                t_begin = gl.where(chunk == chunk_start, first_tile, 0)
+                t_end = gl.where(chunk == chunk_end - 1, last_tile, _GL_TILES_PER_CHUNK)
+            else:
+                t_begin = 0
+                t_end = _GL_TILES_PER_CHUNK
+            for tile in range(t_begin, t_end):
                 key_blocks = gl.full([1], tile, gl.int32, block_layout)
                 scores = qk_tiles(
                     query,
@@ -531,22 +584,16 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0915
                     two_tiles=False,
                 )
                 scale = query_scale * gl.load(ks_slot_ptr + tile)
+                vs_idx = tile * 64 + columns
+                multiplier = smem_vs.gather(vs_idx, 0)[None, :]
+                log_scale = smem_log.gather(vs_idx, 0)[None, :]
                 scores = gl.where(
-                    chunk_active[:, :, None],
-                    gl.where(scale[:, :, None] == 0, 0.0, _unfused_mul(scores, scale[:, :, None])),
-                    -float("inf"),
+                    scale[:, :, None] == 0, 0.0, _unfused_mul(scores, scale[:, :, None])
                 )
-                raw_vs = gl.load(vs_slot_ptr + tile * 64 + columns[None, :])
-                multiplier = raw_vs * 255.0
-                log_scale = gl.where(raw_vs == 0.0, _GL_LOG2_SCALE_EPSILON, gl.log2(raw_vs))
                 shifted_scores = gl.where(
-                    scores != -float("inf"), scores + log_scale[:, None, :], -float("inf")
+                    chunk_active[:, :, None], scores + log_scale[:, None, :], scores
                 )
-                block_max = gl.where(
-                    chunk_active,
-                    gl.reduce(shifted_scores, 2, max_propagate_nan),
-                    -float("inf"),
-                )
+                block_max = gl.reduce(shifted_scores, 2, max_propagate_nan)
                 next_max, next_bias, old_weight, current_weight, has_block, safe_block_max = (
                     advance_tile_max_safe(
                         running_max,
@@ -572,13 +619,27 @@ def _frozen_pool_piper_kernel(  # noqa: PLR0915
                 running_max = next_max
                 running_bias = next_bias
             value_mean = gl.load(vm_slot_ptr + features[None, :])
-            numerator = _fold_safe_value_mean(numerator, chunk_denom, value_mean)
+            numerator = _fold_safe_value_mean(numerator, chunk_denom, value_mean, chunk_active)
 
-    output, lse = _finalize_safe_output(numerator, denominator, running_max, running_bias)
     valid_out = output_rows[None, :] < seq_q
-    offsets = batch * stride_ob + head * stride_oh + output_rows[None, :, None] * stride_om
-    gl.store(output_ptr + offsets + features[None, None, :], output, valid_out[:, :, None])
-    gl.store(lse_ptr + batch * stride_lb + head * stride_lh + output_rows[None, :], lse, valid_out)
+    offsets = out_batch64 * stride_ob + head * stride_oh + output_rows[None, :, None] * stride_om
+    lse_offsets = out_batch64 * stride_lb + head * stride_lh + output_rows[None, :]
+    if has_chunk_splits:
+        has_any = running_max != -float("inf")
+        safe_denom = gl.where(has_any & (denominator != 0.0), denominator, 1.0)
+        inverse_denominator = 1.0 / (safe_denom * 255.0)
+        output = gl.where(has_any[:, :, None], numerator * inverse_denominator[:, :, None], 0.0)
+        lse = gl.where(has_any, running_max, -float("inf"))
+        bias = gl.where(has_any, running_bias, 0.0)
+        log_denom = gl.where(has_any, gl.log2(safe_denom), 0.0)
+        gl.store(output_ptr + offsets + features[None, None, :], output, valid_out[:, :, None])
+        gl.store(lse_ptr + lse_offsets, lse, valid_out)
+        gl.store(partial_bias_ptr + lse_offsets, bias, valid_out)
+        gl.store(partial_log_denom_ptr + lse_offsets, log_denom, valid_out)
+    else:
+        output, lse = _finalize_safe_output(numerator, denominator, running_max, running_bias)
+        gl.store(output_ptr + offsets + features[None, None, :], output, valid_out[:, :, None])
+        gl.store(lse_ptr + lse_offsets, lse, valid_out)
 
 
 def prepare_value(
@@ -777,15 +838,33 @@ def launch_frozen_pool_kernel(
     gqa_group: int,
     head_dim: int,
     has_chunk_map: bool,
+    split_chunks: int = 1,
+    total_splits: int | None = None,
+    has_chunk_splits: bool | None = None,
+    per_row_query_scale: bool = False,
+    partial_bias: torch.Tensor | None = None,
+    partial_log_denom: torch.Tensor | None = None,
 ) -> None:
     """Launch RDNA4 frozen-pool prefill kernel with pre-assembled host arguments."""
+    resolved_total = split_chunks if total_splits is None else total_splits
+    resolved_chunk_splits = (resolved_total > 1) if has_chunk_splits is None else has_chunk_splits
+    if resolved_chunk_splits and (partial_bias is None or partial_log_denom is None):
+        raise ValueError("partial_bias and partial_log_denom are required when has_chunk_splits")
+    bias_target = partial_bias if partial_bias is not None else common_args[11]
+    log_denom_target = partial_log_denom if partial_log_denom is not None else common_args[11]
     with device_context(device):
-        _frozen_pool_piper_kernel[(triton.cdiv(seq_q, 64), q_heads, batch)](
+        _frozen_pool_piper_kernel[(triton.cdiv(seq_q, 64), q_heads, batch * split_chunks)](
             *common_args,
+            split_chunks,
+            bias_target,
+            log_denom_target,
+            resolved_total,
             gqa_group,
             head_dim,
             has_chunk_map,
             query_storage * (head_dim // 8) > (1 << 31),
+            has_chunk_splits=resolved_chunk_splits,
+            per_row_query_scale=per_row_query_scale,
             num_warps=4,
             num_stages=1,
             llvm_fn_attrs=_LLVM_FN_ATTRS,
@@ -865,13 +944,23 @@ def compile_amd_prefill_kernels(
     has_chunk_map: bool = True,
     is_causal: bool = True,
     wide_pool: bool = False,
+    has_chunk_splits: bool = False,
+    per_row_query_scale: bool = False,
+    include_tail: bool = True,
     compile_fn=None,
-) -> tuple[object, object]:
-    """Offline-compile RDNA4 frozen-pool and offset-causal tail prefill kernels."""
+) -> tuple[object, ...]:
+    """Offline-compile RDNA4 frozen-pool and optional offset-causal tail prefill kernels."""
     triton_dtype = _quantization.validate_kv_compile_args(dtype, head_dim)
     options = {"num_warps": 4, "num_stages": 1, "llvm_fn_attrs": _LLVM_FN_ATTRS}
     compiler = triton.compile if compile_fn is None else compile_fn
 
+    frozen_overrides = _quantization.frozen_pool_pointer_signature(
+        triton_dtype, wide_pool=wide_pool
+    )
+    frozen_overrides["partial_bias_ptr"] = "*fp32"
+    frozen_overrides["partial_log_denom_ptr"] = "*fp32"
+    if has_chunk_splits:
+        frozen_overrides["output_ptr"] = "*fp32"
     frozen_source = _quantization.build_kernel_source(
         _frozen_pool_piper_kernel,
         constants={
@@ -879,11 +968,17 @@ def compile_amd_prefill_kernels(
             "head_dim": head_dim,
             "has_chunk_map": has_chunk_map,
             "wide_query_offsets": False,
+            "has_chunk_splits": has_chunk_splits,
+            "per_row_query_scale": per_row_query_scale,
         },
-        overrides=_quantization.frozen_pool_pointer_signature(triton_dtype, wide_pool=wide_pool),
+        overrides=frozen_overrides,
         gluon=True,
         pointer_range_32=not wide_pool,
     )
+
+    frozen_compiled = compiler(frozen_source, target, options)
+    if not include_tail:
+        return (frozen_compiled,)
 
     tail_overrides: dict[str, str] = dict.fromkeys(
         (
@@ -919,7 +1014,4 @@ def compile_amd_prefill_kernels(
         overrides=tail_overrides,
         gluon=True,
     )
-    return (
-        compiler(frozen_source, target, options),
-        compiler(tail_source, target, options),
-    )
+    return (frozen_compiled, compiler(tail_source, target, options))

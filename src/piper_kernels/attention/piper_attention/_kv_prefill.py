@@ -20,7 +20,12 @@ from piper_kernels.attention.kernels.qk_quantization.int8.sage import (
 from piper_kernels.linear._splitk import device_sm_count
 
 from . import _quantization
-from ._decode_schedule import REDUCE_NUM_WARPS
+from ._decode_schedule import (
+    BLOCK_QH,
+    PREFILL_MIN_SEQ_Q,
+    REDUCE_NUM_WARPS,
+    select_split_counts,
+)
 
 _LN2 = tl.constexpr(0.6931471805599453)
 
@@ -269,6 +274,88 @@ def pool_slot_strides(
     )
 
 
+def _launch_splitkv_reduce(
+    po_view: torch.Tensor,
+    pl_view: torch.Tensor,
+    pb_view: torch.Tensor,
+    pld_view: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    batch: int,
+    q_heads: int,
+    seq_q: int,
+    num_splits: int,
+    head_dim: int,
+) -> None:
+    """Reduce Split-KV partial tensors ordered as ``(B, H, S, split[, D])``."""
+    with device_context(output.device):
+        _piper_decode_splitkv_reduce_kernel[(batch * q_heads * seq_q,)](
+            po_view,
+            pl_view,
+            pb_view,
+            pld_view,
+            output,
+            lse,
+            q_heads,
+            seq_q,
+            num_splits,
+            po_view.stride(0),
+            po_view.stride(1),
+            po_view.stride(2),
+            po_view.stride(3),
+            pl_view.stride(0),
+            pl_view.stride(1),
+            pl_view.stride(2),
+            pl_view.stride(3),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            lse.stride(0),
+            lse.stride(1),
+            head_dim=head_dim,
+            num_warps=REDUCE_NUM_WARPS,
+        )
+
+
+def _select_frozen_prefill_splits(
+    device: torch.device,
+    *,
+    prefill_backend: Literal["amd", "nvidia"],
+    batch: int,
+    q_heads: int,
+    seq_q: int,
+    head_dim: int,
+    max_chunks: int,
+    active_chunks_hint: int,
+    allow_subchunk_single: bool = False,
+) -> int:
+    sm_count = device_sm_count(device)
+    base_blocks = max(1, batch * q_heads * triton.cdiv(seq_q, 64))
+    hint_chunks = max_chunks if active_chunks_hint <= 0 else min(max_chunks, active_chunks_hint)
+    if hint_chunks <= 0:
+        return 1
+    if prefill_backend == "amd":
+        from ._amd import policy as amd_policy  # noqa: PLC0415
+
+        return amd_policy.select_frozen_prefill_splits(
+            base_blocks,
+            hint_chunks,
+            sm_count,
+            batch * q_heads * seq_q * head_dim * 4,
+            allow_subchunk_single=allow_subchunk_single,
+        )
+    total_tiles = hint_chunks * 16
+    mem_cap = max(1, (64 * 1024 * 1024) // max(1, batch * q_heads * seq_q * head_dim * 4))
+    if allow_subchunk_single:
+        if base_blocks < sm_count * 3 and total_tiles >= 8:
+            return min(32, total_tiles // 4, max(1, (sm_count * 3) // base_blocks), mem_cap)
+        return 1
+    if prefill_backend == "nvidia" and base_blocks < sm_count and hint_chunks >= 2:
+        return min(16, total_tiles // 4, max(1, (sm_count * 2) // base_blocks), mem_cap)
+    return 1
+
+
 def _launch_frozen_pool_prefill(
     query_int8: torch.Tensor,
     query_scale: torch.Tensor,
@@ -288,6 +375,11 @@ def _launch_frozen_pool_prefill(
     prefill_backend: Literal["amd", "nvidia"],
     active_chunks_hint: int,
     target: AcceleratorTarget | None,
+    per_row_query_scale: bool = False,
+    allow_subchunk_single: bool = False,
+    frozen_splits: int | None = None,
+    total_splits: int | None = None,
+    partial_targets: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Assemble pool views and strides once and dispatch the backend frozen-pool kernel."""
     batch, q_heads, _, head_dim = output.shape
@@ -320,7 +412,24 @@ def _launch_frozen_pool_prefill(
     )
     gqa_group = q_heads // kv_heads
 
-    frozen_splits = 1
+    resolved_splits = (
+        _select_frozen_prefill_splits(
+            query_int8.device,
+            prefill_backend=prefill_backend,
+            batch=batch,
+            q_heads=q_heads,
+            seq_q=seq_q,
+            head_dim=head_dim,
+            max_chunks=max_chunks,
+            active_chunks_hint=active_chunks_hint,
+            allow_subchunk_single=allow_subchunk_single,
+        )
+        if frozen_splits is None
+        else frozen_splits
+    )
+    resolved_total = resolved_splits if total_splits is None else total_splits
+    has_splits = partial_targets is not None or resolved_splits > 1
+
     out_target = output
     lse_target = lse
     partial_out: torch.Tensor | None = None
@@ -329,29 +438,25 @@ def _launch_frozen_pool_prefill(
     partial_log_denom: torch.Tensor | None = None
     bias_target: torch.Tensor | None = None
     log_denom_target: torch.Tensor | None = None
-    if prefill_backend == "nvidia":
-        sm_count = device_sm_count(query_int8.device)
-        base_blocks = max(1, batch * q_heads * triton.cdiv(seq_q, 64))
-        hint_chunks = max_chunks if active_chunks_hint <= 0 else min(max_chunks, active_chunks_hint)
-        if base_blocks < sm_count and hint_chunks >= 4:
-            frozen_splits = min(8, hint_chunks // 2, max(1, (sm_count * 2) // base_blocks))
-    if frozen_splits > 1:
+    if partial_targets is not None:
+        out_target, lse_target, bias_target, log_denom_target = partial_targets
+    elif resolved_splits > 1:
         partial_out = torch.empty(
-            (batch, frozen_splits, q_heads, seq_q, head_dim),
+            (batch, resolved_splits, q_heads, seq_q, head_dim),
             device=output.device,
             dtype=torch.float32,
         )
         partial_lse = torch.empty(
-            (batch, frozen_splits, q_heads, seq_q),
+            (batch, resolved_splits, q_heads, seq_q),
             device=output.device,
             dtype=torch.float32,
         )
         partial_bias = torch.empty_like(partial_lse)
         partial_log_denom = torch.empty_like(partial_lse)
-        out_target = partial_out.view(batch * frozen_splits, q_heads, seq_q, head_dim)
-        lse_target = partial_lse.view(batch * frozen_splits, q_heads, seq_q)
-        bias_target = partial_bias.view(batch * frozen_splits, q_heads, seq_q)
-        log_denom_target = partial_log_denom.view(batch * frozen_splits, q_heads, seq_q)
+        out_target = partial_out.view(batch * resolved_splits, q_heads, seq_q, head_dim)
+        lse_target = partial_lse.view(batch * resolved_splits, q_heads, seq_q)
+        bias_target = partial_bias.view(batch * resolved_splits, q_heads, seq_q)
+        log_denom_target = partial_log_denom.view(batch * resolved_splits, q_heads, seq_q)
 
     common_args: tuple[object, ...] = (
         query_int8,
@@ -398,6 +503,12 @@ def _launch_frozen_pool_prefill(
             gqa_group=gqa_group,
             head_dim=head_dim,
             has_chunk_map=has_chunk_map,
+            split_chunks=resolved_splits,
+            total_splits=resolved_total,
+            has_chunk_splits=has_splits,
+            per_row_query_scale=per_row_query_scale,
+            partial_bias=bias_target,
+            partial_log_denom=log_denom_target,
         )
     else:
         from ._nvidia import prefill as nvidia_prefill  # noqa: PLC0415
@@ -414,48 +525,263 @@ def _launch_frozen_pool_prefill(
             has_chunk_map=has_chunk_map,
             is_tail=False,
             is_causal=False,
-            split_chunks=frozen_splits,
+            split_chunks=resolved_splits,
+            total_splits=resolved_total,
+            has_chunk_splits=has_splits,
+            per_row_query_scale=per_row_query_scale,
             partial_bias=bias_target,
             partial_log_denom=log_denom_target,
             target=target,
         )
-        if (
-            partial_out is not None
-            and partial_lse is not None
-            and partial_bias is not None
-            and partial_log_denom is not None
-        ):
-            po_view = partial_out.permute(0, 2, 3, 1, 4)
-            pl_view = partial_lse.permute(0, 2, 3, 1)
-            pb_view = partial_bias.permute(0, 2, 3, 1)
-            pld_view = partial_log_denom.permute(0, 2, 3, 1)
-            with device_context(output.device):
-                _piper_decode_splitkv_reduce_kernel[(batch * q_heads * seq_q,)](
-                    po_view,
-                    pl_view,
-                    pb_view,
-                    pld_view,
-                    output,
-                    lse,
-                    q_heads,
-                    seq_q,
-                    frozen_splits,
-                    po_view.stride(0),
-                    po_view.stride(1),
-                    po_view.stride(2),
-                    po_view.stride(3),
-                    pl_view.stride(0),
-                    pl_view.stride(1),
-                    pl_view.stride(2),
-                    pl_view.stride(3),
-                    output.stride(0),
-                    output.stride(1),
-                    output.stride(2),
-                    lse.stride(0),
-                    lse.stride(1),
-                    head_dim=head_dim,
-                    num_warps=REDUCE_NUM_WARPS,
-                )
+    if (
+        partial_out is not None
+        and partial_lse is not None
+        and partial_bias is not None
+        and partial_log_denom is not None
+    ):
+        with device_context(output.device):
+            _launch_splitkv_reduce(
+                partial_out.permute(0, 2, 3, 1, 4),
+                partial_lse.permute(0, 2, 3, 1),
+                partial_bias.permute(0, 2, 3, 1),
+                partial_log_denom.permute(0, 2, 3, 1),
+                output,
+                lse,
+                batch=batch,
+                q_heads=q_heads,
+                seq_q=seq_q,
+                num_splits=resolved_splits,
+                head_dim=head_dim,
+            )
+
+
+def _quantize_query(
+    query: torch.Tensor,
+    scale: float,
+    *,
+    prefill_backend: Literal["amd", "nvidia"],
+    grouped_qk: bool,
+    per_row: bool,
+    storage_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if prefill_backend == "amd":
+        from piper_kernels.attention.kernels.piper._amd import (  # noqa: PLC0415
+            quantization as amd_quantization,
+        )
+
+        return amd_quantization.prepare_query(
+            query,
+            scale,
+            per_row=per_row,
+            storage_sequence_length=storage_length,
+        )
+    with device_context(query.device):
+        return qk_quantization.prepare_query(
+            query,
+            scale,
+            grouped=grouped_qk and not per_row,
+            per_row=per_row,
+            storage_query_length=storage_length,
+        )
+
+
+def _run_small_q_decode(
+    query: torch.Tensor,
+    key_int8: torch.Tensor,
+    key_scale: torch.Tensor,
+    key_center: torch.Tensor,
+    value_int8: torch.Tensor,
+    value_scale: torch.Tensor,
+    value_mean: torch.Tensor,
+    chunk_to_slot: torch.Tensor | None,
+    num_chunks: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    tail_key: torch.Tensor | None,
+    tail_value: torch.Tensor | None,
+    tail_len: torch.Tensor | None,
+    scale: float,
+    is_causal: bool,
+    grouped_qk: bool,
+    active_chunks_hint: int,
+    prefill_backend: Literal["amd", "nvidia"],
+    target: AcceleratorTarget | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute native GQA-packed INT8 pool decode plus optional direct BF16/FP16 tail."""
+    batch, q_heads, seq_q, head_dim = query.shape
+    num_slots, kv_heads, _, _ = key_int8.shape
+    max_chunks = num_slots if chunk_to_slot is None else chunk_to_slot.shape[1]
+    tail_cap = 0 if tail_key is None else tail_key.shape[2]
+    has_chunks = max_chunks > 0 and num_slots > 0
+    has_tail = tail_cap > 0
+    gqa_group = q_heads // kv_heads
+    packed_m = gqa_group * seq_q
+    storage_m = triton.cdiv(packed_m, 64) * 64
+
+    if has_chunks and not has_tail:
+        query_int8, query_scale = _quantize_query(
+            query.reshape(batch, kv_heads, packed_m, head_dim),
+            scale,
+            prefill_backend=prefill_backend,
+            grouped_qk=grouped_qk,
+            per_row=True,
+            storage_length=storage_m,
+        )
+        _launch_frozen_pool_prefill(
+            query_int8,
+            query_scale,
+            key_int8,
+            key_scale,
+            key_center,
+            value_int8,
+            value_scale,
+            value_mean,
+            chunk_to_slot,
+            num_chunks,
+            output.view(batch, kv_heads, packed_m, head_dim),
+            lse.view(batch, kv_heads, packed_m),
+            seq_q=packed_m,
+            grouped_qk=grouped_qk,
+            prefill_backend=prefill_backend,
+            active_chunks_hint=active_chunks_hint,
+            target=target,
+            per_row_query_scale=True,
+            allow_subchunk_single=True,
+        )
+        return output, lse
+
+    from .triton import (  # noqa: PLC0415
+        launch_direct_tail_split_decode,
+        select_decode_schedule,
+    )
+
+    resolved_target = AcceleratorTarget.from_device(query.device) if target is None else target
+    schedule = select_decode_schedule(resolved_target, head_dim)
+    sm_count = device_sm_count(query.device)
+    _, tail_splits = select_split_counts(
+        batch=batch,
+        kv_heads=kv_heads,
+        gqa_group=gqa_group,
+        seq_q=seq_q,
+        max_chunks=0,
+        num_slots=0,
+        tail_cap=tail_cap,
+        active_chunks_hint=0,
+        sm_count=sm_count,
+        schedule=schedule,
+    )
+    frozen_splits = (
+        _select_frozen_prefill_splits(
+            query.device,
+            prefill_backend=prefill_backend,
+            batch=batch,
+            q_heads=kv_heads,
+            seq_q=packed_m,
+            head_dim=head_dim,
+            max_chunks=max_chunks,
+            active_chunks_hint=active_chunks_hint,
+            allow_subchunk_single=True,
+        )
+        if has_chunks
+        else 0
+    )
+    total_splits = frozen_splits + tail_splits
+    partial_out = torch.empty(
+        (batch, total_splits, q_heads, seq_q, head_dim),
+        device=query.device,
+        dtype=torch.float32,
+    )
+    partial_lse = torch.empty(
+        (batch, total_splits, q_heads, seq_q),
+        device=query.device,
+        dtype=torch.float32,
+    )
+    partial_bias = torch.empty_like(partial_lse)
+    partial_log_denom = torch.empty_like(partial_lse)
+
+    if has_chunks:
+        query_int8, query_scale = _quantize_query(
+            query.reshape(batch, kv_heads, packed_m, head_dim),
+            scale,
+            prefill_backend=prefill_backend,
+            grouped_qk=grouped_qk,
+            per_row=True,
+            storage_length=storage_m,
+        )
+        _launch_frozen_pool_prefill(
+            query_int8,
+            query_scale,
+            key_int8,
+            key_scale,
+            key_center,
+            value_int8,
+            value_scale,
+            value_mean,
+            chunk_to_slot,
+            num_chunks,
+            output.view(batch, kv_heads, packed_m, head_dim),
+            lse.view(batch, kv_heads, packed_m),
+            seq_q=packed_m,
+            grouped_qk=grouped_qk,
+            prefill_backend=prefill_backend,
+            active_chunks_hint=active_chunks_hint,
+            target=resolved_target,
+            per_row_query_scale=True,
+            allow_subchunk_single=True,
+            frozen_splits=frozen_splits,
+            total_splits=total_splits,
+            partial_targets=(
+                partial_out.view(batch * total_splits, kv_heads, packed_m, head_dim),
+                partial_lse.view(batch * total_splits, kv_heads, packed_m),
+                partial_bias.view(batch * total_splits, kv_heads, packed_m),
+                partial_log_denom.view(batch * total_splits, kv_heads, packed_m),
+            ),
+        )
+
+    po_view = partial_out.permute(0, 2, 3, 1, 4)
+    pl_view = partial_lse.permute(0, 2, 3, 1)
+    pb_view = partial_bias.permute(0, 2, 3, 1)
+    pld_view = partial_log_denom.permute(0, 2, 3, 1)
+    q_tiles = triton.cdiv(packed_m, BLOCK_QH)
+    assert tail_key is not None
+    assert tail_value is not None
+    assert tail_len is not None
+    launch_direct_tail_split_decode(
+        query,
+        tail_key,
+        tail_value,
+        tail_len,
+        po_view,
+        pl_view,
+        pb_view,
+        pld_view,
+        scale=scale,
+        kv_heads=kv_heads,
+        gqa_group=gqa_group,
+        q_tiles=q_tiles,
+        seq_q=seq_q,
+        tail_cap=tail_cap,
+        int8_splits=frozen_splits,
+        tail_splits=tail_splits,
+        is_causal=is_causal,
+        head_dim=head_dim,
+        schedule=schedule,
+    )
+    _launch_splitkv_reduce(
+        po_view,
+        pl_view,
+        pb_view,
+        pld_view,
+        output,
+        lse,
+        batch=batch,
+        q_heads=q_heads,
+        seq_q=seq_q,
+        num_splits=total_splits,
+        head_dim=head_dim,
+    )
+    return output, lse
 
 
 def run_chunked_prefill(
@@ -480,7 +806,7 @@ def run_chunked_prefill(
     prefill_backend: Literal["amd", "nvidia"],
     target: AcceleratorTarget | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run quantized chunked prefill over finalized pool slots plus optional live tail."""
+    """Run native INT8-Q/UINT8-P frozen pool execution plus direct or quantized live tail."""
     batch, q_heads, seq_q, head_dim = query.shape
     num_slots = key_int8.shape[0]
     max_chunks = num_slots if chunk_to_slot is None else chunk_to_slot.shape[1]
@@ -497,20 +823,39 @@ def run_chunked_prefill(
         lse.fill_(-float("inf"))
         return output, lse
 
-    storage_q = triton.cdiv(seq_q, 64) * 64
-    if prefill_backend == "amd":
-        from piper_kernels.attention.kernels.piper._amd import (  # noqa: PLC0415
-            quantization as amd_quantization,
+    if seq_q < PREFILL_MIN_SEQ_Q:
+        return _run_small_q_decode(
+            query,
+            key_int8,
+            key_scale,
+            key_center,
+            value_int8,
+            value_scale,
+            value_mean,
+            chunk_to_slot,
+            num_chunks,
+            output,
+            lse,
+            tail_key=tail_key,
+            tail_value=tail_value,
+            tail_len=tail_len,
+            scale=scale,
+            is_causal=is_causal,
+            grouped_qk=grouped_qk,
+            active_chunks_hint=active_chunks_hint,
+            prefill_backend=prefill_backend,
+            target=target,
         )
 
-        query_int8, query_scale = amd_quantization.prepare_query(
-            query, scale, storage_sequence_length=storage_q
-        )
-    else:
-        with device_context(query.device):
-            query_int8, query_scale = qk_quantization.prepare_query(
-                query, scale, grouped=grouped_qk, storage_query_length=storage_q
-            )
+    storage_q = triton.cdiv(seq_q, 64) * 64
+    query_int8, query_scale = _quantize_query(
+        query,
+        scale,
+        prefill_backend=prefill_backend,
+        grouped_qk=grouped_qk,
+        per_row=False,
+        storage_length=storage_q,
+    )
 
     if has_chunks:
         _launch_frozen_pool_prefill(

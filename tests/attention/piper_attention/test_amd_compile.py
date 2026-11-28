@@ -14,6 +14,7 @@ from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton import amd_compiler_workarounds
 from piper_kernels.attention.piper_attention._amd import gluon as amd_gluon
+from piper_kernels.attention.piper_attention.triton import compile_kv_decode_kernels
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
 
@@ -165,21 +166,12 @@ def test_dense_amd_launch_attributes_unpin_warp_pipeline_loads():
     assert "sched_barrier mask(0x00000001)" not in unpinned.asm["amdgcn"]
 
 
-def _assert_zero_spill_amd_prefill(compiled) -> None:
+def _assert_zero_spills_amdgcn(compiled) -> str:
     assert compiled.asm["hsaco"]
     assert compiled.metadata.global_scratch_size == 0
     amdgcn = compiled.asm["amdgcn"]
-    instructions = [
-        line.replace(" ", "") for line in amdgcn.splitlines() if "v_wmma_i32_16x16x16_iu8" in line
-    ]
-    assert any("0x3e22f983neg_lo:[1,1,0]" in line for line in instructions)
-    assert any("0x3e22f983neg_lo:[1,0,0]" in line for line in instructions)
-    assert all(",0neg_lo:[1,0,0]" not in line for line in instructions)
-    assert all("clamp" not in line for line in instructions)
     if rocm_fences_only_lds():
         assert "global_inv" not in amdgcn
-    if torch.version.hip is not None or not amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS:
-        assert "global_load_b64" not in amdgcn
     vgpr_spills = re.search(r"vgpr_spill[^:]*:\s*(\d+)", amdgcn)
     sgpr_spills = re.search(r"sgpr_spill[^:]*:\s*(\d+)", amdgcn)
     priv_size = re.search(r"amdhsa_private_segment_fixed_size\s+(\d+)", amdgcn)
@@ -189,16 +181,40 @@ def _assert_zero_spill_amd_prefill(compiled) -> None:
     assert int(sgpr_spills.group(1)) == 0
     assert priv_size is not None
     assert int(priv_size.group(1)) == 0
+    return amdgcn
+
+
+def _assert_zero_spill_amd_prefill(compiled) -> None:
+    amdgcn = _assert_zero_spills_amdgcn(compiled)
+    instructions = [
+        line.replace(" ", "") for line in amdgcn.splitlines() if "v_wmma_i32_16x16x16_iu8" in line
+    ]
+    assert any("0x3e22f983neg_lo:[1,1,0]" in line for line in instructions)
+    assert any("0x3e22f983neg_lo:[1,0,0]" in line for line in instructions)
+    assert all(",0neg_lo:[1,0,0]" not in line for line in instructions)
+    assert all("clamp" not in line for line in instructions)
+    if torch.version.hip is not None or not amd_compiler_workarounds.UNPINNED_WARP_PIPELINE_ATTRS:
+        assert "global_load_b64" not in amdgcn
+
+
+def _assert_zero_spill_amd_decode(compiled, *, expected_wmma: str | None = None) -> None:
+    amdgcn = _assert_zero_spills_amdgcn(compiled)
+    if expected_wmma is not None:
+        assert expected_wmma in amdgcn
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(("has_chunk_map", "is_causal"), [(False, False), (True, True)])
+@pytest.mark.parametrize("has_chunk_splits", [False, True])
+@pytest.mark.parametrize("per_row_query_scale", [False, True])
 def test_amd_prefill_compilation_zero_spills(
     head_dim: int,
     dtype: torch.dtype,
     has_chunk_map: bool,
     is_causal: bool,
+    has_chunk_splits: bool,
+    per_row_query_scale: bool,
 ) -> None:
     frozen, tail = amd_gluon.compile_amd_prefill_kernels(
         GPUTarget("hip", "gfx1201", 32),
@@ -206,6 +222,8 @@ def test_amd_prefill_compilation_zero_spills(
         head_dim=head_dim,
         has_chunk_map=has_chunk_map,
         is_causal=is_causal,
+        has_chunk_splits=has_chunk_splits,
+        per_row_query_scale=per_row_query_scale,
     )
     _assert_zero_spill_amd_prefill(frozen)
     _assert_zero_spill_amd_prefill(tail)
@@ -213,13 +231,52 @@ def test_amd_prefill_compilation_zero_spills(
 
 def test_amd_prefill_gfx1200_smoke() -> None:
     for wide_pool in (False, True):
-        frozen, tail = amd_gluon.compile_amd_prefill_kernels(
-            GPUTarget("hip", "gfx1200", 32),
-            dtype=torch.bfloat16,
-            head_dim=128,
-            has_chunk_map=True,
-            is_causal=True,
-            wide_pool=wide_pool,
-        )
-        _assert_zero_spill_amd_prefill(frozen)
-        _assert_zero_spill_amd_prefill(tail)
+        for has_chunk_splits in (False, True):
+            frozen, tail = amd_gluon.compile_amd_prefill_kernels(
+                GPUTarget("hip", "gfx1200", 32),
+                dtype=torch.bfloat16,
+                head_dim=128,
+                has_chunk_map=True,
+                is_causal=True,
+                wide_pool=wide_pool,
+                has_chunk_splits=has_chunk_splits,
+            )
+            _assert_zero_spill_amd_prefill(frozen)
+            _assert_zero_spill_amd_prefill(tail)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("wide_pool", [False, True])
+@pytest.mark.parametrize("contiguous_inputs", [True, False])
+def test_amd_kv_decode_compilation_zero_spills(
+    head_dim: int,
+    dtype: torch.dtype,
+    wide_pool: bool,
+    contiguous_inputs: bool,
+) -> None:
+    frozen, tail, reduce_k = compile_kv_decode_kernels(
+        GPUTarget("hip", "gfx1201", 32),
+        dtype=dtype,
+        head_dim=head_dim,
+        wide_pool=wide_pool,
+        contiguous_inputs=contiguous_inputs,
+    )
+    tail_wmma = "v_wmma_f32_16x16x16_f16" if dtype is torch.float16 else "v_wmma_f32_16x16x16_bf16"
+    _assert_zero_spill_amd_prefill(frozen)
+    _assert_zero_spill_amd_decode(tail, expected_wmma=tail_wmma)
+    _assert_zero_spill_amd_decode(reduce_k)
+
+
+def test_amd_kv_decode_gfx1200_smoke() -> None:
+    for head_dim in (64, 128):
+        for wide_pool in (False, True):
+            frozen, tail, reduce_k = compile_kv_decode_kernels(
+                GPUTarget("hip", "gfx1200", 32),
+                dtype=torch.bfloat16,
+                head_dim=head_dim,
+                wide_pool=wide_pool,
+            )
+            _assert_zero_spill_amd_prefill(frozen)
+            _assert_zero_spill_amd_decode(tail, expected_wmma="v_wmma_f32_16x16x16_bf16")
+            _assert_zero_spill_amd_decode(reduce_k)

@@ -283,8 +283,9 @@ def select_prefill_config(
             # Free one pipeline buffer register when unmapped FP32 split partials spill at loop=2.
             loop_stages = 1 if (has_chunk_splits and not has_chunk_map) else 3
             return 64, 4, False, 3, loop_stages
-        loop_stages = 2 if (not is_tail and has_chunk_map) else 1
-        return 64, 4, True, 2, loop_stages
+        if not is_tail:
+            return 64, 8, True, 2, 2
+        return 64, 4, True, 2, 1
     if not is_tail:
         num_warps = 8 if head_dim == 128 else 4
         return 64, num_warps, head_dim == 128, 1, 1

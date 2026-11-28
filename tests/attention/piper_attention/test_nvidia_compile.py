@@ -19,6 +19,7 @@ from triton.experimental.gluon._runtime import GluonASTSource
 
 from piper_kernels._triton.mixed_int8 import _MixedInt8StageHook
 from piper_kernels._triton.targets import AcceleratorTarget
+from piper_kernels.attention.kernels.qk_quantization.int8.sage import triton as sage_q
 from piper_kernels.attention.piper_attention import _quantization
 from piper_kernels.attention.piper_attention._nvidia.gluon_async_copy import (
     _dense_piper_attention_kernel,
@@ -279,6 +280,48 @@ def test_kv_freeze_8_target_compile_zero_spills(
     )
 
 
+def _compile_kv_decode_zero_spill_checked(
+    monkeypatch: pytest.MonkeyPatch,
+    target: GPUTarget,
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+    has_chunk_map: bool = True,
+    is_causal: bool = True,
+    contiguous_inputs: bool = True,
+    wide_pool: bool = False,
+) -> None:
+    native_cuda = target.backend == "cuda" and int(target.arch) >= 80
+    if native_cuda:
+        monkeypatch.setattr(
+            triton.knobs.runtime, "add_stages_inspection_hook", _MixedInt8StageHook(None)
+        )
+    compiled_out: list[object] = []
+
+    def _compile_and_record(
+        compile_fn: Callable[[object, object, dict[str, object]], object] | None,
+    ) -> tuple[object, ...]:
+        res = compile_kv_decode_kernels(
+            target,
+            dtype=dtype,
+            head_dim=head_dim,
+            has_chunk_map=has_chunk_map,
+            is_causal=is_causal,
+            contiguous_inputs=contiguous_inputs,
+            wide_pool=wide_pool,
+            compile_fn=compile_fn,
+        )
+        compiled_out.extend(res)
+        return res
+
+    _assert_zero_spill_kernels(target, 3, _compile_and_record, check_sgpr_spills=True)
+    if native_cuda:
+        ptx = compiled_out[0].asm["ptx"]  # type: ignore[attr-defined]
+        assert ".s32.s8.s8.s32" in ptx
+        assert ".s32.u8.s8.s32" in ptx
+        assert "piper_attention_u8s8_dot_marker" not in ptx
+
+
 @pytest.mark.parametrize("target", _KV_COMPILE_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -287,6 +330,7 @@ def test_kv_freeze_8_target_compile_zero_spills(
     [(True, True, True), (True, True, False), (False, False, True)],
 )
 def test_kv_decode_8_target_compile_zero_spills(
+    monkeypatch: pytest.MonkeyPatch,
     target: GPUTarget,
     dtype: torch.dtype,
     head_dim: int,
@@ -294,18 +338,14 @@ def test_kv_decode_8_target_compile_zero_spills(
     is_causal: bool,
     contiguous_inputs: bool,
 ) -> None:
-    _assert_zero_spill_kernels(
+    _compile_kv_decode_zero_spill_checked(
+        monkeypatch,
         target,
-        3,
-        lambda compile_fn: compile_kv_decode_kernels(
-            target,
-            dtype=dtype,
-            head_dim=head_dim,
-            has_chunk_map=has_chunk_map,
-            is_causal=is_causal,
-            contiguous_inputs=contiguous_inputs,
-            compile_fn=compile_fn,
-        ),
+        dtype=dtype,
+        head_dim=head_dim,
+        has_chunk_map=has_chunk_map,
+        is_causal=is_causal,
+        contiguous_inputs=contiguous_inputs,
     )
 
 
@@ -478,22 +518,40 @@ def test_kv_wide_pool_prefill_compile_zero_spills(
 @pytest.mark.parametrize("target", _WIDE_POOL_DECODE_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_kv_wide_pool_decode_compile_zero_spills(
+    monkeypatch: pytest.MonkeyPatch,
     target: GPUTarget,
     head_dim: int,
 ) -> None:
-    # Wide i64 pool strides trigger a benign 4-SGPR-to-VGPR spill on gfx1201 D=128 (0 VGPR/scratch).
-    _assert_zero_spill_kernels(
+    _compile_kv_decode_zero_spill_checked(
+        monkeypatch,
         target,
-        3,
-        lambda compile_fn: compile_kv_decode_kernels(
-            target,
-            dtype=torch.bfloat16,
-            head_dim=head_dim,
-            wide_pool=True,
-            compile_fn=compile_fn,
-        ),
-        check_sgpr_spills=not (target.backend == "hip" and head_dim == 128),
+        dtype=torch.bfloat16,
+        head_dim=head_dim,
+        wide_pool=True,
     )
+
+
+@pytest.mark.parametrize("target", _NVIDIA_PREFILL_TARGETS, ids=lambda t: f"{t.backend}-{t.arch}")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_kv_per_row_query_quantize_compile_zero_spills(
+    target: GPUTarget,
+    dtype: torch.dtype,
+    head_dim: int,
+) -> None:
+    triton_dtype = _quantization.validate_kv_compile_args(dtype, head_dim)
+    source = _quantization.build_kernel_source(
+        sage_q.quantize_query_per_thread_kernel,
+        constants={"head_dim": head_dim, "per_row": True},
+        overrides={
+            "query_ptr": f"*{triton_dtype}",
+            "output_ptr": "*i8",
+            "scale_ptr": "*fp32",
+            "softmax_scale": "fp32",
+        },
+    )
+    _, spills = compile_with_spill_stores(source, target, {"num_warps": 4})  # type: ignore[arg-type]
+    assert spills == 0
 
 
 @pytest.mark.parametrize("arch", [80, 86, 89, 120])

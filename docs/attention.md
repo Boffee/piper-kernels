@@ -216,23 +216,29 @@ Pool and operator contract:
   Graph capture and `torch.compile(fullgraph=True, dynamic=True)`.
 - **Grouped Split-KV decode, chunked prefill & LSE wave merge:** `piper_attention_decode`
   automatically selects the kernel path by `seq_q` and GPU target:
-  - For `seq_q < 64` (decode and speculative verification), CPU reference, or GPUs without
-    native quantized tensor-core Piper support (e.g., SM75, SM90, SM100, `gfx942`,
-    `gfx1100`, `gfx1151`), it keeps queries and softmax probabilities in FP32 while
-    dequantizing frozen INT8 K/V slots (approximating FP32 SDPA rather than INT8-Q/UINT8-P
-    `piper_attention` prefill), running native Triton Split-KV kernels on GPU (NVIDIA
-    SM70+ and AMD ROCm) and the portable FP32-accumulation reference elsewhere.
-  - For `seq_q >= 64` (multi-turn / long-prompt chunked prefill) on NVIDIA SM8x/SM12x and
-    AMD RDNA4 (`gfx1200`/`gfx1201`), it routes directly into quantized INT8-Q/UINT8-P
-    tensor-core prefill over finalized `PiperKVChunkPool` slots plus an optional
-    K1024/V1024 chunk-centered live tail (supporting arbitrary non-64-aligned causal offsets
-    `active_tail - seq_q`, zero-copy pool reads, and two-wave FP32 LSE merging).
-  Both paths share the same operator API, zero host readbacks,
-  `torch.compile(fullgraph=True, dynamic=True)`, and CUDA Graph capture support. At
-  `seq_q >= 64`, quantized Q/P prefill approximates FP32 SDPA within INT8/UINT8 Piper
-  quantization error rather than matching FP32-Q/P Split-KV bitwise, and K1024/V1024 tail
-  centering shares per-chunk statistics across causal queries within each 1024-token tail
-  chunk. It attends `query` (`[batch, q_heads, seq_q, head_dim]`
+  - On NVIDIA SM8x/SM12x and AMD RDNA4 (`gfx1200`/`gfx1201`), finalized
+    `PiperKVChunkPool` slots always execute native GQA-packed INT8-Q/UINT8-P
+    tensor-core attention across all `seq_q >= 1`:
+    - For `seq_q < 64` (decode and speculative verification), queries are packed by KV
+      head (`gqa_group * seq_q`) with exact per-row query quantization, run with
+      subtile-granular Split-KV over finalized pool slots, and combined in a single
+      `_piper_decode_splitkv_reduce_kernel` reduction with the direct BF16/FP16 Split-KV
+      live tail (`_piper_decode_tail_split_kernel`, zero tail quantization launch overhead).
+    - For `seq_q >= 64` (multi-turn / long-prompt chunked prefill), frozen pool slots run
+      chunked INT8-Q/UINT8-P alongside a K1024/V1024 chunk-centered quantized live tail
+      (supporting arbitrary non-64-aligned causal offsets `active_tail - seq_q`,
+      zero-copy pool reads, and two-wave FP32 LSE merging).
+  - For CPU reference or GPUs without native quantized tensor-core Piper support (e.g.,
+    SM75, SM90, SM100, `gfx942`, `gfx1100`, `gfx1151`), `piper_attention_decode` keeps
+    queries and softmax probabilities in FP32 while dequantizing frozen INT8 K/V slots
+    (approximating FP32 SDPA rather than INT8-Q/UINT8-P), running native Triton Split-KV
+    kernels on GPU and the portable FP32-accumulation reference elsewhere.
+  All paths share the same operator API, zero host readbacks,
+  `torch.compile(fullgraph=True, dynamic=True)`, and CUDA Graph capture support. Native
+  INT8-Q/UINT8-P frozen pool execution approximates FP32 SDPA within INT8/UINT8 Piper
+  quantization error rather than matching FP32-Q/P Split-KV bitwise; at `seq_q >= 64`,
+  K1024/V1024 tail centering also shares per-chunk statistics across causal queries
+  within each 1024-token tail chunk. It attends `query` (`[batch, q_heads, seq_q, head_dim]`
   in `float16`/`bfloat16`,
   `q_heads` a multiple of `pool.kv_heads`, `seq_q >= 1`) against active slots addressed
   through `chunk_to_slot` (`[batch, max_chunks]` `int32` or `None` for direct
