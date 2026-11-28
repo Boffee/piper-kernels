@@ -91,7 +91,7 @@ def convrot_nvfp4_linear(
             True,
         )
     raise ValueError(
-        "ConvRot NVFP4 linear requires canonical SM120 W4A4 or weight-only NVFP4 operands"
+        "ConvRot NVFP4 linear requires canonical SM120 W4A4 or SM12x/CPU weight-only NVFP4 operands"
     )
 
 

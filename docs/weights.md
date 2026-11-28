@@ -10,8 +10,8 @@ calibration, and model quality.
 |---|---|---|
 | `ConvRotInt8Tensor` | Grouped rotation, INT8 values, FP32 scale per output | Linear and Conv3D, with optimized NVIDIA/AMD kernels and portable fallback; embedding lookups. |
 | `ConvRotTrellisTensor` | Packed 2–6 bpw trellis bitstreams, FP8 block scales, FP32 row scale | Linear (`F.linear`) via Triton kernels on supported NVIDIA/AMD GPUs and CPU fallback. |
-| `PiperNVFP4Tensor` | Packed FP4 values, FP8 block scales, optional FP32 global scale | Native W4A4 linear and fusions target exact NVIDIA SM120; weight-only W4A16 (`act_quant=None`) targets NVIDIA SM75+ and supported AMD ROCm GPUs. |
-| `ConvRotNVFP4Tensor` | NVFP4 in a grouped rotated basis | Same W4A4 and W4A16 GPU targets, plus a CPU reference fallback for weight-only W4A16. |
+| `PiperNVFP4Tensor` | Packed FP4 values, FP8 block scales, optional FP32 global scale | Native W4A4 linear and fusions target exact NVIDIA SM120; weight-only W4A16 (`act_quant=None`) targets NVIDIA SM12x on GPU and uses a portable CPU reference fallback (unsupported GPUs raise `ValueError`). |
+| `ConvRotNVFP4Tensor` | NVFP4 in a grouped rotated basis | Same SM120 W4A4, SM12x W4A16, and CPU weight-only support (unsupported GPUs raise `ValueError`). |
 
 See [installation](../README.md#installation) for platform setup.
 Weight construction and storage are separate from execution support: being able
@@ -84,9 +84,9 @@ codes compared with separately materialized low-precision activations.
 ## Construct and run NVFP4
 
 This complete example supports both full W4A4 execution (requires an NVIDIA SM120
-GPU) and weight-only W4A16 execution (`act_quant=None`,
-supported on NVIDIA SM75+ and Linux/Windows AMD `gfx942`, `gfx1100`, `gfx1151`,
-`gfx1200`, and `gfx1201`). The native path requires 16-value blocks, swizzled
+GPU) and weight-only W4A16 execution (`act_quant=None`, supported on NVIDIA SM12x and
+CPU/`meta`; unsupported GPUs raise `ValueError` and should use ConvRot INT8 or ConvRot
+Trellis instead). The native path requires 16-value blocks, swizzled
 scales, and FP16, BF16, or FP32 activations matching the logical weight dtype.
 ConvRot input widths must also divide into rotation groups.
 
@@ -111,8 +111,9 @@ with torch.inference_mode():
 assert output.shape == rotated_output.shape == (2, 128)
 ```
 
-For W4A16 weight-only execution across SM75+, supported ROCm GPUs, and CPU, construct
-the same tensors with `act_quant=None` and `act_per_tensor_scale=None`. Set `act_quant="dynamic"` or `act_quant="static"` on
+For W4A16 weight-only execution on SM12x, CPU, and `meta`, construct
+the same tensors with `act_quant=None` and `act_per_tensor_scale=None` (calling GPU
+W4A16 on pre-SM12x CUDA or AMD ROCm GPUs raises `ValueError`). Set `act_quant="dynamic"` or `act_quant="static"` on
 SM120 when you want W4A4 activations, including compiled FFN and sparse attention fusions.
 
 `compute_per_tensor_scale=True` computes the weight global scale (after rotation
@@ -133,9 +134,9 @@ To wrap existing packed NVFP4 storage without copying contiguous buffers, use
 (see [ordinary NVFP4](../src/piper_kernels/weights/nvfp4/tensor.py) and
 [ConvRot NVFP4](../src/piper_kernels/weights/convrot/nvfp4/tensor.py) for fields, and
 [NVFP4 reference](../src/piper_kernels/linear/nvfp4/reference.py) for `linear` /
-`linear_w4a16` numerical checks). Native W4A4 ConvRot NVFP4 requires SM120; weight-only
-and unsupported paths either use portable fallbacks or raise when the backend
-constraints are unmet.
+`linear_w4a16` numerical checks). Native W4A4 ConvRot NVFP4 requires SM120, weight-only
+W4A16 requires SM12x on GPU (CPU/`meta` remain supported for portable reference and
+checkpoint tooling), and unsupported GPUs or unmet constraints raise.
 
 ## Look up embedding rows
 
@@ -176,11 +177,12 @@ sizes (`up_gate_block_size`, `down_block_size`), and optional variable-row metad
 
 NVFP4 slabs use packed `uint8` nibbles and finite (`0x7F`/`0xFF` NaN bytes excluded)
 `SWIZZLE_32_4_4` `float8_e4m3fn` 16-value block scales on widths divisible by 16 (and
-`group_size` for ConvRot). ConvRot INT8 slabs use `int8` values,
-`float32` per-row scales (`[num_slots, out]` or `[num_slots, out, 1]`), `group_size` in
-`{16, 64, 256}`, and widths up to `131_071` so INT32 accumulators never wrap; GPU INT8 kernels
-target NVIDIA SM80+ and supported AMD ROCm GPUs, while earlier CUDA targets and CPU run the
-portable reference.
+`group_size` for ConvRot); GPU NVFP4 MoE execution targets NVIDIA SM12x (`ValueError` on
+other GPUs), while CPU and `meta` remain supported. ConvRot INT8 slabs use `int8`
+values, `float32` per-row scales (`[num_slots, out]` or `[num_slots, out, 1]`),
+`group_size` in `{16, 64, 256}`, and widths up to `131_071` so INT32 accumulators never
+wrap; GPU INT8 kernels target NVIDIA SM80+ and supported AMD ROCm GPUs, while earlier
+CUDA targets and CPU run the portable reference.
 
 ConvRot Trellis (`"convrot_trellis"`) slabs store `float8_e4m3fn` block scales
 `[num_slots, out, in / block_size]`, `float32` per-row scales (`[num_slots, out]` or

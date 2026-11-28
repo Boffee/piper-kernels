@@ -13,11 +13,7 @@ from ._nvidia import policy as _nvidia_policy
 
 def select_nvfp4_m1_schedule(target: AcceleratorTarget) -> _schedule.Nvfp4M1Schedule:
     """Resolve the NVFP4 ``rows == 1`` decode schedule for ``target``."""
-    if target.is_nvidia_cuda:
-        return _nvidia_policy.select_nvfp4_m1_schedule(target)
-    if target.is_amd_hip:
-        return _amd_policy.select_nvfp4_m1_schedule(target)
-    return _schedule.default_nvfp4_m1_schedule()
+    return _nvidia_policy.select_nvfp4_m1_schedule(target)
 
 
 def select_nvfp4_batched_schedule(
@@ -28,16 +24,8 @@ def select_nvfp4_batched_schedule(
     logical_dtype: torch.dtype,
 ) -> _schedule.Nvfp4BatchedSchedule:
     """Resolve the NVFP4 batched decode schedule for ``target``."""
-    if target.is_nvidia_cuda:
-        return _nvidia_policy.select_nvfp4_batched_schedule(
-            target, rows=rows, active_dtype=active_dtype, logical_dtype=logical_dtype
-        )
-    if target.is_amd_hip:
-        return _amd_policy.select_nvfp4_batched_schedule(
-            target, rows=rows, active_dtype=active_dtype, logical_dtype=logical_dtype
-        )
-    return _schedule.default_nvfp4_batched_schedule(
-        rows=rows, active_dtype=active_dtype, logical_dtype=logical_dtype
+    return _nvidia_policy.select_nvfp4_batched_schedule(
+        target, rows=rows, active_dtype=active_dtype, logical_dtype=logical_dtype
     )
 
 
@@ -52,27 +40,8 @@ def select_nvfp4_prefill_schedule(
     logical_dtype: torch.dtype,
 ) -> _schedule.Nvfp4PrefillSchedule:
     """Resolve the NVFP4 grouped prefill schedule for ``target``."""
-    if target.is_nvidia_cuda:
-        return _nvidia_policy.select_nvfp4_prefill_schedule(
-            target,
-            chunk_rows=chunk_rows,
-            top_k=top_k,
-            num_slots=num_slots,
-            active_slots_hint=active_slots_hint,
-            active_dtype=active_dtype,
-            logical_dtype=logical_dtype,
-        )
-    if target.is_amd_hip:
-        return _amd_policy.select_nvfp4_prefill_schedule(
-            target,
-            chunk_rows=chunk_rows,
-            top_k=top_k,
-            num_slots=num_slots,
-            active_slots_hint=active_slots_hint,
-            active_dtype=active_dtype,
-            logical_dtype=logical_dtype,
-        )
-    return _schedule.default_nvfp4_prefill_schedule(
+    return _nvidia_policy.select_nvfp4_prefill_schedule(
+        target,
         chunk_rows=chunk_rows,
         top_k=top_k,
         num_slots=num_slots,

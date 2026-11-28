@@ -262,12 +262,18 @@ def _compile_activate_rotate(
 
 
 def _validate_nvfp4_compile_format(
+    accel: AcceleratorTarget,
     *,
     weight_format: str,
     group_size: int,
     hidden_size: int,
     intermediate_size: int,
 ) -> None:
+    if not accel.supports_nvfp4_w4a16:
+        raise ValueError(
+            "NVFP4 MoE requires NVIDIA SM12x "
+            f"(use ConvRot INT8 or ConvRot Trellis on other GPUs), got {accel}"
+        )
     if hidden_size % nvfp4_layout.BLOCK_SIZE or intermediate_size % nvfp4_layout.BLOCK_SIZE:
         raise ValueError("NVFP4 MoE hidden_size and intermediate_size must be multiples of 16")
     if weight_format == "nvfp4_w4a16":
@@ -348,6 +354,7 @@ def _validate_compile_format(
 ) -> None:
     if weight_format in ("nvfp4_w4a16", "convrot_nvfp4_w4a16"):
         _validate_nvfp4_compile_format(
+            accel,
             weight_format=weight_format,
             group_size=group_size,
             hidden_size=hidden_size,
@@ -626,8 +633,6 @@ def _compile_nvfp4_prefill_kernels(
         "has_global_scale": has_global_scale,
         "cast_fp32_to_bf16": schedule.cast_fp32_to_bf16,
         "force_fp32_dot": schedule.force_fp32_dot,
-        "half_scales": schedule.half_scales,
-        "use_sm120_e2m1x2": schedule.use_sm120_e2m1x2,
         "single_dot": schedule.single_dot,
     }
     _bind_opt_ptrs(
@@ -916,7 +921,6 @@ def _compile_nvfp4_kernels(
             logical_dtype=logical_dtype,
         )
         post_scale_only = schedule.post_scale_only
-        use_sm120_e2m1x2 = schedule.use_sm120_e2m1x2
         nvfp4_signature: dict[str, str] = {
             "input_ptr": active_ty,
             "weight_ptr": "*u8",
@@ -945,7 +949,6 @@ def _compile_nvfp4_kernels(
     else:
         m1_schedule = _policy.select_nvfp4_m1_schedule(accel)
         post_scale_only = True
-        use_sm120_e2m1x2 = m1_schedule.use_sm120_e2m1x2
         nvfp4_signature = {
             "input_ptr": active_ty,
             "weight_ptr": "*u8",
@@ -1003,7 +1006,6 @@ def _compile_nvfp4_kernels(
                     "has_global_scale": has_global_scale,
                     "per_expert_input": False,
                     "is_splitk": is_splitk,
-                    "use_sm120_e2m1x2": use_sm120_e2m1x2,
                 },
                 attrs=up_attrs,
             ),
@@ -1020,7 +1022,6 @@ def _compile_nvfp4_kernels(
                     "has_global_scale": has_global_scale,
                     "per_expert_input": True,
                     "is_splitk": True,
-                    "use_sm120_e2m1x2": use_sm120_e2m1x2,
                 },
                 attrs=down_attrs,
             ),

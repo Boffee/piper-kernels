@@ -5,23 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-import torch
-
 from piper_kernels.linear._splitk import select_split_k
 
 from ._ops import _INT8_MAX_REDUCTION_WIDTH
 
 NVFP4_GEMV_BLOCK_N = 16
-NVFP4_GEMV_BLOCK_K = 128
 NVFP4_GEMV_NUM_WARPS = 4
 NVFP4_SM120_GEMV_BLOCK_K = 512
 NVFP4_SM120_M1_SPLITK_CTA_MULT = 3
-NVFP4_SM75_SCALAR_BLOCK_K = 64
 NVFP4_SM120_DOT_NUM_WARPS = 4
 NVFP4_DOT_NUM_WARPS_CUDA = 8
 NVFP4_DOT_BLOCK_N = 64
 NVFP4_DOT_BLOCK_K = 128
-NVFP4_DOT_BLOCK_K_GFX120X = 256
 NVFP4_REDUCE_BLOCK_N = 128
 NVFP4_MAX_SPLIT_K = 16
 NVFP4_MIN_SPLITK_WEIGHT_BYTES = 4 * 1024 * 1024
@@ -54,7 +49,6 @@ PREFILL_GROUP_M = 8
 PREFILL_NVFP4_SPARSE_BLOCK_M = 16
 PREFILL_NVFP4_DENSE_BLOCK_M = 32
 PREFILL_NVFP4_SPARSE_BLOCK_N = 64
-PREFILL_NVFP4_DENSE_BLOCK_N = 128
 PREFILL_NVFP4_BLOCK_K = 64
 NVFP4_SM120_PREFILL_BLOCK_K = 128
 PREFILL_INT8_SPARSE_BLOCK_M = 16
@@ -75,7 +69,6 @@ class Nvfp4M1Schedule:
     block_k: int
     num_warps: int
     splitk_cta_multiplier: int
-    use_sm120_e2m1x2: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +82,6 @@ class Nvfp4BatchedSchedule:
     block_k: int
     num_warps: int
     single_dot: bool
-    use_sm120_e2m1x2: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,13 +90,11 @@ class Nvfp4PrefillSchedule:
 
     cast_fp32_to_bf16: bool
     force_fp32_dot: bool
-    half_scales: bool
     block_m: int
     block_n: int
     block_k: int
     num_warps: int
     single_dot: bool
-    use_sm120_e2m1x2: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +224,7 @@ def select_nvfp4_split_k(
     in_features: int,
     *,
     block_n: int = NVFP4_GEMV_BLOCK_N,
-    block_k: int = NVFP4_GEMV_BLOCK_K,
+    block_k: int = NVFP4_SM120_GEMV_BLOCK_K,
     cta_multiplier: int = 8,
 ) -> int:
     """Select Split-K count for NVFP4 MoE projections."""
@@ -332,101 +322,6 @@ def build_int8_prefill_schedule(
         num_warps=8,
         num_stages=launch.num_stages,
         lds_only_fences=launch.lds_only_fences,
-    )
-
-
-def default_nvfp4_m1_schedule() -> Nvfp4M1Schedule:
-    """Return the portable baseline single-token NVFP4 schedule."""
-    return Nvfp4M1Schedule(
-        block_n=NVFP4_GEMV_BLOCK_N,
-        block_k=NVFP4_GEMV_BLOCK_K,
-        num_warps=NVFP4_GEMV_NUM_WARPS,
-        splitk_cta_multiplier=8,
-        use_sm120_e2m1x2=False,
-    )
-
-
-def default_nvfp4_batched_schedule(
-    *,
-    rows: int,
-    active_dtype: torch.dtype,
-    logical_dtype: torch.dtype,
-    allow_dot: bool = True,
-) -> Nvfp4BatchedSchedule:
-    """Return the portable baseline batched NVFP4 schedule."""
-    use_dot = (
-        allow_dot
-        and rows > 4
-        and (
-            active_dtype in (torch.float16, torch.bfloat16)
-            or (active_dtype is torch.float32 and logical_dtype is torch.bfloat16)
-        )
-    )
-    cast_fp32_to_bf16 = use_dot and active_dtype is torch.float32
-    post_scale_only = not (use_dot and active_dtype is torch.float16)
-    if use_dot:
-        return Nvfp4BatchedSchedule(
-            use_dot=True,
-            cast_fp32_to_bf16=cast_fp32_to_bf16,
-            post_scale_only=post_scale_only,
-            block_n=NVFP4_DOT_BLOCK_N,
-            block_k=NVFP4_DOT_BLOCK_K,
-            num_warps=NVFP4_GEMV_NUM_WARPS,
-            single_dot=False,
-            use_sm120_e2m1x2=False,
-        )
-    return Nvfp4BatchedSchedule(
-        use_dot=False,
-        cast_fp32_to_bf16=False,
-        post_scale_only=post_scale_only,
-        block_n=NVFP4_GEMV_BLOCK_N,
-        block_k=NVFP4_GEMV_BLOCK_K,
-        num_warps=NVFP4_GEMV_NUM_WARPS,
-        single_dot=False,
-        use_sm120_e2m1x2=False,
-    )
-
-
-def default_nvfp4_prefill_schedule(
-    *,
-    chunk_rows: int,
-    top_k: int,
-    num_slots: int,
-    active_slots_hint: int,
-    active_dtype: torch.dtype,
-    logical_dtype: torch.dtype,
-    force_fp32_dot_override: bool = False,
-) -> Nvfp4PrefillSchedule:
-    """Return the portable baseline prefill NVFP4 schedule."""
-    force_fp32_dot = force_fp32_dot_override or (
-        active_dtype is torch.float32 and logical_dtype is not torch.bfloat16
-    )
-    cast_fp32_to_bf16 = (not force_fp32_dot) and (active_dtype is torch.float32)
-    half_scales = not force_fp32_dot
-    block_m = select_prefill_block_m(
-        chunk_rows,
-        top_k,
-        num_slots,
-        active_slots_hint,
-        sparse_m=PREFILL_NVFP4_SPARSE_BLOCK_M,
-        dense_m=PREFILL_NVFP4_DENSE_BLOCK_M,
-    )
-    if block_m == PREFILL_NVFP4_SPARSE_BLOCK_M:
-        block_n = PREFILL_NVFP4_SPARSE_BLOCK_N
-        num_warps = NVFP4_DOT_NUM_WARPS_CUDA if force_fp32_dot else NVFP4_GEMV_NUM_WARPS
-    else:
-        block_n = PREFILL_NVFP4_SPARSE_BLOCK_N if force_fp32_dot else PREFILL_NVFP4_DENSE_BLOCK_N
-        num_warps = NVFP4_DOT_NUM_WARPS_CUDA
-    return Nvfp4PrefillSchedule(
-        cast_fp32_to_bf16=cast_fp32_to_bf16,
-        force_fp32_dot=force_fp32_dot,
-        half_scales=half_scales,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=PREFILL_NVFP4_BLOCK_K,
-        num_warps=num_warps,
-        single_dot=False,
-        use_sm120_e2m1x2=False,
     )
 
 

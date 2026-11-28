@@ -1,4 +1,4 @@
-"""NVIDIA NVFP4 W4A16 launch schedules (SM75, SM8x, and SM120)."""
+"""NVIDIA SM12x NVFP4 W4A16 launch schedules."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from .._w4a16_schedule import (
     W4A16_NARROW_BLOCK_N,
     W4A16Schedule,
     cdiv,
-    default_w4a16_schedule,
     select_w4a16_split_k,
 )
 
@@ -24,7 +23,6 @@ SM120_DEQUANT_SCHEDULE = W4A16Schedule(
     block_n=64,
     block_k=256,
     num_warps=8,
-    use_sm120_e2m1x2=True,
 )
 
 
@@ -57,7 +55,6 @@ def _sm120_w4a16_fp32_schedule(
         num_warps=4,
         num_stages=2,
         use_dot=False,
-        use_sm120_e2m1x2=True,
         split_k=split_k,
     )
 
@@ -94,7 +91,6 @@ def _sm120_w4a16_large_m_schedule(
             num_stages=3,
             use_dot=True,
             single_dot=False,
-            use_sm120_e2m1x2=True,
             split_k=1,
             group_m=group_m,
         )
@@ -121,7 +117,6 @@ def _sm120_w4a16_large_m_schedule(
         num_stages=3,
         use_dot=True,
         single_dot=True,
-        use_sm120_e2m1x2=True,
         split_k=split_k,
         group_m=group_m,
     )
@@ -162,7 +157,6 @@ def _sm120_w4a16_schedule(
             num_warps=4,
             num_stages=2,
             use_dot=False,
-            use_sm120_e2m1x2=True,
             split_k=split_k,
         )
     if input_dtype is torch.float32:
@@ -195,7 +189,6 @@ def _sm120_w4a16_schedule(
             num_stages=3,
             use_dot=True,
             single_dot=False,
-            use_sm120_e2m1x2=True,
             split_k=split_k,
         )
     return _sm120_w4a16_large_m_schedule(num_sms, rows, input_dtype, out_features, input_features)
@@ -209,19 +202,9 @@ def select_w4a16_schedule(
     out_features: int,
     input_features: int,
 ) -> W4A16Schedule:
-    """Resolve the NVIDIA W4A16 schedule for ``target``."""
-    if target.is_cuda_capability(12):
-        return _sm120_w4a16_schedule(num_sms, rows, input_dtype, out_features, input_features)
-    # 8 warps eliminates pre-existing 40-76 B num_warps=4 ptxas spills on SM86/SM89;
-    # SM75 lacks native BF16 tensor-core gemm, so dequantize to FP32 instead.
-    has_bf16_mm = target.cuda_capability_at_least(8)
-    return default_w4a16_schedule(
-        num_sms,
-        rows,
-        input_dtype,
-        out_features,
-        input_features,
-        allow_dot=has_bf16_mm,
-        dot_num_warps=8,
-        dequant_as_fp32=(not has_bf16_mm) and input_dtype is torch.bfloat16,
-    )
+    """Resolve the NVIDIA SM12x W4A16 schedule for ``target``."""
+    if not target.supports_nvfp4_w4a16:
+        raise ValueError(
+            "NVFP4 W4A16 requires NVIDIA SM12x (use ConvRot INT8 or ConvRot Trellis on other GPUs)"
+        )
+    return _sm120_w4a16_schedule(num_sms, rows, input_dtype, out_features, input_features)

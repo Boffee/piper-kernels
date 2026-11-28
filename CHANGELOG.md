@@ -24,13 +24,6 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 
 ### Changed
 
-- Improved AMD RDNA4 (`gfx1200`/`gfx1201`) weight-only NVFP4 W4A16 execution across
-  single-token, small-batch, and large-batch workloads via single-wave GEMV, fused WMMA
-  tiling, and wider dequantization fallback while preserving zero-spill schedules across
-  NVIDIA and non-RDNA4 AMD targets. Verified live on AMD RX 9070 XT (`gfx1201`) and
-  offline across `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
-  `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201`; live NVIDIA (`sm75`/`sm8x`/`sm120`),
-  non-RDNA4 AMD, and Windows execution remain unexercised locally.
 - **Breaking:** Upgraded ConvRot Trellis storage and kernels to the little-endian
   **Trellis v2** layout with 2 trailing wrap guard bytes per block (`stored_bytes =
   code_bytes + 2`, 24-bit per-block overhead including one FP8 scale, variable-row
@@ -51,23 +44,17 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
 - Improved NVIDIA SM120 (`sm120`) weight-only NVFP4 W4A16 execution across small-batch
   and large-batch workloads via hardware `e2m1x2` decoding (using `f16x2` decode for
   `M=1` GEMV and FP16/FP32 dequantization), reduced `M=1` Split-K launch overhead on
-  multi-wave shallow-K projections, and 2D L2-swizzled fused GEMV/GEMM scheduling
-  while preserving zero-spill schedules across SM75/SM8x and AMD ROCm targets. Verified
-  on RTX 5090 (`sm120`) and offline across `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
-  `gfx942`/`gfx1100`/`gfx1151`/`gfx1200`/`gfx1201`; live SM75/SM8x, RDNA4/ROCm, and
-  Windows execution remain unexercised locally.
+  multi-wave shallow-K projections, and 2D L2-swizzled fused GEMV/GEMM scheduling.
+  Verified on RTX 5090 (`sm120`) and offline on `sm120`; live `sm121` and Windows
+  execution remain unexercised locally.
 - Accelerated NVIDIA SM120 (`sm120`) NVFP4 MoE execution across single-token GEMV,
   small-batch bucketed GEMV, and grouped prefill GEMM by sharing hardware `e2m1x2` and
   native E4M3FN block-scale decoding with weight-only NVFP4 linear kernels, vectorizing
   128-bit packed weight loads, deferring single-token per-block K-reductions until after
   the K-loop, fusing even/odd nibble half-products into single tensor-core dots on
-  batched/prefill paths, and tuning SM120 block tiling and single-token Split-K thresholds
-  while preserving zero register/stack spills on NVIDIA targets and zero VGPR/scratch
-  spills on AMD ROCm targets (adjusting SM75 batched scalar K-tiling to 64 under aligned
-  offline specialization). Verified live on RTX 5090 (`sm120`) and offline across
-  `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and `gfx942`/`gfx1100`/`gfx1151`/`gfx1201` for MoE
-  (plus `gfx1200` for shared NVFP4 linear W4A16); live SM75/SM8x, AMD ROCm/RDNA4,
-  multi-GPU, and Windows execution remain unexercised locally.
+  batched/prefill paths, and tuning SM120 block tiling and single-token Split-K thresholds.
+  Verified live on RTX 5090 (`sm120`) and offline on `sm120`; live `sm121`, multi-GPU,
+  and Windows execution remain unexercised locally.
 - Tuned NVIDIA SM120 (`sm120`) execution schedules for `piper_attention_decode`:
   Split-KV decode now uses 64-token K64-aligned blocks, 4 warps, 2 pipeline stages,
   exact two-pass TF32 Q decomposition against INT8 keys (three-pass TF32 for BF16/FP16
@@ -78,6 +65,18 @@ All notable changes to Piper Kernels are documented here. Versions follow the po
   RTX 5090 (`sm120`) and offline across `sm75`/`sm80`/`sm86`/`sm89`/`sm120` and
   `gfx1200`/`gfx1201`; live SM75/SM8x, RDNA4/ROCm, and Windows execution remain
   unexercised locally.
+
+### Removed
+
+- **Breaking:** Removed NVIDIA SM75/SM8x/SM90/SM100 and AMD ROCm GPU execution support
+  for weight-only NVFP4 W4A16 linear (`nvfp4_linear`, `convrot_nvfp4_linear`,
+  `PiperNVFP4Tensor`, `ConvRotNVFP4Tensor` with `act_quant=None`) and NVFP4 MoE
+  (`"nvfp4_w4a16"`, `"convrot_nvfp4_w4a16"` in `moe_ffn` / `moe_ffn_` /
+  `compile_moe_kernels`), along with non-SM12x software FP4 decode and vendor policy
+  fallbacks. GPU NVFP4 now requires NVIDIA Blackwell SM12x (`SM120` for W4A4, `SM12x`
+  for W4A16/MoE) and fails fast with `ValueError` on unsupported GPUs (directing users
+  to ConvRot INT8 or ConvRot Trellis), while keeping CPU/`meta` reference, encoding, and
+  checkpoint tooling as well as ConvRot INT8 and ConvRot Trellis GPU support intact.
 
 ### Fixed
 

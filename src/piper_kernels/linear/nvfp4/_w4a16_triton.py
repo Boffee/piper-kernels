@@ -10,24 +10,20 @@ import torch
 import triton
 import triton.language as tl
 
-from piper_kernels._triton.primitives import decode_e4m3, splitk_tile_bounds
+from piper_kernels._triton.primitives import splitk_tile_bounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._splitk import device_sm_count
 from piper_kernels.weights.nvfp4 import _layout
-from piper_kernels.weights.nvfp4.triton import _decode_fp4_code, swizzled_scale_offsets
+from piper_kernels.weights.nvfp4.triton import swizzled_scale_offsets
 
-from ._amd import policy as amd_policy
 from ._nvidia import policy as nvidia_policy
 from ._nvidia.isa import decode_scale_sm120_e2m1x2, decode_sm120_e2m1x2_f32
 from ._w4a16_schedule import (
-    W4A16_DEQUANT_BLOCK_K,
-    W4A16_DEQUANT_BLOCK_N,
     W4A16_FP32_WORKSPACE_BYTES,
     W4A16_MAX_REDUCE_ROWS,
     W4A16_REDUCE_BLOCK_N,
     W4A16Schedule,
-    default_w4a16_schedule,
 )
 
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(_layout.BLOCK_SIZE)
@@ -81,9 +77,8 @@ def _load_nvfp4_tile(
     scale_column_blocks,
     block_k: tl.constexpr,
     high_first: tl.constexpr,
-    use_sm120_e2m1x2: tl.constexpr = False,
 ):
-    """Load one swizzled NVFP4 weight tile as decoded E2M1 pairs and FP32 block scales."""
+    """Load one swizzled NVFP4 weight tile as SM120-decoded E2M1 pairs and FP32 block scales."""
     packed, scale_u8 = _load_nvfp4_raw_tile(
         weight_ptr,
         weight_scale_ptr,
@@ -95,15 +90,8 @@ def _load_nvfp4_tile(
         scale_column_blocks,
         block_k,
     )
-    if use_sm120_e2m1x2:
-        w_even, w_odd = decode_sm120_e2m1x2_f32(packed, high_first)
-        scales = scale_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        return w_even, w_odd, scales
-    w_lo = _decode_fp4_code(packed & 0xF)
-    w_hi = _decode_fp4_code(packed >> 4)
-    w_even = w_hi if high_first else w_lo
-    w_odd = w_lo if high_first else w_hi
-    scales = decode_e4m3(scale_u8.to(tl.uint32))
+    w_even, w_odd = decode_sm120_e2m1x2_f32(packed, high_first)
+    scales = scale_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
     return w_even, w_odd, scales
 
 
@@ -253,35 +241,13 @@ def _load_scaled_nvfp4_pairs(
     block_k: tl.constexpr,
     high_first: tl.constexpr,
     out_dtype: tl.constexpr,
-    use_sm120_e2m1x2: tl.constexpr,
-    half_scales: tl.constexpr = False,
 ):
-    """Load, decode, and scale one NVFP4 K-tile into even/odd pairs."""
-    if use_sm120_e2m1x2:
-        # Every finite (E2M1, E4M3FN) product fits exactly in FP16 (max 2688, min 2^-10,
-        # 6 significand bits), so f16x2 decode+scale is bit-exact for both FP16 and FP32.
-        is_fp16_scale: tl.constexpr = tl.constexpr(out_dtype != tl.bfloat16)
-        scale_dtype = tl.float16 if is_fp16_scale else tl.bfloat16
-        packed, scale_u8 = _load_nvfp4_raw_tile(
-            weight_ptr,
-            weight_scale_ptr,
-            n_offs_i64,
-            n_valid,
-            k_base,
-            packed_k,
-            scale_k,
-            scale_column_blocks,
-            block_k,
-        )
-        scales_16 = _expand_nvfp4_scales(
-            scale_u8.to(tl.float8e4nv, bitcast=True).to(scale_dtype),
-            block_n,
-            block_k,
-        )
-        w_e, w_o = decode_scale_sm120_e2m1x2(packed, scales_16, high_first, is_fp16_scale)
-        return w_e.to(out_dtype), w_o.to(out_dtype)
-
-    w_even, w_odd, scales = _load_nvfp4_tile(
+    """Load, decode, and scale one NVFP4 K-tile into even/odd pairs via SM120 PTX."""
+    # Every finite (E2M1, E4M3FN) product fits exactly in FP16 (max 2688, min 2^-10,
+    # 6 significand bits), so f16x2 decode+scale is bit-exact for both FP16 and FP32.
+    is_fp16_scale: tl.constexpr = tl.constexpr(out_dtype != tl.bfloat16)
+    scale_dtype = tl.float16 if is_fp16_scale else tl.bfloat16
+    packed, scale_u8 = _load_nvfp4_raw_tile(
         weight_ptr,
         weight_scale_ptr,
         n_offs_i64,
@@ -291,13 +257,14 @@ def _load_scaled_nvfp4_pairs(
         scale_k,
         scale_column_blocks,
         block_k,
-        high_first,
     )
-    if half_scales:
-        scales_expanded = _expand_nvfp4_scales(scales.to(out_dtype), block_n, block_k)
-        return w_even.to(out_dtype) * scales_expanded, w_odd.to(out_dtype) * scales_expanded
-    scales_expanded = _expand_nvfp4_scales(scales, block_n, block_k)
-    return (w_even * scales_expanded).to(out_dtype), (w_odd * scales_expanded).to(out_dtype)
+    scales_16 = _expand_nvfp4_scales(
+        scale_u8.to(tl.float8e4nv, bitcast=True).to(scale_dtype),
+        block_n,
+        block_k,
+    )
+    w_e, w_o = decode_scale_sm120_e2m1x2(packed, scales_16, high_first, is_fp16_scale)
+    return w_e.to(out_dtype), w_o.to(out_dtype)
 
 
 @triton.jit
@@ -322,12 +289,10 @@ def _w4a16_accumulate_dot_tile(
     block_k: tl.constexpr,
     high_first: tl.constexpr,
     pre_scale_in_gemv: tl.constexpr,
-    use_sm120_e2m1x2: tl.constexpr,
     single_dot: tl.constexpr,
 ):
     """Accumulate one NVFP4 K-tile via tensor-core ``tl.dot``."""
     block_packed_k: tl.constexpr = block_k // 2
-    # Decode weights before loading X so RDNA3/3.5 does not hold live X tiles across nibble unpacks.
     w_e, w_o = _load_scaled_nvfp4_pairs(
         weight_ptr,
         weight_scale_ptr,
@@ -341,7 +306,6 @@ def _w4a16_accumulate_dot_tile(
         block_k,
         high_first,
         tl.constexpr(input_ptr.dtype.element_ty),
-        use_sm120_e2m1x2,
     )
     k_elem_offs = k_base + tl.arange(0, block_k)
     x_tile = tl.load(
@@ -381,7 +345,6 @@ def _w4a16_accumulate_scalar_tile(
     block_k: tl.constexpr,
     high_first: tl.constexpr,
     pre_scale_in_gemv: tl.constexpr,
-    use_sm120_e2m1x2: tl.constexpr,
 ):
     """Accumulate one NVFP4 K-tile via FP32 scalar decode and reduction."""
     w_even, w_odd, scales = _load_nvfp4_tile(
@@ -395,7 +358,6 @@ def _w4a16_accumulate_scalar_tile(
         scale_column_blocks,
         block_k,
         high_first,
-        use_sm120_e2m1x2,
     )
 
     k_elem_offs = k_base + tl.arange(0, block_k)
@@ -442,7 +404,6 @@ def w4a16_gemv_splitk_kernel(
     has_bias: tl.constexpr,
     is_splitk: tl.constexpr,
     use_dot: tl.constexpr,
-    use_sm120_e2m1x2: tl.constexpr = False,
     single_dot: tl.constexpr = False,
     group_m: tl.constexpr = 0,
 ):
@@ -502,7 +463,6 @@ def w4a16_gemv_splitk_kernel(
                 block_k,
                 high_first,
                 pre_scale_in_gemv,
-                use_sm120_e2m1x2,
                 single_dot,
             )
         else:
@@ -526,7 +486,6 @@ def w4a16_gemv_splitk_kernel(
                 block_k,
                 high_first,
                 pre_scale_in_gemv,
-                use_sm120_e2m1x2,
             )
 
     if block_m == 1:
@@ -602,7 +561,6 @@ def dequantize_nvfp4_swizzled_kernel(
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     high_first: tl.constexpr,
-    use_sm120_e2m1x2: tl.constexpr = False,
 ):
     """Dequantize packed swizzled NVFP4 weights into a contiguous floating matrix."""
     pid_n = tl.program_id(0)
@@ -629,7 +587,6 @@ def dequantize_nvfp4_swizzled_kernel(
         block_k,
         high_first,
         tl.constexpr(output_ptr.dtype.element_ty),
-        use_sm120_e2m1x2,
     )
     values = tl.reshape(tl.join(w_e, w_o), (block_n, block_k))
     k_elem_offs = k_base + tl.arange(0, block_k)
@@ -649,17 +606,14 @@ def select_w4a16_schedule(
     *,
     target: AcceleratorTarget | None = None,
 ) -> W4A16Schedule:
-    """Resolve the architecture-specific W4A16 schedule shared by runtime and offline compile."""
-    if target is not None and target.is_nvidia_cuda:
-        schedule = nvidia_policy.select_w4a16_schedule(
-            target, num_sms, rows, input_dtype, out_features, input_features
+    """Resolve the SM12x W4A16 schedule shared by runtime and offline compile."""
+    if target is None or not target.supports_nvfp4_w4a16:
+        raise ValueError(
+            "NVFP4 W4A16 requires NVIDIA SM12x (use ConvRot INT8 or ConvRot Trellis on other GPUs)"
         )
-    elif target is not None and target.is_amd_hip:
-        schedule = amd_policy.select_w4a16_schedule(
-            target, num_sms, rows, input_dtype, out_features, input_features
-        )
-    else:
-        schedule = default_w4a16_schedule(num_sms, rows, input_dtype, out_features, input_features)
+    schedule = nvidia_policy.select_w4a16_schedule(
+        target, num_sms, rows, input_dtype, out_features, input_features
+    )
     if schedule.mode == "gemv" and schedule.group_m == 0 and rows > schedule.block_m:
         raise ValueError(
             f"W4A16 schedule requires group_m > 0 when rows ({rows}) > block_m ({schedule.block_m})"
@@ -673,10 +627,9 @@ def _dequantize_nvfp4_swizzled(
     *,
     high_first: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
-    block_n: int = W4A16_DEQUANT_BLOCK_N,
-    block_k: int = W4A16_DEQUANT_BLOCK_K,
-    num_warps: int = 4,
-    use_sm120_e2m1x2: bool = False,
+    block_n: int = nvidia_policy.SM120_DEQUANT_SCHEDULE.block_n,
+    block_k: int = nvidia_policy.SM120_DEQUANT_SCHEDULE.block_k,
+    num_warps: int = nvidia_policy.SM120_DEQUANT_SCHEDULE.num_warps,
 ) -> torch.Tensor:
     """Dequantize a 2-D swizzled NVFP4 weight matrix in Triton without global scale."""
     out_features, packed_k = weight_qdata.shape
@@ -704,7 +657,6 @@ def _dequantize_nvfp4_swizzled(
             block_n=block_n,
             block_k=block_k,
             high_first=high_first,
-            use_sm120_e2m1x2=use_sm120_e2m1x2,
             num_warps=num_warps,
         )
     return output
@@ -722,26 +674,19 @@ def _linear_w4a16_large_m(
     schedule: W4A16Schedule,
 ) -> torch.Tensor:
     rows, out_features = active_2d.shape[0], weight_qdata.shape[0]
-    dequant_fp32 = schedule.dequant_as_fp32
     dequant_weight = _dequantize_nvfp4_swizzled(
         weight_qdata,
         weight_scale,
         high_first=high_first,
-        output_dtype=torch.float32 if dequant_fp32 else active_2d.dtype,
+        output_dtype=active_2d.dtype,
         block_n=schedule.block_n,
         block_k=schedule.block_k,
         num_warps=schedule.num_warps,
-        use_sm120_e2m1x2=schedule.use_sm120_e2m1x2,
     )
     with torch.amp.autocast(active_2d.device.type, enabled=False):
         weight_t = dequant_weight.T
         if weight_per_tensor_scale is None and bias is None and active_2d.dtype is input_dtype:
-            product = (
-                torch.mm(active_2d.float(), weight_t).to(input_dtype)
-                if dequant_fp32
-                else torch.mm(active_2d, weight_t)
-            )
-            return product.reshape(*input_shape[:-1], out_features)
+            return torch.mm(active_2d, weight_t).reshape(*input_shape[:-1], out_features)
         output = torch.empty((rows, out_features), device=active_2d.device, dtype=input_dtype)
         post_scale_only = (
             weight_per_tensor_scale is not None and active_2d.dtype is not torch.float16
@@ -762,10 +707,8 @@ def _linear_w4a16_large_m(
                 active_chunk = active_2d[start:end]
                 if pre_scale is not None:
                     active_chunk = (active_chunk.float() * pre_scale).to(active_2d.dtype)
-                if active_2d.dtype is torch.float32 or dequant_fp32:
-                    partial = torch.mm(
-                        active_chunk.float() if dequant_fp32 else active_chunk, weight_t
-                    )
+                if active_2d.dtype is torch.float32:
+                    partial = torch.mm(active_chunk, weight_t)
                 else:
                     partial = torch.mm(active_chunk, weight_t, out_dtype=torch.float32)
                 chunk_len = end - start
@@ -878,7 +821,6 @@ def linear_w4a16(
             has_bias=bias is not None,
             is_splitk=is_splitk,
             use_dot=schedule.use_dot,
-            use_sm120_e2m1x2=schedule.use_sm120_e2m1x2,
             single_dot=schedule.single_dot,
             group_m=schedule.group_m,
             **launch_kwargs,

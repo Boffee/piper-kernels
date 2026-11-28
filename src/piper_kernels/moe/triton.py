@@ -462,13 +462,11 @@ def _run_nvfp4_prefill_chunk(
     )
     cast_bf16 = prefill_schedule.cast_fp32_to_bf16
     force_fp32_dot = prefill_schedule.force_fp32_dot
-    half_scales = prefill_schedule.half_scales
     block_m = prefill_schedule.block_m
     block_n = prefill_schedule.block_n
     block_k = prefill_schedule.block_k
     num_warps = prefill_schedule.num_warps
     single_dot = prefill_schedule.single_dot
-    use_sm120_e2m1x2 = prefill_schedule.use_sm120_e2m1x2
     tile_slots, tile_m_start, tile_m_len, compact_to_pair, pair_to_compact, max_tiles, _ = (
         _launch_moe_prefill_bucket(topk_ids_chunk.reshape(-1), expert_to_slot, num_slots, block_m)
     )
@@ -507,8 +505,6 @@ def _run_nvfp4_prefill_chunk(
         has_global_scale=up_gate_global_scale is not None,
         cast_fp32_to_bf16=cast_bf16,
         force_fp32_dot=force_fp32_dot,
-        half_scales=half_scales,
-        use_sm120_e2m1x2=use_sm120_e2m1x2,
         single_dot=single_dot,
     )
     del x_compact
@@ -519,7 +515,7 @@ def _run_nvfp4_prefill_chunk(
             triton.cdiv(intermediate_size, _schedule.ACTIVATE_BLOCK_SIZE),
             num_pairs,
             num_warps=4,
-            is_amd_hip=target.is_amd_hip,
+            is_amd_hip=False,
         )
         moe_m1_activate_rotate_kernel[activate_grid](
             mid,
@@ -563,8 +559,6 @@ def _run_nvfp4_prefill_chunk(
         has_global_scale=down_global_scale is not None,
         cast_fp32_to_bf16=cast_bf16,
         force_fp32_dot=force_fp32_dot,
-        half_scales=half_scales,
-        use_sm120_e2m1x2=use_sm120_e2m1x2,
         single_dot=single_dot,
     )
     del act
@@ -757,9 +751,7 @@ def _dispatch_nvfp4_moe(
                 is_splitk=per_expert_input or split_k > 1,
                 use_dot=sched.use_dot if is_batched_sched else False,
                 cast_fp32_to_bf16=sched.cast_fp32_to_bf16 if is_batched_sched else False,
-                use_sm120_e2m1x2=sched.use_sm120_e2m1x2,
                 single_dot=sched.single_dot if is_batched_sched else False,
-                is_amd_hip=resolved_target.is_amd_hip,
             )
 
         _run_a16_chunk(

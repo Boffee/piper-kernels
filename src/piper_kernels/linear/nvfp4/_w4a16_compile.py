@@ -102,6 +102,10 @@ def compile_w4a16_kernels(  # noqa: PLR0913
     has_bias = bias_dtype is not None
     bias_ty = None if bias_dtype is None else TRITON_FLOAT_POINTER_TYPES[bias_dtype]
     target_info = AcceleratorTarget.from_compiler_target(target)
+    if not target_info.supports_nvfp4_w4a16:
+        raise ValueError(
+            "NVFP4 W4A16 requires NVIDIA SM12x (use ConvRot INT8 or ConvRot Trellis on other GPUs)"
+        )
     schedule = select_w4a16_schedule(
         num_sms,
         rows,
@@ -118,7 +122,7 @@ def compile_w4a16_kernels(  # noqa: PLR0913
                     {
                         "weight_ptr": "*u8",
                         "weight_scale_ptr": "*u8",
-                        "output_ptr": "*fp32" if schedule.dequant_as_fp32 else active_ty,
+                        "output_ptr": active_ty,
                         "out_features": "i32",
                         "packed_k": "i32",
                         "scale_column_blocks": "i32",
@@ -127,7 +131,6 @@ def compile_w4a16_kernels(  # noqa: PLR0913
                         "block_n": schedule.block_n,
                         "block_k": schedule.block_k,
                         "high_first": high_first,
-                        "use_sm120_e2m1x2": schedule.use_sm120_e2m1x2,
                     },
                 ),
                 target,
@@ -182,7 +185,6 @@ def compile_w4a16_kernels(  # noqa: PLR0913
                     "has_bias": has_bias,
                     "is_splitk": is_splitk,
                     "use_dot": schedule.use_dot,
-                    "use_sm120_e2m1x2": schedule.use_sm120_e2m1x2,
                     "single_dot": schedule.single_dot,
                     "group_m": schedule.group_m,
                 },

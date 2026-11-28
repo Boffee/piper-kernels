@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 
 GFX120X_ARCHITECTURES = ("gfx1200", "gfx1201")
-_AMD_W4A16_ARCHITECTURES = ("gfx942", "gfx1100", "gfx1151", *GFX120X_ARCHITECTURES)
+_AMD_TRELLIS_ARCHITECTURES = ("gfx942", "gfx1100", "gfx1151", *GFX120X_ARCHITECTURES)
 
 RDNA4_INT8_ACCUMULATOR_SEED = 0x155555
 RDNA4_INT8_ACCUMULATOR_SEED_MIN_REDUCTION = 4096
@@ -124,9 +124,14 @@ class AcceleratorTarget:
     @property
     def supports_nvfp4_w4a16(self) -> bool:
         """Return whether NVFP4 W4A16 execution is supported on this target."""
+        return self.is_cuda_capability(12)
+
+    @property
+    def supports_trellis_moe(self) -> bool:
+        """Return whether ConvRot Trellis MoE GPU execution is supported on this target."""
         return (self.is_nvidia_cuda and self.cuda_capability_at_least(7, 5)) or (
             sys.platform in ("linux", "win32")
-            and self.is_hip_architecture(*_AMD_W4A16_ARCHITECTURES)
+            and self.is_hip_architecture(*_AMD_TRELLIS_ARCHITECTURES)
         )
 
 

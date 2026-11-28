@@ -85,6 +85,14 @@ def w4a16_nvfp4_available() -> bool:
     )
 
 
+def trellis_moe_available() -> bool:
+    """Return whether the default GPU supports ConvRot Trellis MoE execution."""
+    return (
+        torch.cuda.is_available()
+        and AcceleratorTarget.from_device(torch.device("cuda")).supports_trellis_moe
+    )
+
+
 def trellis_encoder_available() -> bool:
     """Return whether the default GPU supports GPU Trellis encoding (NVIDIA SM80+, >= 96 KiB)."""
     if not torch.cuda.is_available():

@@ -704,9 +704,23 @@ def _reject_weight_aliasing(ops: _MoEOperands) -> None:
             raise ValueError("MoE out tensor must not alias weight storage")
 
 
+def _validate_nvfp4_gpu_device(device: torch.device, weight_format: _MoEWeightKind) -> None:
+    if (
+        device.type == "cuda"
+        and weight_format == "nvfp4"
+        and not AcceleratorTarget.from_device(device).supports_nvfp4_w4a16
+    ):
+        raise ValueError(
+            "NVFP4 MoE GPU execution requires NVIDIA SM12x "
+            "(use ConvRot INT8 or ConvRot Trellis on other GPUs)"
+        )
+
+
 def _validate_before_mutating(ops: _MoEOperands) -> tuple[_MoEWeightKind, int, int]:
     validated = _validate_op_operands(ops)
+    weight_format, _, _ = validated
     if ops.input.device.type != "meta":
+        _validate_nvfp4_gpu_device(ops.input.device, weight_format)
         _reject_weight_aliasing(ops)
     return validated
 
@@ -745,6 +759,8 @@ def _resolve_gpu_target(
         from piper_kernels.linear.convrot.int8 import _backend as int8_backend  # noqa: PLC0415
 
         return target if int8_backend.select_linear_backend_for_target(target) is not None else None
+    if weight_format == "convrot_trellis":
+        return target if target.supports_trellis_moe else None
     return target if target.supports_nvfp4_w4a16 else None
 
 
@@ -761,8 +777,10 @@ def _run_moe_ffn(ops: _MoEOperands) -> torch.Tensor:
         weight_format, num_slots, rows = prevalidated
     else:
         weight_format, num_slots, rows = _validate_op_operands(ops)
-        if ops.out is not None and is_concrete:
-            _reject_weight_aliasing(ops)
+        if is_concrete:
+            _validate_nvfp4_gpu_device(ops.input.device, weight_format)
+            if ops.out is not None:
+                _reject_weight_aliasing(ops)
 
     out = ops.out
     top_k = ops.topk_ids.shape[-1]

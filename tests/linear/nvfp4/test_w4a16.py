@@ -9,7 +9,13 @@ import sys
 import pytest
 import torch
 import triton
-from _accelerators import mock_cuda_target, w4a16_nvfp4_available
+from _accelerators import (
+    ensure_convrot_nvfp4_linear_ops,
+    ensure_nvfp4_linear_ops,
+    mock_cuda_target,
+    mock_rocm_target,
+    w4a16_nvfp4_available,
+)
 from _nvidia_resources import capture_cuda_spill_stores
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -23,25 +29,12 @@ from piper_kernels.linear.nvfp4 import triton as nvfp4_triton
 from piper_kernels.weights.convrot.nvfp4 import ConvRotNVFP4Tensor
 from piper_kernels.weights.nvfp4 import PiperNVFP4Tensor
 
-
-def _hip_target_param(arch: str, warp_size: int) -> object:
-    return pytest.param(
-        GPUTarget("hip", arch, warp_size),
-        marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
-    )
-
-
 _PRIMARY_ISA_TARGETS = [
-    GPUTarget("cuda", 80, 32),
-    _hip_target_param("gfx942", 64),
-    _hip_target_param("gfx1201", 32),
+    GPUTarget("cuda", 120, 32),
 ]
 
 _ADDITIONAL_CUDA_TARGETS = [
-    GPUTarget("cuda", 75, 32),
-    GPUTarget("cuda", 86, 32),
-    GPUTarget("cuda", 89, 32),
-    GPUTarget("cuda", 120, 32),
+    GPUTarget("cuda", 121, 32),
 ]
 
 
@@ -418,6 +411,8 @@ def test_meta_w4a4_linear_preserves_prepare_split_for_small_m(
 
 @pytest.mark.parametrize("group_size", [0, 64])
 def test_meta_weight_only_rejects_activation_scales(group_size: int) -> None:
+    ensure_nvfp4_linear_ops()
+    ensure_convrot_nvfp4_linear_ops()
     q = torch.empty(128, 128, dtype=torch.uint8, device="meta")
     s = torch.empty(32, 64, dtype=torch.float8_e4m3fn, device="meta")
     gs = torch.empty((), device="meta")
@@ -682,40 +677,11 @@ _SM120_W4A16_REGIMES = [
     (1024, 1024, 8192, torch.bfloat16, torch.float32, False, True, 0),
 ]
 
-_RDNA4_W4A16_REGIMES = [
-    (1, 4096, 512, torch.bfloat16, torch.float32, False, True, 0),
-    (1, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
-    (1, 64, 5120, torch.bfloat16, torch.float16, True, True, 0),
-    (2, 4096, 5120, torch.float16, torch.float16, False, True, 0),
-    (4, 128, 5120, torch.bfloat16, torch.float32, False, True, 0),
-    (4, 4096, 5120, torch.float32, torch.float32, False, True, 0),
-    (4, 4096, 5120, torch.bfloat16, torch.float32, False, False, 0),
-    (16, 1024, 5120, torch.float16, torch.float32, False, True, 0),
-    (16, 4096, 5120, torch.float32, torch.float32, False, True, 0),
-    (16, 4096, 5120, torch.float16, torch.float16, False, True, 16),
-    (32, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
-    (64, 4096, 5120, torch.float16, torch.float32, False, True, 0),
-    (128, 1024, 5120, torch.bfloat16, torch.float32, False, True, 0),
-    (128, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
-    (256, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
-    (256, 4096, 5120, torch.float16, None, True, True, 0),
-    (1024, 4096, 5120, torch.bfloat16, torch.float32, False, True, 0),
-    (1024, 4096, 5120, torch.float16, torch.float16, False, True, 0),
-    (2048, 4096, 5120, torch.float16, torch.float16, False, True, 0),
-]
-
 
 @pytest.mark.parametrize(
     ("target", "num_sms", "regimes"),
     [
         pytest.param(GPUTarget("cuda", 120, 32), 170, _SM120_W4A16_REGIMES, id="sm120"),
-        pytest.param(
-            GPUTarget("hip", "gfx1201", 32),
-            32,
-            _RDNA4_W4A16_REGIMES,
-            marks=pytest.mark.skipif(sys.platform != "linux", reason="HIP compiler is Linux-only"),
-            id="gfx1201",
-        ),
     ],
 )
 def test_w4a16_arch_regimes_compile_without_spills(
@@ -723,7 +689,6 @@ def test_w4a16_arch_regimes_compile_without_spills(
     num_sms: int,
     regimes: list[tuple[int, int, int, torch.dtype, torch.dtype | None, bool, bool, int]],
 ) -> None:
-    is_sm120 = target.backend == "cuda" and target.arch == 120
     seen_roles: set[str] = set()
     for (
         rows,
@@ -750,7 +715,7 @@ def test_w4a16_arch_regimes_compile_without_spills(
         roles = set(compiled)
         assert roles <= {"gemv", "dequant", "reduce"}
         seen_roles |= roles
-        if is_sm120 and rows == 1:
+        if rows == 1:
             if (out_features, input_features) == (4096, 4096):
                 assert "reduce" not in compiled
             elif (out_features, input_features) in ((1024, 5120), (4096, 14336)):
@@ -759,8 +724,7 @@ def test_w4a16_arch_regimes_compile_without_spills(
             assert "cvt.rn.f16x2.e2m1x2" in ptx
             assert "cvt.rn.bf16x2.e2m1x2" not in ptx
         if (
-            is_sm120
-            and rows == 64
+            rows == 64
             and (out_features, input_features) == (5120, 5120)
             and (
                 input_dtype is torch.float32 or (input_dtype is torch.float16 and group_size == 16)
@@ -771,45 +735,6 @@ def test_w4a16_arch_regimes_compile_without_spills(
             assert "cvt.rn.f16x2.e2m1x2" in ptx
             assert "cvt.rn.bf16x2.e2m1x2" not in ptx
     assert {"gemv", "dequant", "reduce"} <= seen_roles
-
-
-@pytest.mark.parametrize(
-    "target",
-    [
-        _hip_target_param("gfx1100", 32),
-        _hip_target_param("gfx1151", 32),
-        _hip_target_param("gfx1200", 32),
-    ],
-)
-def test_w4a16_additional_amd_arches_compile_without_spills(target: GPUTarget) -> None:
-    compiled = _compile_w4a16_and_assert_clean(
-        target,
-        rows=16,
-        out_features=5120,
-        input_features=5120,
-        input_dtype=torch.float16,
-        bias_dtype=torch.float32,
-        group_size=0,
-        high_first=False,
-        has_weight_per_tensor_scale=True,
-    )
-    assert "gemv" in compiled
-    if target.arch == "gfx1200":
-        canary = _compile_w4a16_and_assert_clean(
-            target,
-            rows=256,
-            out_features=4096,
-            input_features=5120,
-            input_dtype=torch.bfloat16,
-            bias_dtype=torch.float32,
-            group_size=0,
-            high_first=False,
-            has_weight_per_tensor_scale=True,
-            num_sms=32,
-        )
-        roles = set(canary)
-        assert roles <= {"gemv", "dequant", "reduce"}
-        assert {"gemv", "dequant"} & roles
 
 
 @pytest.mark.parametrize("target", _ADDITIONAL_CUDA_TARGETS)
@@ -857,8 +782,107 @@ def test_w4a16_workloads_compile_for_additional_cuda_arches(
     )
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        GPUTarget("cuda", 75, 32),
+        GPUTarget("cuda", 80, 32),
+        GPUTarget("cuda", 89, 32),
+        GPUTarget("cuda", 90, 32),
+        GPUTarget("cuda", 100, 32),
+        GPUTarget("hip", "gfx942", 64),
+        GPUTarget("hip", "gfx1201", 32),
+    ],
+)
+def test_w4a16_compile_rejects_unsupported_targets(target: GPUTarget) -> None:
+    with pytest.raises(ValueError, match="SM12x"):
+        nvfp4_triton.compile_w4a16_kernels(
+            target,
+            rows=16,
+            out_features=1024,
+            input_features=1024,
+            input_dtype=torch.bfloat16,
+        )
+
+
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+def test_gpu_w4a16_rejects_unsupported_targets_without_reference_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(715)
+    dense = torch.randn(128, 128, dtype=torch.bfloat16) * (128**-0.5)
+    swizzled = PiperNVFP4Tensor.from_hp(
+        dense,
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+        act_quant=None,
+    ).to("cuda")
+    unswizzled = PiperNVFP4Tensor.from_hp(
+        dense,
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=False,
+        act_quant=None,
+    ).to("cuda")
+    convrot = ConvRotNVFP4Tensor.from_hp(
+        dense,
+        group_size=16,
+        compute_per_tensor_scale=True,
+        is_swizzled_scales=True,
+        act_quant=None,
+    ).to("cuda")
+    assert isinstance(swizzled, PiperNVFP4Tensor)
+    assert isinstance(unswizzled, PiperNVFP4Tensor)
+    assert isinstance(convrot, ConvRotNVFP4Tensor)
+
+    x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+    swizzled_scale = swizzled.scale.view(128, 8) if swizzled.scale.ndim == 1 else swizzled.scale
+    convrot_scale = convrot.scale.view(128, 8) if convrot.scale.ndim == 1 else convrot.scale
+
+    def _fail_reference(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("unexpected reference fallback on unsupported GPU target")
+
+    monkeypatch.setattr(nvfp4_reference, "linear_w4a16", _fail_reference)
+    for spec in ((7, 5), (8, 9), "gfx1201"):
+        if isinstance(spec, tuple):
+            mock_cuda_target(monkeypatch, spec)
+        else:
+            mock_rocm_target(monkeypatch, spec)
+        with pytest.raises(ValueError, match="SM12x"):
+            F.linear(x, swizzled)
+        with pytest.raises(ValueError, match="SM12x"):
+            F.linear(x, unswizzled)
+        with pytest.raises(ValueError, match="SM12x"):
+            F.linear(x, convrot)
+        with pytest.raises(ValueError, match="SM12x"):
+            torch.ops.piper_kernels.nvfp4_linear.default(
+                x,
+                swizzled.qdata,
+                swizzled_scale,
+                swizzled.per_tensor_scale,
+                None,
+                None,
+                False,
+                False,
+                True,
+            )
+        with pytest.raises(ValueError, match="SM12x"):
+            torch.ops.piper_kernels.convrot_nvfp4_linear.default(
+                x,
+                convrot.qdata,
+                convrot_scale,
+                convrot.per_tensor_scale,
+                None,
+                None,
+                False,
+                16,
+                False,
+                True,
+            )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize("group_size", [0, 64, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("rows", [1, 2, 3, 8, 16, 17, 32, 65, 130])
@@ -900,7 +924,7 @@ def test_gpu_w4a16_linear_matches_reference_across_rows_and_dtypes(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize("group_size", [0, 16])
 @pytest.mark.parametrize("high_first", [False, True])
 def test_gpu_w4a16_handles_noncontiguous_3d_ragged_and_empty_inputs(
@@ -979,7 +1003,7 @@ def test_gpu_w4a16_handles_noncontiguous_3d_ragged_and_empty_inputs(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize("rows", [1, 3, 8, 16, 32, 64])
 @pytest.mark.parametrize("group_size", [0, 256])
 def test_gpu_w4a16_splitk_is_deterministic_and_accurate(rows: int, group_size: int) -> None:
@@ -1012,7 +1036,7 @@ def test_gpu_w4a16_splitk_is_deterministic_and_accurate(rows: int, group_size: i
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 def test_gpu_w4a16_m1_square_shape_matches_reference() -> None:
     torch.manual_seed(745)
     weight = _make_nvfp4_weight(
@@ -1041,7 +1065,7 @@ def test_gpu_w4a16_m1_square_shape_matches_reference() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize("high_first", [False, True])
 @pytest.mark.parametrize("two_level", [False, True])
 @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -1075,7 +1099,7 @@ def test_gpu_large_m_w4a16_identity_matches_dequantize(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize("rows", [1, 17, 65])
 def test_gpu_w4a16_mixed_bias_avoids_pre_bias_fp16_overflow(rows: int) -> None:
     dense = torch.ones(16, 32, dtype=torch.float16)
@@ -1102,7 +1126,7 @@ def test_gpu_w4a16_mixed_bias_avoids_pre_bias_fp16_overflow(rows: int) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize("rows", [1, 8, 17])
 def test_gpu_w4a16_convrot_fp16_preserves_rotation_range(rows: int) -> None:
     pattern = (
@@ -1135,7 +1159,7 @@ def test_gpu_w4a16_convrot_fp16_preserves_rotation_range(rows: int) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 def test_gpu_w4a16_large_m_preserves_weight_scale_and_gemm_range() -> None:
     # Case 1: large global weight scale with small FP16 activations.
     q_small = torch.full((16, 8), 0x22, dtype=torch.uint8, device="cuda")
@@ -1179,7 +1203,7 @@ def test_gpu_w4a16_large_m_preserves_weight_scale_and_gemm_range() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize("group_size", [0, 64])
 @pytest.mark.parametrize("rows", [1, 8, 17, 65])
 def test_gpu_w4a16_torch_compile_fullgraph(group_size: int, rows: int) -> None:
@@ -1205,7 +1229,7 @@ def test_gpu_w4a16_torch_compile_fullgraph(group_size: int, rows: int) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize("rows", [1, 2, 8, 17, 65, 512])
 def test_gpu_w4a16_preserves_zero_and_tiny_global_scales(rows: int) -> None:
     q = torch.full((16, 8), 0x77, dtype=torch.uint8, device="cuda")
@@ -1256,7 +1280,7 @@ def test_gpu_w4a16_preserves_zero_and_tiny_global_scales(rows: int) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize(("rows", "out_features"), [(256, 4096), (512, 2048)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("high_first", [False, True])
@@ -1296,7 +1320,7 @@ def test_gpu_w4a16_wide_2d_gemm_matches_reference(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize("high_first", [False, True])
 def test_gpu_w4a16_deep_k_bf16_matches_dequantized_linear(high_first: bool) -> None:
     torch.manual_seed(790 + int(high_first))
@@ -1322,6 +1346,8 @@ def test_gpu_w4a16_deep_k_bf16_matches_dequantized_linear(high_first: bool) -> N
 
 
 def test_meta_nvfp4_linear_rejects_scalar_input() -> None:
+    ensure_nvfp4_linear_ops()
+    ensure_convrot_nvfp4_linear_ops()
     q = torch.empty(16, 8, dtype=torch.uint8, device="meta")
     s = torch.empty(32, 16, dtype=torch.float8_e4m3fn, device="meta")
     x0 = torch.empty((), dtype=torch.bfloat16, device="meta")
@@ -1357,7 +1383,7 @@ def test_reference_w4a16_preserves_precision_under_autocast() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 def test_gpu_w4a16_convrot_fp16_under_autocast_preserves_range() -> None:
     pattern = (
         torch.tensor(
@@ -1385,7 +1411,7 @@ def test_gpu_w4a16_convrot_fp16_under_autocast_preserves_range() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize("input_features", [16, 48, 80])
 @pytest.mark.parametrize("rows", [1, 16, 65])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

@@ -59,7 +59,6 @@ def nvfp4_moe_m1_gemv_kernel(
     has_global_scale: tl.constexpr,
     per_expert_input: tl.constexpr,
     is_splitk: tl.constexpr,
-    use_sm120_e2m1x2: tl.constexpr = False,
 ):
     """Single-token slot-indirect NVFP4 W4A16 GEMV across ``(N * top_k_x, grid_y, split_k)``."""
     n_tiles = tl.cdiv(out_features, block_n)
@@ -112,7 +111,6 @@ def nvfp4_moe_m1_gemv_kernel(
             scale_column_blocks,
             block_k,
             high_first,
-            use_sm120_e2m1x2,
         )
         k_elem_offs = k_base + tl.arange(0, block_k)
         k_elem_valid = k_elem_offs < input_features
@@ -188,8 +186,6 @@ def _accumulate_nvfp4_batched_dot(
     pre_scale_in_gemv: tl.constexpr,
     cast_fp32_to_bf16: tl.constexpr,
     force_fp32_dot: tl.constexpr = False,
-    half_scales: tl.constexpr = False,
-    use_sm120_e2m1x2: tl.constexpr = False,
     single_dot: tl.constexpr = False,
 ):
     dot_dtype = (
@@ -198,7 +194,7 @@ def _accumulate_nvfp4_batched_dot(
         else (tl.bfloat16 if cast_fp32_to_bf16 else input_ptr.dtype.element_ty)
     )
     # Every finite (E2M1, E4M3FN) product fits in FP16, halving live weight registers on SM120.
-    pair_dtype = tl.float16 if (use_sm120_e2m1x2 and force_fp32_dot) else dot_dtype
+    pair_dtype = tl.float16 if force_fp32_dot else dot_dtype
     w_e, w_o = _load_scaled_nvfp4_pairs(
         weight_ptr,
         weight_scale_ptr,
@@ -212,8 +208,6 @@ def _accumulate_nvfp4_batched_dot(
         block_k,
         high_first,
         tl.constexpr(pair_dtype),
-        use_sm120_e2m1x2,
-        half_scales and not force_fp32_dot,
     )
     input_features = packed_k * 2
     k_elem_offs = k_base + tl.arange(0, block_k)
@@ -268,7 +262,6 @@ def nvfp4_moe_batched_gemv_kernel(
     is_splitk: tl.constexpr,
     use_dot: tl.constexpr,
     cast_fp32_to_bf16: tl.constexpr = False,
-    use_sm120_e2m1x2: tl.constexpr = False,
     single_dot: tl.constexpr = False,
 ):
     """Slot-batched NVFP4 W4A16 projection across ``(N, bucket_tile, split_k)``."""
@@ -340,7 +333,6 @@ def nvfp4_moe_batched_gemv_kernel(
                 high_first,
                 pre_scale_in_gemv,
                 cast_fp32_to_bf16,
-                use_sm120_e2m1x2=use_sm120_e2m1x2,
                 single_dot=single_dot,
             )
         else:
@@ -355,7 +347,6 @@ def nvfp4_moe_batched_gemv_kernel(
                 scale_column_blocks,
                 block_k,
                 high_first,
-                use_sm120_e2m1x2,
             )
             k_elem_offs = k_base + tl.arange(0, block_k)
             k_elem_valid = k_elem_offs < input_features
@@ -417,8 +408,6 @@ def nvfp4_moe_grouped_gemm_kernel(
     has_global_scale: tl.constexpr,
     cast_fp32_to_bf16: tl.constexpr,
     force_fp32_dot: tl.constexpr,
-    half_scales: tl.constexpr,
-    use_sm120_e2m1x2: tl.constexpr = False,
     single_dot: tl.constexpr = False,
 ):
     """Grouped NVFP4 W4A16 GEMM over contiguous slot-compacted tiles."""
@@ -486,8 +475,6 @@ def nvfp4_moe_grouped_gemm_kernel(
             pre_scale_in_gemm,
             cast_fp32_to_bf16,
             force_fp32_dot,
-            half_scales,
-            use_sm120_e2m1x2,
             single_dot,
         )
 
@@ -523,9 +510,7 @@ def launch_nvfp4_proj(
     is_splitk: bool,
     use_dot: bool,
     cast_fp32_to_bf16: bool,
-    use_sm120_e2m1x2: bool = False,
     single_dot: bool = False,
-    is_amd_hip: bool = False,
 ) -> None:
     scale_u8 = scale.view(torch.uint8)
     packed_k = in_features // 2
@@ -557,7 +542,6 @@ def launch_nvfp4_proj(
                 is_splitk=is_splitk,
                 use_dot=use_dot,
                 cast_fp32_to_bf16=cast_fp32_to_bf16,
-                use_sm120_e2m1x2=use_sm120_e2m1x2,
                 single_dot=single_dot,
                 num_warps=num_warps,
                 num_stages=1,
@@ -567,7 +551,7 @@ def launch_nvfp4_proj(
                 n_tiles,
                 routing.top_k,
                 num_warps=num_warps,
-                is_amd_hip=is_amd_hip,
+                is_amd_hip=False,
                 split_k=split_k,
             )
             nvfp4_moe_m1_gemv_kernel[grid](
@@ -593,7 +577,6 @@ def launch_nvfp4_proj(
                 has_global_scale=has_global_scale,
                 per_expert_input=per_expert_input,
                 is_splitk=is_splitk,
-                use_sm120_e2m1x2=use_sm120_e2m1x2,
                 num_warps=num_warps,
             )
 
@@ -621,8 +604,6 @@ def launch_nvfp4_grouped_gemm(
     has_global_scale: bool,
     cast_fp32_to_bf16: bool,
     force_fp32_dot: bool,
-    half_scales: bool,
-    use_sm120_e2m1x2: bool = False,
     single_dot: bool = False,
 ) -> None:
     grid = (max_tiles * triton.cdiv(out_features, block_n),)
@@ -649,8 +630,6 @@ def launch_nvfp4_grouped_gemm(
             has_global_scale=has_global_scale,
             cast_fp32_to_bf16=cast_fp32_to_bf16,
             force_fp32_dot=force_fp32_dot,
-            half_scales=half_scales,
-            use_sm120_e2m1x2=use_sm120_e2m1x2,
             single_dot=single_dot,
             num_warps=num_warps,
             num_stages=1,

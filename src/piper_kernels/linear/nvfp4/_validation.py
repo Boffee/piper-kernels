@@ -62,18 +62,20 @@ def _validate_device(
 ) -> None:
     if device.type == "meta" or (allow_cpu and device.type == "cpu"):
         return
+    requirement = (
+        "NVIDIA SM12x (use ConvRot INT8 or ConvRot Trellis on other GPUs)"
+        if weight_only
+        else "exact NVIDIA SM120"
+    )
     if device.type != "cuda":
-        requirement = (
-            "a supported CUDA or ROCm accelerator" if weight_only else "exact NVIDIA SM120"
-        )
         raise ValueError(f"{name} requires {requirement}")
     target = AcceleratorTarget.from_device(device)
     if weight_only:
         if not target.supports_nvfp4_w4a16:
-            raise ValueError(f"{name} requires a supported CUDA or ROCm accelerator")
+            raise ValueError(f"{name} requires {requirement}")
         return
     if not target.is_cuda_capability(12, 0):
-        raise ValueError(f"{name} requires exact NVIDIA SM120")
+        raise ValueError(f"{name} requires {requirement}")
 
 
 def validate_activation_scale(

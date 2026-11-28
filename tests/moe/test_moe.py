@@ -14,7 +14,10 @@ import torch
 import triton
 from _accelerators import (
     forbid_triton_driver,
+    mock_cuda_target,
+    mock_rocm_target,
     rocm_fences_only_lds,
+    trellis_moe_available,
     w4a16_nvfp4_available,
 )
 from _nvidia_resources import capture_cuda_spill_stores
@@ -43,7 +46,9 @@ MoEFormat = Literal["nvfp4_w4a16", "convrot_nvfp4_w4a16", "convrot_int8", "convr
 TrellisLayoutKind = Literal["uniform", "var2d", "var1d"]
 ActivationKind = Literal["swiglu", "gelu_tanh"]
 
-_INT8_MOE_GPU_AVAILABLE = w4a16_nvfp4_available() and (
+_TRELLIS_MOE_GPU_AVAILABLE = trellis_moe_available()
+_NVFP4_MOE_GPU_AVAILABLE = w4a16_nvfp4_available()
+_INT8_MOE_GPU_AVAILABLE = _TRELLIS_MOE_GPU_AVAILABLE and (
     torch.version.hip is not None or torch.cuda.get_device_capability()[0] >= 8
 )
 _SM75_SHARED_MEMORY_LIMIT = 64 * 1024
@@ -2103,13 +2108,17 @@ def test_cpu_trellis_prepared_waves_misses_and_meta() -> None:
     assert meta_out.shape == (2, 128)
 
 
-@pytest.mark.parametrize("target", _NVIDIA_TARGETS)
 @pytest.mark.parametrize(
-    ("weight_format", "group_size", "logical_dtype"),
+    ("target", "weight_format", "group_size", "logical_dtype"),
     [
-        ("nvfp4_w4a16", 0, torch.bfloat16),
-        ("convrot_nvfp4_w4a16", 64, torch.float16),
-        ("convrot_int8", 256, torch.bfloat16),
+        (target, weight_format, group_size, logical_dtype)
+        for target in _NVIDIA_TARGETS
+        for weight_format, group_size, logical_dtype in (
+            ("nvfp4_w4a16", 0, torch.bfloat16),
+            ("convrot_nvfp4_w4a16", 64, torch.float16),
+            ("convrot_int8", 256, torch.bfloat16),
+        )
+        if weight_format == "convrot_int8" or target.arch // 10 == 12
     ],
 )
 @pytest.mark.parametrize(("split_k", "accumulate"), [(1, False), (2, True)])
@@ -2136,42 +2145,65 @@ def test_offline_nvidia_compile_zero_spills(
     assert f"{expected_prefix}up" in compiled
     assert f"{expected_prefix}down" in compiled
     if weight_format != "convrot_int8":
-        is_sm12x = target.arch // 10 == 12
         for key in ("nvfp4_gemv_up", "nvfp4_gemv_down"):
             ptx = compiled[key].asm["ptx"]
-            if is_sm12x:
-                assert "cvt.rn.f16x2.e2m1x2" in ptx
-                assert "cvt.rn.bf16x2.e2m1x2" not in ptx
-                assert "ld.global.v4" in ptx or "cp.async.cg.shared.global" in ptx
-            else:
-                assert "e2m1x2" not in ptx
+            assert "cvt.rn.f16x2.e2m1x2" in ptx
+            assert "cvt.rn.bf16x2.e2m1x2" not in ptx
+            assert "ld.global.v4" in ptx or "cp.async.cg.shared.global" in ptx
 
 
-@pytest.mark.parametrize("weight_format", ["nvfp4_w4a16", "convrot_nvfp4_w4a16"])
-@pytest.mark.parametrize(("split_k", "accumulate"), [(1, False), (2, True)])
-def test_offline_sm75_compile_matrix(
-    weight_format: MoEFormat, split_k: int, accumulate: bool
+@pytest.mark.parametrize(
+    "target",
+    [
+        GPUTarget("cuda", 75, 32),
+        GPUTarget("cuda", 80, 32),
+        GPUTarget("cuda", 89, 32),
+        GPUTarget("cuda", 90, 32),
+        GPUTarget("cuda", 100, 32),
+        GPUTarget("hip", "gfx942", 64),
+        GPUTarget("hip", "gfx1201", 32),
+    ],
+)
+@pytest.mark.parametrize(
+    ("weight_format", "group_size"),
+    [("nvfp4_w4a16", 0), ("convrot_nvfp4_w4a16", 64)],
+)
+@pytest.mark.parametrize("rows", [1, 8, 128])
+def test_offline_nvfp4_compile_rejects_unsupported_targets(
+    target: GPUTarget,
+    weight_format: MoEFormat,
+    group_size: int,
+    rows: int,
 ) -> None:
-    sm75 = GPUTarget("cuda", 75, 32)
-    _compile_nvidia_and_assert_clean(
-        sm75,
-        weight_format=weight_format,
-        logical_dtype=torch.float16,
-        hidden_size=1024,
-        intermediate_size=512,
-        group_size=64 if weight_format == "convrot_nvfp4_w4a16" else 0,
-        split_k=split_k,
-        accumulate=accumulate,
-    )
-
-    with pytest.raises(ValueError, match="SM80"):
+    with pytest.raises(ValueError, match="SM12x"):
         moe_triton.compile_moe_kernels(
-            sm75,
-            weight_format="convrot_int8",
-            logical_dtype=torch.float16,
-            group_size=64,
+            target,
+            weight_format=weight_format,
+            logical_dtype=torch.bfloat16,
+            rows=rows,
+            top_k=6,
+            hidden_size=1024,
+            intermediate_size=512,
+            group_size=group_size,
         )
+
+
+def test_offline_compile_validation_and_sm120_routing() -> None:
+    sm75 = GPUTarget("cuda", 75, 32)
     sm80 = GPUTarget("cuda", 80, 32)
+    sm120 = GPUTarget("cuda", 120, 32)
+    sm121 = GPUTarget("cuda", 121, 32)
+
+    for bad_int8_rows in (1, 8, 256):
+        with pytest.raises(ValueError, match="SM80"):
+            moe_triton.compile_moe_kernels(
+                sm75,
+                rows=bad_int8_rows,
+                top_k=6,
+                weight_format="convrot_int8",
+                logical_dtype=torch.float16,
+                group_size=64,
+            )
     with pytest.raises(ValueError, match="divisible"):
         moe_triton.compile_moe_kernels(
             sm80,
@@ -2182,49 +2214,85 @@ def test_offline_sm75_compile_matrix(
         )
     with pytest.raises(ValueError, match="multiples of 16"):
         moe_triton.compile_moe_kernels(
-            sm75,
+            sm120,
             weight_format="nvfp4_w4a16",
             hidden_size=24,
             intermediate_size=64,
             group_size=0,
         )
+    with pytest.raises(ValueError, match="must be positive"):
+        moe_triton.compile_moe_kernels(sm120, rows=0)
+
+    for prefill_rows, prefill_top_k in ((17, 6), (16, 65)):
+        routed = _compile_nvidia_and_assert_clean(sm120, rows=prefill_rows, top_k=prefill_top_k)
+        assert "nvfp4_grouped" in routed
+        assert "bucket_count" in routed
+
+    wide_sm120 = _compile_nvidia_and_assert_clean(sm120, rows=20000, top_k=6)
+    assert "nvfp4_grouped" in wide_sm120
+
+    wide_chunk_sm120 = moe_triton.compile_moe_kernels(
+        sm120,
+        weight_format="convrot_nvfp4_w4a16",
+        logical_dtype=torch.bfloat16,
+        rows=2048,
+        top_k=6,
+        num_slots=256,
+        hidden_size=8192,
+        intermediate_size=4096,
+        group_size=64,
+    )
+    small_chunk_sm120 = moe_triton.compile_moe_kernels(
+        sm120,
+        weight_format="convrot_nvfp4_w4a16",
+        logical_dtype=torch.bfloat16,
+        rows=390,
+        top_k=6,
+        num_slots=256,
+        hidden_size=8192,
+        intermediate_size=4096,
+        group_size=64,
+    )
+    assert wide_chunk_sm120["nvfp4_grouped"].hash == small_chunk_sm120["nvfp4_grouped"].hash
+    assert wide_chunk_sm120["bucket_scatter"].hash == small_chunk_sm120["bucket_scatter"].hash
+
+    for smoke_rows in (1, 8, 128):
+        smoke = _compile_nvidia_and_assert_clean(
+            sm121,
+            weight_format="nvfp4_w4a16",
+            logical_dtype=torch.bfloat16,
+            rows=smoke_rows,
+            top_k=6,
+            hidden_size=1024,
+            intermediate_size=512,
+            group_size=0,
+        )
+        assert smoke
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm HIP compiler is Linux-only")
 @pytest.mark.parametrize(("arch", "warp_size"), _AMD_TARGETS)
-@pytest.mark.parametrize(
-    ("weight_format", "group_size", "logical_dtype"),
-    [
-        ("nvfp4_w4a16", 0, torch.bfloat16),
-        ("convrot_nvfp4_w4a16", 64, torch.float16),
-        ("convrot_int8", 256, torch.bfloat16),
-    ],
-)
 @pytest.mark.parametrize(("split_k", "accumulate"), [(1, False), (2, True)])
 def test_offline_amd_compile_matrix_and_fences(
     arch: str,
     warp_size: int,
-    weight_format: MoEFormat,
-    group_size: int,
-    logical_dtype: torch.dtype,
     split_k: int,
     accumulate: bool,
 ) -> None:
     target = GPUTarget("hip", arch, warp_size)
     compiled = moe_triton.compile_moe_kernels(
         target,
-        weight_format=weight_format,
-        logical_dtype=logical_dtype,
+        weight_format="convrot_int8",
+        logical_dtype=torch.bfloat16,
         hidden_size=5120,
         intermediate_size=2304,
-        group_size=group_size,
+        group_size=256,
         split_k=split_k,
         accumulate=accumulate,
     )
     assert compiled
-    expected_prefix = "int8_matmul_" if weight_format == "convrot_int8" else "nvfp4_gemv_"
-    assert f"{expected_prefix}up" in compiled
-    assert f"{expected_prefix}down" in compiled
+    assert "int8_matmul_up" in compiled
+    assert "int8_matmul_down" in compiled
     expected_int8_isa = "v_mfma_i32" if arch == "gfx942" else "v_wmma_i32"
     for name, kernel in compiled.items():
         # gfx1201 short-batch INT8 intentionally uses wide block_k=256 for cold-DRAM
@@ -2242,7 +2310,7 @@ def test_offline_amd_compile_matrix_and_fences(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not _NVFP4_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM12x")
 @pytest.mark.parametrize(
     ("weight_format", "group_size"), [("nvfp4_w4a16", 0), ("convrot_nvfp4_w4a16", 64)]
 )
@@ -2319,8 +2387,8 @@ def test_gpu_moe_matches_reference_int8(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(
-    not w4a16_nvfp4_available(),
-    reason="requires NVIDIA SM75+ or supported ROCm",
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
 )
 def test_gpu_moe_tails_splitk_multirow_and_deepseek_anchor() -> None:
     # 1. Mid-tile swap_halves + unaligned block_k tails (I=80 g=16 and I=192 g=64)
@@ -2348,30 +2416,33 @@ def test_gpu_moe_tails_splitk_multirow_and_deepseek_anchor() -> None:
             )
 
     # 2. high_first=True and compute_per_tensor_scale=False
-    for high_first, two_level in ((True, True), (False, False)):
-        hf_up, hf_down = _make_dense_weights(
-            2, 256, 256, dtype=torch.float16, device="cuda", seed=310 + int(high_first)
-        )
-        w_nvfp4 = MoEWeights.from_hp(
-            hf_up,
-            hf_down,
-            weight_format="convrot_nvfp4_w4a16",
-            group_size=64,
-            high_first=high_first,
-            compute_per_tensor_scale=two_level,
-        )
-        x16 = torch.randn((1, 256), device="cuda", dtype=torch.float16)
-        ids = torch.tensor([[0, 1]], device="cuda", dtype=torch.int64)
-        wts = torch.tensor([[0.55, 0.45]], device="cuda", dtype=torch.float16)
-        _assert_matches_reference(
-            moe_ffn(x16, w_nvfp4, ids, wts),
-            _reference_for_weights(x16, w_nvfp4, ids, wts),
-            weight_format="convrot_nvfp4_w4a16",
-            dtype=torch.float16,
-        )
+    if _NVFP4_MOE_GPU_AVAILABLE:
+        for high_first, two_level in ((True, True), (False, False)):
+            hf_up, hf_down = _make_dense_weights(
+                2, 256, 256, dtype=torch.float16, device="cuda", seed=310 + int(high_first)
+            )
+            w_nvfp4 = MoEWeights.from_hp(
+                hf_up,
+                hf_down,
+                weight_format="convrot_nvfp4_w4a16",
+                group_size=64,
+                high_first=high_first,
+                compute_per_tensor_scale=two_level,
+            )
+            x16 = torch.randn((1, 256), device="cuda", dtype=torch.float16)
+            ids = torch.tensor([[0, 1]], device="cuda", dtype=torch.int64)
+            wts = torch.tensor([[0.55, 0.45]], device="cuda", dtype=torch.float16)
+            _assert_matches_reference(
+                moe_ffn(x16, w_nvfp4, ids, wts),
+                _reference_for_weights(x16, w_nvfp4, ids, wts),
+                weight_format="convrot_nvfp4_w4a16",
+                dtype=torch.float16,
+            )
 
     # 3. Narrow Split-K + M=2 multi-row across NVFP4 and INT8
-    narrow_formats: list[tuple[MoEFormat, int]] = [("nvfp4_w4a16", 0)]
+    narrow_formats: list[tuple[MoEFormat, int]] = []
+    if _NVFP4_MOE_GPU_AVAILABLE:
+        narrow_formats.append(("nvfp4_w4a16", 0))
     if _INT8_MOE_GPU_AVAILABLE:
         narrow_formats.append(("convrot_int8", 256))
     for weight_format, group_size in narrow_formats:
@@ -2404,7 +2475,9 @@ def test_gpu_moe_tails_splitk_multirow_and_deepseek_anchor() -> None:
         [[0.25, 0.2, 0.18, 0.15, 0.12, 0.10]], device="cuda", dtype=torch.bfloat16
     )
     x_ds = torch.randn((1, 5120), device="cuda", dtype=torch.bfloat16)
-    ds_formats: list[tuple[MoEFormat, int]] = [("nvfp4_w4a16", 0)]
+    ds_formats: list[tuple[MoEFormat, int]] = []
+    if _NVFP4_MOE_GPU_AVAILABLE:
+        ds_formats.append(("nvfp4_w4a16", 0))
     if _INT8_MOE_GPU_AVAILABLE:
         ds_formats.append(("convrot_int8", 256))
     for weight_format, group_size in ds_formats:
@@ -2425,12 +2498,29 @@ def test_gpu_moe_tails_splitk_multirow_and_deepseek_anchor() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -2483,12 +2573,29 @@ def test_gpu_slot_indirection_misses_accumulate_and_strided_out(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -2575,7 +2682,10 @@ def test_gpu_two_wave_prepared_input_accumulation(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 def test_gpu_launch_canary_nvfp4_and_int8() -> None:
     torch.manual_seed(400)
     ids = torch.tensor([[0, 1]], device="cuda", dtype=torch.int64)
@@ -2583,44 +2693,52 @@ def test_gpu_launch_canary_nvfp4_and_int8() -> None:
 
     # Up-projection Split-K canary (H=16384, I=256 for NVFP4; H=16384, I=512 for INT8).
     x_up = torch.randn((1, 16384), device="cuda", dtype=torch.bfloat16)
-    w_nvfp4_up = _make_moe_weights(
-        2, 16384, 256, weight_format="nvfp4_w4a16", dtype=torch.bfloat16, device="cuda", seed=401
-    )
-    ref_nvfp4_up = _reference_for_weights(x_up, w_nvfp4_up, ids, wts)
-    nvfp4_first, nvfp4_launches = _record_triton_launches(
-        lambda: moe_ffn(x_up, w_nvfp4_up, ids, wts, active_slots_hint=1)
-    )
-    nvfp4_second = moe_ffn(x_up, w_nvfp4_up, ids, wts, active_slots_hint=1)
-    assert torch.equal(nvfp4_first, nvfp4_second)
-    _assert_matches_reference(
-        nvfp4_first, ref_nvfp4_up, weight_format="nvfp4_w4a16", dtype=torch.bfloat16
-    )
-    assert "nvfp4_moe_m1_gemv_kernel" in nvfp4_launches
-    assert "moe_splitk_reduce_kernel" in nvfp4_launches
-    assert "moe_m1_activate_rotate_kernel" in nvfp4_launches
-    assert "moe_m1_weighted_reduce_kernel" in nvfp4_launches
+    if _NVFP4_MOE_GPU_AVAILABLE:
+        w_nvfp4_up = _make_moe_weights(
+            2,
+            16384,
+            256,
+            weight_format="nvfp4_w4a16",
+            dtype=torch.bfloat16,
+            device="cuda",
+            seed=401,
+        )
+        ref_nvfp4_up = _reference_for_weights(x_up, w_nvfp4_up, ids, wts)
+        nvfp4_first, nvfp4_launches = _record_triton_launches(
+            lambda: moe_ffn(x_up, w_nvfp4_up, ids, wts, active_slots_hint=1)
+        )
+        nvfp4_second = moe_ffn(x_up, w_nvfp4_up, ids, wts, active_slots_hint=1)
+        assert torch.equal(nvfp4_first, nvfp4_second)
+        _assert_matches_reference(
+            nvfp4_first, ref_nvfp4_up, weight_format="nvfp4_w4a16", dtype=torch.bfloat16
+        )
+        assert "nvfp4_moe_m1_gemv_kernel" in nvfp4_launches
+        assert "moe_splitk_reduce_kernel" in nvfp4_launches
+        assert "moe_m1_activate_rotate_kernel" in nvfp4_launches
+        assert "moe_m1_weighted_reduce_kernel" in nvfp4_launches
 
-    # Split-K post_scale must run after Split-K reduction so canceling K-halves yield 0, not NaN.
-    w_sk_cancel = MoEWeights.from_quantized(
-        torch.full_like(w_nvfp4_up.up_gate_qdata[:1], 0x77),
-        torch.ones_like(w_nvfp4_up.up_gate_scale[:1].float()).to(torch.float8_e4m3fn),
-        torch.full_like(w_nvfp4_up.down_qdata[:1], 0x11),
-        torch.ones_like(w_nvfp4_up.down_scale[:1].float()).to(torch.float8_e4m3fn),
-        logical_dtype=torch.float32,
-        up_gate_global_scale=torch.full((1,), 100.0, device="cuda", dtype=torch.float32),
-        down_global_scale=torch.ones((1,), device="cuda", dtype=torch.float32),
-    )
-    # Use an exact power of two so odd Split-K partitions cancel to 0 without FP32 ULP drift
-    # (which SwiGLU would otherwise square to inf) while pre-reduce post_scale still overflows.
-    x_cancel = torch.empty((1, 16384), device="cuda", dtype=torch.float32)
-    x_cancel[:, :8192] = 2.0**110
-    x_cancel[:, 8192:] = -(2.0**110)
-    ids8 = torch.tensor([[0] + [99] * 7], device="cuda", dtype=torch.int64)
-    wts8 = torch.ones((1, 8), device="cuda", dtype=torch.float32)
-    res_hint1 = moe_ffn(x_cancel, w_sk_cancel, ids8, wts8, active_slots_hint=1)
-    res_hint8 = moe_ffn(x_cancel, w_sk_cancel, ids8, wts8, active_slots_hint=8)
-    assert torch.equal(res_hint1, torch.zeros_like(x_cancel))
-    assert torch.equal(res_hint8, torch.zeros_like(x_cancel))
+        # Split-K post_scale must run after Split-K reduction so canceling K-halves yield 0,
+        # not NaN.
+        w_sk_cancel = MoEWeights.from_quantized(
+            torch.full_like(w_nvfp4_up.up_gate_qdata[:1], 0x77),
+            torch.ones_like(w_nvfp4_up.up_gate_scale[:1].float()).to(torch.float8_e4m3fn),
+            torch.full_like(w_nvfp4_up.down_qdata[:1], 0x11),
+            torch.ones_like(w_nvfp4_up.down_scale[:1].float()).to(torch.float8_e4m3fn),
+            logical_dtype=torch.float32,
+            up_gate_global_scale=torch.full((1,), 100.0, device="cuda", dtype=torch.float32),
+            down_global_scale=torch.ones((1,), device="cuda", dtype=torch.float32),
+        )
+        # Use an exact power of two so odd Split-K partitions cancel to 0 without FP32 ULP drift
+        # (which SwiGLU would otherwise square to inf) while pre-reduce post_scale still overflows.
+        x_cancel = torch.empty((1, 16384), device="cuda", dtype=torch.float32)
+        x_cancel[:, :8192] = 2.0**110
+        x_cancel[:, 8192:] = -(2.0**110)
+        ids8 = torch.tensor([[0] + [99] * 7], device="cuda", dtype=torch.int64)
+        wts8 = torch.ones((1, 8), device="cuda", dtype=torch.float32)
+        res_hint1 = moe_ffn(x_cancel, w_sk_cancel, ids8, wts8, active_slots_hint=1)
+        res_hint8 = moe_ffn(x_cancel, w_sk_cancel, ids8, wts8, active_slots_hint=8)
+        assert torch.equal(res_hint1, torch.zeros_like(x_cancel))
+        assert torch.equal(res_hint8, torch.zeros_like(x_cancel))
 
     if _INT8_MOE_GPU_AVAILABLE:
         w_int8_up = _make_moe_weights(
@@ -2648,7 +2766,9 @@ def test_gpu_launch_canary_nvfp4_and_int8() -> None:
 
     # Down-projection Split-K parity and repeatability (H=512, I=16384, active_slots_hint=1).
     x_down = torch.randn((1, 512), device="cuda", dtype=torch.bfloat16)
-    down_formats: list[tuple[MoEFormat, int]] = [("nvfp4_w4a16", 0)]
+    down_formats: list[tuple[MoEFormat, int]] = []
+    if _NVFP4_MOE_GPU_AVAILABLE:
+        down_formats.append(("nvfp4_w4a16", 0))
     if _INT8_MOE_GPU_AVAILABLE:
         down_formats.append(("convrot_int8", 256))
     for fmt, gs in down_formats:
@@ -2674,12 +2794,29 @@ def test_gpu_launch_canary_nvfp4_and_int8() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not _TRELLIS_MOE_GPU_AVAILABLE,
+    reason="requires NVIDIA SM75+ or supported ROCm",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         ("convrot_trellis", 64),
         pytest.param(
             "convrot_int8",
@@ -2715,12 +2852,29 @@ def test_gpu_faketensor_prepare_and_ffn(weight_format: MoEFormat, group_size: in
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not _TRELLIS_MOE_GPU_AVAILABLE,
+    reason="requires NVIDIA SM75+ or supported ROCm",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         ("convrot_trellis", 64),
         pytest.param(
             "convrot_int8",
@@ -2787,10 +2941,15 @@ def test_gpu_torch_compile_fullgraph(weight_format: MoEFormat, group_size: int) 
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 def test_gpu_edge_layout_aliasing_and_inference_guards() -> None:
     torch.manual_seed(435)
-    edge_formats: list[tuple[MoEFormat, int]] = [("nvfp4_w4a16", 0)]
+    edge_formats: list[tuple[MoEFormat, int]] = []
+    if _NVFP4_MOE_GPU_AVAILABLE:
+        edge_formats.append(("nvfp4_w4a16", 0))
     if _INT8_MOE_GPU_AVAILABLE:
         edge_formats.append(("convrot_int8", 64))
     for weight_format, group_size in edge_formats:
@@ -2947,7 +3106,7 @@ def test_gpu_numerical_overflow_zero_scale_and_bf16_parity() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not _NVFP4_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM12x")
 def test_gpu_nvfp4_scale_extremes_and_bf16_parity() -> None:
     torch.manual_seed(441)
     # 1. NVFP4 zero block scale, tiny 1e-30, zero, and extreme 1e37 global scales.
@@ -3035,7 +3194,7 @@ def test_gpu_nvfp4_scale_extremes_and_bf16_parity() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not _NVFP4_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM12x")
 def test_gpu_convrot_nvfp4_rotation_range_and_bf16_parity() -> None:
     torch.manual_seed(442)
     h_ids = torch.zeros((1, 1), device="cuda", dtype=torch.int64)
@@ -3153,11 +3312,21 @@ def test_gpu_sm75_int8_falls_back_cleanly_in_cuda_graph(monkeypatch: pytest.Monk
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -3262,15 +3431,19 @@ def test_gpu_noncurrent_device_preserves_caller_device() -> None:
             )
 
 
-@pytest.mark.parametrize("target", _NVIDIA_TARGETS)
 @pytest.mark.parametrize(
-    ("weight_format", "group_size", "logical_dtype"),
+    ("target", "weight_format", "group_size", "logical_dtype"),
     [
-        ("nvfp4_w4a16", 0, torch.bfloat16),
-        ("nvfp4_w4a16", 0, torch.float16),
-        ("convrot_nvfp4_w4a16", 64, torch.bfloat16),
-        ("convrot_nvfp4_w4a16", 64, torch.float16),
-        ("convrot_int8", 256, torch.bfloat16),
+        (target, weight_format, group_size, logical_dtype)
+        for target in _NVIDIA_TARGETS
+        for weight_format, group_size, logical_dtype in (
+            ("nvfp4_w4a16", 0, torch.bfloat16),
+            ("nvfp4_w4a16", 0, torch.float16),
+            ("convrot_nvfp4_w4a16", 64, torch.bfloat16),
+            ("convrot_nvfp4_w4a16", 64, torch.float16),
+            ("convrot_int8", 256, torch.bfloat16),
+        )
+        if weight_format == "convrot_int8" or target.arch // 10 == 12
     ],
 )
 @pytest.mark.parametrize(("rows", "split_k", "accumulate"), [(4, 1, False), (8, 2, True)])
@@ -3301,7 +3474,6 @@ def test_offline_nvidia_small_batch_compile_zero_spills(
     assert f"{expected_prefix}up" in compiled
     assert f"{expected_prefix}down" in compiled
     if weight_format != "convrot_int8":
-        is_sm12x = target.arch // 10 == 12
         expect_bf16_cvt = rows > 4 and logical_dtype is torch.bfloat16
         expected_sm120_cvt = "cvt.rn.bf16x2.e2m1x2" if expect_bf16_cvt else "cvt.rn.f16x2.e2m1x2"
         other_sm120_cvt = "cvt.rn.f16x2.e2m1x2" if expect_bf16_cvt else "cvt.rn.bf16x2.e2m1x2"
@@ -3311,79 +3483,19 @@ def test_offline_nvidia_small_batch_compile_zero_spills(
         )
         for key in ("nvfp4_gemv_up", "nvfp4_gemv_down"):
             ptx = compiled[key].asm["ptx"]
-            if is_sm12x:
-                assert expected_sm120_cvt in ptx
-                assert other_sm120_cvt not in ptx
-                assert "ld.global.v4" in ptx or "cp.async.cg.shared.global" in ptx
-                if expect_single_dot:
-                    assert len(re.findall(r"\btt\.dot\b", compiled[key].asm["ttir"])) == 1
-            else:
-                assert "e2m1x2" not in ptx
-
-
-@pytest.mark.parametrize("weight_format", ["nvfp4_w4a16", "convrot_nvfp4_w4a16"])
-@pytest.mark.parametrize("logical_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(("rows", "split_k", "accumulate"), [(4, 1, False), (8, 2, True)])
-def test_offline_sm75_small_batch_compile_zero_spills(
-    weight_format: MoEFormat,
-    logical_dtype: torch.dtype,
-    rows: int,
-    split_k: int,
-    accumulate: bool,
-) -> None:
-    sm75 = GPUTarget("cuda", 75, 32)
-    compiled = _compile_nvidia_and_assert_clean(
-        sm75,
-        weight_format=weight_format,
-        logical_dtype=logical_dtype,
-        rows=rows,
-        top_k=6,
-        hidden_size=1024,
-        intermediate_size=512,
-        group_size=64 if weight_format == "convrot_nvfp4_w4a16" else 0,
-        split_k=split_k,
-        accumulate=accumulate,
-    )
-    assert "bucket" in compiled
-    assert "nvfp4_gemv_up" in compiled
-    assert "nvfp4_gemv_down" in compiled
-
-    if rows == 4 and logical_dtype is torch.float16 and weight_format == "nvfp4_w4a16":
-        for prefill_rows, prefill_top_k in ((17, 6), (16, 65)):
-            routed = _compile_nvidia_and_assert_clean(sm75, rows=prefill_rows, top_k=prefill_top_k)
-            assert "nvfp4_grouped" in routed
-            assert "bucket_count" in routed
-        with pytest.raises(ValueError, match="must be positive"):
-            moe_triton.compile_moe_kernels(sm75, rows=0)
-        with pytest.raises(ValueError, match="SM80"):
-            moe_triton.compile_moe_kernels(
-                sm75,
-                rows=8,
-                top_k=6,
-                weight_format="convrot_int8",
-                logical_dtype=torch.float16,
-                group_size=64,
-            )
+            assert expected_sm120_cvt in ptx
+            assert other_sm120_cvt not in ptx
+            assert "ld.global.v4" in ptx or "cp.async.cg.shared.global" in ptx
+            if expect_single_dot:
+                assert len(re.findall(r"\btt\.dot\b", compiled[key].asm["ttir"])) == 1
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm HIP compiler is Linux-only")
 @pytest.mark.parametrize(("arch", "warp_size"), _AMD_TARGETS)
-@pytest.mark.parametrize(
-    ("weight_format", "group_size", "logical_dtype"),
-    [
-        ("nvfp4_w4a16", 0, torch.bfloat16),
-        ("convrot_nvfp4_w4a16", 64, torch.float16),
-        ("convrot_nvfp4_w4a16", 64, torch.bfloat16),
-        ("convrot_int8", 256, torch.bfloat16),
-    ],
-)
 @pytest.mark.parametrize(("rows", "split_k", "accumulate"), [(4, 1, False), (8, 2, True)])
 def test_offline_amd_small_batch_compile_matrix_and_fences(
     arch: str,
     warp_size: int,
-    weight_format: MoEFormat,
-    group_size: int,
-    logical_dtype: torch.dtype,
     rows: int,
     split_k: int,
     accumulate: bool,
@@ -3391,20 +3503,19 @@ def test_offline_amd_small_batch_compile_matrix_and_fences(
     target = GPUTarget("hip", arch, warp_size)
     compiled = moe_triton.compile_moe_kernels(
         target,
-        weight_format=weight_format,
-        logical_dtype=logical_dtype,
+        weight_format="convrot_int8",
+        logical_dtype=torch.bfloat16,
         rows=rows,
         top_k=6,
         hidden_size=5120,
         intermediate_size=2304,
-        group_size=group_size,
+        group_size=256,
         split_k=split_k,
         accumulate=accumulate,
     )
     assert "bucket" in compiled
-    expected_prefix = "int8_matmul_" if weight_format == "convrot_int8" else "nvfp4_gemv_"
-    assert f"{expected_prefix}up" in compiled
-    assert f"{expected_prefix}down" in compiled
+    assert "int8_matmul_up" in compiled
+    assert "int8_matmul_down" in compiled
     expected_int8_isa = "v_mfma_i32" if arch == "gfx942" else "v_wmma_i32"
     for name, kernel in compiled.items():
         check_spills = not (arch == "gfx1201" and name.startswith("int8_matmul"))
@@ -3416,7 +3527,7 @@ def test_offline_amd_small_batch_compile_matrix_and_fences(
         )
         if name.startswith("int8_matmul"):
             assert expected_int8_isa in kernel.asm["amdgcn"]
-    if arch == "gfx1201" and weight_format == "convrot_int8" and rows == 8 and split_k == 2:
+    if arch == "gfx1201" and rows == 8 and split_k == 2:
         narrow = moe_triton.compile_moe_kernels(
             target,
             weight_format="convrot_int8",
@@ -3438,12 +3549,29 @@ def test_offline_amd_small_batch_compile_matrix_and_fences(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -3607,12 +3735,29 @@ def test_gpu_small_batch_matches_reference(weight_format: MoEFormat, group_size:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -3740,7 +3885,7 @@ def test_gpu_small_batch_edge_cases_and_launch_counts(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(not _NVFP4_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM12x")
 def test_gpu_small_batch_big_k_fallback_and_global_scales() -> None:
     torch.manual_seed(640)
     # rows=2, top_k=513 (> _BUCKET_MAX_PAIRS) routes cleanly through prefill bucketing.
@@ -3816,11 +3961,21 @@ def test_gpu_small_batch_big_k_fallback_and_global_scales() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -3884,13 +4039,40 @@ def test_gpu_small_batch_cuda_graph_replay(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size", "dtype"),
     [
-        ("nvfp4_w4a16", 0, torch.bfloat16),
-        ("nvfp4_w4a16", 0, torch.float16),
-        ("convrot_nvfp4_w4a16", 256, torch.bfloat16),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            torch.bfloat16,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            torch.float16,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            256,
+            torch.bfloat16,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             256,
@@ -3981,12 +4163,29 @@ def test_gpu_small_batch_int8_unaligned_tails(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -4144,16 +4343,20 @@ def test_gpu_small_batch_noncurrent_device() -> None:
             )
 
 
-@pytest.mark.parametrize("target", _NVIDIA_TARGETS)
 @pytest.mark.parametrize(
-    ("weight_format", "group_size", "logical_dtype"),
+    ("target", "weight_format", "group_size", "logical_dtype"),
     [
-        ("nvfp4_w4a16", 0, torch.bfloat16),
-        ("nvfp4_w4a16", 0, torch.float16),
-        ("nvfp4_w4a16", 0, torch.float32),
-        ("convrot_nvfp4_w4a16", 64, torch.bfloat16),
-        ("convrot_nvfp4_w4a16", 64, torch.float16),
-        ("convrot_int8", 256, torch.bfloat16),
+        (target, weight_format, group_size, logical_dtype)
+        for target in _NVIDIA_TARGETS
+        for weight_format, group_size, logical_dtype in (
+            ("nvfp4_w4a16", 0, torch.bfloat16),
+            ("nvfp4_w4a16", 0, torch.float16),
+            ("nvfp4_w4a16", 0, torch.float32),
+            ("convrot_nvfp4_w4a16", 64, torch.bfloat16),
+            ("convrot_nvfp4_w4a16", 64, torch.float16),
+            ("convrot_int8", 256, torch.bfloat16),
+        )
+        if weight_format == "convrot_int8" or target.arch // 10 == 12
     ],
 )
 @pytest.mark.parametrize(("rows", "accumulate"), [(128, False), (256, True)])
@@ -4186,7 +4389,6 @@ def test_offline_nvidia_prefill_compile_zero_spills(
     else:
         assert "nvfp4_grouped" in compiled
         assert "activate_rotate" in compiled
-        is_sm12x = target.arch // 10 == 12
         expect_bf16_cvt = logical_dtype is torch.bfloat16
         expected_sm120_cvt = "cvt.rn.bf16x2.e2m1x2" if expect_bf16_cvt else "cvt.rn.f16x2.e2m1x2"
         other_sm120_cvt = "cvt.rn.f16x2.e2m1x2" if expect_bf16_cvt else "cvt.rn.bf16x2.e2m1x2"
@@ -4194,121 +4396,38 @@ def test_offline_nvidia_prefill_compile_zero_spills(
             weight_format == "nvfp4_w4a16" and logical_dtype is torch.float16
         )
         ptx = compiled["nvfp4_grouped"].asm["ptx"]
-        if is_sm12x:
-            assert expected_sm120_cvt in ptx
-            assert other_sm120_cvt not in ptx
-            assert "ld.global.v4" in ptx or "cp.async.cg.shared.global" in ptx
-            assert len(re.findall(r"\btt\.dot\b", compiled["nvfp4_grouped"].asm["ttir"])) == (
-                1 if expect_single_dot else 2
-            )
-        else:
-            assert "e2m1x2" not in ptx
-
-
-@pytest.mark.parametrize("weight_format", ["nvfp4_w4a16", "convrot_nvfp4_w4a16"])
-@pytest.mark.parametrize("logical_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(("rows", "accumulate"), [(128, False), (256, True)])
-def test_offline_sm75_prefill_compile_zero_spills(
-    weight_format: MoEFormat,
-    logical_dtype: torch.dtype,
-    rows: int,
-    accumulate: bool,
-) -> None:
-    sm75 = GPUTarget("cuda", 75, 32)
-    compiled = _compile_nvidia_and_assert_clean(
-        sm75,
-        weight_format=weight_format,
-        logical_dtype=logical_dtype,
-        rows=rows,
-        top_k=6,
-        num_slots=64,
-        hidden_size=1024,
-        intermediate_size=512,
-        group_size=64 if weight_format == "convrot_nvfp4_w4a16" else 0,
-        accumulate=accumulate,
-    )
-    assert "nvfp4_grouped" in compiled
-
-    if rows == 128 and logical_dtype is torch.float16 and weight_format == "nvfp4_w4a16":
-        wide_sm75 = _compile_nvidia_and_assert_clean(sm75, rows=20000, top_k=6)
-        assert "nvfp4_grouped" in wide_sm75
-
-        sm80 = _NVIDIA_TARGETS[0]
-        wide_sm80 = moe_triton.compile_moe_kernels(
-            sm80,
-            weight_format="convrot_nvfp4_w4a16",
-            logical_dtype=torch.bfloat16,
-            rows=2048,
-            top_k=6,
-            num_slots=256,
-            hidden_size=8192,
-            intermediate_size=4096,
-            group_size=64,
+        assert expected_sm120_cvt in ptx
+        assert other_sm120_cvt not in ptx
+        assert "ld.global.v4" in ptx or "cp.async.cg.shared.global" in ptx
+        assert len(re.findall(r"\btt\.dot\b", compiled["nvfp4_grouped"].asm["ttir"])) == (
+            1 if expect_single_dot else 2
         )
-        chunk_sm80 = moe_triton.compile_moe_kernels(
-            sm80,
-            weight_format="convrot_nvfp4_w4a16",
-            logical_dtype=torch.bfloat16,
-            rows=390,
-            top_k=6,
-            num_slots=256,
-            hidden_size=8192,
-            intermediate_size=4096,
-            group_size=64,
-        )
-        assert wide_sm80["nvfp4_grouped"].hash == chunk_sm80["nvfp4_grouped"].hash
-        assert wide_sm80["bucket_scatter"].hash == chunk_sm80["bucket_scatter"].hash
-
-        with pytest.raises(ValueError, match="SM80"):
-            moe_triton.compile_moe_kernels(
-                sm75,
-                rows=256,
-                top_k=6,
-                weight_format="convrot_int8",
-                logical_dtype=torch.float16,
-                group_size=64,
-            )
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="ROCm HIP compiler is Linux-only")
 @pytest.mark.parametrize(("arch", "warp_size"), _AMD_TARGETS)
-@pytest.mark.parametrize(
-    ("weight_format", "group_size", "logical_dtype"),
-    [
-        ("nvfp4_w4a16", 0, torch.bfloat16),
-        ("convrot_nvfp4_w4a16", 64, torch.float16),
-        ("convrot_nvfp4_w4a16", 64, torch.bfloat16),
-        ("convrot_int8", 256, torch.bfloat16),
-    ],
-)
 @pytest.mark.parametrize(("rows", "accumulate"), [(128, False), (256, True)])
 def test_offline_amd_prefill_compile_matrix_and_fences(
     arch: str,
     warp_size: int,
-    weight_format: MoEFormat,
-    group_size: int,
-    logical_dtype: torch.dtype,
     rows: int,
     accumulate: bool,
 ) -> None:
     target = GPUTarget("hip", arch, warp_size)
     compiled = moe_triton.compile_moe_kernels(
         target,
-        weight_format=weight_format,
-        logical_dtype=logical_dtype,
+        weight_format="convrot_int8",
+        logical_dtype=torch.bfloat16,
         rows=rows,
         top_k=6,
         num_slots=64,
         hidden_size=5120,
         intermediate_size=2304,
-        group_size=group_size,
+        group_size=256,
         accumulate=accumulate,
     )
-    if weight_format == "convrot_int8":
-        assert "int8_grouped_up" in compiled
-        assert "int8_grouped_down" in compiled
-    else:
-        assert "nvfp4_grouped" in compiled
+    assert "int8_grouped_up" in compiled
+    assert "int8_grouped_down" in compiled
     expected_int8_isa = "v_mfma_i32" if arch == "gfx942" else "v_wmma_i32"
     for name, kernel in compiled.items():
         # Sparse gfx1201 INT8 (block_m=16, block_k=256) trades L1-cached private scratch for
@@ -4325,7 +4444,7 @@ def test_offline_amd_prefill_compile_matrix_and_fences(
         )
         if name.startswith("int8_grouped"):
             assert expected_int8_isa in kernel.asm["amdgcn"]
-    if arch == "gfx1201" and weight_format == "convrot_int8" and rows == 256:
+    if arch == "gfx1201" and rows == 256:
         unaligned = moe_triton.compile_moe_kernels(
             target,
             weight_format="convrot_int8",
@@ -4347,12 +4466,29 @@ def test_offline_amd_prefill_compile_matrix_and_fences(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -4464,12 +4600,29 @@ def test_gpu_prefill_matches_reference(weight_format: MoEFormat, group_size: int
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -4630,68 +4783,71 @@ def test_gpu_prefill_skew_tails_waves_and_launches(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 def test_gpu_prefill_global_scales_and_multichunk() -> None:
     torch.manual_seed(880)
     # 1. Extreme NVFP4 global scales (0.0, 1e-30, and FP16 1e-8) in dense M=36 prefill.
-    w_base = _make_moe_weights(
-        2, 64, 64, weight_format="nvfp4_w4a16", dtype=torch.float32, device="cuda", seed=881
-    )
-    q_max = torch.full_like(w_base.up_gate_qdata, 0x77)
-    dq_max = torch.full_like(w_base.down_qdata, 0x77)
-    ones_f8 = torch.ones_like(w_base.up_gate_scale.float()).to(torch.float8_e4m3fn)
-    d_ones_f8 = torch.ones_like(w_base.down_scale.float()).to(torch.float8_e4m3fn)
-    w_zero_tiny = MoEWeights.from_quantized(
-        q_max,
-        ones_f8,
-        dq_max,
-        d_ones_f8,
-        logical_dtype=torch.float32,
-        up_gate_global_scale=torch.tensor([0.0, 1e-30], device="cuda", dtype=torch.float32),
-        down_global_scale=torch.tensor([1.0, 1e-30], device="cuda", dtype=torch.float32),
-    )
-    w_fp16_base = _make_moe_weights(
-        2,
-        64,
-        64,
-        weight_format="nvfp4_w4a16",
-        activation_fn="gelu_tanh",
-        dtype=torch.float16,
-        device="cuda",
-        seed=882,
-    )
-    w_fp16_tiny = MoEWeights.from_quantized(
-        torch.full_like(w_fp16_base.up_gate_qdata, 0x77),
-        torch.full_like(w_fp16_base.up_gate_scale.float(), 448.0).to(torch.float8_e4m3fn),
-        torch.full_like(w_fp16_base.down_qdata, 0x77),
-        torch.full_like(w_fp16_base.down_scale.float(), 448.0).to(torch.float8_e4m3fn),
-        logical_dtype=torch.float16,
-        up_gate_global_scale=torch.tensor([0.0, 1e-8], device="cuda", dtype=torch.float32),
-        down_global_scale=torch.tensor([1.0, 1e4], device="cuda", dtype=torch.float32),
-        activation_fn="gelu_tanh",
-    )
-    ids_gs = torch.tensor([[0, 1]], device="cuda", dtype=torch.int64).repeat(36, 1)
-    wts_gs = torch.ones((36, 2), device="cuda", dtype=torch.float32)
-    x_huge = torch.full((36, 64), 1e37, device="cuda", dtype=torch.float32)
-    actual_32 = moe_ffn(x_huge, w_zero_tiny, ids_gs, wts_gs)
-    expected_32 = _reference_for_weights(x_huge, w_zero_tiny, ids_gs, wts_gs).to("cuda")
-    assert torch.isfinite(actual_32).all()
-    assert float(actual_32.abs().min()) > 0.0
-    torch.testing.assert_close(actual_32, expected_32, rtol=1e-4, atol=1e-4)
+    if _NVFP4_MOE_GPU_AVAILABLE:
+        w_base = _make_moe_weights(
+            2, 64, 64, weight_format="nvfp4_w4a16", dtype=torch.float32, device="cuda", seed=881
+        )
+        q_max = torch.full_like(w_base.up_gate_qdata, 0x77)
+        dq_max = torch.full_like(w_base.down_qdata, 0x77)
+        ones_f8 = torch.ones_like(w_base.up_gate_scale.float()).to(torch.float8_e4m3fn)
+        d_ones_f8 = torch.ones_like(w_base.down_scale.float()).to(torch.float8_e4m3fn)
+        w_zero_tiny = MoEWeights.from_quantized(
+            q_max,
+            ones_f8,
+            dq_max,
+            d_ones_f8,
+            logical_dtype=torch.float32,
+            up_gate_global_scale=torch.tensor([0.0, 1e-30], device="cuda", dtype=torch.float32),
+            down_global_scale=torch.tensor([1.0, 1e-30], device="cuda", dtype=torch.float32),
+        )
+        w_fp16_base = _make_moe_weights(
+            2,
+            64,
+            64,
+            weight_format="nvfp4_w4a16",
+            activation_fn="gelu_tanh",
+            dtype=torch.float16,
+            device="cuda",
+            seed=882,
+        )
+        w_fp16_tiny = MoEWeights.from_quantized(
+            torch.full_like(w_fp16_base.up_gate_qdata, 0x77),
+            torch.full_like(w_fp16_base.up_gate_scale.float(), 448.0).to(torch.float8_e4m3fn),
+            torch.full_like(w_fp16_base.down_qdata, 0x77),
+            torch.full_like(w_fp16_base.down_scale.float(), 448.0).to(torch.float8_e4m3fn),
+            logical_dtype=torch.float16,
+            up_gate_global_scale=torch.tensor([0.0, 1e-8], device="cuda", dtype=torch.float32),
+            down_global_scale=torch.tensor([1.0, 1e4], device="cuda", dtype=torch.float32),
+            activation_fn="gelu_tanh",
+        )
+        ids_gs = torch.tensor([[0, 1]], device="cuda", dtype=torch.int64).repeat(36, 1)
+        wts_gs = torch.ones((36, 2), device="cuda", dtype=torch.float32)
+        x_huge = torch.full((36, 64), 1e37, device="cuda", dtype=torch.float32)
+        actual_32 = moe_ffn(x_huge, w_zero_tiny, ids_gs, wts_gs)
+        expected_32 = _reference_for_weights(x_huge, w_zero_tiny, ids_gs, wts_gs).to("cuda")
+        assert torch.isfinite(actual_32).all()
+        assert float(actual_32.abs().min()) > 0.0
+        torch.testing.assert_close(actual_32, expected_32, rtol=1e-4, atol=1e-4)
 
-    x_fp16_sub = torch.full((36, 64), 2e-4, device="cuda", dtype=torch.float16)
-    wts_16 = torch.ones((36, 2), device="cuda", dtype=torch.float16)
-    actual_16 = moe_ffn(x_fp16_sub, w_fp16_tiny, ids_gs, wts_16)
-    expected_16 = _reference_for_weights(x_fp16_sub, w_fp16_tiny, ids_gs, wts_16).to("cuda")
-    assert torch.isfinite(actual_16).all()
-    assert float(actual_16.abs().min()) > 0.0
-    torch.testing.assert_close(actual_16, expected_16, rtol=2e-2, atol=1e-4)
+        x_fp16_sub = torch.full((36, 64), 2e-4, device="cuda", dtype=torch.float16)
+        wts_16 = torch.ones((36, 2), device="cuda", dtype=torch.float16)
+        actual_16 = moe_ffn(x_fp16_sub, w_fp16_tiny, ids_gs, wts_16)
+        expected_16 = _reference_for_weights(x_fp16_sub, w_fp16_tiny, ids_gs, wts_16).to("cuda")
+        assert torch.isfinite(actual_16).all()
+        assert float(actual_16.abs().min()) > 0.0
+        torch.testing.assert_close(actual_16, expected_16, rtol=2e-2, atol=1e-4)
 
     # 2. Natural multi-chunk prefill (M=300, top_k=64, H=2048, I=1024 exceeds 256 MiB workspace).
-    multi_formats: list[tuple[MoEFormat, int]] = [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
-    ]
+    multi_formats: list[tuple[MoEFormat, int]] = []
+    if _NVFP4_MOE_GPU_AVAILABLE:
+        multi_formats.extend([("nvfp4_w4a16", 0), ("convrot_nvfp4_w4a16", 64)])
     if _INT8_MOE_GPU_AVAILABLE:
         multi_formats.append(("convrot_int8", 256))
     for fmt, gs in multi_formats:
@@ -4739,12 +4895,29 @@ def test_gpu_prefill_global_scales_and_multichunk() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -4830,12 +5003,29 @@ def test_gpu_prefill_cuda_graph_replay(weight_format: MoEFormat, group_size: int
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not (_NVFP4_MOE_GPU_AVAILABLE or _INT8_MOE_GPU_AVAILABLE),
+    reason="requires NVIDIA SM12x or supported ConvRot INT8 GPU target",
+)
 @pytest.mark.parametrize(
     ("weight_format", "group_size"),
     [
-        ("nvfp4_w4a16", 0),
-        ("convrot_nvfp4_w4a16", 64),
+        pytest.param(
+            "nvfp4_w4a16",
+            0,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
+        pytest.param(
+            "convrot_nvfp4_w4a16",
+            64,
+            marks=pytest.mark.skipif(
+                not _NVFP4_MOE_GPU_AVAILABLE,
+                reason="requires NVIDIA SM12x",
+            ),
+        ),
         pytest.param(
             "convrot_int8",
             64,
@@ -5196,7 +5386,9 @@ def _assert_trellis_prefill_matches_oracle(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not _TRELLIS_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM75+ or supported ROCm"
+)
 @pytest.mark.parametrize("rows", [1, 4, 8])
 @pytest.mark.parametrize(
     ("up_layout", "down_layout"),
@@ -5364,7 +5556,9 @@ def test_gpu_trellis_m1_and_batched_parity(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not _TRELLIS_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM75+ or supported ROCm"
+)
 def test_gpu_trellis_single_slot_high_tile_batched_parity() -> None:
     torch.manual_seed(968)
     w_hi = _make_trellis_moe_weights(
@@ -5392,7 +5586,9 @@ def test_gpu_trellis_single_slot_high_tile_batched_parity() -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not _TRELLIS_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM75+ or supported ROCm"
+)
 @pytest.mark.parametrize(
     ("up_layout", "down_layout"),
     [
@@ -5541,7 +5737,9 @@ def test_gpu_trellis_prefill_parity_and_multichunk(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not _TRELLIS_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM75+ or supported ROCm"
+)
 def test_gpu_trellis_prefill_edge_cases() -> None:
     torch.manual_seed(973)
     weights = _make_trellis_moe_weights(
@@ -5631,7 +5829,9 @@ def test_gpu_trellis_prefill_intra_expert_row_windowing(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not _TRELLIS_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM75+ or supported ROCm"
+)
 @pytest.mark.parametrize("layout_kind", ["uniform", "var1d"])
 def test_gpu_trellis_compile_dynamic_all_regimes(layout_kind: TrellisLayoutKind) -> None:
     torch.manual_seed(980 + int(layout_kind == "var1d"))
@@ -5693,7 +5893,9 @@ def test_gpu_trellis_compile_dynamic_all_regimes(layout_kind: TrellisLayoutKind)
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not _TRELLIS_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM75+ or supported ROCm"
+)
 @pytest.mark.parametrize(
     "rows",
     [
@@ -5779,7 +5981,9 @@ def test_gpu_trellis_cuda_graph_replay(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not _TRELLIS_MOE_GPU_AVAILABLE, reason="requires NVIDIA SM75+ or supported ROCm"
+)
 @pytest.mark.parametrize("layout_kind", ["uniform", "var2d", "var1d"])
 def test_gpu_trellis_reference_cuda_graph_replay(layout_kind: TrellisLayoutKind) -> None:
     torch.manual_seed(995 + int(layout_kind == "var1d"))
@@ -5866,6 +6070,9 @@ def test_gpu_trellis_reference_cuda_graph_replay(layout_kind: TrellisLayoutKind)
             ("convrot_int8", 64),
         )
         if not (target.arch < 80 and weight_format == "convrot_int8")
+        and not (
+            target.arch // 10 != 12 and weight_format in ("nvfp4_w4a16", "convrot_nvfp4_w4a16")
+        )
     ],
 )
 @pytest.mark.parametrize(("rows", "split_k"), [(1, 2), (256, 1)])
@@ -5924,6 +6131,9 @@ def test_offline_nvidia_int8_unaligned_nk_compile_zero_spills(
             ("convrot_int8", 64),
         )
         if not (target.arch < 80 and weight_format == "convrot_int8")
+        and not (
+            target.arch // 10 != 12 and weight_format in ("nvfp4_w4a16", "convrot_nvfp4_w4a16")
+        )
     ],
 )
 def test_offline_nvidia_batched_block_p_1024_compile_zero_spills(
@@ -5960,17 +6170,11 @@ def test_offline_optional_null_pointers_compile_zero_spills(
     for target in _NVIDIA_TRELLIS_TARGETS:
         if target.arch < 80 and weight_format == "convrot_int8":
             continue
-        # On 48-warp/SM SM86/SM89, ptxas trades 8 stack bytes (REG:72, STACK:8) for
-        # higher CTA occupancy when use_dot=False and has_global_scale=False.
-        spill_limits = (
-            {"nvfp4_gemv_up": 8}
-            if (weight_format == "nvfp4_w4a16" and rows == 4 and target.arch in (86, 89))
-            else None
-        )
+        if target.arch // 10 != 12 and weight_format == "nvfp4_w4a16":
+            continue
         _compile_nvidia_and_assert_clean(
             target,
             check_int8_mma=True,
-            max_spill_stores=spill_limits,
             weight_format=weight_format,
             logical_dtype=torch.bfloat16,
             rows=rows,
@@ -5982,7 +6186,7 @@ def test_offline_optional_null_pointers_compile_zero_spills(
             has_global_scale=False,
             split_k=split_k,
         )
-    if sys.platform == "linux":
+    if sys.platform == "linux" and weight_format != "nvfp4_w4a16":
         amd_target = GPUTarget("hip", "gfx1201", 32)
         compiled = moe_triton.compile_moe_kernels(
             amd_target,
@@ -6003,13 +6207,17 @@ def test_offline_optional_null_pointers_compile_zero_spills(
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(not w4a16_nvfp4_available(), reason="requires NVIDIA SM75+ or supported ROCm")
+@pytest.mark.skipif(
+    not _TRELLIS_MOE_GPU_AVAILABLE,
+    reason="requires NVIDIA SM75+ or supported ROCm",
+)
 def test_gpu_m1_top_k_exceeds_cuda_grid_y_limit() -> None:
     torch.manual_seed(1001)
     formats: list[tuple[MoEFormat, int, int, str]] = [
-        ("nvfp4_w4a16", 0, 64, "nvfp4_moe_m1_gemv_kernel"),
         ("convrot_trellis", 64, 256, "trellis_moe_gemv_kernel"),
     ]
+    if _NVFP4_MOE_GPU_AVAILABLE:
+        formats.append(("nvfp4_w4a16", 0, 64, "nvfp4_moe_m1_gemv_kernel"))
     if _INT8_MOE_GPU_AVAILABLE:
         formats.append(("convrot_int8", 64, 64, "int8_moe_m1_matmul_kernel"))
 
@@ -6044,49 +6252,50 @@ def test_gpu_m1_top_k_exceeds_cuda_grid_y_limit() -> None:
             actual, expected, weight_format=weight_format, dtype=torch.bfloat16
         )
 
-    # rows=2, top_k=70_000 triggers _select_moe_execution_regime prefill-to-M1 fallback.
-    w_nvfp4 = _make_moe_weights(
-        2, 64, 64, weight_format="nvfp4_w4a16", dtype=torch.bfloat16, device="cuda", seed=1005
-    )
-    x_two = torch.randn((2, 64), device="cuda", dtype=torch.bfloat16)
-    ids_two = ids.repeat(2, 1)
-    wts_two = wts.repeat(2, 1)
-    actual_two, launches_two = _record_triton_launches(
-        lambda: moe_ffn(x_two, w_nvfp4, ids_two, wts_two, active_slots_hint=2)
-    )
-    assert "nvfp4_moe_m1_gemv_kernel" in launches_two
-    assert "moe_m1_weighted_reduce_kernel" in launches_two
-    _assert_matches_reference(
-        actual_two,
-        _independent_moe_oracle(x_two, w_nvfp4, ids_two, wts_two),
-        weight_format="nvfp4_w4a16",
-        dtype=torch.bfloat16,
-    )
-
-    # Wide H triggers Split-K on up_gate and exercises flattened moe_splitk_reduce_kernel.
-    if torch.cuda.get_device_properties(0).multi_processor_count >= 32:
-        w_splitk = _make_moe_weights(
-            2,
-            8192,
-            256,
-            weight_format="nvfp4_w4a16",
-            dtype=torch.bfloat16,
-            device="cuda",
-            seed=1006,
+    if _NVFP4_MOE_GPU_AVAILABLE:
+        # rows=2, top_k=70_000 triggers _select_moe_execution_regime prefill-to-M1 fallback.
+        w_nvfp4 = _make_moe_weights(
+            2, 64, 64, weight_format="nvfp4_w4a16", dtype=torch.bfloat16, device="cuda", seed=1005
         )
-        x_splitk = torch.randn((1, 8192), device="cuda", dtype=torch.bfloat16)
-        actual_sk, launches_sk = _record_triton_launches(
-            lambda: moe_ffn(x_splitk, w_splitk, ids, wts, active_slots_hint=2)
+        x_two = torch.randn((2, 64), device="cuda", dtype=torch.bfloat16)
+        ids_two = ids.repeat(2, 1)
+        wts_two = wts.repeat(2, 1)
+        actual_two, launches_two = _record_triton_launches(
+            lambda: moe_ffn(x_two, w_nvfp4, ids_two, wts_two, active_slots_hint=2)
         )
-        assert "nvfp4_moe_m1_gemv_kernel" in launches_sk
-        assert "moe_splitk_reduce_kernel" in launches_sk
-        assert "moe_m1_activate_rotate_kernel" in launches_sk
+        assert "nvfp4_moe_m1_gemv_kernel" in launches_two
+        assert "moe_m1_weighted_reduce_kernel" in launches_two
         _assert_matches_reference(
-            actual_sk,
-            _independent_moe_oracle(x_splitk, w_splitk, ids, wts),
+            actual_two,
+            _independent_moe_oracle(x_two, w_nvfp4, ids_two, wts_two),
             weight_format="nvfp4_w4a16",
             dtype=torch.bfloat16,
         )
+
+        # Wide H triggers Split-K on up_gate and exercises flattened moe_splitk_reduce_kernel.
+        if torch.cuda.get_device_properties(0).multi_processor_count >= 32:
+            w_splitk = _make_moe_weights(
+                2,
+                8192,
+                256,
+                weight_format="nvfp4_w4a16",
+                dtype=torch.bfloat16,
+                device="cuda",
+                seed=1006,
+            )
+            x_splitk = torch.randn((1, 8192), device="cuda", dtype=torch.bfloat16)
+            actual_sk, launches_sk = _record_triton_launches(
+                lambda: moe_ffn(x_splitk, w_splitk, ids, wts, active_slots_hint=2)
+            )
+            assert "nvfp4_moe_m1_gemv_kernel" in launches_sk
+            assert "moe_splitk_reduce_kernel" in launches_sk
+            assert "moe_m1_activate_rotate_kernel" in launches_sk
+            _assert_matches_reference(
+                actual_sk,
+                _independent_moe_oracle(x_splitk, w_splitk, ids, wts),
+                weight_format="nvfp4_w4a16",
+                dtype=torch.bfloat16,
+            )
 
     # Wide H on ConvRot Trellis M1 (down_proj grid_x * blockDim.x exceeds HIP grid_size_x).
     w_trellis = _make_moe_weights(
@@ -6112,6 +6321,76 @@ def test_gpu_m1_top_k_exceeds_cuda_grid_y_limit() -> None:
         weight_format="convrot_trellis",
         dtype=torch.bfloat16,
     )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm GPU")
+def test_gpu_nvfp4_moe_rejects_unsupported_targets_without_mutation_or_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(1010)
+    gpu_weights: list[MoEWeights] = []
+    for fmt, gs in (("nvfp4_w4a16", 0), ("convrot_nvfp4_w4a16", 64)):
+        cpu_w = _make_moe_weights(
+            2,
+            64,
+            64,
+            weight_format=fmt,  # type: ignore[arg-type]
+            group_size=gs,
+            dtype=torch.bfloat16,
+            device="cpu",
+            seed=1010 + gs,
+        )
+        gpu_weights.append(
+            MoEWeights.from_quantized(
+                cpu_w.up_gate_qdata.cuda(),
+                cpu_w.up_gate_scale.cuda(),
+                cpu_w.down_qdata.cuda(),
+                cpu_w.down_scale.cuda(),
+                logical_dtype=torch.bfloat16,
+                up_gate_global_scale=(
+                    None
+                    if cpu_w.up_gate_global_scale is None
+                    else cpu_w.up_gate_global_scale.cuda()
+                ),
+                down_global_scale=(
+                    None if cpu_w.down_global_scale is None else cpu_w.down_global_scale.cuda()
+                ),
+                group_size=gs,
+            )
+        )
+
+    def _fail_reference(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("unexpected reference fallback on unsupported GPU target")
+
+    monkeypatch.setattr(moe_reference, "moe_ffn_reference", _fail_reference)
+    for spec in ((7, 5), (8, 9), "gfx1201"):
+        if isinstance(spec, tuple):
+            mock_cuda_target(monkeypatch, spec)
+        else:
+            mock_rocm_target(monkeypatch, spec)
+        for weights in gpu_weights:
+            for rows in (2, 0):
+                x = torch.randn((rows, 64), device="cuda", dtype=torch.bfloat16)
+                ids = torch.zeros((rows, 2), device="cuda", dtype=torch.int64)
+                wts = torch.full((rows, 2), 0.5, device="cuda", dtype=torch.bfloat16)
+                with pytest.raises(ValueError, match="SM12x"):
+                    moe_ffn(x, weights, ids, wts)
+
+                out = torch.full((rows, 64), 7.0, device="cuda", dtype=torch.bfloat16)
+                expected_out = out.clone()
+                prev_version = out._version
+                with pytest.raises(ValueError, match="SM12x"):
+                    moe_ffn(x, weights, ids, wts, out=out)
+                assert out._version == prev_version
+                assert torch.equal(out, expected_out)
+
+                with torch.inference_mode():
+                    inf_out = torch.full((rows, 64), 7.0, device="cuda", dtype=torch.bfloat16)
+                    expected_inf = inf_out.clone()
+                    with pytest.raises(ValueError, match="SM12x"):
+                        moe_ffn(x, weights, ids, wts, out=inf_out)
+                    assert torch.equal(inf_out, expected_inf)
 
 
 @pytest.mark.gpu
