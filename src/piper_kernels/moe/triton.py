@@ -24,7 +24,7 @@ from piper_kernels.weights.convrot.int8._quantization import dynamic_quantize_ro
 from piper_kernels.weights.convrot.triton import rotate_input
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
-from . import _int8_triton, _nvfp4_triton, _routing_triton, _schedule, _trellis_triton
+from . import _int8_triton, _nvfp4_triton, _policy, _schedule, _trellis_triton
 from ._int8_triton import (
     int8_moe_batched_matmul_kernel,
     int8_moe_grouped_gemm_kernel,
@@ -37,6 +37,7 @@ from ._nvfp4_triton import (
 )
 from ._routing_triton import (
     A16ChunkRouting,
+    moe_2d_tile_grid,
     moe_bucket_tokens_kernel,
     moe_m1_activate_rotate_kernel,
     moe_m1_weighted_reduce_kernel,
@@ -298,7 +299,7 @@ def _run_a16_chunk(
     with device_context(device):
         launch_proj(False, active_x_chunk, routing, up_target, split_k_up)
         if split_k_up > 1:
-            reduce_grid = _routing_triton.moe_2d_tile_grid(
+            reduce_grid = moe_2d_tile_grid(
                 triton.cdiv(up_gate_out, _schedule.NVFP4_REDUCE_BLOCK_N),
                 num_pairs,
                 num_warps=4,
@@ -327,7 +328,7 @@ def _run_a16_chunk(
                 swap_halves=False,
                 num_warps=4,
             )
-        activate_grid = _routing_triton.moe_2d_tile_grid(
+        activate_grid = moe_2d_tile_grid(
             triton.cdiv(intermediate_size, _schedule.ACTIVATE_BLOCK_SIZE),
             num_pairs,
             num_warps=4,
@@ -450,7 +451,7 @@ def _run_nvfp4_prefill_chunk(
     num_slots, hidden_size, packed_inter = down_qdata.shape
     intermediate_size = 2 * packed_inter
     up_gate_out = up_gate_qdata.shape[1]
-    prefill_schedule = _routing_triton.select_nvfp4_prefill_schedule(
+    prefill_schedule = _policy.select_nvfp4_prefill_schedule(
         target,
         chunk_rows=chunk_rows,
         top_k=top_k,
@@ -514,7 +515,7 @@ def _run_nvfp4_prefill_chunk(
     act_dtype = torch.float32 if group_size > 0 else out_chunk.dtype
     act = torch.empty((num_pairs, intermediate_size), device=device, dtype=act_dtype)
     with device_context(device):
-        activate_grid = _routing_triton.moe_2d_tile_grid(
+        activate_grid = moe_2d_tile_grid(
             triton.cdiv(intermediate_size, _schedule.ACTIVATE_BLOCK_SIZE),
             num_pairs,
             num_warps=4,
@@ -653,7 +654,7 @@ def _dispatch_nvfp4_moe(
 
     batched = regime == "batched"
     split_k_up = split_k_down = 1
-    m1_schedule = _routing_triton.select_nvfp4_m1_schedule(resolved_target)
+    m1_schedule = _policy.select_nvfp4_m1_schedule(resolved_target)
     active_schedule: _schedule.Nvfp4M1Schedule | _schedule.Nvfp4BatchedSchedule = m1_schedule
     post_scale_only = True
     num_sms = device_sm_count(device)
@@ -685,7 +686,7 @@ def _dispatch_nvfp4_moe(
     ):
         if batched:
             chunk_n = active_chunk.shape[0]
-            batched_schedule = _routing_triton.select_nvfp4_batched_schedule(
+            batched_schedule = _policy.select_nvfp4_batched_schedule(
                 resolved_target,
                 rows=chunk_n,
                 active_dtype=active_chunk.dtype,
@@ -882,7 +883,7 @@ def _run_int8_chunk(
             is_amd_hip=target.is_amd_hip,
         )
         if split_k_up > 1:
-            reduce_grid = _routing_triton.moe_2d_tile_grid(
+            reduce_grid = moe_2d_tile_grid(
                 triton.cdiv(up_gate_out, _schedule.INT8_REDUCE_BLOCK_N),
                 num_pairs,
                 num_warps=4,
@@ -1157,7 +1158,7 @@ def _run_int8_prefill_chunk(
     else:
         num_slots, hidden_size, intermediate_size = down_qdata.shape
         up_gate_out = up_gate_qdata.shape[1]
-    prefill_schedule = _routing_triton.select_int8_prefill_schedule(
+    prefill_schedule = _policy.select_int8_prefill_schedule(
         target,
         chunk_rows=chunk_rows,
         top_k=top_k,
@@ -1470,7 +1471,7 @@ def _dispatch_int8_moe(
         rows=chunk_rows * top_k,
         out_features=None,
     )
-    launch_schedule = _routing_triton.select_int8_launch_schedule(resolved_target)
+    launch_schedule = _policy.select_int8_launch_schedule(resolved_target)
     block_k = launch_schedule.block_k
     num_stages = launch_schedule.num_stages
     compiler_options = amd_compiler_workarounds.lds_only_fence_options(
@@ -1594,7 +1595,7 @@ def _dispatch_trellis_moe(
 
     int8_backend = (
         int8_backend_mod.select_linear_backend_for_target(resolved_target)
-        if _routing_triton.supports_trellis_int8_prefill(resolved_target)
+        if _policy.supports_trellis_int8_prefill(resolved_target)
         else None
     )
     bytes_per_pair = _schedule.prefill_bytes_per_pair(
@@ -1653,7 +1654,7 @@ def _dispatch_trellis_moe(
     down_slot_bytes = down_qdata.numel() // max(1, num_slots)
     expected_slots = min(num_slots, active_slots_hint) if active_slots_hint > 0 else num_slots
     split_k_up = split_k_down = 1
-    schedule = _routing_triton.select_trellis_schedule(
+    schedule = _policy.select_trellis_schedule(
         resolved_target,
         batched=batched,
         num_pairs=top_k,
@@ -1726,7 +1727,7 @@ def _dispatch_trellis_moe(
     ):
         if batched:
             num_pairs = active_chunk.shape[0] * top_k
-            schedule = _routing_triton.select_trellis_schedule(
+            schedule = _policy.select_trellis_schedule(
                 resolved_target,
                 batched=True,
                 num_pairs=num_pairs,

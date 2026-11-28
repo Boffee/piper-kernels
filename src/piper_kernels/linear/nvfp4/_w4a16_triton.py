@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from piper_kernels._triton.primitives import splitk_tile_bounds
+from piper_kernels._triton.primitives import decode_e4m3, splitk_tile_bounds
 from piper_kernels._triton.runtime import device_context
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear._splitk import device_sm_count
@@ -32,18 +32,6 @@ from ._w4a16_schedule import (
 
 _NVFP4_BLOCK_SIZE_TL = tl.constexpr(_layout.BLOCK_SIZE)
 _NVFP4_QDATA_BLOCK_SIZE_TL = tl.constexpr(_layout.QDATA_BLOCK_SIZE)
-
-
-@triton.jit
-def _decode_e4m3_u8(code):
-    """Exact FP32 value of FP8 E4M3FN byte bits without backend FP8 lowering quirks."""
-    sign = code >> 7
-    exponent = (code >> 3) & 15
-    mantissa = code & 7
-    normal = (((exponent + 120) << 23) | (mantissa << 20)).to(tl.float32, bitcast=True)
-    subnormal = mantissa.to(tl.float32) * 0.001953125
-    magnitude = tl.where(exponent == 0, subnormal, normal)
-    return tl.where(sign != 0, -magnitude, magnitude)
 
 
 @triton.jit
@@ -115,7 +103,7 @@ def _load_nvfp4_tile(
     w_hi = _decode_fp4_code(packed >> 4)
     w_even = w_hi if high_first else w_lo
     w_odd = w_lo if high_first else w_hi
-    scales = _decode_e4m3_u8(scale_u8.to(tl.uint32))
+    scales = decode_e4m3(scale_u8.to(tl.uint32))
     return w_even, w_odd, scales
 
 

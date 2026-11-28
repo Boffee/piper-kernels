@@ -1,8 +1,8 @@
-"""RDNA4 Gluon kernels for fused ConvRot INT8 sparse-Piper Q/K/V projections.
+"""RDNA4 Gluon kernels and AMD dispatch for sparse-Piper Q/K/V projections.
 
 Uses the shared 4x2 wave32 (128x128x64, 16 KB LDS) projection fragments and adds
 sparse-only K64 routing summaries, two-term K64 centers, and optional ``block_lengths``
-masking.
+masking. Falls back to shared Triton launchers when shapes or value formats differ.
 """
 
 # Gluon exposes low-level signatures and layouts that are not modeled by static type checkers.
@@ -12,13 +12,19 @@ masking.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import cdna3
 
 from piper_kernels._triton.runtime import device_context
-from piper_kernels.attention.kernels.sparse_piper.layout import TILE_ROWS, ValueFormat
+from piper_kernels.attention.kernels.sparse_piper.layout import (
+    TILE_ROWS,
+    ValueFormat,
+    padded_sequence_length,
+)
 from piper_kernels.attention.sparse_piper_attention._contracts import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_projection._amd import fragments
 from piper_kernels.fusions.convrot_int8_projection._plan import (
@@ -26,7 +32,9 @@ from piper_kernels.fusions.convrot_int8_projection._plan import (
     resolve_row_block_launches,
 )
 
+from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
+from . import policy
 from .policy import GLUON_BLOCK_M
 
 # One-barrier cross-M-warp column reduction layouts (distributes 128 columns across warps/lanes).
@@ -707,6 +715,65 @@ def _value_kernel(
         )
 
 
+def default_execution_plan(
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    *,
+    operation: policy.ProjectionOperation,
+    head_dim: int,
+    rotary_dim: int = 0,
+    storage_sequence_length: int | None = None,
+    value_format: ValueFormat = ValueFormat.AMD_WMMA,
+) -> policy.AmdExecutionPlan:
+    """Resolve operand metadata and select RDNA4 Gluon or Triton execution."""
+    resolved_storage_sequence = (
+        padded_sequence_length(input_qdata.shape[1])
+        if storage_sequence_length is None
+        else storage_sequence_length
+    )
+    heads = (
+        weight_qdata.shape[0] // head_dim
+        if head_dim > 0 and weight_qdata.shape[0] % head_dim == 0
+        else 0
+    )
+    return policy.select_execution_plan(
+        operation,
+        head_dim=head_dim,
+        input_features=input_qdata.shape[2],
+        heads=heads,
+        rotary_dim=rotary_dim,
+        operands_aligned=operands_aligned(
+            input_qdata,
+            weight_qdata,
+            storage_sequence_length=resolved_storage_sequence,
+            rotary_dim=rotary_dim,
+            head_dim=head_dim,
+        ),
+        value_format=value_format,
+    )
+
+
+def partial_row_block_size(
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    *,
+    operation: Literal["key", "value"],
+    head_dim: int,
+    rotary_dim: int = 0,
+    value_format: ValueFormat = ValueFormat.TRANSPOSED,
+) -> int:
+    """Return RDNA4's row block height for partial K/V launches."""
+    return default_execution_plan(
+        input_qdata,
+        weight_qdata,
+        operation=operation,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        storage_sequence_length=padded_sequence_length(input_qdata.shape[1]),
+        value_format=value_format,
+    ).block_m
+
+
 def project_query(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
@@ -724,11 +791,43 @@ def project_query(
     chunk_rows: int,
     out: QueryOutput,
     bias: torch.Tensor | None = None,
-    execution_plan: ProjectionExecutionPlan,
+    execution_plan: ProjectionExecutionPlan | None = None,
 ) -> None:
-    """Fill Q32 INT8 queries, scales, and Q64 summaries via RDNA4 Gluon kernels."""
+    """Fill Q32 INT8 queries, scales, and Q64 summaries via RDNA4 Gluon or Triton fallback."""
     query, query_scale, query_summary = out
     batch, heads, storage_sequence_length, head_dim = query.shape
+    plan = (
+        default_execution_plan(
+            input_qdata,
+            weight_qdata,
+            operation="query",
+            head_dim=head_dim,
+            rotary_dim=cos.shape[1],
+            storage_sequence_length=storage_sequence_length,
+        )
+        if execution_plan is None
+        else execution_plan
+    )
+    if not (isinstance(plan, policy.AmdExecutionPlan) and plan.uses_gluon):
+        projection.project_query(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            norm_weight,
+            cos,
+            sin,
+            norm_epsilon,
+            softmax_scale,
+            routing_mode,
+            block_lengths,
+            execution_plan=plan,
+            chunk_start=chunk_start,
+            chunk_rows=chunk_rows,
+            out=out,
+            bias=bias,
+        )
+        return
     if batch == 0 or chunk_rows == 0:
         return
     mask_block_lengths = block_lengths is not None
@@ -767,8 +866,8 @@ def project_query(
                 mean_pool_summary=routing_mode == _MEAN_ROUTING,
                 mask_block_lengths=mask_block_lengths,
                 mask_rows=(not aligned_rows) or mask_block_lengths,
-                group_m=execution_plan.group_m,
-                num_warps=execution_plan.num_warps,
+                group_m=plan.group_m,
+                num_warps=plan.num_warps,
                 **options,
             )
 
@@ -787,13 +886,44 @@ def project_key(
     *,
     out: KeyOutput,
     bias: torch.Tensor | None = None,
-    execution_plan: ProjectionExecutionPlan,
+    execution_plan: ProjectionExecutionPlan | None = None,
     start_row_block: int = 0,
     num_row_blocks: int | None = None,
 ) -> None:
-    """Fill K64-centered INT8 keys, scales, 2-term centers, and summaries via RDNA4 Gluon."""
+    """Fill K64-centered INT8 keys, scales, centers, and summaries via RDNA4 Gluon or Triton."""
     key, key_scale, key_center, key_center_scale, key_summary, key_aux = out
     batch, heads, storage_sequence_length, head_dim = key.shape
+    plan = (
+        default_execution_plan(
+            input_qdata,
+            weight_qdata,
+            operation="key",
+            head_dim=head_dim,
+            rotary_dim=cos.shape[1],
+            storage_sequence_length=storage_sequence_length,
+        )
+        if execution_plan is None
+        else execution_plan
+    )
+    if not (isinstance(plan, policy.AmdExecutionPlan) and plan.uses_gluon):
+        projection.project_key(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            norm_weight,
+            cos,
+            sin,
+            norm_epsilon,
+            routing_mode,
+            block_lengths,
+            execution_plan=plan,
+            out=out,
+            bias=bias,
+            start_row_block=start_row_block,
+            num_row_blocks=num_row_blocks,
+        )
+        return
     sequence_length = input_qdata.shape[1]
     if batch == 0 or sequence_length == 0:
         return
@@ -845,8 +975,8 @@ def project_key(
                 mean_pool_summary=mean_pool_summary,
                 mask_block_lengths=mask_block_lengths,
                 mask_rows=mask_rows,
-                group_m=execution_plan.group_m,
-                num_warps=execution_plan.num_warps,
+                group_m=plan.group_m,
+                num_warps=plan.num_warps,
                 **options,
             )
 
@@ -861,15 +991,44 @@ def project_value(
     value_format: ValueFormat,
     out: ValueOutput,
     bias: torch.Tensor | None = None,
-    execution_plan: ProjectionExecutionPlan,
+    execution_plan: ProjectionExecutionPlan | None = None,
     start_row_block: int = 0,
     num_row_blocks: int | None = None,
 ) -> None:
-    """Fill K64 tile-centered INT8 values, multipliers, and BF16 means via RDNA4 Gluon."""
-    if value_format is not ValueFormat.AMD_WMMA:
-        raise ValueError("RDNA4 Gluon V projection requires ValueFormat.AMD_WMMA storage")
+    """Fill K64 tile-centered INT8 values, multipliers, and BF16 means via RDNA4 Gluon or Triton."""
     value, value_scale_multiplier, value_mean = out
     batch, heads, storage_tiles, head_dim = value_mean.shape
+    plan = (
+        default_execution_plan(
+            input_qdata,
+            weight_qdata,
+            operation="value",
+            head_dim=head_dim,
+            storage_sequence_length=storage_tiles * TILE_ROWS,
+            value_format=value_format,
+        )
+        if execution_plan is None
+        else execution_plan
+    )
+    if not (
+        isinstance(plan, policy.AmdExecutionPlan)
+        and plan.uses_gluon
+        and value_format is ValueFormat.AMD_WMMA
+    ):
+        projection.project_value(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            block_lengths,
+            execution_plan=plan,
+            value_format=value_format,
+            out=out,
+            bias=bias,
+            start_row_block=start_row_block,
+            num_row_blocks=num_row_blocks,
+        )
+        return
     sequence_length = input_qdata.shape[1]
     if batch == 0 or sequence_length == 0:
         return
@@ -903,7 +1062,7 @@ def project_value(
                 head_dim=head_dim,
                 mask_block_lengths=mask_block_lengths,
                 mask_rows=(not aligned_rows) or mask_block_lengths,
-                group_m=execution_plan.group_m,
-                num_warps=execution_plan.num_warps,
+                group_m=plan.group_m,
+                num_warps=plan.num_warps,
                 **options,
             )

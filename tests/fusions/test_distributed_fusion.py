@@ -1151,7 +1151,7 @@ def test_kv_gather_overlap_and_fallback_order(monkeypatch: pytest.MonkeyPatch) -
 def test_nvidia_partial_kv_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("triton")
     from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import (  # noqa: PLC0415
-        dispatch as nvidia_dispatch,
+        gluon as nvidia_dispatch,
     )
 
     with FakeTensorMode():

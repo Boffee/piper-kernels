@@ -11,8 +11,8 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
 from piper_kernels._triton.amd_compiler_workarounds import lds_only_fence_options
-from piper_kernels.attention.sparse_piper_attention._backend import (
-    select_amd_minmax_score_schedule,
+from piper_kernels.attention.sparse_piper_attention._amd.policy import (
+    select_minmax_score_schedule as select_amd_minmax_score_schedule,
 )
 from piper_kernels.attention.sparse_piper_attention._nvidia.policy import (
     select_sm120_minmax_score_schedule,

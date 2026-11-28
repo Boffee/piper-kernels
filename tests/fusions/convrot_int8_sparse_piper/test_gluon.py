@@ -23,7 +23,7 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
     _MINMAX_ROUTING,
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as projection
-from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import dispatch, gluon, policy
+from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import gluon, policy
 from piper_kernels.linear.convrot.int8._nvidia import gluon_tma
 
 from ._reference import reconstruct_key_center
@@ -112,18 +112,19 @@ def _launch(
     bias=None,
     window=(64, 129),
     target=_SM89_TARGET,
+    use_default_plan=False,
     **options,
 ):
     input_qdata, input_scale, weight_qdata, weight_scale, *_ = operands
-    if module in (dispatch, gluon) and "execution_plan" not in options:
+    if module is gluon and "execution_plan" not in options:
         metadata = {
             "operation": operation,
             "head_dim": out[0].shape[2 if operation == "value" else 3],
             "rotary_dim": 0 if operation == "value" else operands[5].shape[1],
         }
         options["execution_plan"] = (
-            dispatch.default_execution_plan(input_qdata, weight_qdata, target=target, **metadata)
-            if module is dispatch
+            gluon.default_execution_plan(input_qdata, weight_qdata, target=target, **metadata)
+            if use_default_plan
             else policy.select_execution_plan(
                 target, input_features=input_qdata.shape[2], operands_aligned=True, **metadata
             )
@@ -177,16 +178,16 @@ def _launch(
 def test_every_target_uses_gluon_only_for_supported_projections(
     monkeypatch, target, operation, head_dim, input_features, rotary_dim, supported
 ):
-    monkeypatch.setattr(dispatch.linear_gluon, "operands_aligned", lambda *operands: True)
+    monkeypatch.setattr(gluon.linear_gluon, "operands_aligned", lambda *operands: True)
     gluon_launch, triton_launch = Mock(), Mock()
-    monkeypatch.setattr(gluon, f"project_{operation}", gluon_launch)
+    monkeypatch.setattr(gluon, f"_project_{operation}_gluon", gluon_launch)
     monkeypatch.setattr(projection, f"project_{operation}", triton_launch)
     with FakeTensorMode():
         operands = _operands(
             "cuda:1", input_features=input_features, head_dim=head_dim, rotary_dim=rotary_dim
         )
         out = _outputs(operation, "cuda:1", storage=256, head_dim=head_dim)
-        _launch(dispatch, operation, operands, out, target=target)
+        _launch(gluon, operation, operands, out, target=target, use_default_plan=True)
     # V has no RoPE, so only its head and input widths matter.
     uses_gluon = supported or (
         operation == "value" and head_dim == 128 and input_features % 64 == 0
@@ -515,7 +516,7 @@ def test_execution_plan_checks_both_operand_pointer_alignments(target, operand_i
     original = operands[operand_index]
     storage = torch.empty(original.numel() + offset, dtype=torch.int8)
     operands[operand_index] = storage[offset:].view_as(original)
-    plan = dispatch.default_execution_plan(
+    plan = gluon.default_execution_plan(
         operands[0],
         operands[2],
         target=target,
@@ -533,9 +534,9 @@ def test_execution_plan_requires_contiguous_operands(target, operand_index):
     operands = list(_operands("cpu", batch=1, sequence=192, heads=2))
     operands[0] = operands[0][:, ::2, :] if operand_index == 0 else operands[0]
     operands[2] = operands[2][::2, :] if operand_index == 2 else operands[2]
-    assert dispatch.linear_gluon.operands_aligned(operands[0], operands[2])
+    assert gluon.linear_gluon.operands_aligned(operands[0], operands[2])
     assert not operands[operand_index].is_contiguous()
-    plan = dispatch.default_execution_plan(
+    plan = gluon.default_execution_plan(
         operands[0],
         operands[2],
         target=target,
@@ -564,7 +565,7 @@ def test_unaligned_projections_use_the_triton_fallback(
     operands[operand_index] = storage[offset:].view_as(original).copy_(original)
     assert operands[operand_index].is_contiguous()
     guard = Mock(side_effect=AssertionError("unaligned operands reached Gluon"))
-    monkeypatch.setattr(gluon, f"project_{operation}", guard)
+    monkeypatch.setattr(gluon, f"_project_{operation}_gluon", guard)
     expected = _outputs(operation, "cuda", storage=256, batch=1, heads=1)
     actual = _outputs(operation, "cuda", storage=256, batch=1, heads=1)
     plan = policy.select_execution_plan(
@@ -578,7 +579,7 @@ def test_unaligned_projections_use_the_triton_fallback(
         execution_plan=plan,
         window=(0, 193),
     )
-    _launch(dispatch, operation, operands, actual, window=(0, 193))
+    _launch(gluon, operation, operands, actual, window=(0, 193), use_default_plan=True)
     guard.assert_not_called()
     for left, right in zip(actual, expected, strict=True):
         torch.testing.assert_close(left, right, rtol=0, atol=0)
@@ -607,13 +608,14 @@ def test_gluon_query_window_intersects_block_lengths(routing_mode, rows, lengths
         (expected, storage, effective_lengths),
     ):
         _launch(
-            dispatch,
+            gluon,
             "query",
             operands,
             out,
             routing_mode=routing_mode,
             block_lengths=torch.tensor(valid_prefixes, device="cuda", dtype=torch.int32),
             window=(start, window_rows),
+            use_default_plan=True,
         )
     for left, right in zip(actual, expected, strict=True):
         torch.testing.assert_close(left, right, rtol=0, atol=0)
@@ -638,7 +640,7 @@ def test_sm120_tma_projections_match_async_copy(operation, input_features, mean_
     bias = torch.randn(heads * 128, device="cuda").bfloat16() if mean_routing else None
     window = (64, 129)
     storage = padded_sequence_length(window[1] if operation == "query" else sequence)
-    plan = dispatch.default_execution_plan(
+    plan = gluon.default_execution_plan(
         operands[0], operands[2], operation=operation, head_dim=128, rotary_dim=96
     )
     assert plan.kernel == "gluon_tma"
@@ -648,7 +650,7 @@ def test_sm120_tma_projections_match_async_copy(operation, input_features, mean_
             operation, "cuda", storage=storage, batch=batch, heads=heads, mean_routing=mean_routing
         )
         _launch(
-            dispatch,
+            gluon,
             operation,
             operands,
             out,
@@ -671,20 +673,20 @@ def test_sm120_tma_graph_capture_and_replay(operation):
     batch, sequence, heads = 2, 193, 3
     operands = _operands("cuda", batch=batch, sequence=sequence, heads=heads, input_features=256)
     storage = padded_sequence_length(sequence)
-    plan = dispatch.default_execution_plan(
+    plan = gluon.default_execution_plan(
         operands[0], operands[2], operation=operation, head_dim=128, rotary_dim=96
     )
     assert plan.kernel == "gluon_tma"
     actual = _outputs(operation, "cuda", storage=storage, batch=batch, heads=heads)
     expected = _outputs(operation, "cuda", storage=storage, batch=batch, heads=heads)
-    _launch(dispatch, operation, operands, actual, window=(0, sequence), execution_plan=plan)
+    _launch(gluon, operation, operands, actual, window=(0, sequence), execution_plan=plan)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _launch(dispatch, operation, operands, actual, window=(0, sequence), execution_plan=plan)
+        _launch(gluon, operation, operands, actual, window=(0, sequence), execution_plan=plan)
     operands[0].random_(-127, 128)
     for tensor in actual:
         tensor.zero_()
     graph.replay()
-    _launch(dispatch, operation, operands, expected, window=(0, sequence), execution_plan=plan)
+    _launch(gluon, operation, operands, expected, window=(0, sequence), execution_plan=plan)
     for left, right in zip(actual, expected, strict=True):
         assert torch.equal(left.view(torch.uint8), right.view(torch.uint8))

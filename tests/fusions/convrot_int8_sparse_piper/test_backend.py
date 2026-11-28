@@ -36,17 +36,16 @@ from piper_kernels.fusions.convrot_int8_projection._plan import resolve_row_bloc
 from piper_kernels.fusions.convrot_int8_sparse_piper import (
     _backend,
     _compile,
-    _kernels,
     _output_compile,
     key,
     output,
     query,
     value,
 )
-from piper_kernels.fusions.convrot_int8_sparse_piper._amd import gluon as amd_gluon
+from piper_kernels.fusions.convrot_int8_sparse_piper import triton as shared_triton
+from piper_kernels.fusions.convrot_int8_sparse_piper._amd import gluon as amd
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy as amd_policy
-from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
-from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import dispatch as nvidia
+from piper_kernels.fusions.convrot_int8_sparse_piper._nvidia import gluon as nvidia
 from piper_kernels.fusions.nvfp4_sparse_piper import output as nvfp4_output
 
 
@@ -162,12 +161,11 @@ class _MissingModuleFinder(importlib.abc.MetaPathFinder):
 @pytest.mark.parametrize("vendor", ["_nvidia", "_amd"])
 def test_projection_import_only_tolerates_absent_top_level_triton(monkeypatch, missing, vendor):
     package = "piper_kernels.fusions.convrot_int8_sparse_piper"
-    implementation = "dispatch" if vendor == "_nvidia" else "triton"
-    fullname = f"{package}.{vendor}.{implementation}"
+    fullname = f"{package}.{vendor}.gluon"
     error = ModuleNotFoundError("missing dependency", name=missing)
     vendor_pkg = sys.modules.get(f"{package}.{vendor}")
     if vendor_pkg is not None:
-        monkeypatch.delitem(vendor_pkg.__dict__, implementation, raising=False)
+        monkeypatch.delitem(vendor_pkg.__dict__, "gluon", raising=False)
     monkeypatch.delitem(sys.modules, fullname, raising=False)
     monkeypatch.setattr(sys, "meta_path", [_MissingModuleFinder(fullname, error), *sys.meta_path])
     spec = importlib.util.spec_from_file_location(_backend.__name__, _backend.__file__)
@@ -732,13 +730,13 @@ def _capture_projection(
         mock_rocm_target(monkeypatch, target.architecture)
         monkeypatch.setattr(sys, "platform", "linux")
     functions = {
-        "query": _kernels._convrot_project_rmsnorm_rope_quantize_query_kernel,
-        "key": _kernels._convrot_project_rmsnorm_rope_quantize_sparse_key_kernel,
-        "value": _kernels._convrot_project_quantize_sparse_value_kernel,
+        "query": shared_triton._convrot_project_rmsnorm_rope_quantize_query_kernel,
+        "key": shared_triton._convrot_project_rmsnorm_rope_quantize_sparse_key_kernel,
+        "value": shared_triton._convrot_project_quantize_sparse_value_kernel,
     }
     function = functions[operation]
     kernel = MagicMock()
-    monkeypatch.setattr(_kernels, function.__name__, kernel)
+    monkeypatch.setattr(shared_triton, function.__name__, kernel)
     guard = Mock(side_effect=lambda device: nullcontext())
     monkeypatch.setattr(torch.cuda, "device", guard)
     with FakeTensorMode():
@@ -985,7 +983,7 @@ def _compile_amd_gluon_kernel(
     mask_block_lengths: bool,
     input_features: int = 5376,
 ):
-    function = getattr(amd_gluon, f"_{operation}_kernel")
+    function = getattr(amd, f"_{operation}_kernel")
     heads = 56 if head_dim == 128 else 32
     constants = {
         "input_features": input_features,
@@ -1012,7 +1010,7 @@ def _compile_amd_gluon_kernel(
         else:
             signature[name] = "i32"
     extra = (
-        amd_gluon._build_key_kernel_options(
+        amd._build_key_kernel_options(
             head_dim,
             rotary_dim,
             mask_rows=mask_rows,
@@ -1020,7 +1018,7 @@ def _compile_amd_gluon_kernel(
             mean_pool_summary=mean_pool_summary,
         )
         if operation == "key"
-        else amd_gluon._build_kernel_options()
+        else amd._build_kernel_options()
     )
     compiled = triton.compile(
         GluonASTSource(function, signature, constexprs=constants, attrs=attributes),
@@ -1077,19 +1075,19 @@ def test_amd_policy_and_gluon_eligibility_contracts():
         w_d64_odd = torch.empty((3 * 64, 256), device="cuda:0", dtype=torch.int8)
         w_d128 = torch.empty((3 * 128, 256), device="cuda:0", dtype=torch.int8)
 
-        assert amd_gluon.operands_aligned(
+        assert amd.operands_aligned(
             q_in, w_d64_even, storage_sequence_length=256, rotary_dim=48, head_dim=64
         )
-        assert not amd_gluon.operands_aligned(
+        assert not amd.operands_aligned(
             q_in[:, ::2], w_d64_even, storage_sequence_length=128, rotary_dim=48, head_dim=64
         )
-        assert not amd_gluon.operands_aligned(
+        assert not amd.operands_aligned(
             q_in, w_d64_even[:, ::2], storage_sequence_length=256, rotary_dim=48, head_dim=64
         )
         # Signed 32-bit FP32 byte-offset check: 8_388_608 * 64 * 4 exceeds 2**31 bytes.
         q_large_fp32 = torch.empty((1, 8_388_608, 64), device="cuda:0", dtype=torch.int8)
         w_small = torch.empty((4 * 64, 64), device="cuda:0", dtype=torch.int8)
-        assert not amd_gluon.operands_aligned(
+        assert not amd.operands_aligned(
             q_large_fp32, w_small, storage_sequence_length=8_388_608, rotary_dim=64, head_dim=64
         )
 

@@ -22,8 +22,8 @@ from piper_kernels.attention.sparse_piper_attention._contracts import (
 )
 from piper_kernels.fusions.convrot_int8_sparse_piper import _backend, key, output, query, value
 from piper_kernels.fusions.convrot_int8_sparse_piper import triton as shared_triton
+from piper_kernels.fusions.convrot_int8_sparse_piper._amd import gluon as amd
 from piper_kernels.fusions.convrot_int8_sparse_piper._amd import policy
-from piper_kernels.fusions.convrot_int8_sparse_piper._amd import triton as amd
 from piper_kernels.linear.convrot.int8 import _backend as linear_backend
 
 from ._reference import (

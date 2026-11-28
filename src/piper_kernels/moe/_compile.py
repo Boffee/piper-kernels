@@ -31,7 +31,7 @@ from piper_kernels.trellis.triton import _decode_stream_flags, decode_slots_int8
 from piper_kernels.weights.convrot._rotation import validate_group_size
 from piper_kernels.weights.nvfp4 import _layout as nvfp4_layout
 
-from . import _routing_triton, _schedule
+from . import _policy, _schedule
 from ._int8_triton import (
     int8_moe_batched_matmul_kernel,
     int8_moe_grouped_gemm_kernel,
@@ -477,7 +477,7 @@ def _compile_int8_prefill_kernels(
     compile_fn: TritonCompileFn,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
-    schedule = _routing_triton.select_int8_prefill_schedule(
+    schedule = _policy.select_int8_prefill_schedule(
         accel,
         chunk_rows=rows,
         top_k=top_k,
@@ -594,7 +594,7 @@ def _compile_nvfp4_prefill_kernels(
 ) -> dict[str, triton.compiler.CompiledKernel]:
     active_dtype = torch.float32 if group_size > 0 else logical_dtype
     active_ty = TRITON_FLOAT_POINTER_TYPES[active_dtype]
-    schedule = _routing_triton.select_nvfp4_prefill_schedule(
+    schedule = _policy.select_nvfp4_prefill_schedule(
         accel,
         chunk_rows=rows,
         top_k=top_k,
@@ -690,7 +690,7 @@ def _compile_int8_kernels(
     compile_fn: TritonCompileFn,
 ) -> dict[str, triton.compiler.CompiledKernel]:
     up_gate_out = intermediate_size * (2 if activation_fn == "swiglu" else 1)
-    schedule = _routing_triton.select_int8_launch_schedule(accel)
+    schedule = _policy.select_int8_launch_schedule(accel)
     block_k = schedule.block_k
     num_stages = schedule.num_stages
     compiler_options = amd_compiler_workarounds.lds_only_fence_options(schedule.lds_only_fences)
@@ -909,7 +909,7 @@ def _compile_nvfp4_kernels(
     active_ty = TRITON_FLOAT_POINTER_TYPES[active_dtype]
     is_splitk = split_k > 1
     if batched:
-        schedule = _routing_triton.select_nvfp4_batched_schedule(
+        schedule = _policy.select_nvfp4_batched_schedule(
             accel,
             rows=rows,
             active_dtype=active_dtype,
@@ -943,7 +943,7 @@ def _compile_nvfp4_kernels(
         }
         gemv_opts: dict[str, object] = {"num_warps": schedule.num_warps, "num_stages": 1}
     else:
-        m1_schedule = _routing_triton.select_nvfp4_m1_schedule(accel)
+        m1_schedule = _policy.select_nvfp4_m1_schedule(accel)
         post_scale_only = True
         use_sm120_e2m1x2 = m1_schedule.use_sm120_e2m1x2
         nvfp4_signature = {
@@ -1181,7 +1181,7 @@ def _compile_trellis_kernels(
     tile_steps = triton.next_power_of_2(block_size)
     exact_pow2 = block_size == tile_steps
     expected_slots = min(num_slots, active_slots_hint) if active_slots_hint > 0 else num_slots
-    schedule = _routing_triton.select_trellis_schedule(
+    schedule = _policy.select_trellis_schedule(
         accel,
         batched=batched,
         num_pairs=rows * top_k,
@@ -1374,7 +1374,7 @@ def compile_moe_kernels(
         from piper_kernels.linear.convrot.int8 import _backend as int8_backend_mod  # noqa: PLC0415
 
         has_int8_backend = (
-            _routing_triton.supports_trellis_int8_prefill(accel)
+            _policy.supports_trellis_int8_prefill(accel)
             and int8_backend_mod.select_linear_backend_for_target(accel) is not None
         )
 

@@ -2,23 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 
 from piper_kernels._triton.targets import GFX120X_ARCHITECTURES, AcceleratorTarget
 
 from .._schedule import (
-    NVFP4_DOT_BLOCK_K,
     NVFP4_DOT_BLOCK_K_GFX120X,
-    NVFP4_DOT_BLOCK_N,
-    NVFP4_DOT_NUM_WARPS_CUDA,
-    NVFP4_GEMV_BLOCK_K,
-    NVFP4_GEMV_BLOCK_N,
     NVFP4_GEMV_NUM_WARPS,
-    PREFILL_NVFP4_BLOCK_K,
-    PREFILL_NVFP4_DENSE_BLOCK_M,
-    PREFILL_NVFP4_DENSE_BLOCK_N,
-    PREFILL_NVFP4_SPARSE_BLOCK_M,
-    PREFILL_NVFP4_SPARSE_BLOCK_N,
     TRELLIS_GEMV_BATCH_BLOCK_M,
     TRELLIS_GEMV_GFX120X_SPARSE_BLOCK_M,
     TRELLIS_GEMV_NUM_WARPS,
@@ -27,8 +19,9 @@ from .._schedule import (
     Nvfp4M1Schedule,
     Nvfp4PrefillSchedule,
     TrellisMoeSchedule,
+    default_nvfp4_batched_schedule,
     default_nvfp4_m1_schedule,
-    select_prefill_block_m,
+    default_nvfp4_prefill_schedule,
 )
 
 
@@ -45,38 +38,12 @@ def select_nvfp4_batched_schedule(
     logical_dtype: torch.dtype,
 ) -> Nvfp4BatchedSchedule:
     """Resolve small-batch NVFP4 MoE schedule for AMD gfx120x and fallback HIP targets."""
-    use_dot = rows > 4 and (
-        active_dtype in (torch.float16, torch.bfloat16)
-        or (active_dtype is torch.float32 and logical_dtype is torch.bfloat16)
+    base = default_nvfp4_batched_schedule(
+        rows=rows, active_dtype=active_dtype, logical_dtype=logical_dtype
     )
-    cast_fp32_to_bf16 = use_dot and active_dtype is torch.float32
-    post_scale_only = not (use_dot and active_dtype is torch.float16)
-    if use_dot:
-        block_k = (
-            NVFP4_DOT_BLOCK_K_GFX120X
-            if target.is_hip_architecture(*GFX120X_ARCHITECTURES)
-            else NVFP4_DOT_BLOCK_K
-        )
-        return Nvfp4BatchedSchedule(
-            use_dot=True,
-            cast_fp32_to_bf16=cast_fp32_to_bf16,
-            post_scale_only=post_scale_only,
-            block_n=NVFP4_DOT_BLOCK_N,
-            block_k=block_k,
-            num_warps=NVFP4_GEMV_NUM_WARPS,
-            single_dot=False,
-            use_sm120_e2m1x2=False,
-        )
-    return Nvfp4BatchedSchedule(
-        use_dot=False,
-        cast_fp32_to_bf16=False,
-        post_scale_only=post_scale_only,
-        block_n=NVFP4_GEMV_BLOCK_N,
-        block_k=NVFP4_GEMV_BLOCK_K,
-        num_warps=NVFP4_GEMV_NUM_WARPS,
-        single_dot=False,
-        use_sm120_e2m1x2=False,
-    )
+    if base.use_dot and target.is_hip_architecture(*GFX120X_ARCHITECTURES):
+        return replace(base, block_k=NVFP4_DOT_BLOCK_K_GFX120X)
+    return base
 
 
 def select_nvfp4_prefill_schedule(
@@ -90,37 +57,17 @@ def select_nvfp4_prefill_schedule(
     logical_dtype: torch.dtype,
 ) -> Nvfp4PrefillSchedule:
     """Resolve grouped prefill NVFP4 MoE schedule for AMD wave32/wave64 targets."""
-    force_fp32_dot = active_dtype is torch.float32 and logical_dtype is not torch.bfloat16
-    cast_fp32_to_bf16 = (not force_fp32_dot) and (active_dtype is torch.float32)
-    half_scales = not force_fp32_dot
-    block_m = select_prefill_block_m(
-        chunk_rows,
-        top_k,
-        num_slots,
-        active_slots_hint,
-        sparse_m=PREFILL_NVFP4_SPARSE_BLOCK_M,
-        dense_m=PREFILL_NVFP4_DENSE_BLOCK_M,
+    base = default_nvfp4_prefill_schedule(
+        chunk_rows=chunk_rows,
+        top_k=top_k,
+        num_slots=num_slots,
+        active_slots_hint=active_slots_hint,
+        active_dtype=active_dtype,
+        logical_dtype=logical_dtype,
     )
-    is_wave64 = target.is_hip_architecture("gfx942")
-    if block_m == PREFILL_NVFP4_SPARSE_BLOCK_M:
-        block_n = PREFILL_NVFP4_SPARSE_BLOCK_N
-        num_warps = (
-            NVFP4_DOT_NUM_WARPS_CUDA if (force_fp32_dot and not is_wave64) else NVFP4_GEMV_NUM_WARPS
-        )
-    else:
-        block_n = PREFILL_NVFP4_SPARSE_BLOCK_N if force_fp32_dot else PREFILL_NVFP4_DENSE_BLOCK_N
-        num_warps = NVFP4_GEMV_NUM_WARPS if is_wave64 else NVFP4_DOT_NUM_WARPS_CUDA
-    return Nvfp4PrefillSchedule(
-        cast_fp32_to_bf16=cast_fp32_to_bf16,
-        force_fp32_dot=force_fp32_dot,
-        half_scales=half_scales,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=PREFILL_NVFP4_BLOCK_K,
-        num_warps=num_warps,
-        single_dot=False,
-        use_sm120_e2m1x2=False,
-    )
+    if target.is_hip_architecture("gfx942"):
+        return replace(base, num_warps=NVFP4_GEMV_NUM_WARPS)
+    return base
 
 
 def select_int8_launch_schedule(target: AcceleratorTarget) -> Int8LaunchSchedule:

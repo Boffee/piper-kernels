@@ -10,7 +10,7 @@ from ._nvidia import policy as nvidia_projection_policy
 
 try:
     from ._amd import gluon as _amd_projection
-    from ._nvidia import dispatch as _nvidia_projection
+    from ._nvidia import gluon as _nvidia_projection
 except ModuleNotFoundError as error:
     if error.name != "triton":
         raise

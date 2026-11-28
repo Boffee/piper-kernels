@@ -1,4 +1,4 @@
-"""SM8x and SM120 Gluon kernels for the fused ConvRot INT8 sparse-Piper Q/K/V projections.
+"""SM8x and SM120 Gluon kernels and NVIDIA dispatch for sparse-Piper Q/K/V projections.
 
 Each program projects 128 rows onto one D128 head with the shared projection
 fragments, using ``cp.async`` copies on SM8x and TMA loads on SM120. Q emits
@@ -18,11 +18,14 @@ The policy module selects shared Triton launchers for other shapes or unaligned 
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from piper_kernels._triton.runtime import device_context
+from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.attention.kernels.sparse_piper.layout import (
     QUERY_SCALE_ROWS,
     TILE_ROWS,
@@ -30,9 +33,15 @@ from piper_kernels.attention.kernels.sparse_piper.layout import (
 )
 from piper_kernels.attention.sparse_piper_attention._contracts import _MEAN_ROUTING
 from piper_kernels.fusions.convrot_int8_projection._nvidia import fragments
-from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import NvidiaExecutionPlan
+from piper_kernels.fusions.convrot_int8_projection._nvidia.policy import (
+    NvidiaExecutionPlan,
+    ProjectionOperation,
+)
+from piper_kernels.linear.convrot.int8._nvidia import gluon_async_copy as linear_gluon
 
+from .. import triton as projection
 from .._interfaces import KeyOutput, QueryOutput, ValueOutput
+from . import policy
 
 _HEAD_DIM = fragments.HEAD_DIM
 
@@ -574,7 +583,32 @@ def _value_kernel(
     )
 
 
-def project_query(
+def default_execution_plan(
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    *,
+    operation: ProjectionOperation,
+    head_dim: int,
+    rotary_dim: int = 0,
+    target: AcceleratorTarget | None = None,
+) -> NvidiaExecutionPlan:
+    """Resolve operand metadata, accepting an explicit target for offline tuning."""
+    target = AcceleratorTarget.from_device(input_qdata.device) if target is None else target
+    return policy.select_execution_plan(
+        target,
+        operation=operation,
+        input_features=input_qdata.shape[2],
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        operands_aligned=(
+            linear_gluon.operands_aligned(input_qdata, weight_qdata)
+            and input_qdata.is_contiguous()
+            and weight_qdata.is_contiguous()
+        ),
+    )
+
+
+def _project_query_gluon(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -638,7 +672,7 @@ def project_query(
         fragments.launch_row_blocks(chunk_rows, launch, mask_full_tiles=mask_block_lengths)
 
 
-def project_key(
+def _project_key_gluon(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -700,7 +734,7 @@ def project_key(
         fragments.launch_row_blocks(sequence_length, launch, mask_full_tiles=mask_block_lengths)
 
 
-def project_value(
+def _project_value_gluon(
     input_qdata: torch.Tensor,
     input_scale: torch.Tensor,
     weight_qdata: torch.Tensor,
@@ -750,3 +784,202 @@ def project_value(
         fragments.launch_row_blocks(
             input_qdata.shape[1], launch, mask_full_tiles=mask_block_lengths
         )
+
+
+def project_query(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_epsilon: float,
+    softmax_scale: float,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None,
+    *,
+    chunk_start: int,
+    chunk_rows: int,
+    out: QueryOutput,
+    bias: torch.Tensor | None = None,
+    execution_plan: NvidiaExecutionPlan | None = None,
+) -> None:
+    """Project a query window, with the Gluon kernel when it covers the operands."""
+    plan = (
+        execution_plan
+        if execution_plan is not None
+        else default_execution_plan(
+            input_qdata,
+            weight_qdata,
+            operation="query",
+            head_dim=out[0].shape[3],
+            rotary_dim=cos.shape[1],
+        )
+    )
+    launch = _project_query_gluon if plan.uses_gluon else projection.project_query
+    launch(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        norm_weight,
+        cos,
+        sin,
+        norm_epsilon,
+        softmax_scale,
+        routing_mode,
+        block_lengths,
+        chunk_start=chunk_start,
+        chunk_rows=chunk_rows,
+        out=out,
+        bias=bias,
+        execution_plan=plan,
+    )
+
+
+def partial_row_block_size(
+    input_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    *,
+    operation: Literal["key", "value"],
+    head_dim: int,
+    rotary_dim: int = 0,
+    value_format: ValueFormat = ValueFormat.TRANSPOSED,
+) -> int | None:
+    """Return the Triton row block height for partial launches, preserving Gluon selections."""
+    plan = default_execution_plan(
+        input_qdata,
+        weight_qdata,
+        operation=operation,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+    )
+    use_gluon = plan.uses_gluon and (operation == "key" or value_format is ValueFormat.TRANSPOSED)
+    if use_gluon:
+        return None
+    return plan.block_m
+
+
+def project_key(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    norm_epsilon: float,
+    routing_mode: int,
+    block_lengths: torch.Tensor | None,
+    *,
+    out: KeyOutput,
+    bias: torch.Tensor | None = None,
+    execution_plan: NvidiaExecutionPlan | None = None,
+    start_row_block: int = 0,
+    num_row_blocks: int | None = None,
+) -> None:
+    """Project keys, with the Gluon kernel when it covers the operands."""
+    plan = (
+        execution_plan
+        if execution_plan is not None
+        else default_execution_plan(
+            input_qdata,
+            weight_qdata,
+            operation="key",
+            head_dim=out[0].shape[3],
+            rotary_dim=cos.shape[1],
+        )
+    )
+    use_gluon = plan.uses_gluon
+    if start_row_block != 0 or num_row_blocks is not None:
+        if use_gluon:
+            raise ValueError("Partial key row-block launches require a Triton execution plan")
+        projection.project_key(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            norm_weight,
+            cos,
+            sin,
+            norm_epsilon,
+            routing_mode,
+            block_lengths,
+            out=out,
+            bias=bias,
+            execution_plan=plan,
+            start_row_block=start_row_block,
+            num_row_blocks=num_row_blocks,
+        )
+        return
+    launch = _project_key_gluon if use_gluon else projection.project_key
+    launch(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        norm_weight,
+        cos,
+        sin,
+        norm_epsilon,
+        routing_mode,
+        block_lengths,
+        out=out,
+        bias=bias,
+        execution_plan=plan,
+    )
+
+
+def project_value(
+    input_qdata: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_lengths: torch.Tensor | None,
+    *,
+    value_format: ValueFormat,
+    out: ValueOutput,
+    bias: torch.Tensor | None = None,
+    execution_plan: NvidiaExecutionPlan | None = None,
+    start_row_block: int = 0,
+    num_row_blocks: int | None = None,
+) -> None:
+    """Project values, with the Gluon kernel when it covers the operands."""
+    plan = (
+        execution_plan
+        if execution_plan is not None
+        else default_execution_plan(
+            input_qdata, weight_qdata, operation="value", head_dim=out[2].shape[-1]
+        )
+    )
+    use_gluon = plan.uses_gluon and value_format is ValueFormat.TRANSPOSED
+    if start_row_block != 0 or num_row_blocks is not None:
+        if use_gluon:
+            raise ValueError("Partial value row-block launches require a Triton execution plan")
+        projection.project_value(
+            input_qdata,
+            input_scale,
+            weight_qdata,
+            weight_scale,
+            block_lengths,
+            value_format=value_format,
+            out=out,
+            bias=bias,
+            execution_plan=plan,
+            start_row_block=start_row_block,
+            num_row_blocks=num_row_blocks,
+        )
+        return
+    launch = _project_value_gluon if use_gluon else projection.project_value
+    launch(
+        input_qdata,
+        input_scale,
+        weight_qdata,
+        weight_scale,
+        block_lengths,
+        value_format=value_format,
+        out=out,
+        bias=bias,
+        execution_plan=plan,
+    )

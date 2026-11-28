@@ -12,7 +12,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from triton.backends.compiler import GPUTarget
 from triton.experimental.gluon._runtime import GluonASTSource
 
-from piper_kernels.fusions.convrot_int8_piper import _backend, _kernels, key, value
+from piper_kernels.fusions.convrot_int8_piper import _backend, key, value
 from piper_kernels.fusions.convrot_int8_piper import triton as projection
 from piper_kernels.fusions.convrot_int8_projection import triton as shared_projection
 
@@ -24,10 +24,10 @@ from .test_query import _compile_rdna4_launch, _operands
 @pytest.mark.parametrize("operation", ["key", "value"])
 def test_context_launches_compile_for_rdna4(monkeypatch, head_dim, operation):
     function = (
-        _kernels._project_key_kernel if operation == "key" else _kernels._project_value_kernel
+        projection._project_key_kernel if operation == "key" else projection._project_value_kernel
     )
     kernel = MagicMock()
-    monkeypatch.setattr(_kernels, function.__name__, kernel)
+    monkeypatch.setattr(projection, function.__name__, kernel)
     mock_rocm_target(monkeypatch, "gfx1201")
     with FakeTensorMode():
         operands = _operands("cuda:0", sequence=193, head_dim=head_dim)
