@@ -57,6 +57,32 @@ def _build_hadamard(
     return result / math.sqrt(size)
 
 
+def _rotate_groups_butterfly(value: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Apply factorized H4 butterfly stages on CPU without materializing a dense matrix."""
+    features = value.shape[-1]
+    compute = value.float() if value.dtype in (torch.float16, torch.bfloat16) else value
+    rotated = compute.reshape(math.prod(value.shape[:-1]), features // group_size, group_size)
+    stride = 1
+    while stride < group_size:
+        stage = rotated.reshape(
+            *rotated.shape[:-1],
+            group_size // (4 * stride),
+            4,
+            stride,
+        )
+        # Scale by 0.5 per H4 stage and pair additions identically to
+        # weights/convrot/triton.py:rotate_hadamard_stage(..., normalize=True)
+        # so FP32 values near FLT_MAX do not overflow before final normalization.
+        first, second, third, fourth = (stage * 0.5).unbind(-2)
+        p = first + second
+        q = first - second
+        r = third + fourth
+        s = third - fourth
+        rotated = torch.stack((p + s, p - s, q + r, r - q), dim=-2).reshape(rotated.shape)
+        stride *= 4
+    return rotated.to(dtype=value.dtype).reshape(value.shape)
+
+
 def rotate_groups(value: torch.Tensor, group_size: int) -> torch.Tensor:
     """Multiply groups along the final dimension by ConvRot's regular Hadamard."""
     validate_group_size(group_size)
@@ -65,6 +91,8 @@ def rotate_groups(value: torch.Tensor, group_size: int) -> torch.Tensor:
         raise ValueError(
             f"ConvRot feature dimension {features} is not divisible by group size {group_size}"
         )
+    if value.device.type == "cpu":
+        return _rotate_groups_butterfly(value, group_size)
     matrix = build_hadamard(group_size, value.device, value.dtype)
     grouped = value.reshape(-1, features // group_size, group_size)
     return torch.matmul(grouped, matrix).reshape(value.shape)

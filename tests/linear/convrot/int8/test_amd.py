@@ -151,10 +151,12 @@ def test_gfx1201_short_batch_matmul_schedules():
     ) == policy.select_execution_plan(gfx1200, in_features=5376)
 
 
-def test_optional_amd_compiler_option_compatibility(monkeypatch):
-    target = AcceleratorTarget("hip", "gfx1201")
-    monkeypatch.setattr(amd_triton.importlib, "import_module", Mock(return_value=object()))
-    assert amd_triton._amd_matmul_compiler_options(target) == {}
+def test_amd_matmul_compiler_options_scope_to_rdna4():
+    assert amd_triton._amd_matmul_compiler_options(AcceleratorTarget("hip", "gfx942")) == {}
+    assert amd_triton._amd_matmul_compiler_options(AcceleratorTarget("hip", "gfx1100")) == {}
+    for arch in ("gfx1200", "gfx1201"):
+        options = amd_triton._amd_matmul_compiler_options(AcceleratorTarget("hip", arch))
+        assert ("amdgpu-sched-strategy", "iterative-ilp") in options["llvm_fn_attrs"]
 
 
 def test_gfx1201_accumulator_seed_fits_every_int8_partial_sum():

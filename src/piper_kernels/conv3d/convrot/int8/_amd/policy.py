@@ -52,9 +52,6 @@ def _convolution_schedule(outputs: int, rows: int) -> ConvolutionSchedule:
     return ConvolutionSchedule(32, 64, 64, 4, 2)
 
 
-convolution_schedule = _convolution_schedule
-
-
 def preparation_schedule(channels: int) -> PreparationSchedule:
     """Bound the FP32 rotation tile independently of the convolution output width."""
     return PreparationSchedule(max(1, min(16, 4096 // channels)), 4)

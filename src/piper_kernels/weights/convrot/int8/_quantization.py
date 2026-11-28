@@ -8,35 +8,6 @@ from piper_kernels.weights.convrot._rotation import rotate_groups, validate_grou
 _SUPPORTED_LOGICAL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-def _rotate_weight_groups(value: torch.Tensor, group_size: int) -> torch.Tensor:
-    """Rotate FP32 convolution weights without a dense CPU matmul."""
-    if value.device.type != "cpu":
-        return rotate_groups(value, group_size)
-
-    features = value.shape[-1]
-    rotated = value.reshape(-1, features // group_size, group_size)
-    stride = 1
-    while stride < group_size:
-        stage = rotated.reshape(
-            *rotated.shape[:-1],
-            group_size // (4 * stride),
-            4,
-            stride,
-        )
-        first, second, third, fourth = stage.unbind(-2)
-        rotated = torch.stack(
-            (
-                first + second + third - fourth,
-                first + second - third + fourth,
-                first - second + third + fourth,
-                -first + second + third + fourth,
-            ),
-            dim=-2,
-        ).reshape(rotated.shape)
-        stride *= 4
-    return rotated.mul_(group_size**-0.5).reshape(value.shape)
-
-
 def validate_hp_weight(weight: torch.Tensor, group_size: int, *, ndims: tuple[int, ...]) -> None:
     """Validate a high-precision weight for ConvRot INT8 quantization or encoding.
 
@@ -77,7 +48,7 @@ def quantize_weight(
         channels_last = weight.permute(0, 2, 3, 4, 1).to(
             dtype=torch.float32, memory_format=torch.contiguous_format
         )
-        rotated = _rotate_weight_groups(channels_last, group_size)
+        rotated = rotate_groups(channels_last, group_size)
         qdata, scale = dynamic_quantize_rows(rotated.flatten(1))
         return qdata.view_as(rotated), scale
     return dynamic_quantize_rows(rotate_groups(weight.float(), group_size))
@@ -154,10 +125,9 @@ def dequantize_weight(
     if output_dtype not in _SUPPORTED_LOGICAL_DTYPES:
         raise ValueError("ConvRot INT8 dequantization output dtype must be floating point")
     rotated = qdata.float() * scale.reshape(-1, *((1,) * (qdata.ndim - 1)))
+    result = rotate_groups(rotated, group_size)
     if qdata.ndim == 5:
-        result = _rotate_weight_groups(rotated, group_size).permute(0, 4, 1, 2, 3)
-    else:
-        result = rotate_groups(rotated, group_size)
+        result = result.permute(0, 4, 1, 2, 3)
     return result.to(dtype=output_dtype, memory_format=torch.contiguous_format)
 
 

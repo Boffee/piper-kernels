@@ -40,3 +40,45 @@ def test_fake_rotation_does_not_reuse_or_populate_concrete_cache(warm_cache: boo
     assert build_hadamard(16) is concrete
     if before is not None:
         assert concrete is before
+
+
+@pytest.mark.parametrize("group_size", [16, 64, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("leading_shape", [(0,), (5,), (2, 3, 4)])
+def test_cpu_butterfly_rotate_groups_matches_dense_hadamard(
+    group_size: int,
+    dtype: torch.dtype,
+    leading_shape: tuple[int, ...],
+) -> None:
+    torch.manual_seed(17 + group_size)
+    features = 2 * group_size
+    value = torch.randn(*leading_shape, features, dtype=dtype)
+    actual = _rotation.rotate_groups(value, group_size)
+    reference_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+    matrix = build_hadamard(group_size, value.device, reference_dtype)
+    grouped = value.to(reference_dtype).reshape(-1, features // group_size, group_size)
+    expected = torch.matmul(grouped, matrix).to(dtype).reshape(value.shape)
+    assert actual.shape == value.shape
+    assert actual.dtype is dtype
+    torch.testing.assert_close(actual, expected)
+
+
+def test_cpu_butterfly_rotate_groups_supports_autograd_and_empty_features() -> None:
+    empty = torch.empty(3, 0, dtype=torch.float32)
+    assert _rotation.rotate_groups(empty, 64).shape == (3, 0)
+
+    x = torch.randn(4, 64, dtype=torch.float64, requires_grad=True)
+    y = _rotation.rotate_groups(x, 64)
+    y.square().sum().backward()
+    assert x.grad is not None
+    # H is orthogonal, so d/dx ||x H||^2 = 2x.
+    torch.testing.assert_close(x.grad, 2.0 * x.detach())
+
+
+@pytest.mark.parametrize("group_size", [16, 64, 256])
+def test_cpu_butterfly_rotate_groups_preserves_fp32_large_magnitude_range(group_size: int) -> None:
+    """Per-stage 0.5 scaling avoids intermediate FP32 overflow near FLT_MAX."""
+    value = torch.full((2, group_size), 1e38, dtype=torch.float32)
+    actual = _rotation.rotate_groups(value, group_size)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, value, rtol=1e-5, atol=1e2)

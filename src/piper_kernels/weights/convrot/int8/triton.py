@@ -94,28 +94,76 @@ def _store_quantized_chunk(
 
 
 @triton.jit
+def _load_and_store_static_chunk(
+    x_ptr,
+    q_ptr,
+    input_row_offset,
+    packed_row_offset,
+    output_row_offset,
+    row_width,
+    scale,
+    chunk_start: tl.constexpr,
+    chunk_size: tl.constexpr,
+    group_size: tl.constexpr,
+    inverse_sqrt_group: tl.constexpr,
+    activation_fn: tl.constexpr,
+    accelerator_backend: tl.constexpr,
+    gguf_quant_type: tl.constexpr,
+):
+    chunk_offsets = tl.arange(0, chunk_size)
+    values = convrot_backend.load_rotated_chunk(
+        x_ptr,
+        input_row_offset,
+        packed_row_offset,
+        row_width,
+        chunk_start,
+        chunk_offsets,
+        chunk_size,
+        group_size,
+        inverse_sqrt_group,
+        activation_fn,
+        accelerator_backend,
+        gguf_quant_type,
+    )
+    _store_quantized_chunk(
+        q_ptr,
+        output_row_offset,
+        row_width,
+        chunk_start,
+        chunk_offsets,
+        values,
+        scale,
+        accelerator_backend,
+    )
+
+
+@triton.jit
 def rotate_quantize_rows_kernel(
     x_ptr,
     q_ptr,
     scale_ptr,
     row_width,
-    chunk_size: tl.constexpr,
-    chunk_count: tl.constexpr,
+    block0: tl.constexpr,
+    block1: tl.constexpr,
+    block2: tl.constexpr,
     group_size: tl.constexpr,
     inverse_sqrt_group: tl.constexpr,
     activation_fn: tl.constexpr,
     accelerator_backend: tl.constexpr,
     gguf_quant_type: tl.constexpr,
     static_scale_ptr=None,
+    fold_norm_into_scale: tl.constexpr = False,
 ):
-    """Rotate and quantize a row held as one, two, or three equal chunks.
+    """Rotate and quantize a row held as one, two, or three group-aligned chunks.
 
     Dynamic scaling keeps rotated chunks live until the row maximum is known.
-    Static scaling quantizes and stores each chunk immediately.
+    Static scaling quantizes and stores each chunk immediately. When
+    ``fold_norm_into_scale`` is set (dynamic scaling only), the exact
+    power-of-two group normalization factor is applied once to the stored row
+    scale instead of every rotated value.
     """
     row = tl.program_id(0)
     row_i64 = row.to(tl.int64)
-    chunk_offsets = tl.arange(0, chunk_size)
     input_row_width = row_width * (2 if activation_fn == "swiglu" else 1)
     input_row_offset = row_i64 * input_row_width
     packed_row_offset = 0
@@ -128,119 +176,124 @@ def rotate_quantize_rows_kernel(
 
     if static_scale_ptr is not None:
         scale = tl.load(static_scale_ptr)
-        for chunk in tl.static_range(chunk_count):  # pyright: ignore[reportGeneralTypeIssues]
-            values = convrot_backend.load_rotated_chunk(
-                x_ptr,
-                input_row_offset,
-                packed_row_offset,
-                row_width,
-                chunk * chunk_size,
-                chunk_offsets,
-                chunk_size,
+        static_head = (
+            x_ptr,
+            q_ptr,
+            input_row_offset,
+            packed_row_offset,
+            output_row_offset,
+            row_width,
+            scale,
+        )
+        _load_and_store_static_chunk(
+            *static_head,
+            0,
+            block0,
+            group_size,
+            inverse_sqrt_group,
+            activation_fn,
+            accelerator_backend,
+            gguf_quant_type,
+        )
+        if block1 > 0:
+            _load_and_store_static_chunk(
+                *static_head,
+                block0,
+                block1,
                 group_size,
                 inverse_sqrt_group,
                 activation_fn,
                 accelerator_backend,
                 gguf_quant_type,
             )
-            _store_quantized_chunk(
-                q_ptr,
-                output_row_offset,
-                row_width,
-                chunk * chunk_size,
-                chunk_offsets,
-                values,
-                scale,
+        if block2 > 0:
+            _load_and_store_static_chunk(
+                *static_head,
+                block0 + block1,
+                block2,
+                group_size,
+                inverse_sqrt_group,
+                activation_fn,
                 accelerator_backend,
+                gguf_quant_type,
             )
         tl.store(scale_ptr + row_i64, scale)
         return
 
+    load_norm: tl.constexpr = tl.constexpr(1.0) if fold_norm_into_scale else inverse_sqrt_group
+    load_head = (x_ptr, input_row_offset, packed_row_offset, row_width)
+    offsets0 = tl.arange(0, block0)
     values0 = convrot_backend.load_rotated_chunk(
-        x_ptr,
-        input_row_offset,
-        packed_row_offset,
-        row_width,
+        *load_head,
         0,
-        chunk_offsets,
-        chunk_size,
+        offsets0,
+        block0,
         group_size,
-        inverse_sqrt_group,
+        load_norm,
         activation_fn,
         accelerator_backend,
         gguf_quant_type,
     )
     row_max = tl.max(tl.abs(values0).to(tl.float32), axis=0)
-    if chunk_count >= 2:
+    if block1 > 0:
+        offsets1 = tl.arange(0, block1)
         values1 = convrot_backend.load_rotated_chunk(
-            x_ptr,
-            input_row_offset,
-            packed_row_offset,
-            row_width,
-            chunk_size,
-            chunk_offsets,
-            chunk_size,
+            *load_head,
+            block0,
+            offsets1,
+            block1,
             group_size,
-            inverse_sqrt_group,
+            load_norm,
             activation_fn,
             accelerator_backend,
             gguf_quant_type,
         )
-        row_max = tl.maximum(
-            row_max,
-            tl.max(tl.abs(values1).to(tl.float32), axis=0),
-        )
-    if chunk_count >= 3:
+        row_max = tl.maximum(row_max, tl.max(tl.abs(values1).to(tl.float32), axis=0))
+    if block2 > 0:
+        offsets2 = tl.arange(0, block2)
         values2 = convrot_backend.load_rotated_chunk(
-            x_ptr,
-            input_row_offset,
-            packed_row_offset,
-            row_width,
-            2 * chunk_size,
-            chunk_offsets,
-            chunk_size,
+            *load_head,
+            block0 + block1,
+            offsets2,
+            block2,
             group_size,
-            inverse_sqrt_group,
+            load_norm,
             activation_fn,
             accelerator_backend,
             gguf_quant_type,
         )
-        row_max = tl.maximum(
-            row_max,
-            tl.max(tl.abs(values2).to(tl.float32), axis=0),
-        )
+        row_max = tl.maximum(row_max, tl.max(tl.abs(values2).to(tl.float32), axis=0))
 
-    scale = tl.maximum(int8_scale_from_max(row_max, accelerator_backend == "hip"), 1e-30)
-    _store_quantized_chunk(
-        q_ptr,
-        output_row_offset,
-        row_width,
-        0,
-        chunk_offsets,
-        values0,
-        scale,
-        accelerator_backend,
-    )
-    if chunk_count >= 2:
+    if fold_norm_into_scale:
+        # Every supported group has an exact power-of-two normalization factor.
+        # Apply it once to the stored row scale instead of every rotated value.
+        quantize_scale = tl.maximum(
+            int8_scale_from_max(row_max, accelerator_backend == "hip"),
+            1e-30 / inverse_sqrt_group,
+        )
+        scale = quantize_scale * inverse_sqrt_group
+    else:
+        scale = tl.maximum(int8_scale_from_max(row_max, accelerator_backend == "hip"), 1e-30)
+        quantize_scale = scale
+
+    store_head = (q_ptr, output_row_offset, row_width)
+    _store_quantized_chunk(*store_head, 0, offsets0, values0, quantize_scale, accelerator_backend)
+    if block1 > 0:
         _store_quantized_chunk(
-            q_ptr,
-            output_row_offset,
-            row_width,
-            chunk_size,
-            chunk_offsets,
+            *store_head,
+            block0,
+            offsets1,  # pyright: ignore[reportPossiblyUnboundVariable]
             values1,  # pyright: ignore[reportPossiblyUnboundVariable]
-            scale,
+            quantize_scale,
             accelerator_backend,
         )
-    if chunk_count >= 3:
+    if block2 > 0:
         _store_quantized_chunk(
-            q_ptr,
-            output_row_offset,
-            row_width,
-            2 * chunk_size,
-            chunk_offsets,
+            *store_head,
+            block0 + block1,
+            offsets2,  # pyright: ignore[reportPossiblyUnboundVariable]
             values2,  # pyright: ignore[reportPossiblyUnboundVariable]
-            scale,
+            quantize_scale,
             accelerator_backend,
         )
     tl.store(scale_ptr + row_i64, scale)
@@ -330,6 +383,32 @@ def quantize_rows_kernel(
     quantized = _quantize_int8(values, scale, accelerator_backend)
     tl.store(q_ptr + row_offset + offsets, quantized, mask=mask)
     tl.store(scale_ptr + row_i64, scale)
+
+
+def quantize_input(
+    rotated: torch.Tensor,
+    input_qdata: torch.Tensor,
+    row_scales: torch.Tensor,
+    *,
+    input_scale: torch.Tensor | None = None,
+    num_warps: int,
+    target: AcceleratorTarget | None = None,
+) -> None:
+    """Apply the portable split-path rowwise quantization."""
+    resolved = AcceleratorTarget.from_device(rotated.device) if target is None else target
+    m, k = rotated.shape
+    with device_context(rotated.device):
+        quantize_rows_kernel[(m,)](
+            rotated,
+            input_qdata,
+            row_scales,
+            k,
+            block_size=max(128, triton.next_power_of_2(k)),
+            accelerator_backend=resolved.backend,
+            reciprocal_scale=resolved.is_amd_hip,
+            static_scale_ptr=input_scale,
+            num_warps=num_warps,
+        )
 
 
 @triton.jit
@@ -508,6 +587,8 @@ def _addmm_fused_(
     beta: float,
     alpha: float,
     rounding_seed: int | None = None,
+    *,
+    target: AcceleratorTarget | None = None,
 ) -> None:
     """Merge contiguous INT8 rows with group-aligned tiles.
 
@@ -517,8 +598,18 @@ def _addmm_fused_(
     One-column-tile rows can reduce and pack in one pass. Rotation and GEMM
     retain the batched path's dtype rounding boundaries, including autocast.
     """
+    resolved = AcceleratorTarget.from_device(qdata.device) if target is None else target
     if alpha == 0 or mat1.shape[1] == 0:
-        _requantize_update_(qdata, scale, qdata, beta, alpha, rounding_seed, has_update=False)
+        _requantize_update_(
+            qdata,
+            scale,
+            qdata,
+            beta,
+            alpha,
+            rounding_seed,
+            has_update=False,
+            target=resolved,
+        )
         return
     rows, width = qdata.shape
     block_n = max(128, group_size)
@@ -560,7 +651,7 @@ def _addmm_fused_(
                 stochastic=rounding_seed is not None,
                 write_maxima=write_maxima,
                 single_tile=tiles == 1,
-                accelerator_backend="hip" if _reciprocal_scale(qdata) else qdata.device.type,
+                accelerator_backend=resolved.backend,
                 block_m=_ADDMM_BLOCK_M,
                 block_n=block_n,
                 block_k=_ADDMM_BLOCK_K,
@@ -573,16 +664,12 @@ def _addmm_fused_(
                     new_scale,
                     tiles,
                     block_size=triton.next_power_of_2(tiles),
-                    reciprocal_scale=_reciprocal_scale(qdata),
+                    reciprocal_scale=resolved.is_amd_hip,
                     num_warps=4,
                 )
         # Every packing CTA must finish reading the old scales before replacement.
         if tiles > 1:
             scale.copy_(new_scale)
-
-
-def _reciprocal_scale(value: torch.Tensor) -> bool:
-    return value.device.type == "cuda" and torch.version.hip is not None
 
 
 def convert_gguf_out(data, quant_type, group_size, qdata, scale):
@@ -601,8 +688,9 @@ def convert_gguf_out(data, quant_type, group_size, qdata, scale):
                 qdata,
                 scale,
                 width,
-                chunk_size=chunk_size,
-                chunk_count=chunk_count,
+                block0=chunk_size,
+                block1=chunk_size if chunk_count >= 2 else 0,
+                block2=chunk_size if chunk_count >= 3 else 0,
                 group_size=group_size,
                 inverse_sqrt_group=group_size**-0.5,
                 activation_fn=None,
@@ -616,6 +704,7 @@ def convert_gguf_out(data, quant_type, group_size, qdata, scale):
 
 def _convert_gguf_tiled_out(data, quant_type, group_size, qdata, scale):
     """Convert with at most 1 MiB of maxima, or one row's maxima."""
+    resolved = AcceleratorTarget.from_device(data.device)
     rows, width = qdata.shape
     tiles = (width + _GGUF_TILE_SIZE - 1) // _GGUF_TILE_SIZE
     batch_rows = min(rows, max(1, _GGUF_MAXIMA_BYTES // (tiles * 4)))
@@ -636,7 +725,7 @@ def _convert_gguf_tiled_out(data, quant_type, group_size, qdata, scale):
                     group_size=group_size,
                     quant_type=quant_type,
                     write_maxima=write_maxima,
-                    accelerator_backend="hip" if _reciprocal_scale(data) else data.device.type,
+                    accelerator_backend=resolved.backend,
                     num_warps=4,
                 )
                 if write_maxima:
@@ -645,7 +734,7 @@ def _convert_gguf_tiled_out(data, quant_type, group_size, qdata, scale):
                         scales,
                         tiles,
                         block_size=triton.next_power_of_2(tiles),
-                        reciprocal_scale=_reciprocal_scale(data),
+                        reciprocal_scale=resolved.is_amd_hip,
                         num_warps=4,
                     )
 
@@ -668,17 +757,26 @@ def _addmm_(
             mat1 = mat1.clone()
         if _shares_storage(mat2, qdata) or _shares_storage(mat2, scale):
             mat2 = mat2.clone()
-    if _supports_fused_addmm(AcceleratorTarget.from_device(qdata.device)):
-        _addmm_fused_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed)
+    target = AcceleratorTarget.from_device(qdata.device)
+    if _supports_fused_addmm(target):
+        _addmm_fused_(
+            qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed, target=target
+        )
     else:
-        _addmm_batched_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed)
+        _addmm_batched_(
+            qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed, target=target
+        )
 
 
-def _addmm_batched_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed=None):
+def _addmm_batched_(
+    qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_seed=None, *, target=None
+):
     """Rotate the right factor and merge row batches with a bounded product buffer."""
     has_update = alpha != 0 and mat1.shape[1] != 0
     if not has_update:
-        _requantize_update_(qdata, scale, qdata, beta, alpha, rounding_seed, has_update=False)
+        _requantize_update_(
+            qdata, scale, qdata, beta, alpha, rounding_seed, has_update=False, target=target
+        )
         return
 
     mat2_contiguous = mat2.contiguous()
@@ -688,7 +786,9 @@ def _addmm_batched_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_
     batch_rows = min(rows, max(1, _UPDATE_WORKSPACE_BYTES // (width * mat1.element_size())))
     if batch_rows == rows:
         update = torch.mm(mat1, rotated_mat2)
-        _requantize_update_(qdata, scale, update, beta, alpha, rounding_seed, has_update=True)
+        _requantize_update_(
+            qdata, scale, update, beta, alpha, rounding_seed, has_update=True, target=target
+        )
         return
     for start in range(0, rows, batch_rows):
         stop = min(start + batch_rows, rows)
@@ -702,15 +802,17 @@ def _addmm_batched_(qdata, scale, mat1, mat2, group_size, beta, alpha, rounding_
             rounding_seed,
             has_update=True,
             start_row=start,
+            target=target,
         )
         # Release before the next matmul allocates, keeping only one product live.
         del batch_update
 
 
 def _requantize_update_(
-    qdata, scale, update, beta, alpha, rounding_seed, *, has_update, start_row=0
+    qdata, scale, update, beta, alpha, rounding_seed, *, has_update, start_row=0, target=None
 ):
     """Refill rowwise storage with one shared schedule on the weight's device."""
+    resolved = AcceleratorTarget.from_device(qdata.device) if target is None else target
     out_features, in_features = qdata.shape
     with device_context(qdata.device):
         requantize_update_rows_kernel[(out_features,)](
@@ -731,8 +833,8 @@ def _requantize_update_(
             has_base=beta != 0,
             has_update=has_update,
             stochastic=rounding_seed is not None,
-            reciprocal_scale=_reciprocal_scale(qdata),
-            accelerator_backend="hip" if _reciprocal_scale(qdata) else qdata.device.type,
+            reciprocal_scale=resolved.is_amd_hip,
+            accelerator_backend=resolved.backend,
             num_warps=8,
         )
 

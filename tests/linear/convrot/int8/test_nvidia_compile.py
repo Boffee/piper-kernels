@@ -33,13 +33,15 @@ def test_nvidia_preparation_compiles_without_a_device(architecture, static):
             **({"static_scale_ptr": "*fp32"} if static else {}),
         },
         constexprs={
-            "chunk_size": chunk_size,
-            "chunk_count": chunk_count,
+            "block0": chunk_size,
+            "block1": chunk_size if chunk_count >= 2 else 0,
+            "block2": chunk_size if chunk_count >= 3 else 0,
             "group_size": 256,
             "inverse_sqrt_group": 256**-0.5,
             "activation_fn": "gelu_tanh",
             "accelerator_backend": "cuda",
             "gguf_quant_type": -1,
+            "fold_norm_into_scale": False,
             **({} if static else {"static_scale_ptr": None}),
         },
     )

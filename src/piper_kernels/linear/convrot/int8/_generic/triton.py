@@ -1,17 +1,9 @@
 """Conservative shared Triton launchers without a GPU-model allowlist."""
 
-# pyright: reportCallIssue=false
-
 import torch
-import triton
 
-from piper_kernels._triton.runtime import device_context
-from piper_kernels.weights.convrot.int8.triton import quantize_rows_kernel
+from piper_kernels.weights.convrot.int8.triton import quantize_input
 from piper_kernels.weights.convrot.triton import rotate_input
-
-
-def _reciprocal_scale(value: torch.Tensor) -> bool:
-    return value.device.type == "cuda" and torch.version.hip is not None
 
 
 def prepare_input(input, group_size, input_scale=None, *, out):  # noqa: A002
@@ -22,16 +14,5 @@ def prepare_input(input, group_size, input_scale=None, *, out):  # noqa: A002
         return out
     rotated = torch.empty(value.shape, device=value.device, dtype=torch.float32)
     rotate_input(value, rotated, group_size, num_warps=4)
-    with device_context(input.device):
-        quantize_rows_kernel[(value.shape[0],)](
-            rotated,
-            out[0],
-            out[1],
-            width,
-            block_size=max(128, triton.next_power_of_2(width)),
-            reciprocal_scale=_reciprocal_scale(value),
-            accelerator_backend="hip" if _reciprocal_scale(value) else value.device.type,
-            static_scale_ptr=input_scale,
-            num_warps=4,
-        )
-        return out
+    quantize_input(rotated, out[0], out[1], input_scale=input_scale, num_warps=4)
+    return out

@@ -15,7 +15,7 @@ from piper_kernels.attention.sage_attention_2pp import triton as sage
 from piper_kernels.attention.sage_attention_2pp._policy import SageAttention2ppExecutionPlan
 from piper_kernels.gguf import GGUFQuantizationType
 from piper_kernels.linear.convrot.int8 import _backend, _generic
-from piper_kernels.linear.convrot.int8._generic import triton as generic
+from piper_kernels.linear.convrot.int8 import triton as linear_int8_triton
 from piper_kernels.weights.convrot import triton as rotation
 from piper_kernels.weights.convrot.int8 import _gguf
 from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
@@ -147,7 +147,7 @@ def test_generic_operations_keep_triton_on_noncurrent_gpu(launches, operation, m
     monkeypatch.setattr(int8_weight_triton, "_supports_fused_addmm", lambda *args: False)
     for module, name in (
         (rotation, "rotate_groups_kernel"),
-        (generic, "quantize_rows_kernel"),
+        (int8_weight_triton, "quantize_rows_kernel"),
         (int8_weight_triton, "requantize_update_rows_kernel"),
     ):
         launches.watch(module, name)
@@ -204,9 +204,9 @@ def test_prepared_paired_projection_owns_context_for_all_launches(launches, back
     launches.backend = "hip" if backend is amd else "cuda"
     launches.fail = fail
     kernel_backend = backend.kernels
-    launches.watch(kernel_backend, "int8_matmul_kernel")
+    launches.watch(linear_int8_triton, "int8_matmul_kernel")
     if backend is nvidia:
-        launches.watch(kernel_backend, "dynamic_m_int8_matmul_kernel")
+        launches.watch(linear_int8_triton, "dynamic_m_int8_matmul_kernel")
     else:
         launches.watch(kernel_backend, "_paired_int8_matmul_kernel")
     with FakeTensorMode():
@@ -242,11 +242,11 @@ def test_prepared_residual_projection_owns_context_for_all_launches(launches, ba
     launches.backend = "hip" if backend is amd else "cuda"
     launches.fail = fail
     kernel_backend = backend.kernels
-    launches.watch(kernel_backend, "int8_matmul_kernel")
+    launches.watch(linear_int8_triton, "int8_matmul_kernel")
     launches.watch(residual_kernels, "_residual_add_kernel")
     if backend is nvidia:
+        launches.watch(linear_int8_triton, "dynamic_m_int8_matmul_kernel")
         for name in (
-            "dynamic_m_int8_matmul_kernel",
             "int8_residual_matmul_kernel",
             "dynamic_m_int8_residual_matmul_kernel",
         ):

@@ -185,3 +185,26 @@ def test_padding_fusion_requires_proven_reflection_bounds(symbolic):
     assert conv.args[0] is padded
     assert shape_env.guards == guards
     assert shape_env.deferred_runtime_asserts == deferred_asserts
+
+
+def test_padding_fusion_binds_conv3d_keyword_arguments():
+    with FakeTensorMode():
+        value = torch.empty(1, 64, 3, 5, 6)
+    graph = torch.fx.Graph()
+    source = graph.placeholder("source")
+    source.meta["example_value"] = value
+    weight = graph.placeholder("weight")
+    padded = graph.call_function(functional.pad, (source, (1, 1, 1, 1, 0, 0), "reflect"))
+    conv = graph.call_function(
+        _CONV,
+        args=(padded, weight, weight, None, 64, weight, [1, 1, 1]),
+        kwargs={"padding": [0, 0, 0, 0, 2, 0], "spatial_reflection": False, "residual": None},
+    )
+    graph.output(conv)
+    with torch.no_grad():
+        _run_padding_pass(graph)
+    assert conv.args[0] is source
+    assert conv.args[7] == [1, 1, 1, 1, 2, 0]
+    assert conv.args[8] is True
+    assert conv.kwargs == {}
+    assert all(n.target is not functional.pad for n in graph.nodes)

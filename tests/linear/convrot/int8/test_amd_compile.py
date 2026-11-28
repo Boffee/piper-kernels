@@ -16,6 +16,7 @@ from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import triton as kernels
 from piper_kernels.linear.convrot.int8._amd import policy
 from piper_kernels.linear.convrot.int8._amd import triton as amd
+from piper_kernels.weights.convrot.int8 import triton as kernels_weights
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="ROCm support is Linux-only")
 
@@ -174,28 +175,43 @@ def test_rdna4_projection_barriers_fence_only_lds():
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx1100", "gfx1151", "gfx1201"])
-@pytest.mark.parametrize("width", [5376, 9216, 12288, 14336, 16384])
+@pytest.mark.parametrize(
+    ("width", "dtype", "activation", "fold_norm"),
+    [
+        (5376, "*bf16", "swiglu", True),
+        (9216, "*bf16", "swiglu", True),
+        (12288, "*bf16", "swiglu", True),
+        (14336, "*bf16", "swiglu", True),
+        (16384, "*fp16", "gelu_tanh", False),
+        (16384, "*bf16", "gelu_tanh", True),
+    ],
+)
 @pytest.mark.parametrize("static", [False, True])
-def test_amd_activated_preparation_compiles(architecture, width, static):
-    chunked = width != 16384
+def test_amd_activated_preparation_compiles(
+    architecture, width, dtype, activation, fold_norm, static
+):
     plan = policy.select_execution_plan(AcceleratorTarget("hip", architecture), in_features=width)
+    blocks = policy.preparation_blocks(width)
+    if dtype == "*bf16" and blocks[1] != 0:
+        block0, block1, block2 = blocks
+    else:
+        block0, block1, block2 = max(128, triton.next_power_of_2(width)), 0, 0
     constants = {
+        "block0": block0,
+        "block1": block1,
+        "block2": block2,
         "group_size": 256,
         "inverse_sqrt_group": 256**-0.5,
-        "activation_fn": "swiglu" if chunked else "gelu_tanh",
+        "activation_fn": activation,
         "accelerator_backend": "hip",
+        "gguf_quant_type": -1,
+        "fold_norm_into_scale": fold_norm,
         **({} if static else {"static_scale_ptr": None}),
     }
-    if chunked:
-        constants.update(
-            zip(("block0", "block1", "block2"), policy.preparation_blocks(width), strict=True)
-        )
-    else:
-        constants["block_size"] = width
     source = ASTSource(
-        amd.rotate_quantize_rows_chunked_kernel if chunked else amd.rotate_quantize_rows_kernel,
+        kernels_weights.rotate_quantize_rows_kernel,
         {
-            "x_ptr": "*bf16" if chunked else "*fp16",
+            "x_ptr": dtype,
             "q_ptr": "*i8",
             "scale_ptr": "*fp32",
             "row_width": "i32",
@@ -212,9 +228,12 @@ def test_amd_activated_preparation_compiles(architecture, width, static):
     # BF16 inputs are widened on load; rotated/activated values stay FP32
     # until the terminal integer conversion, on every supported AMD target.
     assert "arith.truncf" not in compiled.asm["ttir"]
-    if not chunked:
+    if activation == "gelu_tanh":
         assert "ocml_tanh" not in compiled.asm["llir"]
         assert "v_exp_f32" in compiled.asm["amdgcn"]
+    if architecture == "gfx1201":
+        assert ".vgpr_spill_count: 0" in compiled.asm["amdgcn"]
+        assert ".private_segment_fixed_size: 0" in compiled.asm["amdgcn"]
 
     if static:
         assert "tt.reduce" not in compiled.asm["ttir"]

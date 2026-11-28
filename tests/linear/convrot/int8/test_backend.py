@@ -14,6 +14,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from piper_kernels._residual import ResidualAdd, ReusableUpdate
 from piper_kernels._triton.targets import AcceleratorTarget
 from piper_kernels.linear.convrot.int8 import _backend, _functional
+from piper_kernels.linear.convrot.int8 import triton as linear_triton
 from piper_kernels.linear.convrot.int8._generic import mean as generic_mean
 from piper_kernels.weights.convrot.int8 import _gguf as int8_gguf
 from piper_kernels.weights.convrot.int8 import _update
@@ -79,13 +80,12 @@ def test_select_backend_preserves_supported_targets(monkeypatch, target, platfor
     ],
 )
 def test_matmul_uses_one_launch_and_only_metadata(monkeypatch, backend, target, m, n, k):
-    kernel_backend = backend.kernels
     kernel = MagicMock()
     gluon_kernel = MagicMock()
     tma_kernel = MagicMock()
-    monkeypatch.setattr(kernel_backend, "int8_matmul_kernel", kernel)
+    monkeypatch.setattr(linear_triton, "int8_matmul_kernel", kernel)
+    monkeypatch.setattr(linear_triton, "dynamic_m_int8_matmul_kernel", kernel)
     if backend is nvidia:
-        monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
         monkeypatch.setattr(nvidia_kernels.gluon_async_copy, "_int8_matmul_kernel", gluon_kernel)
         monkeypatch.setattr(nvidia_kernels.gluon_tma, "_int8_tma_matmul_kernel", tma_kernel)
     value = torch.empty(m, k, device="meta", dtype=torch.int8)
@@ -144,8 +144,8 @@ def test_triton_tail_scheduling_is_independent_of_bias_rounding(
     monkeypatch, specialize_m, explicit_bias_fma
 ):
     kernel = MagicMock()
-    monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", kernel)
-    monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
+    monkeypatch.setattr(linear_triton, "int8_matmul_kernel", kernel)
+    monkeypatch.setattr(linear_triton, "dynamic_m_int8_matmul_kernel", kernel)
     value = torch.empty(33, 256, device="meta", dtype=torch.int8)
     weight = torch.empty(64, 256, device="meta", dtype=torch.int8)
     plan = replace(
@@ -186,8 +186,8 @@ def test_nvidia_launch_grouping_follows_the_plan(
 ):
     target = AcceleratorTarget("cuda", architecture)
     kernel = MagicMock()
-    monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", kernel)
-    monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
+    monkeypatch.setattr(linear_triton, "int8_matmul_kernel", kernel)
+    monkeypatch.setattr(linear_triton, "dynamic_m_int8_matmul_kernel", kernel)
     k = 1024
     value = torch.empty(rows, k, device="meta", dtype=torch.int8)
     weight = torch.empty(n, k, device="meta", dtype=torch.int8)
@@ -232,8 +232,8 @@ def test_sm8x_wide_projections_launch_the_gluon_kernel(
     target = AcceleratorTarget("cuda", "sm89")
     kernel = MagicMock()
     gluon_kernel = MagicMock()
-    monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", kernel)
-    monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", kernel)
+    monkeypatch.setattr(linear_triton, "int8_matmul_kernel", kernel)
+    monkeypatch.setattr(linear_triton, "dynamic_m_int8_matmul_kernel", kernel)
     monkeypatch.setattr(nvidia_kernels.gluon_async_copy, "_int8_matmul_kernel", gluon_kernel)
     k = 1024
     value = torch.empty(rows, k, device="meta", dtype=torch.int8)
@@ -263,8 +263,8 @@ def test_sm120_large_projections_launch_tma_or_fall_back_to_grouped_triton(monke
     target = AcceleratorTarget("cuda", "sm120")
     triton_kernel = MagicMock()
     tma_kernel = MagicMock()
-    monkeypatch.setattr(nvidia_kernels, "int8_matmul_kernel", triton_kernel)
-    monkeypatch.setattr(nvidia_kernels, "dynamic_m_int8_matmul_kernel", triton_kernel)
+    monkeypatch.setattr(linear_triton, "int8_matmul_kernel", triton_kernel)
+    monkeypatch.setattr(linear_triton, "dynamic_m_int8_matmul_kernel", triton_kernel)
     monkeypatch.setattr(nvidia_kernels.gluon_tma, "_int8_tma_matmul_kernel", tma_kernel)
     rows, n = 4096, 1000
     value = torch.empty(rows, k, device="meta", dtype=torch.int8)
@@ -605,8 +605,9 @@ def test_nvidia_fused_launcher_validates_target_before_launch(monkeypatch, targe
         kernel.__getitem__.assert_called_once_with((2,))
         launch = kernel.__getitem__.return_value
         launch.assert_called_once()
-        assert launch.call_args.kwargs["chunk_count"] == 1
-        assert launch.call_args.kwargs["chunk_size"] == 512
+        assert launch.call_args.kwargs["block0"] == 512
+        assert launch.call_args.kwargs["block1"] == 0
+        assert launch.call_args.kwargs["block2"] == 0
         assert launch.call_args.kwargs["accelerator_backend"] == "cuda"
     else:
         with pytest.raises(ValueError, match="preparation has no optimized policy"):
